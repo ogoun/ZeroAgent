@@ -16,14 +16,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      # Канал и компоненты берутся из rust-toolchain.toml
+      # С rustup 1.28 `rustup show` больше не ставит тулчейн; без аргументов
+      # `rustup toolchain install` читает канал и компоненты из rust-toolchain.toml.
       - name: Тулчейн Rust
-        run: rustup show
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo xtask policy
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # cargo-deny ставится бинарником: EmbarkStudios/cargo-deny-action это
+      # Docker-действие и на windows-latest не запускается.
+      - uses: taiki-e/install-action@v2
         with:
-          command: check
+          tool: cargo-deny
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo --locked xtask policy
+      - run: cargo deny --locked check
