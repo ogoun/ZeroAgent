@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use za_protocol::Seq;
-use za_store::ProjectStore;
+use za_store::{ProjectStore, StoreError};
 
 /// Сколько ждать первого подтверждения: запуск процесса и миграции.
 const FIRST_ACK_TIMEOUT: Duration = Duration::from_secs(20);
@@ -115,14 +115,26 @@ fn read_all_seqs(s: &ProjectStore) -> HashSet<Seq> {
     })
 }
 
+/// Открывает журнал после убийства писателя. Блокировку `journal.lock` ОС
+/// снимает вместе с процессом, но на Windows не всегда мгновенно: `Locked`
+/// повторяется ограниченно (10 × 100 мс), как в бинарнике zero-agent.
+fn open_after_kill(d: &Path) -> ProjectStore {
+    for _ in 0..10 {
+        match ProjectStore::open(d) {
+            Err(StoreError::Locked) => std::thread::sleep(Duration::from_millis(100)),
+            r => return r.unwrap(),
+        }
+    }
+    ProjectStore::open(d).unwrap()
+}
+
 fn crash_rounds(name: &str, rounds: u64, durable: bool) {
     for round in 0..rounds {
         let d = dir(&format!("{name}{round}"));
         let mut w = spawn_writer(&d, durable);
         let mut acked = read_seqs_for(&mut w, Duration::from_millis(50 + round * 37));
         kill(&mut w, &mut acked);
-        // Блокировка `journal.lock` снята ОС вместе с процессом: не `Locked`.
-        let s = ProjectStore::open(&d).unwrap();
+        let s = open_after_kill(&d);
         let got = read_all_seqs(&s);
         let lost: Vec<_> = acked.iter().filter(|q| !got.contains(q)).collect();
         assert!(
