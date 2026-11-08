@@ -187,8 +187,8 @@ fn decode(key: &EffectKey, mut envelope: Value) -> Result<Value, EffectError> {
         }
         _ => {}
     }
-    Err(EffectError::Store(StoreError::Sqlite(format!(
-        "повреждённые данные журнала: квитанция {} без конверта исхода",
+    Err(EffectError::Store(StoreError::Corrupt(format!(
+        "квитанция {} без конверта исхода",
         key.0
     ))))
 }

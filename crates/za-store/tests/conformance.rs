@@ -354,6 +354,44 @@ async fn blob_over_one_mib_is_a_file() {
     assert_eq!(s.get_blob(&h).await.unwrap(), Some(data));
 }
 
+/// Строка blob есть, а файл пропал (например, после отключения питания):
+/// повторный `put_blob` тех же данных восстанавливает файл.
+#[tokio::test]
+async fn put_blob_restores_missing_file() {
+    let d = dir("blob-restore");
+    let s = ProjectStore::open(&d).unwrap();
+    let data = vec![9u8; 1024 * 1024 + 7];
+    let h = s.put_blob(&data).await.unwrap();
+    let file = d.join("blobs").join(&h.0);
+    std::fs::remove_file(&file).unwrap();
+    assert!(
+        s.get_blob(&h).await.is_err(),
+        "файла нет — чтение не удаётся"
+    );
+
+    assert_eq!(s.put_blob(&data).await.unwrap(), h);
+    assert!(file.is_file());
+    assert_eq!(s.get_blob(&h).await.unwrap(), Some(data.clone()));
+
+    // Файл другой длины (оборванная запись) тоже переписывается.
+    std::fs::write(&file, &data[..10]).unwrap();
+    assert_eq!(s.put_blob(&data).await.unwrap(), h);
+    assert_eq!(s.get_blob(&h).await.unwrap(), Some(data));
+}
+
+/// Подменённое содержимое файла blob — повреждение журнала, а не ошибка SQLite.
+#[tokio::test]
+async fn tampered_blob_file_is_corruption() {
+    let d = dir("blob-tampered");
+    let s = ProjectStore::open(&d).unwrap();
+    let data = vec![3u8; 1024 * 1024 + 1];
+    let h = s.put_blob(&data).await.unwrap();
+    let mut other = data.clone();
+    other[0] = 4;
+    std::fs::write(d.join("blobs").join(&h.0), &other).unwrap();
+    assert!(matches!(s.get_blob(&h).await, Err(StoreError::Corrupt(_))));
+}
+
 #[tokio::test]
 async fn create_run_writes_row_and_event() {
     let s = open("run-create");

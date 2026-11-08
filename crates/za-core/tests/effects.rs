@@ -314,7 +314,10 @@ async fn receipt_without_envelope_is_corruption() {
         .effect(spec(EffectClass::Idempotent), || async { Ok(json!(1)) })
         .await
         .unwrap_err();
-    assert!(matches!(err, EffectError::Store(_)), "получено {err:?}");
+    assert!(
+        matches!(err, EffectError::Store(za_store::StoreError::Corrupt(_))),
+        "получено {err:?}"
+    );
 }
 
 #[tokio::test]

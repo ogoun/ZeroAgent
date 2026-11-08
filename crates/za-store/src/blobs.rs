@@ -49,7 +49,9 @@ fn hash(data: &[u8]) -> BlobHash {
 ///
 /// Файл пишется до вставки строки; если транзакция затем откатится, файл
 /// останется без строки. Это безопасно: имя файла — хеш содержимого, повторная
-/// запись его переиспользует.
+/// запись его переиспользует. Если строка уже есть, а файла нет или его длина
+/// иная (сбой питания до сброса каталога на диск, оборванная запись), файл
+/// пишется заново: данные на руках, хеш тот же.
 pub(crate) fn put(
     c: &Connection,
     dir: &Path,
@@ -57,12 +59,26 @@ pub(crate) fn put(
     mime: Option<&str>,
 ) -> Result<BlobHash, StoreError> {
     let h = hash(data);
-    let exists = c
-        .query_row("SELECT 1 FROM blobs WHERE hash = ?1", [&h.0], |_| Ok(()))
-        .optional()?
-        .is_some();
-    if exists {
-        return Ok(h);
+    let stored = c
+        .query_row(
+            "SELECT typeof(path_or_data) = 'text' FROM blobs WHERE hash = ?1",
+            [&h.0],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?;
+    match stored {
+        Some(true) => {
+            let path = file_path(dir, &h);
+            let intact =
+                std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == data.len() as u64);
+            if !intact {
+                tracing::warn!(hash = %h.0, "файл blob отсутствует или неполон, пишется заново");
+                write_file(&path, data)?;
+            }
+            return Ok(h);
+        }
+        Some(false) => return Ok(h),
+        None => {}
     }
     let size = i64::try_from(data.len()).map_err(|_| corrupt(&h, "размер"))?;
     if data.len() > FILE_THRESHOLD {
@@ -114,10 +130,24 @@ fn file_path(dir: &Path, h: &BlobHash) -> PathBuf {
     dir.join(BLOB_DIR).join(&h.0)
 }
 
-/// Пишет файл атомарно: во временный, `fsync`, переименование.
+/// Пишет файл атомарно: во временный, `fsync`, переименование, `fsync` каталога.
+///
+/// На Unix запись в каталог (создание `blobs/`, переименование) переживает
+/// отключение питания только после `fsync` самого каталога, поэтому после
+/// `rename` синхронизируется `blobs/`, а при его создании — и каталог проекта.
+/// На Windows каталог так не синхронизируется, а `std::fs::rename` не просит
+/// `MOVEFILE_WRITE_THROUGH`: после отключения питания файл может пропасть при
+/// зафиксированной строке. Это ограничение закрывает [`put`]: повторная запись
+/// тех же данных восстанавливает файл, а чтение без файла даёт ошибку, не
+/// подменённые данные.
 fn write_file(path: &Path, data: &[u8]) -> Result<(), StoreError> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.is_dir()
+    {
         std::fs::create_dir_all(parent)?;
+        if let Some(project) = parent.parent() {
+            sync_dir(project)?;
+        }
     }
     let tmp = path.with_extension("tmp");
     {
@@ -126,9 +156,25 @@ fn write_file(path: &Path, data: &[u8]) -> Result<(), StoreError> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Сбрасывает на диск запись каталога (Unix); на других ОС ничего не делает.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), StoreError> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Сбрасывает на диск запись каталога (Unix); на других ОС ничего не делает.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
 fn corrupt(h: &BlobHash, what: &str) -> StoreError {
-    StoreError::Sqlite(format!("повреждённый blob {}: {what}", h.0))
+    StoreError::Corrupt(format!("blob {}: {what}", h.0))
 }

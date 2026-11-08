@@ -51,7 +51,13 @@ pub fn sqlite_library_version() -> &'static str {
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ошибки хранилища.
+///
+/// Варианты различают, что делать вызывающему: [`StoreError::Sqlite`] и
+/// [`StoreError::Io`] — сбой среды, который может пройти при повторе;
+/// [`StoreError::Corrupt`] и [`StoreError::SchemaTooNew`] — журнал нельзя
+/// читать этой версией, нужен человек. Новые варианты не ломают вызывающих.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StoreError {
     /// Журнал уже открыт другим процессом или экземпляром.
     #[error("журнал проекта уже открыт другим процессом")]
@@ -62,9 +68,19 @@ pub enum StoreError {
     /// Встроенная SQLite старше требуемой.
     #[error("SQLite {0} старше требуемой 3.51.3")]
     SqliteTooOld(String),
-    /// Прочая ошибка SQLite или неверные данные в БД.
+    /// Ошибка SQLite.
     #[error("ошибка SQLite: {0}")]
     Sqlite(String),
+    /// Данные журнала повреждены: не разбираются, не сходятся с хешем, нет
+    /// обязательных полей или файлов.
+    #[error("повреждённые данные журнала: {0}")]
+    Corrupt(String),
+    /// Схема журнала новее той, что знает эта версия.
+    #[error("схема журнала версии {found} новее поддерживаемой {supported}")]
+    SchemaTooNew { found: u32, supported: u32 },
+    /// Значение не сериализуется для записи в журнал.
+    #[error("ошибка сериализации: {0}")]
+    Serde(String),
     /// Ошибка файловой системы.
     #[error("ошибка ввода-вывода: {0}")]
     Io(String),

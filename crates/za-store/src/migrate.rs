@@ -17,10 +17,10 @@ pub(crate) fn latest() -> u32 {
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     let current: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if current > latest() {
-        return Err(StoreError::Sqlite(format!(
-            "схема журнала версии {current} новее поддерживаемой {}",
-            latest()
-        )));
+        return Err(StoreError::SchemaTooNew {
+            found: current,
+            supported: latest(),
+        });
     }
     for (version, sql) in MIGRATIONS.iter().filter(|m| m.0 > current) {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -71,7 +71,13 @@ mod tests {
     fn newer_schema_is_rejected() {
         let mut c = Connection::open_in_memory().unwrap();
         c.pragma_update(None, "user_version", latest() + 1).unwrap();
-        assert!(matches!(migrate(&mut c), Err(StoreError::Sqlite(_))));
+        assert_eq!(
+            migrate(&mut c),
+            Err(StoreError::SchemaTooNew {
+                found: latest() + 1,
+                supported: latest()
+            })
+        );
     }
 
     #[test]

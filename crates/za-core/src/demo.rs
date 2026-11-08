@@ -258,8 +258,8 @@ pub async fn replay_hash(store: &ProjectStore, run: RunId) -> Result<String, Sto
 
 /// Значимые поля события для [`replay_hash`].
 fn significant(e: &Event, run_text: &str) -> Result<Value, StoreError> {
-    let actor = serde_json::to_value(e.actor)
-        .map_err(|err| StoreError::Sqlite(format!("actor не сериализуется: {err}")))?;
+    let actor =
+        serde_json::to_value(e.actor).map_err(|err| StoreError::Serde(format!("actor: {err}")))?;
     let mut payload = replace_run(&e.payload, run_text);
     if e.kind == EventKind::InterruptOpened
         && let Some(Value::Object(inner)) = payload.get_mut("payload")

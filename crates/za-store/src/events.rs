@@ -210,7 +210,7 @@ pub(crate) fn payload_at(
 pub(crate) fn name_of<T: Serialize + std::fmt::Debug>(v: T) -> Result<String, StoreError> {
     match serde_json::to_value(&v) {
         Ok(Value::String(s)) => Ok(s),
-        _ => Err(StoreError::Sqlite(format!("{v:?} не сериализуется в имя"))),
+        _ => Err(StoreError::Serde(format!("{v:?} не сериализуется в имя"))),
     }
 }
 
@@ -238,5 +238,5 @@ fn limit_sql(n: usize) -> i64 {
 }
 
 pub(crate) fn corrupt(what: &str) -> StoreError {
-    StoreError::Sqlite(format!("повреждённые данные журнала: {what}"))
+    StoreError::Corrupt(what.to_owned())
 }
