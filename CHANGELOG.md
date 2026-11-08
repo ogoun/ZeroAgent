@@ -5,6 +5,7 @@
 ## Не выпущено
 
 ### Добавлено
+- `za-llm`: рендер стабильного префикса промпта (`render_tools` с сортировкой и каноническим JSON, `render_system` — единственное system-сообщение, нормализация CRLF) и его хэш `prefix_hash` (BLAKE3) с золотым тестом.
 - `za-core`: протокол эффектов намерение → выполнение → квитанция (`RunCtx::effect`) с явным исходом в квитанции (`outcome` ok/error), отравление контекста после ошибки журнала (`EffectError::Poisoned`), повтор незавершённых `Pure`/`ReadOnly`/`Idempotent`, прерывание `unknown_outcome` с детерминированным id для `NonIdempotent`, `recover`.
 - `za-store`: хранилище эффектов и прерываний (`record_intent` с FULL для `NonIdempotent`, `record_receipt`, `effect`, `pending_effects`, `open_interrupt`, `interrupts`), ошибки `UnknownEffect` и `EffectConflict`.
 - `za-store`: blobs по BLAKE3 (в строке до 1 МиБ, больше — файлом `blobs/<hash>`), вынос payload событий длиннее 64 КиБ в blob с прозрачным чтением, runs с переходами статусов по таблице и проверкой `generation`, события `run.created`/`run.status`, снимки состояния.

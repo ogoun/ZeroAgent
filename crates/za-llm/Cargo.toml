@@ -8,3 +8,8 @@ description = "zero-agent: za-llm"
 
 [lints]
 workspace = true
+
+[dependencies]
+za-protocol = { path = "../za-protocol" }
+serde_json.workspace = true
+blake3.workspace = true

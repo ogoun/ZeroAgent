@@ -508,6 +508,11 @@ dependencies = [
 [[package]]
 name = "za-llm"
 version = "0.0.1"
+dependencies = [
+ "blake3",
+ "serde_json",
+ "za-protocol",
+]
 
 [[package]]
 name = "za-memory"

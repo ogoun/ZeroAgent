@@ -2,6 +2,10 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R0, задача 7: стабильный префикс и его хэш
+
+`za-llm`: `render_tools` — инструменты, отсортированные по `name`, массивом объектов `{description, name, parameters}` в каноническом JSON (CTX-001); `render_system` — единственное system-сообщение из блоков core, adapter, overlay, agents_md через пустую строку, блоки из одних пробельных символов пропускаются (CTX-004). Во всех строках, включая строки внутри `parameters`, CRLF заменяется на LF, иначе хэш расходился бы между Windows и Linux. `prefix_hash` — BLAKE3 hex от тега формата `za-prefix-v1`, затем tools и system, каждая часть с префиксом длины (u64 LE), чтобы перенос текста между частями менял хэш. Золотой хэш фикстуры (три инструмента, короткие блоки) в `crates/za-llm/tests/golden/prefix.hash`, файл помечен `-text` в `.gitattributes`; при расхождении тест печатает новый хэш. `za-llm` зависит только от `za-protocol`, `serde_json`, `blake3`.
+
 ## 2026-11-09. R0, задача 6: протокол эффектов и восстановление
 
 `za-store`: `record_intent` пишет строку `effects` и событие `effect.intent {key, class, name, args}` в одной транзакции; намерение `NonIdempotent` фиксируется с `synchronous=FULL` (CORE-005), прочие классы — с надёжностью по умолчанию. `record_receipt` пишет `effect.receipt {key, result}`; результат длиннее `BLOB_THRESHOLD` уходит в blob, в событии `{key, result_blob}`, хеш в `effects.blob_ref`. `effect` отдаёт строку вместе с результатом, `pending_effects` — намерения без квитанции по `intent_seq`. `open_interrupt` идемпотентен (`ON CONFLICT DO NOTHING`, событие `interrupt.opened {id, kind, payload}` только при первом открытии), статус `open`. Новые ошибки: `UnknownEffect` (квитанция без намерения), `EffectConflict` (повторное намерение или квитанция). Намерение и прерывание для неизвестного run дают `UnknownRun`.
