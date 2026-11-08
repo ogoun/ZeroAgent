@@ -209,6 +209,11 @@ impl ProjectStore {
     }
 }
 
+/// Проверяет, что run существует; иначе [`StoreError::UnknownRun`].
+pub(crate) fn ensure_run(c: &Connection, id: RunId) -> Result<(), StoreError> {
+    current_status(c, id).map(|_| ())
+}
+
 /// Текущие статус и `generation` run в транзакции писателя.
 fn current_status(c: &Connection, id: RunId) -> Result<(RunStatus, u64), StoreError> {
     let (status, generation) = c
@@ -222,7 +227,7 @@ fn current_status(c: &Connection, id: RunId) -> Result<(RunStatus, u64), StoreEr
     Ok((parse_name(status, "status")?, generation_from(generation)?))
 }
 
-fn runtime_event(run: RunId, kind: EventKind, payload: Value) -> NewEvent {
+pub(crate) fn runtime_event(run: RunId, kind: EventKind, payload: Value) -> NewEvent {
     NewEvent {
         run_id: run,
         parent_seq: None,
@@ -233,7 +238,7 @@ fn runtime_event(run: RunId, kind: EventKind, payload: Value) -> NewEvent {
     }
 }
 
-fn id_sql(id: RunId) -> Vec<u8> {
+pub(crate) fn id_sql(id: RunId) -> Vec<u8> {
     id.0.as_bytes().to_vec()
 }
 

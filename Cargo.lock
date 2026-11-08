@@ -496,6 +496,14 @@ dependencies = [
 [[package]]
 name = "za-core"
 version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "za-protocol",
+ "za-store",
+]
 
 [[package]]
 name = "za-llm"

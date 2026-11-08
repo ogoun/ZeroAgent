@@ -5,8 +5,11 @@
 //! процесса, миграции по `PRAGMA user_version`. Большие payload и данные хранятся
 //! в blobs по BLAKE3 (ARC-032), runs меняют статус по таблице переходов с проверкой
 //! `generation` (SWM-064), снимки состояния служат для resume (CORE-006).
+//! Эффекты записываются протоколом намерение → квитанция (CORE-002), прерывания
+//! открываются идемпотентно по детерминированному id (CORE-007).
 
 mod blobs;
+mod effects;
 mod events;
 mod migrate;
 mod reader;
@@ -14,6 +17,7 @@ mod runs;
 mod writer;
 
 pub use blobs::BLOB_THRESHOLD;
+pub use effects::{EffectRow, InterruptRow};
 pub use runs::{NewRun, Run};
 
 use std::fs::{File, OpenOptions, TryLockError};
@@ -25,7 +29,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode};
 use tokio::sync::oneshot;
-use za_protocol::{RunId, RunStatus};
+use za_protocol::{EffectKey, RunId, RunStatus};
 
 use crate::reader::ReadJob;
 use crate::writer::JobSender;
@@ -69,6 +73,12 @@ pub enum StoreError {
     /// Команда основана на устаревшей `generation` run (SWM-064).
     #[error("устаревшая generation, текущая {current}")]
     StaleGeneration { current: u64 },
+    /// Квитанция для эффекта без записанного намерения.
+    #[error("эффект {} не найден", .0.0)]
+    UnknownEffect(EffectKey),
+    /// Повторное намерение или повторная квитанция того же эффекта.
+    #[error("эффект {} уже записан", .0.0)]
+    EffectConflict(EffectKey),
 }
 
 impl From<rusqlite::Error> for StoreError {

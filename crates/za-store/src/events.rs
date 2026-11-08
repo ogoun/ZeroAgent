@@ -191,6 +191,21 @@ fn decode(c: &Connection, dir: &Path, r: Row) -> Result<Event, StoreError> {
     })
 }
 
+/// Payload события `seq` (вынесенный в blob подставляется); `None`, если события нет.
+pub(crate) fn payload_at(
+    c: &Connection,
+    dir: &Path,
+    seq: Seq,
+) -> Result<Option<Value>, StoreError> {
+    let mut found = query(
+        c,
+        dir,
+        &format!("{SELECT} WHERE seq = ?1"),
+        params![seq_sql(seq)],
+    )?;
+    Ok(found.pop().map(|e| e.payload))
+}
+
 /// Имя варианта перечисления протокола в snake_case, как в его сериализации.
 pub(crate) fn name_of<T: Serialize + std::fmt::Debug>(v: T) -> Result<String, StoreError> {
     match serde_json::to_value(&v) {
