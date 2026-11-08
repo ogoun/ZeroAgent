@@ -149,7 +149,7 @@ queued → running ⇄ paused → done | partial | blocked | failed | cancelled
 
 Сбой провайдера, лимит и нехватка ресурса переводят run в `paused` с причиной, а не в `failed`.
 
-Дополнительно: отмена допустима из любого нетерминального статуса (`queued`, `running`, `pausing`, `paused`, `blocked_on_budget` → `cancelling`; `queued` → `cancelled` напрямую). Из `pausing` допустимы `running` (продолжение пришло раньше, чем пауза применилась), `paused` и `failed`. Таблица переходов — `za-protocol::RunStatus::can_transition`.
+Дополнительно: отмена допустима из любого нетерминального статуса (`queued`, `running`, `pausing`, `paused`, `blocked_on_budget` → `cancelling`; `queued` → `cancelled` напрямую). Из `pausing` допустимы `running` (продолжение пришло раньше, чем пауза применилась), `paused` и `failed`. Рантайм может перевести `running` прямо в `paused`, если сам ставит паузу в безопасной точке (ожидание решения пользователя, сбой провайдера); причина пишется в событие `run.status`. Переход через `pausing` остаётся для паузы по команде, которая ждёт границы шага. Таблица переходов — `za-protocol::RunStatus::can_transition`.
 
 ## 5. Данные
 
