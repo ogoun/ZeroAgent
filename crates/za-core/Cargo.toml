@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 za-protocol = { path = "../za-protocol" }
 za-store = { path = "../za-store" }
+za-llm = { path = "../za-llm" }
+blake3.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

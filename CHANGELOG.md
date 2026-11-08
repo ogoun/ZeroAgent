@@ -5,6 +5,7 @@
 ## Не выпущено
 
 ### Добавлено
+- `za-core`: демонстрационный run `run_demo` (шаги `model`/`Idempotent` и `tool`/`NonIdempotent` с записью `step N` в `workdir/log.txt`, точки аварийного завершения `CrashPoint`, исход `DemoOutcome::NeedsDecision` при неизвестном исходе) и `replay_hash` — BLAKE3 значимых событий run без времени, id и `seq`.
 - `za-llm`: зонд llama.cpp `probe_llama` — `GET /props`, размер контекста `n_ctx` (из корня или `default_generation_settings`), имя модели, `total_slots`; ошибки `Unreachable` (соединение 2 с, всего 5 с) и `BadResponse`. Без прокси из окружения. Зависимости `reqwest` (rustls, встроенные корни webpki-roots), в тестах `axum`; в `deny.toml` разрешена CDLA-Permissive-2.0.
 - `za-llm`: рендер стабильного префикса промпта (`render_tools` с сортировкой и каноническим JSON, `render_system` — единственное system-сообщение, нормализация CRLF) и его хэш `prefix_hash` (BLAKE3) с золотым тестом.
 - `za-core`: протокол эффектов намерение → выполнение → квитанция (`RunCtx::effect`) с явным исходом в квитанции (`outcome` ok/error), отравление контекста после ошибки журнала (`EffectError::Poisoned`), повтор незавершённых `Pure`/`ReadOnly`/`Idempotent`, прерывание `unknown_outcome` с детерминированным id для `NonIdempotent`, `recover`.

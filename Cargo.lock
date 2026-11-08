@@ -1416,10 +1416,12 @@ dependencies = [
 name = "za-core"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+ "za-llm",
  "za-protocol",
  "za-store",
 ]
