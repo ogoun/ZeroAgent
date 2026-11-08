@@ -587,3 +587,43 @@ async fn unknown_outcome_poisons_the_context() {
             .is_none()
     );
 }
+
+/// Дробные числа в аргументах переживают запись в журнал без потери точности:
+/// повтор не даёт ложного [`EffectError::ReplayMismatch`].
+#[tokio::test]
+async fn float_args_replay_without_mismatch() {
+    let (s, run) = setup("float-args").await;
+    // Детерминированный набор «трудных» f64: случайные биты и крайние значения.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut vals: Vec<f64> = (0..2000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            f64::from_bits(x)
+        })
+        .filter(|v| v.is_finite())
+        .collect();
+    vals.extend([
+        0.1 + 0.2,
+        5e-324,
+        2.225_073_858_507_201_4e-308,
+        f64::MAX,
+        std::f64::consts::PI,
+    ]);
+    let sp = EffectSpec {
+        class: EffectClass::Idempotent,
+        name: "model".into(),
+        args: json!({ "temperature": vals }),
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    RunCtx::new(s.clone(), run)
+        .effect(sp.clone(), counted(&calls, json!(1)))
+        .await
+        .unwrap();
+    let r = RunCtx::new(s.clone(), run)
+        .effect(sp, counted(&calls, json!(2)))
+        .await;
+    assert_eq!(r, Ok(json!(1)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

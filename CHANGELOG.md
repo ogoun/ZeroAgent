@@ -5,7 +5,7 @@
 ## Не выпущено
 
 ### Исправлено
-- `za-core`: расхождение имени или аргументов эффекта с журналом при повторе (в том числе дрейф `prefix_hash` у `model` демонстрации) — ошибка `EffectError::ReplayMismatch { key, field }` вместо `warn`; `demo-run --resume` завершается кодом 1. `EffectError::Unknown` и `ReplayMismatch` отравляют `RunCtx`, как ошибка журнала.
+- `za-core`: расхождение имени или аргументов эффекта с журналом при повторе (в том числе дрейф `prefix_hash` у `model` демонстрации) — ошибка `EffectError::ReplayMismatch { key, field }` вместо `warn`; `demo-run --resume` завершается кодом 1. `EffectError::Unknown` и `ReplayMismatch` отравляют `RunCtx`, как ошибка журнала. `serde_json` с функцией `float_roundtrip`: дробные аргументы читаются из журнала точно и не дают ложного расхождения.
 - `za-store`: контроль роста WAL (ARC-035) — `journal_size_limit` 64 МиБ и `wal_checkpoint(TRUNCATE)` писателем при WAL больше 8 МиБ (проверка каждые 16 пачек), без ожидания читателей.
 - `za-store`: `put_blob` восстанавливает пропавший или неполный файл blob при существующей строке; на Unix после `rename` синхронизируется каталог `blobs/`, при его создании — каталог проекта.
 - `zero-agent`: `--resume`, `replay` и тестовые хелперы повторяют открытие журнала на `Locked` (10 × 100 мс).
