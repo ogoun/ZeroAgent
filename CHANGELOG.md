@@ -4,7 +4,18 @@
 
 ## Не выпущено
 
+### Исправлено
+- `za-core`: расхождение имени или аргументов эффекта с журналом при повторе (в том числе дрейф `prefix_hash` у `model` демонстрации) — ошибка `EffectError::ReplayMismatch { key, field }` вместо `warn`; `demo-run --resume` завершается кодом 1. `EffectError::Unknown` и `ReplayMismatch` отравляют `RunCtx`, как ошибка журнала.
+- `za-store`: контроль роста WAL (ARC-035) — `journal_size_limit` 64 МиБ и `wal_checkpoint(TRUNCATE)` писателем при WAL больше 8 МиБ (проверка каждые 16 пачек), без ожидания читателей.
+- `za-store`: `put_blob` восстанавливает пропавший или неполный файл blob при существующей строке; на Unix после `rename` синхронизируется каталог `blobs/`, при его создании — каталог проекта.
+- `zero-agent`: `--resume`, `replay` и тестовые хелперы повторяют открытие журнала на `Locked` (10 × 100 мс).
+- `deny.toml`: убрана неиспользуемая лицензия `Zlib`.
+
+### Изменено
+- `za-store`: `StoreError` помечен `#[non_exhaustive]`, новые варианты `Corrupt` (повреждение журнала), `SchemaTooNew { found, supported }`, `Serde` вместо общего `Sqlite`.
+
 ### Добавлено
+- `zero-agent`: логи `tracing` в stderr (`tracing-subscriber 0.3.23`, фильтр `filter::Targets`), уровень по умолчанию `warn`, переопределение `ZA_LOG` или `RUST_LOG`. Golden-хэш реплея демонстрации `crates/zero-agent/tests/golden/demo-replay.hash`; реплей после сбоя проверяется в приёмке. Раздел «Быстрый старт» в README.
 - `zero-agent`: бинарник с командами `doctor [--json]` (SQLite ≥ 3.51.3, llama.cpp по `LLAMA_URL` — только предупреждение, версия компилятора сборки), `demo-run` (`--steps`, `--resume`, `--crash-at intent:N|execute:N`, id run первой строкой) и `replay` (хэш значимых событий); коды выхода 0/1/3. Каталог данных `ZA_HOME` (по умолчанию `%LOCALAPPDATA%\zero-agent`, `~/.local/share/zero-agent`), журнал в `ZA_HOME/projects/<project_id>/`. Приёмочные тесты R0. `za-store`: `sqlite_library_version`, `MIN_SQLITE`. Зависимость `clap 4.6.7`.
 - `za-protocol`: прямой переход статуса `running → paused` (немедленная пауза в безопасной точке рантайма). `za-store`: `set_status_with_reason` — причина перехода в payload `run.status`. `za-llm`: функция `probe` (по умолчанию) — без неё крейт не тянет `reqwest`; `za-core` подключает `za-llm` без функций по умолчанию.
 - `za-core`: демонстрационный run `run_demo` (шаги `model`/`Idempotent` и `tool`/`NonIdempotent` с записью `step N` в `workdir/log.txt`, точки аварийного завершения `CrashPoint`, пауза `paused` с причиной `needs_decision` и исход `DemoOutcome::NeedsDecision` при неизвестном исходе, продолжение после паузы без открытых решений) и `replay_hash` — BLAKE3 значимых событий run без времени, id и `seq`.
