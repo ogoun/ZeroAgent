@@ -8,3 +8,16 @@ description = "zero-agent: za-store"
 
 [lints]
 workspace = true
+
+[dependencies]
+za-protocol = { path = "../za-protocol" }
+rusqlite.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+thiserror.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+jiff.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
