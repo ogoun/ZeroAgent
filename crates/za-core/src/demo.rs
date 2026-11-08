@@ -12,7 +12,8 @@
 //! Повтор run берёт завершённые эффекты из журнала, поэтому строка каждого шага
 //! пишется ровно один раз. Если исход `tool` неизвестен (намерение без
 //! квитанции после сбоя), run не продолжается: [`recover`] открывает
-//! прерывание, и [`run_demo`] возвращает [`DemoOutcome::NeedsDecision`].
+//! прерывание, run переводится в `paused` с причиной [`NEEDS_DECISION`], и
+//! [`run_demo`] возвращает [`DemoOutcome::NeedsDecision`].
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,9 @@ const RUN_PLACEHOLDER: &str = "{run}";
 const REPLAY_TAG: &[u8] = b"za-replay-v1\0";
 /// Размер страницы чтения событий в [`replay_hash`].
 const PAGE: usize = 1000;
+
+/// Причина паузы run в событии `run.status`, когда нужно решение человека.
+pub const NEEDS_DECISION: &str = "needs_decision";
 
 /// Параметры демонстрационного run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,18 +69,22 @@ pub enum DemoOutcome {
     /// Все шаги выполнены, run в статусе `done`.
     Done,
     /// Исход `NonIdempotent`-эффектов неизвестен; id открытых прерываний.
-    /// Run остаётся в статусе `running`, шаги не выполнялись.
+    /// Run в статусе `paused` с причиной [`NEEDS_DECISION`].
     NeedsDecision(Vec<String>),
 }
 
 /// Выполняет или продолжает демонстрационный run.
 ///
 /// Нет run — создаётся (`RunRole::Top`, статус `queued`) и переводится в
-/// `running`. Run в `running` (прерван сбоем) сначала проходит [`recover`]:
-/// при неизвестном исходе возвращается [`DemoOutcome::NeedsDecision`] без
-/// выполнения шагов. Run в `done` возвращает [`DemoOutcome::Done`], ничего не
-/// выполняя и не записывая. Иной статус — [`StoreError::InvalidTransition`].
-/// После всех шагов run переводится в `done`.
+/// `running`. Перед шагами run проходит [`recover`]: при неизвестном исходе
+/// run переводится `running → paused` с причиной [`NEEDS_DECISION`] и
+/// возвращается [`DemoOutcome::NeedsDecision`] без выполнения шагов; так же
+/// обрабатывается [`EffectError::Unknown`] во время шагов. Run в `paused`
+/// снова проходит [`recover`]: прерывания открыты — те же id без новых
+/// событий; открытых нет — `paused → running` и продолжение. Run в `done`
+/// возвращает [`DemoOutcome::Done`], ничего не выполняя и не записывая. Иной
+/// статус — [`StoreError::InvalidTransition`]. После всех шагов run
+/// переводится в `done`.
 pub async fn run_demo(
     store: &ProjectStore,
     run: RunId,
@@ -107,6 +115,14 @@ pub async fn run_demo(
                 .await?
         }
         RunStatus::Running => current.generation,
+        RunStatus::Paused => {
+            if let Recovery::NeedsDecision { interrupt_ids } = recover(store, run).await? {
+                return Ok(DemoOutcome::NeedsDecision(interrupt_ids));
+            }
+            store
+                .set_status(run, RunStatus::Running, current.generation)
+                .await?
+        }
         from => {
             return Err(StoreError::InvalidTransition {
                 from,
@@ -116,7 +132,7 @@ pub async fn run_demo(
         }
     };
     if let Recovery::NeedsDecision { interrupt_ids } = recover(store, run).await? {
-        return Ok(DemoOutcome::NeedsDecision(interrupt_ids));
+        return pause_for_decision(store, run, generation, interrupt_ids).await;
     }
 
     let prefix = demo_prefix_hash();
@@ -126,7 +142,7 @@ pub async fn run_demo(
         match step(&mut ctx, n, &prefix, cfg).await {
             Ok(()) => {}
             Err(EffectError::Unknown { interrupt_id }) => {
-                return Ok(DemoOutcome::NeedsDecision(vec![interrupt_id]));
+                return pause_for_decision(store, run, generation, vec![interrupt_id]).await;
             }
             Err(e) => return Err(e),
         }
@@ -134,6 +150,20 @@ pub async fn run_demo(
     store.set_status(run, RunStatus::Done, generation).await?;
     tracing::info!(%run, steps = cfg.steps, "демонстрационный run завершён");
     Ok(DemoOutcome::Done)
+}
+
+/// Переводит run `running → paused` с причиной [`NEEDS_DECISION`].
+async fn pause_for_decision(
+    store: &ProjectStore,
+    run: RunId,
+    generation: u64,
+    interrupt_ids: Vec<String>,
+) -> Result<DemoOutcome, EffectError> {
+    store
+        .set_status_with_reason(run, RunStatus::Paused, generation, Some(NEEDS_DECISION))
+        .await?;
+    tracing::warn!(%run, ?interrupt_ids, "демонстрационный run ждёт решения");
+    Ok(DemoOutcome::NeedsDecision(interrupt_ids))
 }
 
 /// Шаг `n`: эффект `model`, затем эффект `tool`.

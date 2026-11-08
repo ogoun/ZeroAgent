@@ -143,7 +143,21 @@ impl ProjectStore {
         to: RunStatus,
         expected_generation: u64,
     ) -> Result<u64, StoreError> {
+        self.set_status_with_reason(id, to, expected_generation, None)
+            .await
+    }
+
+    /// Как [`Self::set_status`], но с причиной перехода: `Some(reason)` добавляет
+    /// в payload `run.status` поле `reason`, `None` пишет payload без него.
+    pub async fn set_status_with_reason(
+        &self,
+        id: RunId,
+        to: RunStatus,
+        expected_generation: u64,
+        reason: Option<&str>,
+    ) -> Result<u64, StoreError> {
         let dir = self.dir();
+        let reason = reason.map(str::to_owned);
         self.write(move |c| {
             let (from, current) = current_status(c, id)?;
             if current != expected_generation {
@@ -169,7 +183,10 @@ impl ProjectStore {
             if n != 1 {
                 return Err(corrupt("строка run изменилась внутри транзакции"));
             }
-            let payload = json!({ "from": from, "to": to, "generation": next });
+            let mut payload = json!({ "from": from, "to": to, "generation": next });
+            if let Some(reason) = reason {
+                payload["reason"] = Value::String(reason);
+            }
             events::insert(c, &dir, &runtime_event(id, EventKind::RunStatus, payload))?;
             Ok(next)
         })

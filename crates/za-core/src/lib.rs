@@ -12,6 +12,6 @@ mod demo;
 mod recovery;
 mod runtime;
 
-pub use demo::{CrashPoint, DemoConfig, DemoOutcome, replay_hash, run_demo};
+pub use demo::{CrashPoint, DemoConfig, DemoOutcome, NEEDS_DECISION, replay_hash, run_demo};
 pub use recovery::{Recovery, UNKNOWN_OUTCOME, recover};
 pub use runtime::{EffectError, EffectSpec, RunCtx};

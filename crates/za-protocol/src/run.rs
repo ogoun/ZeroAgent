@@ -38,6 +38,9 @@ impl RunStatus {
                 | (Queued, Cancelling)
                 | (Queued, Cancelled)
                 | (Running, Pausing)
+                // Немедленная пауза в безопасной точке, выбранной самим рантаймом:
+                // ожидание решения человека, отказ провайдера.
+                | (Running, Paused)
                 | (Pausing, Paused)
                 | (Pausing, Running)
                 | (Pausing, Failed)
@@ -106,6 +109,14 @@ mod tests {
         ] {
             assert!(a.can_transition(b), "{a:?} -> {b:?}");
         }
+    }
+
+    #[test]
+    fn running_can_pause_immediately() {
+        // Немедленная пауза в безопасной точке, выбранной рантаймом
+        // (ожидание решения, отказ провайдера), минуя `pausing`.
+        assert!(RunStatus::Running.can_transition(RunStatus::Paused));
+        assert!(!RunStatus::Paused.can_transition(RunStatus::Paused));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use za_core::{DemoConfig, DemoOutcome, replay_hash, run_demo};
-use za_protocol::{EffectClass, EffectKey, RunId, RunRole, RunStatus, Seq};
+use za_protocol::{EffectClass, EffectKey, EventKind, RunId, RunRole, RunStatus, Seq};
 use za_store::{NewRun, ProjectStore};
 
 /// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
@@ -99,9 +99,17 @@ async fn replay_hash_ignores_time() {
 
     run_demo(&s, a, &cfg(3, &d.join("a"))).await.unwrap();
     // Другие время, id run, каталог и seq событий.
-    std::thread::sleep(Duration::from_millis(20));
+    tokio::time::sleep(Duration::from_millis(20)).await;
     run_demo(&s, b, &cfg(3, &d.join("b"))).await.unwrap();
     run_demo(&s, c, &cfg(2, &d.join("c"))).await.unwrap();
+
+    let ea = s.read_run(a, Seq(0), usize::MAX).await.unwrap();
+    let eb = s.read_run(b, Seq(0), usize::MAX).await.unwrap();
+    assert_eq!(ea.len(), eb.len());
+    assert!(
+        ea.iter().zip(&eb).all(|(x, y)| x.ts != y.ts),
+        "время событий различается"
+    );
 
     let ha = replay_hash(&s, a).await.unwrap();
     assert_eq!(ha.len(), 64);
@@ -139,9 +147,55 @@ async fn pending_tool_intent_needs_decision() {
 
     let want = DemoOutcome::NeedsDecision(vec![format!("unk-{}", key.0)]);
     assert_eq!(run_demo(&s, run, &cfg(3, &work)).await.unwrap(), want);
-    // Повтор даёт те же id и шагов не выполняет.
+    let r = s.get_run(run).await.unwrap().unwrap();
+    assert_eq!(r.status, RunStatus::Paused);
+    let events = s.read_run(run, Seq(0), usize::MAX).await.unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.kind, EventKind::RunStatus);
+    assert_eq!(
+        last.payload,
+        json!({"from": "running", "to": "paused", "generation": 2, "reason": "needs_decision"})
+    );
+
+    // Повтор даёт те же id, шагов не выполняет и событий не пишет.
     assert_eq!(run_demo(&s, run, &cfg(3, &work)).await.unwrap(), want);
     assert!(!work.join("log.txt").exists());
-    let r = s.get_run(run).await.unwrap().unwrap();
-    assert_eq!(r.status, RunStatus::Running);
+    assert_eq!(event_count(&s, run).await, events.len());
+    assert_eq!(s.get_run(run).await.unwrap().unwrap(), r);
+}
+
+#[tokio::test]
+async fn paused_run_without_open_decisions_resumes() {
+    let d = dir("paused_resume");
+    let s = ProjectStore::open(&d.join("project")).unwrap();
+    let run = RunId::new();
+    let work = d.join("work");
+    s.create_run(NewRun {
+        id: run,
+        project_id: "demo".into(),
+        parent_id: None,
+        role: RunRole::Top,
+        model_profile: None,
+    })
+    .await
+    .unwrap();
+    s.set_status(run, RunStatus::Running, 0).await.unwrap();
+    s.set_status_with_reason(run, RunStatus::Paused, 1, Some("needs_decision"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        run_demo(&s, run, &cfg(2, &work)).await.unwrap(),
+        DemoOutcome::Done
+    );
+    assert_eq!(log_lines(&work), ["step 1", "step 2"]);
+    let statuses: Vec<_> = s
+        .read_run(run, Seq(0), usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::RunStatus)
+        .map(|e| e.payload["to"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(statuses, ["running", "paused", "running", "done"]);
 }

@@ -13,9 +13,20 @@ workspace = true
 za-protocol = { path = "../za-protocol" }
 serde_json.workspace = true
 blake3.workspace = true
-tracing.workspace = true
-thiserror.workspace = true
-reqwest.workspace = true
+# Нужны только зонду llama.cpp (`probe`).
+tracing = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+
+[features]
+# Без `probe` крейт — только рендер префикса и его хэш, без HTTP-клиента:
+# так его подключает `za-core`.
+default = ["probe"]
+probe = ["dep:reqwest", "dep:thiserror", "dep:tracing"]
+
+[[test]]
+name = "probe"
+required-features = ["probe"]
 
 [dev-dependencies]
 axum.workspace = true

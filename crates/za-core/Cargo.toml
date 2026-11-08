@@ -12,11 +12,12 @@ workspace = true
 [dependencies]
 za-protocol = { path = "../za-protocol" }
 za-store = { path = "../za-store" }
-za-llm = { path = "../za-llm" }
+# Только префикс и его хэш: без зонда и HTTP-клиента.
+za-llm = { path = "../za-llm", default-features = false }
 blake3.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

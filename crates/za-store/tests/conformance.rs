@@ -415,6 +415,34 @@ async fn set_status_bumps_generation_and_logs_event() {
 }
 
 #[tokio::test]
+async fn set_status_with_reason_logs_reason() {
+    let s = open("run-status-reason");
+    let r = s.create_run(new_run(None)).await.unwrap();
+    s.set_status(r.id, RunStatus::Running, 0).await.unwrap();
+    assert_eq!(
+        s.set_status_with_reason(r.id, RunStatus::Paused, 1, Some("needs_decision"))
+            .await,
+        Ok(2)
+    );
+    let got = s.get_run(r.id).await.unwrap().unwrap();
+    assert_eq!((got.status, got.generation), (RunStatus::Paused, 2));
+    let evs = s.read_run(r.id, Seq(0), 10).await.unwrap();
+    assert_eq!(
+        evs[2].payload,
+        json!({"from": "running", "to": "paused", "generation": 2, "reason": "needs_decision"})
+    );
+    // Без причины payload прежний, поля `reason` нет.
+    s.set_status_with_reason(r.id, RunStatus::Running, 2, None)
+        .await
+        .unwrap();
+    let evs = s.read_run(r.id, Seq(0), 10).await.unwrap();
+    assert_eq!(
+        evs[3].payload,
+        json!({"from": "paused", "to": "running", "generation": 3})
+    );
+}
+
+#[tokio::test]
 async fn invalid_transition_is_rejected() {
     let s = open("run-invalid");
     let r = s.create_run(new_run(None)).await.unwrap();
