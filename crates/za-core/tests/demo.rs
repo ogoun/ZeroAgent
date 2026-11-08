@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::json;
-use za_core::{DemoConfig, DemoOutcome, replay_hash, run_demo};
+use za_core::{DemoConfig, DemoOutcome, EffectError, replay_hash, run_demo};
 use za_protocol::{EffectClass, EffectKey, EventKind, RunId, RunRole, RunStatus, Seq};
 use za_store::{NewRun, ProjectStore};
 
@@ -198,4 +198,51 @@ async fn paused_run_without_open_decisions_resumes() {
         .map(|e| e.payload["to"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(statuses, ["running", "paused", "running", "done"]);
+}
+
+/// Дрейф префикса: журнал записан с другим `prefix_hash` в аргументах `model`.
+/// Продолжение — ошибка, шаги не выполняются.
+#[tokio::test]
+async fn prefix_drift_on_resume_is_an_error() {
+    let d = dir("prefix_drift");
+    let s = ProjectStore::open(&d.join("project")).unwrap();
+    let run = RunId::new();
+    let work = d.join("work");
+    s.create_run(NewRun {
+        id: run,
+        project_id: "demo".into(),
+        parent_id: None,
+        role: RunRole::Top,
+        model_profile: None,
+    })
+    .await
+    .unwrap();
+    s.set_status(run, RunStatus::Running, 0).await.unwrap();
+    let key = EffectKey::derive(run, 1, 0);
+    s.record_intent(
+        run,
+        &key,
+        EffectClass::Idempotent,
+        "model",
+        json!({"step": 1, "prefix_hash": "0".repeat(64)}),
+    )
+    .await
+    .unwrap();
+    s.record_receipt(
+        run,
+        &key,
+        json!({"outcome": "ok", "value": {"text": "ответ модели на шаг 1"}}),
+    )
+    .await
+    .unwrap();
+
+    let err = run_demo(&s, run, &cfg(2, &work)).await.unwrap_err();
+    assert_eq!(
+        err,
+        EffectError::ReplayMismatch {
+            key: key.0,
+            field: "args"
+        }
+    );
+    assert!(!work.join("log.txt").exists(), "шаги не выполнены");
 }

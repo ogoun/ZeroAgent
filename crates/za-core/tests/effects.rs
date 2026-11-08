@@ -44,6 +44,14 @@ fn spec(class: EffectClass) -> EffectSpec {
     }
 }
 
+/// Намерение с именем и аргументами [`spec`], как его записал бы `RunCtx`.
+async fn record_spec_intent(s: &ProjectStore, run: RunId, key: &EffectKey, class: EffectClass) {
+    let sp = spec(class);
+    s.record_intent(run, key, class, &sp.name, sp.args)
+        .await
+        .unwrap();
+}
+
 /// Замыкание эффекта, считающее вызовы и возвращающее `v`.
 fn counted(
     calls: &Arc<AtomicUsize>,
@@ -126,9 +134,7 @@ async fn effect_keys_follow_step_and_effect_seq() {
 async fn idempotent_intent_without_receipt_is_retried() {
     let (s, run) = setup("idem-retry").await;
     let key = first_key(run);
-    s.record_intent(run, &key, EffectClass::Idempotent, "write_file", json!({}))
-        .await
-        .unwrap();
+    record_spec_intent(&s, run, &key, EffectClass::Idempotent).await;
 
     let calls = Arc::new(AtomicUsize::new(0));
     let mut ctx = RunCtx::new(s.clone(), run);
@@ -152,15 +158,7 @@ async fn idempotent_intent_without_receipt_is_retried() {
 async fn non_idempotent_intent_without_receipt_interrupts() {
     let (s, run) = setup("nonidem-interrupt").await;
     let key = first_key(run);
-    s.record_intent(
-        run,
-        &key,
-        EffectClass::NonIdempotent,
-        "send_mail",
-        json!({}),
-    )
-    .await
-    .unwrap();
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
 
     let calls = Arc::new(AtomicUsize::new(0));
     let mut ctx = RunCtx::new(s.clone(), run);
@@ -194,9 +192,7 @@ async fn non_idempotent_intent_without_receipt_interrupts() {
 async fn interrupt_id_is_deterministic() {
     let (s, run) = setup("interrupt-id").await;
     let key = first_key(run);
-    s.record_intent(run, &key, EffectClass::NonIdempotent, "pay", json!({}))
-        .await
-        .unwrap();
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
 
     let mut ids = Vec::new();
     for _ in 0..2 {
@@ -303,9 +299,7 @@ async fn success_that_looks_like_error_replays_as_success() {
 async fn receipt_without_envelope_is_corruption() {
     let (s, run) = setup("no-envelope").await;
     let key = first_key(run);
-    s.record_intent(run, &key, EffectClass::Idempotent, "f", json!({}))
-        .await
-        .unwrap();
+    record_spec_intent(&s, run, &key, EffectClass::Idempotent).await;
     s.record_receipt(run, &key, json!({"error": "голое значение"}))
         .await
         .unwrap();
@@ -499,4 +493,97 @@ async fn effect_row_carries_name_and_args() {
     let row = s.effect(run, &first_key(run)).await.unwrap().unwrap();
     assert_eq!(row.name, "write_file");
     assert_eq!(row.args, json!({"path": "a.txt"}));
+}
+
+/// Подменённые при продолжении аргументы — ошибка, а не результат из журнала:
+/// эффект не выполняется, контекст отравлен.
+#[tokio::test]
+async fn changed_args_on_replay_is_an_error() {
+    let (s, run) = setup("mismatch-args").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut a = RunCtx::new(s.clone(), run);
+    a.effect(spec(EffectClass::Idempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap();
+
+    let mut b = RunCtx::new(s.clone(), run);
+    let mut changed = spec(EffectClass::Idempotent);
+    changed.args = json!({"path": "b.txt"});
+    let err = b
+        .effect(changed, counted(&calls, json!(2)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EffectError::ReplayMismatch {
+            key: first_key(run).0,
+            field: "args"
+        }
+    );
+    assert!(err.to_string().contains("расходится с журналом"), "{err}");
+    let err = b
+        .effect(spec(EffectClass::Idempotent), counted(&calls, json!(3)))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Poisoned);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Другое имя действия под тем же ключом — тоже расхождение, даже если
+/// намерение ещё без квитанции: эффект не повторяется и прерывание не открывается.
+#[tokio::test]
+async fn changed_name_on_pending_intent_is_an_error() {
+    let (s, run) = setup("mismatch-name").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let mut changed = spec(EffectClass::NonIdempotent);
+    changed.name = "delete_file".into();
+    let err = ctx
+        .effect(changed, counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EffectError::ReplayMismatch {
+            key: key.0.clone(),
+            field: "name"
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(s.interrupts(run).await.unwrap().is_empty());
+}
+
+/// После `Unknown` контекст отравлен: следующий эффект не займёт ключ `seq+1`.
+#[tokio::test]
+async fn unknown_outcome_poisons_the_context() {
+    let (s, run) = setup("unknown-poison").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let err = ctx
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EffectError::Unknown { .. }),
+        "получено {err:?}"
+    );
+    for _ in 0..2 {
+        let err = ctx
+            .effect(spec(EffectClass::Pure), counted(&calls, json!(2)))
+            .await
+            .unwrap_err();
+        assert_eq!(err, EffectError::Poisoned);
+        ctx.next_step();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        s.effect(run, &EffectKey::derive(run, 0, 1))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

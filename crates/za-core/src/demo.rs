@@ -84,7 +84,9 @@ pub enum DemoOutcome {
 /// событий; открытых нет — `paused → running` и продолжение. Run в `done`
 /// возвращает [`DemoOutcome::Done`], ничего не выполняя и не записывая. Иной
 /// статус — [`StoreError::InvalidTransition`]. После всех шагов run
-/// переводится в `done`.
+/// переводится в `done`. Если записанные аргументы эффекта расходятся с
+/// текущими (например, хэш префикса промпта в `model` изменился), шаги не
+/// выполняются: [`EffectError::ReplayMismatch`], run остаётся в `running`.
 pub async fn run_demo(
     store: &ProjectStore,
     run: RunId,

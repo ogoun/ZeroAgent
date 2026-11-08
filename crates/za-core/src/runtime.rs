@@ -8,11 +8,16 @@
 //! `{"outcome":"ok","value":…}` или `{"outcome":"error","message":…}`, поэтому
 //! успешное значение любой формы при повторе остаётся успехом. Конверт для
 //! хранилища — обычное значение: большой конверт целиком уходит в blob.
+//!
+//! При повторе имя и аргументы эффекта сверяются с намерением в журнале:
+//! расхождение (например, дрейф хэша префикса промпта в аргументах вызова
+//! модели) — [`EffectError::ReplayMismatch`], а не тихая выдача записанного
+//! результата.
 
 use std::future::Future;
 
 use serde_json::{Value, json};
-use za_protocol::{EffectClass, EffectKey, RunId};
+use za_protocol::{EffectClass, EffectKey, RunId, canonical_json};
 use za_store::{ProjectStore, StoreError};
 
 use crate::recovery::open_unknown;
@@ -38,9 +43,17 @@ pub enum EffectError {
     /// Эффект завершился отказом; отказ записан и при повторе не выполняется.
     #[error("эффект завершился отказом: {0}")]
     Failed(String),
-    /// Контекст отравлен прежней ошибкой журнала: продолжать можно только из
-    /// нового контекста после восстановления.
-    #[error("контекст run отравлен ошибкой журнала, нужен новый контекст")]
+    /// Имя или аргументы эффекта расходятся с намерением в журнале под тем же
+    /// ключом: код узла недетерминирован или изменился. `field` — `name` или
+    /// `args`. Эффект не выполняется, записанный результат не отдаётся.
+    #[error(
+        "эффект {key}: поле {field} расходится с журналом — повтор run недетерминирован, продолжение остановлено"
+    )]
+    ReplayMismatch { key: String, field: &'static str },
+    /// Контекст отравлен прежней ошибкой журнала, неизвестным исходом или
+    /// расхождением с журналом: продолжать можно только из нового контекста
+    /// после восстановления.
+    #[error("контекст run отравлен прежней ошибкой, нужен новый контекст")]
     Poisoned,
 }
 
@@ -49,7 +62,10 @@ pub enum EffectError {
 /// После любой [`EffectError::Store`] контекст отравлен: неизвестно, зафиксирована
 /// ли запись, поэтому ни занять следующий ключ, ни повторить текущий нельзя —
 /// иначе после перезапуска `NonIdempotent`-действие выполнится повторно или ключи
-/// шага сдвинутся. Все дальнейшие вызовы [`RunCtx::effect`] дают
+/// шага сдвинутся. Так же отравляют [`EffectError::Unknown`] (run ждёт решения
+/// человека, следующий эффект не должен занять ключ `seq+1`) и
+/// [`EffectError::ReplayMismatch`] (дальнейшие ключи уже не соответствуют
+/// журналу). Все дальнейшие вызовы [`RunCtx::effect`] дают
 /// [`EffectError::Poisoned`] без обращения к журналу, `next_step` отравление не
 /// снимает; продолжение — только новым контекстом через восстановление.
 /// `Clone` намеренно не реализован: два контекста одного run выдавали бы одни ключи.
@@ -85,7 +101,8 @@ impl RunCtx {
     ///
     /// Каждый вызов занимает следующий номер эффекта в шаге; ключи совпадают с
     /// исходными при повторе run из нового контекста, если код узла детерминирован.
-    /// Ошибка журнала отравляет контекст (см. [`RunCtx`]).
+    /// Ошибка журнала, неизвестный исход и расхождение с журналом отравляют
+    /// контекст (см. [`RunCtx`]).
     pub async fn effect<F, Fut>(&mut self, spec: EffectSpec, f: F) -> Result<Value, EffectError>
     where
         F: FnOnce() -> Fut,
@@ -97,8 +114,13 @@ impl RunCtx {
         let key = EffectKey::derive(self.run, self.step, self.effect_seq);
         self.effect_seq += 1;
         let r = self.run_effect(&key, spec, f).await;
-        if let Err(EffectError::Store(e)) = &r {
-            tracing::error!(key = %key.0, error = %e, "ошибка журнала, контекст run отравлен");
+        if let Err(
+            e @ (EffectError::Store(_)
+            | EffectError::Unknown { .. }
+            | EffectError::ReplayMismatch { .. }),
+        ) = &r
+        {
+            tracing::error!(key = %key.0, error = %e, "контекст run отравлен");
             self.poisoned = true;
         }
         r
@@ -121,9 +143,23 @@ impl RunCtx {
                     tracing::warn!(key = %key.0, journal = ?row.class, spec = ?spec.class,
                         "класс эффекта расходится с журналом");
                 }
-                if row.name != spec.name || row.args != spec.args {
-                    tracing::warn!(key = %key.0, journal = %row.name, spec = %spec.name,
-                        "имя или аргументы эффекта расходятся с журналом");
+                let field = if row.name != spec.name {
+                    Some("name")
+                } else if row.args != spec.args {
+                    Some("args")
+                } else {
+                    None
+                };
+                if let Some(field) = field {
+                    tracing::error!(key = %key.0, field,
+                        journal_name = %row.name, spec_name = %spec.name,
+                        journal_args = %canonical_json(&row.args),
+                        spec_args = %canonical_json(&spec.args),
+                        "эффект расходится с журналом");
+                    return Err(EffectError::ReplayMismatch {
+                        key: key.0.clone(),
+                        field,
+                    });
                 }
                 if let Some(result) = row.result {
                     tracing::debug!(key = %key.0, "эффект завершён ранее, результат из журнала");
