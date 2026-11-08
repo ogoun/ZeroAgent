@@ -38,15 +38,28 @@ pub enum EffectError {
     /// Эффект завершился отказом; отказ записан и при повторе не выполняется.
     #[error("эффект завершился отказом: {0}")]
     Failed(String),
+    /// Контекст отравлен прежней ошибкой журнала: продолжать можно только из
+    /// нового контекста после восстановления.
+    #[error("контекст run отравлен ошибкой журнала, нужен новый контекст")]
+    Poisoned,
 }
 
 /// Контекст выполнения run: хранилище, шаг и номер эффекта в шаге.
-#[derive(Debug, Clone)]
+///
+/// После любой [`EffectError::Store`] контекст отравлен: неизвестно, зафиксирована
+/// ли запись, поэтому ни занять следующий ключ, ни повторить текущий нельзя —
+/// иначе после перезапуска `NonIdempotent`-действие выполнится повторно или ключи
+/// шага сдвинутся. Все дальнейшие вызовы [`RunCtx::effect`] дают
+/// [`EffectError::Poisoned`] без обращения к журналу, `next_step` отравление не
+/// снимает; продолжение — только новым контекстом через восстановление.
+/// `Clone` намеренно не реализован: два контекста одного run выдавали бы одни ключи.
+#[derive(Debug)]
 pub struct RunCtx {
     store: ProjectStore,
     run: RunId,
     step: u64,
     effect_seq: u64,
+    poisoned: bool,
 }
 
 impl RunCtx {
@@ -57,10 +70,12 @@ impl RunCtx {
             run,
             step: 0,
             effect_seq: 0,
+            poisoned: false,
         }
     }
 
     /// Переходит к следующему шагу; нумерация эффектов начинается заново.
+    /// Отравление контекста не снимается.
     pub fn next_step(&mut self) {
         self.step += 1;
         self.effect_seq = 0;
@@ -68,25 +83,51 @@ impl RunCtx {
 
     /// Выполняет эффект по протоколу намерение → выполнение → квитанция.
     ///
-    /// Номер эффекта растёт при каждом вызове, в том числе неудачном, чтобы ключи
-    /// при повторе run совпадали с исходными.
+    /// Каждый вызов занимает следующий номер эффекта в шаге; ключи совпадают с
+    /// исходными при повторе run из нового контекста, если код узла детерминирован.
+    /// Ошибка журнала отравляет контекст (см. [`RunCtx`]).
     pub async fn effect<F, Fut>(&mut self, spec: EffectSpec, f: F) -> Result<Value, EffectError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Value, String>>,
     {
+        if self.poisoned {
+            return Err(EffectError::Poisoned);
+        }
         let key = EffectKey::derive(self.run, self.step, self.effect_seq);
         self.effect_seq += 1;
+        let r = self.run_effect(&key, spec, f).await;
+        if let Err(EffectError::Store(e)) = &r {
+            tracing::error!(key = %key.0, error = %e, "ошибка журнала, контекст run отравлен");
+            self.poisoned = true;
+        }
+        r
+    }
 
-        match self.store.effect(self.run, &key).await? {
+    async fn run_effect<F, Fut>(
+        &self,
+        key: &EffectKey,
+        spec: EffectSpec,
+        f: F,
+    ) -> Result<Value, EffectError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Value, String>>,
+    {
+        match self.store.effect(self.run, key).await? {
             Some(row) => {
-                if let Some(result) = row.result {
-                    tracing::debug!(key = %key.0, "эффект завершён ранее, результат из журнала");
-                    return decode(&key, result);
-                }
+                // Расхождение с журналом — признак недетерминированного узла.
                 if row.class != spec.class {
                     tracing::warn!(key = %key.0, journal = ?row.class, spec = ?spec.class,
                         "класс эффекта расходится с журналом");
+                }
+                if row.name != spec.name || row.args != spec.args {
+                    tracing::warn!(key = %key.0, journal = %row.name, spec = %spec.name,
+                        "имя или аргументы эффекта расходятся с журналом");
+                }
+                if let Some(result) = row.result {
+                    tracing::debug!(key = %key.0, "эффект завершён ранее, результат из журнала");
+                    return decode(key, result);
                 }
                 // Решает более строгий из классов: записанного и текущего.
                 if row.class == EffectClass::NonIdempotent
@@ -100,7 +141,7 @@ impl RunCtx {
             }
             None => {
                 self.store
-                    .record_intent(self.run, &key, spec.class, &spec.name, spec.args)
+                    .record_intent(self.run, key, spec.class, &spec.name, spec.args)
                     .await?;
             }
         }
@@ -108,14 +149,14 @@ impl RunCtx {
         match f().await {
             Ok(v) => {
                 let envelope = json!({ "outcome": OUTCOME_OK, "value": v });
-                self.store.record_receipt(self.run, &key, envelope).await?;
+                self.store.record_receipt(self.run, key, envelope).await?;
                 Ok(v)
             }
             Err(msg) => {
                 self.store
                     .record_receipt(
                         self.run,
-                        &key,
+                        key,
                         json!({ "outcome": OUTCOME_ERROR, "message": msg }),
                     )
                     .await?;

@@ -30,6 +30,10 @@ const INTERRUPT_OPEN: &str = "open";
 pub struct EffectRow {
     pub key: EffectKey,
     pub class: EffectClass,
+    /// Имя действия из намерения.
+    pub name: String,
+    /// Аргументы из намерения.
+    pub args: Value,
     /// `seq` события `effect.intent`.
     pub intent_seq: Seq,
     /// `seq` события `effect.receipt`; `None`, пока эффект не завершён.
@@ -154,9 +158,12 @@ impl ProjectStore {
                 None => None,
                 Some(seq) => Some(load_result(c, &dir, seq, raw.blob_ref.as_ref())?),
             };
+            let (name, args) = load_intent(c, &dir, raw.intent_seq)?;
             Ok(Some(EffectRow {
                 key,
                 class: raw.class,
+                name,
+                args,
                 intent_seq: raw.intent_seq,
                 receipt_seq: raw.receipt_seq,
                 result,
@@ -167,6 +174,7 @@ impl ProjectStore {
 
     /// Эффекты run с намерением, но без квитанции, по возрастанию `intent_seq`.
     pub async fn pending_effects(&self, run: RunId) -> Result<Vec<EffectRow>, StoreError> {
+        let dir = self.dir();
         self.read(move |c| {
             let mut stmt = c.prepare(
                 "SELECT effect_key, class, intent_seq FROM effects \
@@ -181,10 +189,14 @@ impl ProjectStore {
             })?;
             rows.map(|r| {
                 let (key, class, intent) = r?;
+                let intent_seq = seq_from(intent)?;
+                let (name, args) = load_intent(c, &dir, intent_seq)?;
                 Ok(EffectRow {
                     key: EffectKey(key),
                     class: parse_name(class, "class")?,
-                    intent_seq: seq_from(intent)?,
+                    name,
+                    args,
+                    intent_seq,
                     receipt_seq: None,
                     result: None,
                 })
@@ -300,6 +312,25 @@ fn load_row(c: &Connection, run: RunId, key: &EffectKey) -> Result<Option<RawRow
         })
     })
     .transpose()
+}
+
+/// Имя и аргументы из события намерения `seq`.
+fn load_intent(
+    c: &Connection,
+    dir: &std::path::Path,
+    seq: Seq,
+) -> Result<(String, Value), StoreError> {
+    let mut payload = events::payload_at(c, dir, seq)?
+        .ok_or_else(|| corrupt(&format!("нет события намерения {}", seq.0)))?;
+    let name = match payload.get_mut("name").map(Value::take) {
+        Some(Value::String(n)) => n,
+        _ => return Err(corrupt(&format!("в намерении {} нет name", seq.0))),
+    };
+    let args = payload
+        .get_mut("args")
+        .map(Value::take)
+        .ok_or_else(|| corrupt(&format!("в намерении {} нет args", seq.0)))?;
+    Ok((name, args))
 }
 
 /// Результат из blob `effects.blob_ref` или из события квитанции `seq`.

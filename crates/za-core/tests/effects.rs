@@ -383,3 +383,117 @@ async fn recover_unknown_run_is_an_error() {
         za_store::StoreError::UnknownRun(run)
     );
 }
+
+#[tokio::test]
+async fn store_error_poisons_the_context() {
+    let s = ProjectStore::open(&dir("poison")).unwrap();
+    // Run ещё не создан: намерение не запишется, это ошибка журнала.
+    let run = RunId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let err = ctx
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EffectError::Store(za_store::StoreError::UnknownRun(run))
+    );
+
+    s.create_run(NewRun {
+        id: run,
+        project_id: "p".into(),
+        parent_id: None,
+        role: RunRole::Top,
+        model_profile: None,
+    })
+    .await
+    .unwrap();
+    // Даже когда журнал снова исправен, отравленный контекст ничего не делает,
+    // в том числе после смены шага.
+    for _ in 0..2 {
+        let err = ctx
+            .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(err, EffectError::Poisoned);
+        ctx.next_step();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(s.pending_effects(run).await.unwrap().is_empty());
+
+    // Новый контекст начинает с того же ключа (шаг 0, эффект 0).
+    let mut fresh = RunCtx::new(s.clone(), run);
+    fresh
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(7)))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let row = s.effect(run, &first_key(run)).await.unwrap().unwrap();
+    assert_eq!(row.result, Some(ok(json!(7))));
+}
+
+#[tokio::test]
+async fn recreated_context_resumes_at_same_key_without_rerunning() {
+    let (s, run) = setup("poison-resume").await;
+    let key = first_key(run);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+
+    // Действие выполнено, но квитанция контекста не записывается: внутри
+    // замыкания квитанцию занимает другой писатель, запись даёт ошибку журнала.
+    let probe = s.clone();
+    let k = key.clone();
+    let c = Arc::clone(&calls);
+    let err = ctx
+        .effect(spec(EffectClass::NonIdempotent), move || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            probe
+                .record_receipt(run, &k, ok(json!("sent")))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!("sent"))
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EffectError::Store(_)), "получено {err:?}");
+
+    // Повтор на том же контексте не занимает ключ (0, 1) и ничего не выполняет.
+    let err = ctx
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(0)))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Poisoned);
+    assert!(
+        s.effect(run, &EffectKey::derive(run, 0, 1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Новый контекст после восстановления видит тот же ключ (0, 0) завершённым.
+    assert_eq!(recover(&s, run).await.unwrap(), Recovery::Clean);
+    let mut fresh = RunCtx::new(s.clone(), run);
+    let r = fresh
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(0)))
+        .await
+        .unwrap();
+    assert_eq!(r, json!("sent"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "необратимое действие не повторено"
+    );
+}
+
+#[tokio::test]
+async fn effect_row_carries_name_and_args() {
+    let (s, run) = setup("name-args").await;
+    let mut ctx = RunCtx::new(s.clone(), run);
+    ctx.effect(spec(EffectClass::Pure), || async { Ok(json!(1)) })
+        .await
+        .unwrap();
+    let row = s.effect(run, &first_key(run)).await.unwrap().unwrap();
+    assert_eq!(row.name, "write_file");
+    assert_eq!(row.args, json!({"path": "a.txt"}));
+}
