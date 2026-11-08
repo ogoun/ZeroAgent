@@ -1,0 +1,127 @@
+Для реальной задачи предлагаю начать использовать память для разработки собственного агента с названием zero-agent.
+
+Сначала изучи готовые проекты:
+https://github.com/openclaw/openclaw
+https://github.com/razzant/ouroboros
+https://github.com/deepseek-ai/deepseek-harness
+https://github.com/OthmanAdi/planning-with-files
+https://github.com/affaan-m/ECC
+https://github.com/addyosmani/agent-skills
+https://github.com/ruvnet/ruflo
+https://github.com/wshobson/agents
+https://github.com/Panniantong/Agent-Reach
+https://github.com/farion1231/cc-switch
+https://github.com/phuryn/pm-skills
+https://github.com/alirezarezvani/claude-skills
+https://github.com/career-ops-hq/career-ops
+https://github.com/osaurus-ai/osaurus
+https://github.com/nousresearch/hermes-agent
+https://paseo.sh/
+https://github.com/AtomicBot-ai/atomic-agent
+https://github.com/alishahryar1/free-claude-code
+https://github.com/mattpocock/skills
+https://github.com/gitroomhq/postiz-app
+https://github.com/Get-Concord-AI/concord-mcp
+https://github.com/gamedev-skills/awesome-gamedev-agent-skills
+https://github.com/Shubhamsaboo/awesome-llm-apps
+https://github.com/punkpeye/awesome-mcp-servers
+https://github.com/mlabonne/llm-course
+https://github.com/microsoft/ai-agents-for-beginners
+https://github.com/NirDiamant/RAG_Techniques
+https://github.com/NirDiamant/agents-towards-production 
+https://github.com/AgriciDaniel/claude-seo
+https://github.com/chiphuyen/aie-book
+https://github.com/pullboard-dev/pullboard
+https://github.com/langchain-ai/langgraph
+https://github.com/pydantic/pydantic-ai
+https://github.com/openai/openai-agents-python
+https://github.com/google/adk-python
+https://github.com/crewAIInc/crewAI
+https://github.com/mastra-ai/mastra
+https://github.com/microsoft/agent-framework
+https://github.com/microsoft/autogen/discussions/7066
+https://github.com/run-llama/llama_index
+https://github.com/huggingface/smolagents
+https://github.com/agno-agi/agno
+https://github.com/OpenHands/OpenHands
+https://github.com/browser-use/browser-use
+https://github.com/letta-ai/letta
+https://github.com/SWE-agent/SWE-agent
+https://github.com/langgenius/dify
+https://github.com/AlexWortega/remarkabl
+
+
+Репозитории под конкретные задачи:
+https://github.com/morluto/rea
+https://github.com/Donchitos/Claude-Code-Game-Studios
+https://github.com/docusealco/docuseal
+https://github.com/luongnv89/claude-howto
+https://github.com/ZSeven-W/openpencil
+
+Тулзы:
+https://www.reddit.com/r/BestGitHubRepos/comments/1xcb8ah/coolify_an_opensource_platform_to_deploy/
+https://github.com/NationalSecurityAgency/ghidra
+
+
+Тут лежит скачанный репозиторий с системными промтами:
+I:\CL4R1T4S
+Нужно составить свой системный промт, но так как он предназначен для локальных моделей в первую очередь с относительно небольшим контекстом, войти в него должно только то что касается работы.
+Не нужно включать в него ничего связанного с ограничениями, толерантностью, этикой или моралью и прочим идиотизмом который ограничивает работу моделей. Цель - не политика, а рабочий инструмент.
+
+Изучи и возможности агентов с закрытым исходным кодом:
+ChatGPT Work
+Claude Cowork
+Manus
+Genspark Super Agent
+Gemini Deep Research / Gemini Enterprise
+Perplexity Comet
+Claude Code
+Cursor Cloud Agents
+OpenAI Codex
+Devin
+GitHub Copilot Coding Agent
+Replit Agent
+
+Проведи полное исследование возможностей. Составь полноценное ТЗ со всеми фичами для разработки собственного агента, максимально широкого спектра возможностей. Агент должен максимально полно использовать возможности памяти из проекта H:\Documents\GitHub\ZeroAIMemory.
+
+Архитектурно:
+zero-agent - непосредственно агент
+zero-agent-relay - сервис для связи агентов по сети, то есть, если несколько агентов подключены к одному релэй сервису,
+ то с любого агента можно получить доступ к любому другому агенту в сети и к его проектам. Легитимность доступа проверяется токеном прописанным на релэй сервисе и в конфигах агентов.
+zero-agent - поднимает веб-страницу с которой ведется вся работа. С этой же страницы можно подключаться к другим агентам связанным через zero-agent-relay
+
+
+Сразу из важного:
+1. При создании инструментов для каких либо задач на питоне обязательно делать это в отдельном окружении.
+2. Агент работает строго внутри каталога проекта, если ему на сказано явно что он может обратиться к данным наружу.
+3. Агент должен быть универсальным, от поиска по инету, до огромных исследований и создания больших проектов, независимо от задачи должен работать максимально эффективно.
+4. Агент должен уметь выполнять периодические задания, например, раз в сутки изучать что появилось нового по заданной теме и проводить сравнения решений.
+5. UI должен быть в виде веб приложения.
+
+Предварительно, язык разработки rust, персистентность - sqlite.
+
+
+Для оценки качества агенту нужно использовать бенчмарки:
+
+Уже подустаревшие но хорошие:
+AgentBench FC — общая агентность и работа с разными окружениями.
+WebArena-Verified — браузерные задачи.
+Terminal-Bench — работа в терминале.
+SWE-bench Verified — программирование и исправление репозиториев.
+τ-bench 2.0 — диалог, политики и вызов бизнес-инструментов.
+AgentDojo — безопасность и prompt injection.
+OSWorld 2.1 — опционально, если агенты умеют работать с GUI/скриншотами.
+
+Новые:
+Long-Horizon Terminal-Bench 2.0
+FrontierCS 2
+SWE-Bench Pro V2
+BU Bench V2.1
+WildClawBench
+OSWorld 2.1
+UniClawBench
+SWE-EVO
+General AgentBench
+MCP-Universe / MCPMark
+
+Для бенчмарков подготовь удобную арену, чтобы проводить исследования максимально быстро.

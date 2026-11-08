@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zero-agent — прототип интерфейса</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#F6F7F9; --panel:#FFFFFF; --soft:#FBFBFC; --line:#E3E6EB; --line2:#EEF0F3; --ctl:#D5DAE1;
+  --text:#14181F; --muted:#5B6472; --text2:#3A4250;
+  --accent:#2457D6; --accent-ink:#1D43A8; --accent-bg:#E8EEFC; --accent-soft:#F3F6FD; --accent-line:#C9D6F5;
+  --ok:#1F7A4D; --ok-ink:#14532D; --ok-bg:#E7F3EC;
+  --warn:#B45309; --warn-ink:#6B2E04; --warn-text:#8A3A05; --warn-bg:#FFFAF2; --warn-line:#F0C48A; --warn-chip:#FDF0E1;
+  --bad:#B42318; --idle:#8A93A0; --bar:#EEF1F5; --bar-fill:#6B7686;
+  --user-bg:#1E2633; --user-text:#F3F5F8;
+  --mono:'JetBrains Mono',ui-monospace,Consolas,monospace;
+}
+:root[data-theme="dark"]{
+  --bg:#0F1217; --panel:#161A21; --soft:#12161C; --line:#262C36; --line2:#20252E; --ctl:#343B47;
+  --text:#E6E9EE; --muted:#9AA3B1; --text2:#C2C8D1;
+  --accent:#5B8CFF; --accent-ink:#A9C2FF; --accent-bg:#1B2742; --accent-soft:#18213A; --accent-line:#2E4270;
+  --ok:#3DBA7E; --ok-ink:#8FE0B5; --ok-bg:#15291F;
+  --warn:#E09A3E; --warn-ink:#F6CF97; --warn-text:#F0B76A; --warn-bg:#251C10; --warn-line:#5A4220; --warn-chip:#3A2A14;
+  --bad:#F06A5E; --idle:#6F7887; --bar:#232934; --bar-fill:#8A95A6;
+  --user-bg:#2A3448; --user-text:#F3F5F8;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;font-size:14px}
+a{color:var(--accent-ink);text-decoration:none}a:hover{text-decoration:underline}
+button{font-family:inherit;cursor:pointer;color:var(--text)}
+.mono{font-family:var(--mono)}
+.muted{color:var(--muted)} .t2{color:var(--text2)} .small{font-size:12px} .s13{font-size:13px}
+.app{height:100vh;display:flex;flex-direction:column;overflow:hidden}
+header.top{display:flex;align-items:center;gap:12px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.logo{display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px;cursor:pointer;background:none;border:0;padding:0}
+.logo i{width:22px;height:22px;border-radius:6px;background:var(--accent);display:inline-block}
+.btn{height:34px;padding:0 12px;border:1px solid var(--ctl);border-radius:8px;background:var(--panel);font-size:13px;display:inline-flex;align-items:center;gap:8px}
+.btn.sm{height:28px;padding:0 9px;font-size:12px;border-radius:6px}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.btn.danger{color:var(--bad);border-color:var(--bad);font-weight:600}
+.btn.ghost-danger{color:var(--bad)}
+.btn:hover{filter:brightness(.97)}
+.chip{height:34px;display:inline-flex;align-items:center;gap:6px;padding:0 10px;border-radius:8px;background:var(--bar);font-size:12px}
+.chip.ok{background:var(--ok-bg);color:var(--ok-ink)}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto}
+.dot.run{background:var(--accent)} .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.wait{border:2px solid var(--idle)} .dot.bad{background:var(--bad)}
+.spacer{flex:1 1 auto}
+.body{display:flex;flex:1 1 auto;min-height:0}
+nav.side{flex:0 0 260px;overflow:auto;padding:16px 12px;border-right:1px solid var(--line);background:var(--soft);display:flex;flex-direction:column;gap:16px}
+.navh{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;padding:0 8px 4px}
+.navlist{display:flex;flex-direction:column;gap:2px}
+.navitem{display:flex;align-items:center;gap:8px;justify-content:space-between;padding:8px 10px;border-radius:8px;background:none;border:0;text-align:left;font-size:14px;width:100%}
+.navitem:hover{background:var(--bar)} .navitem.active{background:var(--accent-bg);font-weight:600}
+.proj{flex-direction:column;align-items:stretch;gap:2px}
+.proj .row{display:flex;justify-content:space-between;align-items:center;gap:8px;font-weight:500}
+.proj .sub{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);font-weight:400}
+.badge{min-width:20px;padding:0 6px;text-align:center;border-radius:10px;background:var(--warn-chip);color:var(--warn-text);font-size:12px;font-weight:600}
+.add{height:34px;border:1px dashed var(--ctl);border-radius:8px;background:transparent;font-size:13px;color:var(--text2)}
+input.search{height:34px;padding:0 10px;border:1px solid var(--ctl);border-radius:8px;font:inherit;font-size:13px;background:var(--panel);color:var(--text)}
+main.center{flex:1 1 560px;min-width:0;min-height:0;display:flex;flex-direction:column}
+.bar{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:14px 24px;background:var(--panel);border-bottom:1px solid var(--line)}
+.bar h1{margin:0;font-size:17px;font-weight:600}
+.meta{display:flex;flex-wrap:wrap;gap:18px;padding:8px 24px;background:var(--panel);border-bottom:1px solid var(--line);font-size:12px;color:var(--text2)}
+.meta b{font-family:var(--mono)}
+.status{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:13px;font-size:12px;font-weight:600}
+.status.run{background:var(--accent-bg);color:var(--accent-ink)} .status.pause{background:var(--warn-chip);color:var(--warn-text)} .status.done{background:var(--ok-bg);color:var(--ok-ink)}
+.feed{flex:1 1 auto;min-height:0;overflow:auto;padding:20px 24px;display:flex;flex-direction:column;gap:14px}
+.feed > *{max-width:860px}
+.msg-user{align-self:flex-end;max-width:78%;padding:12px 14px;border-radius:12px;background:var(--user-bg);color:var(--user-text);line-height:1.5;white-space:pre-wrap}
+.msg-agent{padding:14px;border-radius:10px;background:var(--panel);border:1px solid var(--line);line-height:1.55;display:flex;flex-direction:column;gap:8px}
+.who{font-size:12px;color:var(--muted)}
+.tool{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:13px;cursor:pointer}
+.tool .name{font-family:var(--mono);color:var(--text2)} .tool .desc{color:var(--muted);flex:1 1 auto}
+.tool-body{display:none;margin:-4px 0 0;padding:10px 12px;border:1px solid var(--line);border-top:0;border-radius:0 0 8px 8px;background:var(--soft);font-family:var(--mono);font-size:12px;white-space:pre-wrap;color:var(--text2)}
+.tool.open + .tool-body{display:block}
+.tag-ext{padding:1px 6px;border-radius:4px;background:var(--warn-chip);color:var(--warn-text);font-size:11px;font-weight:600}
+.card{padding:14px;border:1px solid var(--accent-line);border-radius:10px;background:var(--panel);display:flex;flex-direction:column;gap:10px}
+.card.warn{border-color:var(--warn-line);background:var(--warn-bg)}
+.card .ttl{font-weight:600} .card.warn .ttl{color:var(--warn-ink)}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.pill{padding:3px 8px;border-radius:4px;background:var(--bar);font-size:12px}
+.pill.run{background:var(--accent-bg);color:var(--accent-ink)}
+.kv{display:grid;grid-template-columns:150px minmax(0,1fr);gap:8px 14px;font-size:13px}
+.kv span:nth-child(odd){color:var(--muted)}
+.kv input{font:inherit;font-size:13px;padding:4px 6px;border:1px solid var(--ctl);border-radius:6px;background:var(--panel);color:var(--text)}
+.now{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+form.composer{margin:0;flex:0 0 auto;padding:12px 24px 18px;background:var(--bg);border-top:1px solid var(--line)}
+.compose{border:1px solid var(--ctl);border-radius:12px;background:var(--panel);padding:10px 12px;display:flex;flex-direction:column;gap:8px;max-width:860px}
+.compose textarea{border:0;resize:none;font:inherit;font-size:14px;outline:none;color:var(--text);background:transparent}
+.compose .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+select.sel{height:30px;padding:0 8px;border:1px solid var(--ctl);border-radius:6px;background:var(--panel);font:inherit;font-size:12px;color:var(--text)}
+aside.right{flex:0 1 380px;min-width:0;overflow:auto;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column}
+.tabs{display:flex;flex-wrap:wrap;gap:2px;padding:8px 12px 0;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
+.tab{height:34px;padding:0 10px;border:0;border-bottom:2px solid transparent;background:transparent;font-size:13px;color:var(--muted)}
+.tab.active{border-bottom-color:var(--accent);font-weight:600;color:var(--text)}
+.pane{padding:16px;display:flex;flex-direction:column;gap:14px}
+.note{padding:10px 12px;border-radius:8px;background:var(--accent-soft);font-size:12px;color:var(--accent-ink);line-height:1.45}
+ol.plan{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:8px;font-size:13px}
+ol.plan li{display:flex;gap:10px}
+.st-done{color:var(--ok);font-weight:700} .st-run{color:var(--accent);font-weight:700} .st-cut{color:var(--idle)}
+.term{background:#0F1217;color:#C9D1D9;border-radius:8px;padding:12px;font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;min-height:220px}
+.diff{font-family:var(--mono);font-size:12px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.diff div{padding:2px 10px;white-space:pre}
+.diff .add{background:var(--ok-bg);color:var(--ok-ink);border:0;height:auto;border-radius:0;text-align:left;font-size:12px}
+.diff .del{background:#FCEBEA;color:#7A1A12} :root[data-theme="dark"] .diff .del{background:#2E1614;color:#F5B4AD}
+.browser{border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.browser .url{padding:6px 10px;background:var(--bar);font-family:var(--mono);font-size:12px}
+.browser .shot{height:180px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px;background:repeating-linear-gradient(45deg,var(--soft),var(--soft) 10px,var(--bar) 10px,var(--bar) 20px)}
+.page{flex:1 1 auto;min-height:0;overflow:auto}
+.pagehead{display:flex;flex-wrap:wrap;align-items:center;gap:14px;padding:12px 24px;background:var(--panel);border-bottom:1px solid var(--line)}
+.pagehead h1{margin:0;font-size:18px;font-weight:600}
+.grid{display:flex;flex-wrap:wrap;gap:20px;padding:20px 24px;align-items:flex-start}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.box h2{margin:0;font-size:15px;font-weight:600}
+.box.accent{border-color:var(--accent-line)}
+.tbl{display:grid;font-size:13px}
+.tbl > span{padding:9px 6px;border-top:1px solid var(--line2);display:flex;align-items:center;gap:6px;min-width:0}
+.tbl > span.h{border-top:0;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.meter{display:grid;grid-template-columns:90px minmax(0,1fr) 140px;gap:10px 12px;align-items:center;font-size:13px}
+.track{height:10px;border-radius:5px;background:var(--bar)} .fill{height:10px;border-radius:5px;background:var(--bar-fill)}
+.fill.acc{background:var(--accent)} .fill.warn{background:var(--warn)}
+.warnbox{padding:10px 12px;border-radius:8px;background:var(--warn-bg);border:1px solid var(--warn-line);font-size:13px;color:var(--warn-ink);line-height:1.5}
+.stat{padding:10px;border-radius:8px;background:var(--bg)} .stat .v{font-size:20px;font-weight:600;font-family:var(--mono)}
+.jobitem{padding:14px 16px;border-top:1px solid var(--line2);display:flex;flex-direction:column;gap:4px;cursor:pointer;background:none;border-left:0;border-right:0;border-bottom:0;text-align:left;width:100%}
+.jobitem:first-child{border-top:0} .jobitem.active{background:var(--accent-soft)}
+
+dialog{border:1px solid var(--line);border-radius:12px;padding:20px;background:var(--panel);color:var(--text);max-width:420px}
+dialog::backdrop{background:rgba(10,14,20,.45)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--user-bg);color:var(--user-text);padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:10}
+.toast.show{opacity:1}
+.hidden{display:none !important}
+@media (max-width: 900px){
+  .app{height:auto;overflow:visible} .body{flex-wrap:wrap} nav.side{flex:1 1 100%} aside.right{flex:1 1 100%}
+  .feed,.page{overflow:visible}
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+<header class="top">
+  <button class="logo" data-go="home" aria-label="На главную"><i aria-hidden="true"></i>zero-agent</button>
+  <select class="sel" id="node" aria-label="Узел" style="height:34px;font-size:13px">
+    <option>Узел: workstation</option><option>Узел: laptop</option>
+  </select>
+  <span id="crumb" class="s13 muted"></span>
+  <div class="spacer"></div>
+  <button class="chip mono" data-go="resources" id="modelchip" style="border:0">Qwen3.8-27B · очередь 2 · GPU 71 %</button>
+  <span class="chip ok">Память: подключена, L2</span>
+  <button class="btn" id="theme" aria-label="Сменить тему">Тема</button>
+  <button class="btn danger" id="stopall">Остановить всё</button>
+</header>
+
+<div class="body">
+
+<!-- ЛЕВАЯ ПАНЕЛЬ: ГЛАВНАЯ -->
+<nav class="side" id="nav-home" aria-label="Проекты">
+  <label class="hidden" for="find">Найти проект</label>
+  <input class="search" id="find" placeholder="Найти проект…">
+  <button class="navitem active" data-go="home">Общий диалог</button>
+  <div>
+    <div class="navh">Проекты</div>
+    <div class="navlist" id="projects"></div>
+    <button class="add" id="newproj" style="width:100%;margin-top:6px">+ Новый проект</button>
+  </div>
+  <div style="margin-top:auto">
+    <div class="navh">Общее</div>
+    <div class="navlist">
+      <button class="navitem" data-go="jobs">Задания</button>
+      <button class="navitem" data-go="resources">Ресурсы и узлы</button>
+      <button class="navitem" data-stub="Память">Память</button>
+      <button class="navitem" data-stub="Утилиты">Утилиты</button>
+      <button class="navitem" data-stub="Арена">Арена</button>
+      <button class="navitem" data-stub="Настройки">Настройки</button>
+    </div>
+  </div>
+</nav>
+
+<!-- ЛЕВАЯ ПАНЕЛЬ: ПРОЕКТ -->
+<nav class="side hidden" id="nav-project" aria-label="Навигация проекта">
+  <button class="navitem" data-go="home">← Все проекты</button>
+  <div>
+    <div class="navh">Входящие</div>
+    <div class="navlist">
+      <button class="navitem" data-stub="Входящие">Нужен ввод <span class="badge" id="inboxcount">2</span></button>
+      <button class="navitem" data-stub="Входящие">Ошибки <span class="small muted">0</span></button>
+      <button class="navitem" data-stub="Входящие">Готово <span class="small muted">5</span></button>
+    </div>
+  </div>
+  <div>
+    <div class="navh">Запуски</div>
+    <div class="navlist">
+      <button class="navitem active" data-go="project"><span style="display:flex;gap:8px;align-items:center"><i class="dot run" id="rundot"></i>Обзор памяти для агентов</span></button>
+      <button class="navitem" data-stub="Запуск"><span style="display:flex;gap:8px;align-items:center"><i class="dot warn"></i>Рефакторинг журнала</span></button>
+      <button class="navitem" data-stub="Запуск"><span style="display:flex;gap:8px;align-items:center" class="muted"><i class="dot ok"></i>Сравнение Harbor и Inspect</span></button>
+    </div>
+  </div>
+  <div>
+    <div class="navh">Проект</div>
+    <div class="navlist">
+      <button class="navitem" data-go="agents">Агенты и рой</button>
+      <button class="navitem" data-go="context">Инспектор контекста</button>
+      <button class="navitem" data-go="jobs">Задания</button>
+      <button class="navitem" data-go="resources">Ресурсы и очереди</button>
+    </div>
+  </div>
+</nav>
+
+<!-- ЭКРАН: ГЛАВНАЯ -->
+<main class="center" id="scr-home">
+  <div class="bar"><div><h1>Общий диалог</h1><div class="small muted">Вне проекта: агент видит список проектов, их состояние и общую память. Файлы проектов не меняет.</div></div></div>
+  <div class="feed" id="feed-home">
+    <div class="msg-user">Есть ли у нас готовая утилита для разбора таблиц из PDF?</div>
+    <div class="msg-agent"><div class="who">zero-agent · 16:02</div><div>Да, в реестре утилит есть <span class="mono">pdf-tables 1.2.0</span>: Python 3.12, на входе PDF, на выходе CSV, без сети. Последняя проверка 2 нояб., тесты прошли.</div><a href="#" data-stub="Контракт утилиты">Открыть контракт утилиты</a></div>
+    <div class="msg-user">Что сейчас с @ZeroAgent?</div>
+    <div class="msg-agent"><div class="who">zero-agent · 16:05</div><div>Идёт обзор памяти для агентов: шаг 23, рой из 3 воркеров, факт ×1,8 к одному потоку. Ждут вас два решения.</div><a href="#" data-open-project="ZeroAgent">Перейти в проект</a></div>
+  </div>
+  <form class="composer" data-feed="feed-home">
+    <div class="compose">
+      <label class="small muted" for="ask-home">Сообщение — Enter отправить, Shift+Enter новая строка. Попробуйте: «создай проект …»</label>
+      <textarea id="ask-home" rows="2" placeholder="Спросите что угодно, создайте проект или обратитесь к проекту через @имя…"></textarea>
+      <div class="row">
+        <select class="sel" aria-label="Контекст"><option>Контекст: все проекты</option><option>Контекст: ZeroAgent</option><option>Контекст: без проектов</option></select>
+        <select class="sel" aria-label="Модель"><option>Qwen3.8-27B, локально</option><option>Claude, облако</option><option>OpenRouter</option></select>
+        <div class="spacer"></div>
+        <button class="btn primary" type="submit">Отправить</button>
+      </div>
+    </div>
+  </form>
+</main>
+<aside class="right" id="side-home" aria-label="Сводка">
+  <div class="pane">
+    <div class="box" style="padding:0;border:0;gap:8px"><h2>Ждут вас</h2><div id="waiting" style="display:flex;flex-direction:column;gap:8px"></div></div>
+    <div class="box" style="padding:0;border:0;gap:8px"><h2>Работает сейчас</h2>
+      <div class="s13" style="display:flex;justify-content:space-between"><span>Обзор памяти для агентов</span><span class="muted" id="sum-run">ZeroAgent · рой 3</span></div>
+      <div class="s13" style="display:flex;justify-content:space-between"><span>Рефакторинг журнала</span><span style="color:var(--warn-text)">пауза</span></div>
+    </div>
+    <div class="box" style="padding:0;border:0;gap:8px"><h2>Ближайшие задания</h2>
+      <div class="s13" style="display:flex;justify-content:space-between"><span>Арена: nightly</span><span class="mono muted">01:00</span></div>
+      <div class="s13" style="display:flex;justify-content:space-between"><span>Новинки по агентам</span><span class="mono muted">07:00</span></div>
+      <a href="#" data-go="jobs" class="s13">Все задания</a>
+    </div>
+    <div class="box" style="padding:0;border:0;gap:8px"><h2>Узлы</h2>
+      <div class="s13" style="display:flex;justify-content:space-between"><span>workstation</span><span class="mono" style="color:var(--warn-text)">VRAM 92 %</span></div>
+      <div class="s13" style="display:flex;justify-content:space-between"><span>laptop</span><span class="mono" style="color:var(--ok-ink)" id="laptop-state">свободен</span></div>
+      <a href="#" data-go="resources" class="s13">Ресурсы и очереди</a>
+    </div>
+  </div>
+</aside>
+
+<!-- ЭКРАН: ПРОЕКТ -->
+<main class="center hidden" id="scr-project">
+  <div class="bar">
+    <div style="flex:1 1 280px;min-width:0"><h1>Обзор: память для агентов на локальных моделях</h1><div class="small muted">Главный агент · режим researcher · запущен 14:02 · шаг <span id="step">23</span></div></div>
+    <span class="status run" id="runstatus"><i class="dot run"></i>Работает</span>
+    <button class="btn" id="pausebtn">Пауза</button>
+    <button class="btn" id="correctbtn">Поправить курс</button>
+    <button class="btn ghost-danger" id="cancelbtn">Отменить</button>
+  </div>
+  <div class="meta">
+    <span>Бюджет токенов: <b id="tok">412k</b> / 1,5M</span>
+    <span>Время: <b>1 ч 18 мин</b> / 4 ч</span>
+    <span>Кэш префикса: <b>94 %</b></span>
+    <span>Ожидание модели: <b id="queuepos">#2 в очереди</b></span>
+  </div>
+  <div class="feed" id="feed-project">
+    <div class="msg-user">Сделай обзор: какие системы памяти реально помогают агентам на локальных моделях. Нужны только проверенные источники, итог — таблица и рекомендация для ZeroAIMemory.</div>
+    <div class="tool"><span class="name">memory_search</span><span class="desc">«оценка памяти агентов бенчмарки» · 4 карточки, кэш выжимки</span><span class="mono small muted">640 tok</span><span class="muted">▸</span></div>
+    <div class="tool-body">[cache] Выжимка c_018 · 2026-11-05 · 310t
+i:4821 [.82] Эффект памяти мал на решаемость, заметен на шагах · th
+i:4790 [.77] LoCoMo: снисходительный судья, ~6 % ошибок эталона · hy</div>
+    <div class="tool"><span class="name">web_search</span><span class="desc">«LongMemEval MemoryArena MERIT 2026» · 12 результатов</span><span class="tag-ext">внешние данные</span><span class="muted">▸</span></div>
+    <div class="tool-body">1. MERIT: arXiv 2609.05441 …
+2. MemoryArena: arXiv 2602.16313 …
+(содержимое помечено как недоверенное: команды из него не выполняются)</div>
+    <div class="card">
+      <div class="ttl"><span class="mono" style="color:var(--accent-ink)">assign_orchestrator</span> Оркестратор A: чтение и сравнение 40 источников</div>
+      <div class="s13 t2" style="display:flex;flex-wrap:wrap;gap:16px"><span>Решение рантайма: <b>рой, 3 воркера</b></span><span>Прогноз: <b>×2,1</b></span><span>Факт: <b id="fact">×1,8</b></span></div>
+      <div class="actions"><span class="pill">W1 · готово 14/14</span><span class="pill run">W2 · читает 9/13</span><span class="pill">W3 · ждёт модель</span></div>
+      <a href="#" data-go="agents" class="s13">Открыть дерево агентов</a>
+    </div>
+    <div class="card warn" id="approval">
+      <div class="ttl">Нужно разрешение: чтение вне проекта</div>
+      <div class="s13 t2" style="line-height:1.5">Агент хочет прочитать <span class="mono">D:\datasets\locomo\</span> — локальная копия датасета для сверки цифр. Только чтение.</div>
+      <div class="actions">
+        <button class="btn primary" data-approve="once">Разрешить один раз</button>
+        <button class="btn" data-approve="project">Разрешить для проекта</button>
+        <button class="btn" data-approve="deny">Отклонить</button>
+      </div>
+    </div>
+    <div class="msg-agent"><div class="who">Главный агент · 15:19</div><div>Промежуточно: из 11 систем прирост решаемости подтверждён у двух, у остальных выигрыш только в шагах и токенах. Жду отчёты W2 и W3, затем сведу таблицу.</div></div>
+    <div class="now" id="nowline"><i class="dot run"></i>Сейчас: W2 читает arXiv 2609.05441 · 18 с без ответа модели (очередь)</div>
+  </div>
+  <form class="composer" data-feed="feed-project">
+    <div class="compose">
+      <label class="small muted" for="ask-project">Сообщение агенту — правка курса пересматривает весь план</label>
+      <textarea id="ask-project" rows="2" placeholder="Написать, поправить курс или добавить в очередь…"></textarea>
+      <div class="row">
+        <select class="sel" aria-label="Режим"><option>Режим: researcher</option><option>Режим: coder</option><option>Режим: operator</option><option>Режим: writer</option></select>
+        <select class="sel" aria-label="Модель"><option>Qwen3.8-27B, локально</option><option>Claude, облако</option><option>OpenRouter</option></select>
+        <select class="sel" id="delivery" aria-label="Доставка"><option>Доставка: следующим шагом</option><option>Доставка: прервать и применить</option></select>
+        <div class="spacer"></div>
+        <button class="btn primary" type="submit">Отправить</button>
+      </div>
+    </div>
+  </form>
+</main>
+<aside class="right hidden" id="side-project" aria-label="Панель проекта">
+  <div class="tabs" role="tablist">
+    <button class="tab active" data-tab="plan">План</button>
+    <button class="tab" data-tab="diff">Diff</button>
+    <button class="tab" data-tab="files">Файлы</button>
+    <button class="tab" data-tab="term">Терминал</button>
+    <button class="tab" data-tab="browser">Браузер</button>
+    <button class="tab" data-tab="evidence">Доказательства</button>
+  </div>
+  <div class="pane" data-pane="plan">
+    <div style="display:flex;justify-content:space-between;align-items:baseline"><b>План · версия <span id="planv">3</span></b><a href="#" class="small" data-stub="Сравнение версий плана">что изменилось</a></div>
+    <div class="note" id="plannote">Пересмотрен 3 мин назад: правка пользователя «только проверенные источники». +1 пункт, 1 отменён, рой оставлен.</div>
+    <ol class="plan" id="plan">
+      <li><span class="st-done">✓</span><span>Поиск в памяти: прошлые выводы и эксперименты</span></li>
+      <li><span class="st-done">✓</span><span>Отбор 40 источников</span></li>
+      <li><span class="st-run">●</span><span><b>Чтение и выписки — рой, 3 воркера</b></span></li>
+      <li><span class="st-run">+</span><span>Сверка цифр по первоисточникам</span></li>
+      <li class="st-cut"><span>−</span><span style="text-decoration:line-through">Обзор блогов вендоров</span></li>
+      <li class="t2"><span>○</span><span>Таблица и рекомендация</span></li>
+      <li class="t2"><span>○</span><span>Запись выводов в ZeroAIMemory</span></li>
+    </ol>
+    <div style="border-top:1px solid var(--line);padding-top:12px" class="small t2">Записано в память: 2 гипотезы с меткой «внешние данные» · 1 выжимка<br>Ожидает подтверждения: замена старого вывода</div>
+  </div>
+  <div class="pane hidden" data-pane="diff">
+    <b>Изменения запуска · 2 файла</b>
+    <div class="diff"><div class="muted">notes/memory-review.md</div><div class="add">+ | MERIT | +55 п.п. к нижней границе | arXiv 2609.05441 |</div><div class="add">+ | VibeMemBench | +1,1–4,5 п.п. | arXiv 2609.23570 |</div><div class="del">- | Блог вендора X | «в 10 раз лучше» | без источника |</div></div>
+    <div class="actions"><button class="btn sm">Принять</button><button class="btn sm">Откатить к чекпоинту</button></div>
+  </div>
+  <div class="pane hidden" data-pane="files">
+    <b>Файлы проекта</b>
+    <div class="s13 mono t2" style="line-height:1.8">docs/<br>&nbsp;&nbsp;research/<br>&nbsp;&nbsp;specs/<br>notes/<br>&nbsp;&nbsp;memory-review.md <span class="tag-ext" style="background:var(--accent-bg);color:var(--accent-ink)">изменён</span><br>.zero-agent/work/spill/</div>
+  </div>
+  <div class="pane hidden" data-pane="term">
+    <b>Терминал · W2</b>
+    <div class="term">$ uv run --script tools/pdf-tables/main.py paper.pdf
+таблицы: 3, строк: 41
+записано: notes/merit-tables.csv
+$ <span style="opacity:.6">█</span></div>
+  </div>
+  <div class="pane hidden" data-pane="browser">
+    <b>Браузер · W2</b>
+    <div class="browser"><div class="url">https://arxiv.org/abs/2609.05441</div><div class="shot">живой экран браузера</div></div>
+    <button class="btn sm" style="align-self:flex-start">Взять управление</button>
+  </div>
+  <div class="pane hidden" data-pane="evidence">
+    <b>Доказательства</b>
+    <div class="s13 t2" style="line-height:1.6">✓ 14 выписок W1 — источники открыты<br>✓ таблица MERIT — сверена с PDF<br>○ итоговая таблица — ещё не проверена независимым проверяющим</div>
+  </div>
+</aside>
+
+<!-- ЭКРАН: АГЕНТЫ -->
+<section class="page hidden" id="scr-agents">
+  <div class="pagehead">
+    <h1>Дерево агентов</h1><span class="s13 muted">Запуск «Обзор: память для агентов» · 5 агентов · бюджет дерева 412k / 1,5M</span>
+    <div class="spacer"></div>
+    <button class="btn" id="pausetree">Пауза всего дерева</button>
+    <button class="btn danger" data-stub="Отмена дерева">Отменить дерево</button>
+  </div>
+  <div class="grid">
+    <div class="box" style="flex:999 1 640px;padding:0;overflow:hidden">
+      <div class="tbl" id="tree" style="grid-template-columns:minmax(0,2.4fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.6fr) minmax(0,1.4fr);padding:0 12px"></div>
+    </div>
+    <div style="flex:1 1 360px;min-width:0;display:flex;flex-direction:column;gap:16px">
+      <div class="box">
+        <h2>Эффективность роя</h2>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px">
+          <div class="stat"><div class="small muted">Прогноз</div><div class="v">×2,1</div></div>
+          <div class="stat"><div class="small muted">Факт сейчас</div><div class="v" id="fact2">×1,8</div></div>
+        </div>
+        <div class="s13 t2" style="line-height:1.5" id="swarmwhy">Почему рой: чтение без общей записи, 40 независимых источников. Ограничение: 2 слота модели на workstation, третий воркер на laptop.</div>
+        <button class="btn" id="single">Перейти в один поток сейчас</button>
+      </div>
+      <div class="box">
+        <h2>Очередь работ и шина</h2>
+        <div class="warnbox" id="proposal" style="display:flex;flex-direction:column;gap:8px"><span><b>Предложено W1:</b> сверить таблицу MERIT с оригиналом <span class="tag-ext">черновик</span></span>
+          <div class="actions"><button class="btn sm primary" id="prop-ok">В очередь</button><button class="btn sm" id="prop-no">Отклонить</button></div></div>
+        <div class="s13 t2" style="display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;justify-content:space-between"><span>Готово к выдаче</span><b class="mono" id="ready">3</b></div>
+          <div style="display:flex;justify-content:space-between"><span>В работе</span><b class="mono">2</b></div>
+          <div style="display:flex;justify-content:space-between"><span>Доска роя: факты и решения</span><b class="mono">11</b></div>
+        </div>
+      </div>
+      <div class="box">
+        <label for="correct" style="font-size:15px;font-weight:600">Поправить курс оркестратора A</label>
+        <textarea id="correct" rows="3" placeholder="Например: отбросить источники старше мая 2026" style="border:1px solid var(--ctl);border-radius:8px;padding:8px;font:inherit;font-size:13px;background:var(--panel);color:var(--text)"></textarea>
+        <div class="small muted">План будет пересмотрен целиком, затронутые воркеры получат уведомление.</div>
+        <div class="actions"><button class="btn primary" id="correct-go">Следующим шагом</button><button class="btn" id="correct-now">Прервать и применить</button></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ЭКРАН: РЕСУРСЫ -->
+<section class="page hidden" id="scr-resources">
+  <div class="pagehead"><h1>Ресурсы и очереди</h1><span class="s13 muted">2 узла в сети · обновлено 2 с назад</span></div>
+  <div class="grid">
+    <div class="box" style="flex:1 1 520px">
+      <div style="display:flex;align-items:baseline;gap:10px"><h2>workstation</h2><span class="small muted">этот узел · RTX 3090 24 ГБ · 128 ГБ RAM</span></div>
+      <div class="meter">
+        <span>CPU</span><div class="track"><div class="fill" style="width:38%"></div></div><span class="mono small">38 %</span>
+        <span>RAM</span><div class="track"><div class="fill" style="width:46%"></div></div><span class="mono small">59 / 128 ГБ</span>
+        <span>GPU</span><div class="track"><div class="fill acc" style="width:71%" id="gpufill"></div></div><span class="mono small" id="gputxt">71 %</span>
+        <span>VRAM</span><div class="track"><div class="fill warn" style="width:92%" id="vramfill"></div></div><span class="mono small" style="color:var(--warn-text)" id="vramtxt">22,1 / 24 ГБ</span>
+        <span>Диск C:</span><div class="track"><div class="fill" style="width:64%"></div></div><span class="mono small">320 ГБ свободно</span>
+        <span>Диск H:</span><div class="track"><div class="fill warn" style="width:88%"></div></div><span class="mono small" style="color:var(--warn-text)">118 ГБ свободно</span>
+      </div>
+      <div class="warnbox" id="vramwarn">VRAM почти занята: новые запросы на второй слот ждут. Диск H: при текущем росте заполнится примерно через 9 дней.</div>
+      <div class="s13" style="font-weight:600">Занято агентом на дисках</div>
+      <div class="small t2" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px">
+        <span>Модели <b class="mono">54 ГБ</b></span><span>Кэши uv и cargo <b class="mono" id="cache">21 ГБ</b></span><span>Журналы и блобы <b class="mono">3,4 ГБ</b></span>
+        <span>Worktree <b class="mono">6,2 ГБ</b></span><span>Выгрузки вывода <b class="mono">0,8 ГБ</b></span><span>Браузер <b class="mono">1,1 ГБ</b></span>
+      </div>
+      <button class="btn sm" id="clean" style="align-self:flex-start">Очистить кэши агента…</button>
+    </div>
+    <div class="box" style="flex:1 1 520px">
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:baseline"><h2>Очередь к модели</h2><span class="small muted">Локальные: Qwen3.8-27B · 2 слота · ожидание p95 34 с</span></div>
+      <div class="tbl" id="queue" style="grid-template-columns:70px minmax(0,1.6fr) minmax(0,1fr) 120px"></div>
+      <div class="small muted">Облачные модели: отдельный пул, лимит 4 параллельных запроса · сейчас не используются</div>
+    </div>
+    <div class="box accent" style="flex:1 1 100%;flex-direction:row;flex-wrap:wrap;align-items:center;gap:20px" id="offer">
+      <div style="flex:1 1 420px;min-width:0;display:flex;flex-direction:column;gap:6px">
+        <h2>Узел laptop свободен</h2>
+        <div class="s13 t2" style="line-height:1.5">RTX 4070 12 ГБ · Qwen3.5-9B · свободных слотов 2 · задержка 18 мс. Перенос задания «Новинки по агентам» и арены на laptop сократит очередь здесь; оценка выигрыша — около 25 минут.</div>
+      </div>
+      <div class="actions"><button class="btn primary" id="move">Перенести на laptop</button><button class="btn" id="moveauto">Разрешать автоматически для проекта</button><button class="btn" id="movelater">Не сейчас</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- ЭКРАН: КОНТЕКСТ -->
+<section class="page hidden" id="scr-context">
+  <div class="pagehead"><h1>Инспектор контекста</h1><span class="s13 muted">Главный агент · ход <span id="turn">23</span> · окно 64k</span><div class="spacer"></div><button class="btn" id="tprev">← Предыдущий ход</button><button class="btn" id="tnext">Следующий ход →</button></div>
+  <div class="grid">
+    <div class="box" style="flex:999 1 640px">
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:baseline"><h2>Что уходит в модель</h2><span class="s13 t2"><b class="mono" id="ctxtotal"></b> из 64 000 токенов · из кэша <b class="mono" id="ctxcache"></b></span></div>
+      <div id="ctxbar" aria-hidden="true" style="display:flex;height:22px;border-radius:6px;overflow:hidden;background:var(--bar)"></div>
+      <div class="tbl" id="ctxtbl" style="grid-template-columns:minmax(0,2fr) 110px 90px minmax(0,1fr)"></div>
+      <div class="actions"><button class="btn sm" data-stub="Точные байты запроса">Показать точные байты</button><button class="btn sm" data-stub="Сравнение ходов">Сравнить с предыдущим ходом</button></div>
+    </div>
+    <div style="flex:1 1 360px;min-width:0;display:flex;flex-direction:column;gap:16px">
+      <div class="box"><h2>Стабильность префикса</h2><div class="s13 t2">Хэш префикса <span class="mono">7f3a…c21e</span>, не менялся <span id="stable">23</span> хода</div><div class="s13" style="display:flex;justify-content:space-between"><span>Доля кэша в ходе</span><b class="mono" id="cachepct"></b></div><div class="s13" style="display:flex;justify-content:space-between"><span>Слот llama.cpp</span><b class="mono">1, закреплён</b></div></div>
+      <div class="box"><h2>Компакция</h2><div class="s13 t2" style="line-height:1.5">Заполнено <b id="fillpct"></b>. Компакция при 75 %: перед ней обновится следующий шаг задачи в памяти, после — восстановление из памяти.</div><button class="btn sm" id="compact" style="align-self:flex-start">Сжать сейчас</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- ЭКРАН: ЗАДАНИЯ -->
+<section class="page hidden" id="scr-jobs">
+  <div class="pagehead"><h1>Задания</h1><span class="s13 muted">4 задания · следующее через 2 ч 10 мин</span><div class="spacer"></div><button class="btn primary" data-stub="Мастер нового задания">+ Новое задание</button></div>
+  <div class="grid">
+    <div class="box" style="flex:1 1 480px;padding:0;overflow:hidden" id="joblist"></div>
+    <div class="box" style="flex:1 1 520px" id="jobdetail"></div>
+  </div>
+</section>
+
+</div>
+</div>
+
+<dialog id="dlg"><form method="dialog" style="display:flex;flex-direction:column;gap:14px"><b id="dlg-t"></b><div class="s13 t2" id="dlg-b" style="line-height:1.5"></div><div class="actions" style="justify-content:flex-end"><button class="btn" value="no">Отмена</button><button class="btn danger" value="yes" id="dlg-ok">Подтвердить</button></div></form></dialog>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+const now = () => new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('show');clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove('show'),2200)}
+function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+
+/* ---------- состояние ---------- */
+const S = {
+  projects:[
+    {name:'ZeroAgent', sub:'2 запуска · нужен ввод', dot:'run', badge:2},
+    {name:'ZeroAIMemory', sub:'только чтение · отдельный сервер', dot:'wait'},
+    {name:'Исследования агентов', sub:'задание завтра 07:00', dot:'ok'},
+    {name:'Сайт студии', sub:'на паузе с 12:40', dot:'warn', node:'laptop'},
+  ],
+  waiting:[{t:'Чтение вне проекта',s:'ZeroAgent · D:\\datasets\\locomo\\'},{t:'Замена вывода в памяти',s:'ZeroAgent · источник: веб'}],
+  paused:false, plan:3, step:23,
+  tree:[
+    {id:'top',name:'Главный агент',sub:'top · 98k токенов',st:'run',stt:'Ждёт отчёты',model:'Qwen3.8-27B',now:'wait_events · 42 с',lvl:0},
+    {id:'A',name:'Оркестратор A',sub:'чтение источников · 61k',st:'run',stt:'Работает',model:'Qwen3.8-27B',now:'проверяет отчёт W1',lvl:1},
+    {id:'W1',name:'W1 · источники 1–14',sub:'воркер · 88k',st:'ok',stt:'Готово',model:'Qwen3.8-27B',now:'14 выписок',lvl:2},
+    {id:'W2',name:'W2 · источники 15–27',sub:'воркер · 54k',st:'run',stt:'Работает',model:'Qwen3.8-27B',now:'web_fetch · 9 из 13',lvl:2},
+    {id:'W3',name:'W3 · источники 28–40',sub:'воркер · на узле laptop',st:'wait',stt:'Ждёт модель',model:'Qwen3.5-9B',now:'#3 в очереди laptop',lvl:2},
+  ],
+  queue:[
+    {slot:'1',who:'W2 · web_fetch → разбор',pr:'воркер',t:'генерация 6 с'},
+    {slot:'2',who:'Оркестратор A · проверка',pr:'оркестратор',t:'генерация 2 с'},
+    {slot:'ждёт',who:'Главный агент',pr:'главный',t:'18 с'},
+    {slot:'ждёт',who:'Задание «Новинки по агентам»',pr:'задание',t:'1 мин 40 с'},
+    {slot:'пауза',who:'Арена: nightly smoke',pr:'арена',t:'нет VRAM',warn:true},
+  ],
+  jobs:[
+    {name:'Новинки по агентам',when:'ежедневно 07:00, МСК',cron:'0 7 * * *',desc:'Найти, что появилось нового по теме, сравнить решения, отчёт в память и файл',last:'Последний: сегодня 07:00, готово за 34 мин',paused:false,hist:[['07.11 07:00','Готово · 9 новых работ, 1 во Входящих'],['06.11 07:00','Готово · 4 новых работы'],['05.11 07:41','Догон после сна машины']]},
+    {name:'Аудит утилит',when:'по понедельникам 03:00',cron:'0 3 * * 1',desc:'Проверка устаревания версий языка, зависимостей и тестов утилит в реестре',last:'Последний: 2 нояб., 2 утилиты к пересмотру',paused:false,hist:[['02.11 03:00','Готово · 2 утилиты отмечены']]},
+    {name:'Арена: nightly',when:'ежедневно 01:00',cron:'0 1 * * *',desc:'Парный прогон 60 задач, вердикт по изменениям',last:'Сейчас на паузе: нет свободной VRAM',paused:true,hist:[['06.11 01:00','Вердикт: без регрессий']]},
+    {name:'При новом релизе llama.cpp',when:'событие',cron:'событие: релиз',desc:'Перезапустить зонд модели и conformance-набор',last:'Последнее срабатывание: 4 нояб.',paused:false,hist:[['04.11 11:12','Зонд: n_ctx 65536, шаблон совпал']]},
+  ],
+  job:0, turn:23,
+};
+
+/* ---------- навигация ---------- */
+const screens = {home:['scr-home','side-home','nav-home'],project:['scr-project','side-project','nav-project'],agents:['scr-agents',null,'nav-project'],resources:['scr-resources',null,null],context:['scr-context',null,'nav-project'],jobs:['scr-jobs',null,null]};
+let current='home', lastNav='nav-home';
+function go(name){
+  const [scr,side,nav]=screens[name];
+  $$('main.center,section.page,aside.right').forEach(e=>e.classList.add('hidden'));
+  $('#'+scr).classList.remove('hidden'); if(side) $('#'+side).classList.remove('hidden');
+  const n = nav || lastNav; lastNav=n;
+  $$('nav.side').forEach(e=>e.classList.add('hidden')); $('#'+n).classList.remove('hidden');
+  $$('nav.side .navitem').forEach(b=>b.classList.toggle('active', b.dataset.go===name));
+  $('#crumb').textContent = name==='home' ? '' : (n==='nav-project' ? 'Проект: ZeroAgent' : '');
+  current=name; window.scrollTo(0,0);
+}
+document.addEventListener('click',e=>{
+  const g=e.target.closest('[data-go]'); if(g){e.preventDefault();go(g.dataset.go);return}
+  const st=e.target.closest('[data-stub]'); if(st){e.preventDefault();toast('В прототипе нет экрана: '+st.dataset.stub);return}
+  const op=e.target.closest('[data-open-project]'); if(op){e.preventDefault();go('project');return}
+  const t=e.target.closest('.tool'); if(t){t.classList.toggle('open');t.lastElementChild.textContent=t.classList.contains('open')?'▾':'▸'}
+});
+
+/* ---------- главная ---------- */
+function renderProjects(){
+  const q=$('#find').value.trim().toLowerCase();
+  $('#projects').innerHTML = S.projects.filter(p=>p.name.toLowerCase().includes(q)).map((p,i)=>`
+    <button class="navitem proj" data-proj="${i}">
+      <span class="row">${esc(p.name)}${p.badge?`<span class="badge">${p.badge}</span>`:p.node?`<span class="small muted">${p.node}</span>`:''}</span>
+      <span class="sub"><i class="dot ${p.dot}"></i>${esc(p.sub)}</span>
+    </button>`).join('');
+  $$('[data-proj]').forEach(b=>b.onclick=()=>{ if(b.dataset.proj==='0') go('project'); else toast('В прототипе открыт только проект ZeroAgent'); });
+}
+function renderWaiting(){
+  $('#waiting').innerHTML = S.waiting.length ? S.waiting.map(w=>`<a href="#" data-go="project" class="card warn" style="padding:10px 12px;gap:2px;color:var(--text)"><span class="s13" style="font-weight:600">${esc(w.t)}</span><span class="small muted">${esc(w.s)}</span></a>`).join('') : '<div class="s13 muted">Ничего не ждёт</div>';
+  const p=S.projects[0]; p.badge=S.waiting.length; p.sub = S.waiting.length? `2 запуска · нужен ввод`:'2 запуска'; renderProjects();
+  $('#inboxcount').textContent=S.waiting.length;
+}
+$('#find').oninput=renderProjects;
+
+function addMsg(feed, html, cls){const d=document.createElement('div');d.className=cls;d.innerHTML=html;$('#'+feed).appendChild(d);$('#'+feed).scrollTop=1e9;return d}
+function agentSay(feed, text, who='zero-agent'){return addMsg(feed,`<div class="who">${who} · ${now()}</div><div>${text}</div>`,'msg-agent')}
+
+function draftCard(feed, title){
+  const name = title || 'Новый проект';
+  const slug = name.toLowerCase().replace(/[^a-zа-я0-9]+/gi,'-').replace(/^-|-$/g,'') || 'new-project';
+  const c = addMsg(feed, `
+    <div class="ttl">Новый проект — черновик</div>
+    <div class="kv">
+      <span>Название</span><input value="${esc(name)}" data-f="name" aria-label="Название">
+      <span>Каталог</span><input class="mono" value="H:\\Documents\\GitHub\\${esc(slug)}" data-f="dir" aria-label="Каталог">
+      <span>Основа</span><span>Rust workspace, CI, AGENTS.md</span>
+      <span>Память</span><span>Новое решение в ZeroAIMemory</span>
+      <span>Задание</span><span>нет, можно добавить позже</span>
+      <span>Узел</span><span>workstation</span>
+    </div>
+    <div class="small muted">Каталог создаётся вне существующих проектов: это нужно подтвердить.</div>
+    <div class="actions"><button class="btn primary" data-a="create">Создать и открыть</button><button class="btn" data-a="cancel">Отмена</button></div>`,'card');
+  c.querySelector('[data-a="create"]').onclick=()=>{
+    const n=c.querySelector('[data-f="name"]').value.trim()||name;
+    S.projects.push({name:n,sub:'создан только что',dot:'ok'}); renderProjects();
+    c.innerHTML=`<div class="s13">Проект <b>${esc(n)}</b> создан: каталог, решение в памяти, AGENTS.md.</div>`;
+    toast('Проект создан: '+n);
+  };
+  c.querySelector('[data-a="cancel"]').onclick=()=>{c.innerHTML='<div class="s13 muted">Черновик отменён.</div>'};
+}
+$('#newproj').onclick=()=>{go('home');draftCard('feed-home','')};
+
+function replyHome(text){
+  const t=text.toLowerCase();
+  if(/созда(й|ть|йте).*проект|новый проект/.test(t)){
+    const m=text.match(/проект[:\s]+(.+)/i); const name=m?m[1].split(/[,.]/)[0].trim():'';
+    agentSay('feed-home','Подготовил черновик проекта. Поправьте поля и подтвердите.');
+    draftCard('feed-home', name.charAt(0).toUpperCase()+name.slice(1));
+  } else if(/@zeroagent|zeroagent/.test(t)){
+    agentSay('feed-home','В ZeroAgent идёт обзор памяти для агентов, шаг '+S.step+'. '+(S.paused?'Запуск на паузе.':'Рой работает.')+' Ждут вас решений: '+S.waiting.length+'. <a href="#" data-go="project">Перейти в проект</a>');
+  } else if(/утилит/.test(t)){
+    agentSay('feed-home','В реестре 7 утилит. По запросу подходит <span class="mono">pdf-tables 1.2.0</span>.');
+  } else {
+    agentSay('feed-home','(Прототип) Здесь будет ответ модели. Агент ответит по общей памяти и состоянию проектов, а для работы с файлами предложит перейти в проект.');
+  }
+}
+function replyProject(text){
+  const interrupt=$('#delivery').selectedIndex===1;
+  S.plan++; $('#planv').textContent=S.plan;
+  $('#plannote').textContent=`Пересмотрен только что: правка пользователя «${text.slice(0,60)}». Весь план проверен заново, рой оставлен.`;
+  const li=document.createElement('li'); li.innerHTML='<span class="st-run">+</span><span>'+esc(text.slice(0,70))+'</span>'; $('#plan').insertBefore(li,$('#plan').children[3]);
+  agentSay('feed-project', (interrupt?'Прервал текущий шаг. ':'Применю со следующего шага. ')+`План пересмотрен целиком: версия ${S.plan}. Затронутые воркеры получили уведомление.`,'Главный агент');
+}
+$$('form.composer').forEach(f=>{
+  const ta=f.querySelector('textarea');
+  const send=()=>{const v=ta.value.trim(); if(!v) return; addMsg(f.dataset.feed,esc(v),'msg-user'); ta.value='';
+    setTimeout(()=> f.dataset.feed==='feed-home'?replyHome(v):replyProject(v), 450)};
+  f.onsubmit=e=>{e.preventDefault();send()};
+  ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
+});
+
+/* ---------- проект ---------- */
+$$('[data-approve]').forEach(b=>b.onclick=()=>{
+  const k=b.dataset.approve, txt={once:'Разрешено один раз: чтение D:\\datasets\\locomo\\',project:'Разрешено для проекта: D:\\datasets\\locomo\\ (только чтение)',deny:'Отклонено. Агент продолжит без локальной копии.'}[k];
+  $('#approval').outerHTML=`<div class="now"><i class="dot ${k==='deny'?'bad':'ok'}"></i>${txt}</div>`;
+  S.waiting.shift(); renderWaiting(); toast(txt);
+});
+function setPaused(p){
+  S.paused=p;
+  $('#runstatus').className='status '+(p?'pause':'run'); $('#runstatus').innerHTML=`<i class="dot ${p?'warn':'run'}"></i>${p?'На паузе':'Работает'}`;
+  $('#pausebtn').textContent=p?'Продолжить':'Пауза'; $('#rundot').className='dot '+(p?'warn':'run');
+  $('#nowline').innerHTML=p?'<i class="dot warn"></i>Пауза: рантайм остановил запросы к модели, текущий инструмент дорабатывает':'<i class="dot run"></i>Продолжено с сохранённого состояния';
+  S.tree.forEach(n=>{ if(n.st!=='ok'){ n._prev=n._prev||[n.st,n.stt]; if(p){n.st='warn';n.stt='Пауза'} else {[n.st,n.stt]=n._prev; n._prev=null} }});
+  renderTree(); $('#pausetree').textContent=p?'Продолжить дерево':'Пауза всего дерева';
+  $('#sum-run').textContent=p?'ZeroAgent · пауза':'ZeroAgent · рой 3';
+}
+$('#pausebtn').onclick=()=>{setPaused(!S.paused);toast(S.paused?'Пауза: команда применена рантаймом':'Продолжено')};
+$('#correctbtn').onclick=()=>{const ta=$('#ask-project');ta.focus();ta.placeholder='Что поправить? План будет пересмотрен целиком.'};
+$('#cancelbtn').onclick=()=>confirmDlg('Отменить запуск?','Рантайм оборвёт стрим модели, снимет процессы, освободит захваты и сохранит частичные результаты.',()=>{
+  setPaused(true); $('#runstatus').className='status pause'; $('#runstatus').innerHTML='<i class="dot bad"></i>Отменён'; toast('Запуск отменён')});
+$$('.tab').forEach(t=>t.onclick=()=>{$$('.tab').forEach(x=>x.classList.toggle('active',x===t));$$('[data-pane]').forEach(p=>p.classList.toggle('hidden',p.dataset.pane!==t.dataset.tab))});
+
+/* ---------- дерево ---------- */
+function renderTree(){
+  const head='<span class="h">Агент</span><span class="h">Статус</span><span class="h">Модель</span><span class="h">Сейчас</span><span class="h">Управление</span>';
+  $('#tree').innerHTML=head+S.tree.map(n=>{
+    const col={run:'var(--accent-ink)',ok:'var(--ok-ink)',warn:'var(--warn-text)',wait:'var(--text2)'}[n.st];
+    const ctl = n.st==='ok' ? '<a href="#" data-stub="Отчёт воркера" class="small">Отчёт</a>' :
+      `<button class="btn sm" data-node="${n.id}">${n.st==='warn'?'Продолжить':'Пауза'}</button>${n.id==='W3'?'<button class="btn sm" data-stub="Перенос воркера">Перенести</button>':''}`;
+    return `<span style="padding-left:${6+n.lvl*24}px;flex-direction:column;align-items:flex-start;gap:2px"><b style="font-weight:${n.lvl<2?600:500}">${n.lvl?'└ ':''}${esc(n.name)}</b><span class="small muted">${esc(n.sub)}</span></span>
+      <span style="color:${col}"><i class="dot ${n.st}"></i>${n.stt}</span><span class="mono small">${n.model}</span><span class="s13 t2">${esc(n.now)}</span><span>${ctl}</span>`;
+  }).join('');
+  $$('[data-node]').forEach(b=>b.onclick=()=>{
+    const n=S.tree.find(x=>x.id===b.dataset.node);
+    if(n.st==='warn'){[n.st,n.stt]=n._prev||['run','Работает'];n._prev=null}else{n._prev=[n.st,n.stt];n.st='warn';n.stt='Пауза'}
+    renderTree(); toast(n.name+': '+n.stt);
+  });
+}
+$('#pausetree').onclick=()=>{setPaused(!S.paused);toast(S.paused?'Пауза распространена на всё дерево':'Дерево продолжено')};
+$('#single').onclick=()=>{$('#swarmwhy').textContent='Рой отменён пользователем. Оркестратор A продолжает в один поток, незавершённые элементы вернулись в его план.';$('#single').disabled=true;$('#fact2').textContent='—';toast('Переход в один поток')};
+$('#prop-ok').onclick=()=>{$('#proposal').innerHTML='<span class="s13">Работа поставлена в очередь оркестратором.</span>';$('#ready').textContent=4};
+$('#prop-no').onclick=()=>{$('#proposal').innerHTML='<span class="s13 muted">Предложение отклонено.</span>'};
+const corr=(now)=>{const v=$('#correct').value.trim();if(!v){$('#correct').focus();return}
+  S.plan++;$('#planv').textContent=S.plan;$('#correct').value='';toast((now?'Прервано и применено':'Будет применено следующим шагом')+': план v'+S.plan+', 2 воркера уведомлены')};
+$('#correct-go').onclick=()=>corr(false); $('#correct-now').onclick=()=>corr(true);
+
+/* ---------- ресурсы ---------- */
+function renderQueue(){
+  $('#queue').innerHTML='<span class="h">Слот</span><span class="h">Кто</span><span class="h">Приоритет</span><span class="h">Время</span>'+
+    S.queue.map(q=>`<span class="mono ${q.slot.match(/\d/)?'':'muted'}">${q.slot}</span><span>${esc(q.who)}</span><span>${q.pr}</span><span class="mono" ${q.warn?'style="color:var(--warn-text)"':''}>${q.t}</span>`).join('');
+}
+$('#move').onclick=()=>{
+  S.queue=S.queue.filter(q=>!/Задание|Арена/.test(q.who));
+  S.queue.push({slot:'laptop',who:'Задание «Новинки по агентам»',pr:'задание',t:'генерация'},{slot:'laptop',who:'Арена: nightly smoke',pr:'арена',t:'ждёт 4 с'});
+  renderQueue(); $('#offer').innerHTML='<div class="s13">Задание и арена перенесены на laptop. Очередь здесь сократилась до 3 запросов.</div>';
+  $('#laptop-state').textContent='занят: 2 задачи'; $('#modelchip').textContent='Qwen3.8-27B · очередь 1 · GPU 64 %'; $('#queuepos').textContent='#1 в очереди'; toast('Перенесено на laptop');
+};
+$('#moveauto').onclick=()=>{toast('Для проекта включено: распределять по узлам автоматически');$('#move').click()};
+$('#movelater').onclick=()=>{$('#offer').classList.add('hidden')};
+$('#clean').onclick=()=>confirmDlg('Очистить кэши агента?','Будут удалены кэши uv и cargo (21 ГБ). Файлы проектов не затрагиваются. Кэши восстановятся при следующей сборке.',()=>{$('#cache').textContent='0 ГБ';toast('Освобождено 21 ГБ')});
+
+/* ---------- контекст ---------- */
+function renderCtx(){
+  const k=S.turn, dlg=17000+(k-15)*520, fresh= k%3===0?7200:4940;
+  const rows=[['Описания инструментов (14)',2180,true,'вне лимита 3000','#1E2633'],['Системный промпт: ядро и режим',710,true,'лимит 3000','#3A4A63'],['AGENTS.md проекта',1040,true,'','#5E7290'],['Окружение и снимок памяти',1520,true,'заморожен на старте','#8EA0BA'],['Диалог и результаты',dlg,true,'3 вывода выгружены на диск','var(--accent)'],['Новое в этом ходе',fresh,false,'отчёт воркера, подсказка памяти','var(--warn)']];
+  const total=rows.reduce((a,r)=>a+r[1],0), cached=rows.filter(r=>r[2]).reduce((a,r)=>a+r[1],0);
+  $('#turn').textContent=k; $('#ctxtotal').textContent=total.toLocaleString('ru-RU'); $('#ctxcache').textContent=cached.toLocaleString('ru-RU');
+  $('#ctxbar').innerHTML=rows.map(r=>`<div title="${r[0]}" style="width:${(r[1]/64000*100).toFixed(2)}%;background:${r[4]}"></div>`).join('');
+  $('#ctxtbl').innerHTML='<span class="h">Блок</span><span class="h">Токены</span><span class="h">Кэш</span><span class="h">Примечание</span>'+rows.map(r=>`<span>${r[0]}</span><span class="mono">${r[1].toLocaleString('ru-RU')}</span><span style="color:${r[2]?'var(--ok-ink)':'var(--warn-text)'}">${r[2]?'да':'нет'}</span><span class="muted">${r[3]}</span>`).join('');
+  $('#cachepct').textContent=Math.round(cached/total*100)+' %'; $('#fillpct').textContent=Math.round(total/64000*100)+' %'; $('#stable').textContent=k;
+}
+$('#tprev').onclick=()=>{if(S.turn>1){S.turn--;renderCtx()}}; $('#tnext').onclick=()=>{if(S.turn<40){S.turn++;renderCtx()}};
+$('#compact').onclick=()=>{toast('Компакция: next_step обновлён, 6 старых результатов заменены ссылками');S.turn=Math.max(15,S.turn-6);renderCtx()};
+
+/* ---------- задания ---------- */
+function renderJobs(){
+  $('#joblist').innerHTML=S.jobs.map((j,i)=>`<button class="jobitem ${i===S.job?'active':''}" data-job="${i}">
+    <span style="display:flex;justify-content:space-between;gap:8px;width:100%"><b>${esc(j.name)}</b><span class="small ${i===S.job?'':'muted'}" style="${i===S.job?'color:var(--accent-ink)':''}">${j.when}</span></span>
+    <span class="s13 t2">${esc(j.desc)}</span><span class="small" style="color:${j.paused?'var(--warn-text)':'var(--muted)'}">${j.paused?'На паузе':esc(j.last)}</span></button>`).join('');
+  $$('[data-job]').forEach(b=>b.onclick=()=>{S.job=+b.dataset.job;renderJobs()});
+  const j=S.jobs[S.job];
+  $('#jobdetail').innerHTML=`<h2>${esc(j.name)}</h2>
+    <div class="kv"><span>Расписание</span><span class="mono">${j.cron}</span><span>Пропуски</span><span>последний за 7 дней</span><span>Модель</span><span>Qwen3.8-27B, локально</span><span>Бюджет запуска</span><span>300k токенов, 1 ч</span></div>
+    <div class="stat" style="display:flex;flex-direction:column;gap:6px;font-size:13px"><b>Что можно без вас</b><span class="t2">Поиск и чтение веба, запись гипотез в память, файл отчёта в проекте.</span><span class="t2">Всё остальное откладывается во Входящие, работа продолжается.</span></div>
+    <div class="s13" style="font-weight:600">История</div>
+    <div class="tbl" style="grid-template-columns:120px minmax(0,1fr) 70px">${j.hist.map(h=>`<span class="mono">${h[0]}</span><span>${esc(h[1])}</span><a href="#" data-stub="Отчёт запуска">отчёт</a>`).join('')}</div>
+    <div class="actions"><button class="btn" id="jrun">Запустить сейчас</button><button class="btn" id="jdry">Пробный прогон</button><button class="btn" id="jpause">${j.paused?'Возобновить':'Приостановить'}</button></div>`;
+  $('#jrun').onclick=()=>{j.hist.unshift([new Date().toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'})+' '+now(),'Запущено вручную · в очереди к модели']);renderJobs();toast('Задание поставлено в очередь')};
+  $('#jdry').onclick=()=>toast('Пробный прогон: план и права проверены, внешних действий не будет');
+  $('#jpause').onclick=()=>{j.paused=!j.paused;renderJobs()};
+}
+
+/* ---------- общее ---------- */
+function confirmDlg(t,b,ok){const d=$('#dlg');$('#dlg-t').textContent=t;$('#dlg-b').textContent=b;d.returnValue='';d.showModal();d.onclose=()=>{if(d.returnValue==='yes')ok()}}
+$('#stopall').onclick=()=>confirmDlg('Остановить всё?','Пауза всех запусков, заданий и арены на всех проектах этого узла. Работа продолжится с сохранённого состояния.',()=>{setPaused(true);S.jobs.forEach(j=>j.paused=true);renderJobs();toast('Всё остановлено')});
+$('#theme').onclick=()=>{const r=document.documentElement;const d=r.dataset.theme!=='dark';r.dataset.theme=d?'dark':'light';try{localStorage.setItem('za-theme',r.dataset.theme)}catch(e){}};
+try{const t=localStorage.getItem('za-theme'); if(t) document.documentElement.dataset.theme=t; else if(matchMedia('(prefers-color-scheme: dark)').matches) document.documentElement.dataset.theme='dark'}catch(e){}
+$('#node').onchange=e=>{if(e.target.selectedIndex===1){toast('Подключение к laptop через relay: в прототипе показываем только workstation');e.target.selectedIndex=0}};
+
+renderProjects(); renderWaiting(); renderTree(); renderQueue(); renderCtx(); renderJobs(); go('home');
+</script>
+</body>
+</html>
