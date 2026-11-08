@@ -14,7 +14,6 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
-    "Zlib",
     "CC0-1.0",
     # webpki-roots (встроенные корни TLS для reqwest/rustls): данные сертификатов Mozilla,
     # разрешительная лицензия без копилефта.

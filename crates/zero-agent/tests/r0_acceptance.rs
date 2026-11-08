@@ -8,10 +8,11 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use serde_json::Value;
-use za_protocol::{EffectKey, EventKind, RunId, RunStatus, Seq};
-use za_store::ProjectStore;
+use serde_json::{Value, json};
+use za_protocol::{EffectClass, EffectKey, EventKind, RunId, RunRole, RunStatus, Seq};
+use za_store::{NewRun, ProjectStore};
 use zero_agent::home::project_id;
+use zero_agent::journal::open_retrying;
 
 /// Код выхода «нужно решение пользователя».
 const NEEDS_DECISION: i32 = 3;
@@ -41,12 +42,22 @@ fn env_at(name: &str, home: &str, project: &str) -> Env {
 
 impl Env {
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_zero-agent"))
-            .args(args)
+        self.run_with(args, &[])
+    }
+
+    /// Запуск бинарника с дополнительными переменными окружения; `ZA_LOG` и
+    /// `RUST_LOG` окружения тестов не наследуются.
+    fn run_with(&self, args: &[&str], vars: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_zero-agent"));
+        cmd.args(args)
             .env("ZA_HOME", &self.home)
             .env_remove("LLAMA_URL")
-            .output()
-            .unwrap()
+            .env_remove("ZA_LOG")
+            .env_remove("RUST_LOG");
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap()
     }
 
     fn project_arg(&self) -> &str {
@@ -77,8 +88,19 @@ impl Env {
             .join(project_id(&self.project).unwrap())
     }
 
+    /// Журнал проекта; после убитого процесса блокировка на Windows может
+    /// сниматься не сразу, поэтому `Locked` ограниченно повторяется.
     fn store(&self) -> ProjectStore {
-        ProjectStore::open(&self.journal_dir()).unwrap()
+        open_retrying(&self.journal_dir()).unwrap()
+    }
+
+    /// Хэш реплея run; бинарник должен завершиться с кодом 0.
+    fn replay_hash(&self, run: &str) -> String {
+        let o = self.replay(run);
+        assert_eq!(o.status.code(), Some(0), "{o:?}");
+        let hash = stdout(&o).trim().to_owned();
+        assert_eq!(hash.len(), 64, "{hash:?}");
+        hash
     }
 
     fn log_lines(&self) -> Vec<String> {
@@ -130,6 +152,16 @@ async fn intents(s: &ProjectStore, run: RunId, key: &EffectKey) -> usize {
         .count()
 }
 
+/// Сбой `--crash-at <crash>` на 5 шагах, затем `--resume` в чистом проекте;
+/// возвращает хэш реплея.
+fn crash_and_resume(name: &str, crash: &str) -> String {
+    let e = env(name);
+    let id = run_id(&e.demo(5, &["--crash-at", crash]));
+    let resumed = e.demo(5, &["--resume", &id]);
+    assert_eq!(resumed.status.code(), Some(NEEDS_DECISION), "{resumed:?}");
+    e.replay_hash(&id)
+}
+
 #[test]
 fn crash_after_execute_resumes_without_repeating_idempotent_effects() {
     let e = env("crash_execute");
@@ -150,11 +182,19 @@ fn crash_after_execute_resumes_without_repeating_idempotent_effects() {
     // Шаги не повторены: файл не изменился.
     assert_eq!(e.log_lines(), steps(3));
 
-    // Повтор даёт то же решение и не трогает файл.
+    // Реплей после сбоя стабилен: два подряд дают один хэш.
+    let hash = e.replay_hash(&id);
+    assert_eq!(e.replay_hash(&id), hash);
+
+    // Повтор даёт то же решение, не трогает файл и не меняет хэш.
     let again = e.demo(5, &["--resume", &id]);
     assert_eq!(again.status.code(), Some(NEEDS_DECISION));
     assert!(stdout(&again).contains(&unknown));
     assert_eq!(e.log_lines(), steps(3));
+    assert_eq!(e.replay_hash(&id), hash);
+
+    // Тот же сбой и то же продолжение в другом проекте дают тот же хэш.
+    assert_eq!(crash_and_resume("crash_execute_other", "execute:3"), hash);
 
     let s = e.store();
     rt().block_on(async {
@@ -189,6 +229,10 @@ fn crash_after_intent_is_not_silently_retried() {
     assert_eq!(resumed.status.code(), Some(NEEDS_DECISION));
     // `NonIdempotent` шага 2 не выполнен повторно.
     assert_eq!(e.log_lines(), steps(1));
+
+    let hash = e.replay_hash(&id);
+    assert_eq!(e.replay_hash(&id), hash);
+    assert_eq!(crash_and_resume("crash_intent_other", "intent:2"), hash);
 
     let run = parse_run(&id);
     let s = e.store();
@@ -292,4 +336,86 @@ fn doctor_without_llama_url_exits_zero() {
     let out = stdout(&o);
     assert!(out.contains("sqlite"), "{out}");
     assert!(out.contains("LLAMA_URL"), "{out}");
+}
+
+/// Golden-хэш реплея демонстрации на 5 шагах: одинаков на любой ОС и при
+/// любом времени; меняется только вместе со сценарием или форматом хэша.
+#[test]
+fn demo_replay_hash_matches_golden() {
+    let e = env("golden");
+    let done = e.demo(5, &[]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    let actual = e.replay_hash(&run_id(&done));
+    let golden = include_str!("golden/demo-replay.hash").trim();
+    assert_eq!(
+        actual, golden,
+        "replay_hash демонстрации изменился; если намеренно, запишите в \
+         crates/zero-agent/tests/golden/demo-replay.hash: {actual}"
+    );
+}
+
+/// Журнал записан с другим `prefix_hash` у `model` шага 1: `--resume`
+/// завершается кодом 1 с понятным сообщением и шагов не выполняет.
+#[test]
+fn resume_with_prefix_drift_fails() {
+    let e = env("prefix_drift");
+    let run = RunId::new();
+    {
+        let s = e.store();
+        rt().block_on(async {
+            s.create_run(NewRun {
+                id: run,
+                project_id: "demo".into(),
+                parent_id: None,
+                role: RunRole::Top,
+                model_profile: None,
+            })
+            .await
+            .unwrap();
+            s.set_status(run, RunStatus::Running, 0).await.unwrap();
+            let key = EffectKey::derive(run, 1, 0);
+            s.record_intent(
+                run,
+                &key,
+                EffectClass::Idempotent,
+                "model",
+                json!({"step": 1, "prefix_hash": "0".repeat(64)}),
+            )
+            .await
+            .unwrap();
+            s.record_receipt(
+                run,
+                &key,
+                json!({"outcome": "ok", "value": {"text": "ответ модели на шаг 1"}}),
+            )
+            .await
+            .unwrap();
+        });
+    }
+    let o = e.demo(2, &["--resume", &run.to_string()]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("расходится с журналом"), "{err}");
+    assert!(!e.project.join("log.txt").exists(), "шаги не выполнены");
+}
+
+/// Логи ядра и хранилища идут в stderr: по умолчанию только `warn` и выше,
+/// `ZA_LOG` (или `RUST_LOG`) меняет уровень.
+#[test]
+fn log_level_comes_from_za_log() {
+    let e = env("logging");
+    let args = ["demo-run", "--project", e.project_arg(), "--steps", "1"];
+    let quiet = e.run_with(&args, &[]);
+    assert_eq!(quiet.status.code(), Some(0), "{quiet:?}");
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("журнал открыт"),
+        "{quiet:?}"
+    );
+    let loud = e.run_with(&args, &[("ZA_LOG", "info")]);
+    assert_eq!(loud.status.code(), Some(0), "{loud:?}");
+    let err = String::from_utf8_lossy(&loud.stderr);
+    assert!(err.contains("журнал открыт"), "{err}");
+    assert!(!stdout(&loud).contains("журнал открыт"), "логи не в stdout");
+    let rust_log = e.run_with(&args, &[("RUST_LOG", "za_store=info")]);
+    assert!(String::from_utf8_lossy(&rust_log.stderr).contains("журнал открыт"));
 }

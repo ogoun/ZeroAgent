@@ -4,22 +4,33 @@
 //! 3 — нужно решение пользователя. Журнал проекта лежит в
 //! `ZA_HOME/projects/<project_id>/` (ARC-020), `log.txt` демонстрации — в
 //! каталоге проекта.
+//!
+//! Логи `tracing` ядра и хранилища пишутся в stderr; уровень по умолчанию
+//! `warn`, фильтр задаётся `ZA_LOG` (приоритетнее) или `RUST_LOG` в формате
+//! `info` или `warn,za_store=debug`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::layer::SubscriberExt;
 use za_core::{CrashPoint, DemoConfig, DemoOutcome, EffectError, replay_hash, run_demo};
 use za_protocol::RunId;
 use za_store::{ProjectStore, StoreError};
 use zero_agent::doctor::{self, LLAMA_URL_ENV};
 use zero_agent::home::{self, NoHome};
+use zero_agent::journal::open_retrying;
 
 /// Код выхода «нужно решение пользователя».
 const EXIT_NEEDS_DECISION: u8 = 3;
 /// Имя файла журнала в каталоге журнала проекта.
 const JOURNAL_FILE: &str = "journal.db";
+/// Переменная окружения с фильтром логов; без неё читается `RUST_LOG`.
+const LOG_ENV: &str = "ZA_LOG";
+/// Фильтр логов по умолчанию.
+const DEFAULT_LOG: &str = "warn";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -106,7 +117,39 @@ fn parse_crash(s: &str) -> Result<CrashPoint, String> {
     }
 }
 
+/// Ставит подписчик `tracing`: текст в stderr, фильтр из `ZA_LOG` или
+/// `RUST_LOG`, иначе [`DEFAULT_LOG`]. Неразборчивый фильтр — предупреждение
+/// и уровень по умолчанию.
+fn init_logging() {
+    let spec = [LOG_ENV, "RUST_LOG"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()));
+    let filter = match spec.as_deref().map(str::parse::<Targets>) {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => {
+            eprintln!("zero-agent: фильтр логов не разобран ({e}), уровень {DEFAULT_LOG}");
+            default_filter()
+        }
+        None => default_filter(),
+    };
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
+        )
+        .with(filter);
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        eprintln!("zero-agent: подписчик логов уже установлен");
+    }
+}
+
+fn default_filter() -> Targets {
+    Targets::new().with_default(tracing::Level::WARN)
+}
+
 fn main() -> ExitCode {
+    init_logging();
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
@@ -172,7 +215,14 @@ async fn cmd_demo(
         path: project.to_path_buf(),
         source,
     })?;
-    let store = ProjectStore::open(&journal_dir(project)?)?;
+    let dir = journal_dir(project)?;
+    // Продолжение часто идёт сразу после аварийного завершения: блокировка
+    // убитого процесса может сниматься не мгновенно.
+    let store = if resume.is_some() {
+        open_retrying(&dir)?
+    } else {
+        ProjectStore::open(&dir)?
+    };
     let run = match resume {
         Some(run) => {
             if store.get_run(run).await?.is_none() {
@@ -214,7 +264,7 @@ async fn cmd_replay(project: &Path, run: RunId) -> Result<ExitCode, AppError> {
     if !dir.join(JOURNAL_FILE).is_file() {
         return Err(AppError::NoJournal(dir));
     }
-    let store = ProjectStore::open(&dir)?;
+    let store = open_retrying(&dir)?;
     println!("{}", replay_hash(&store, run).await?);
     Ok(ExitCode::SUCCESS)
 }

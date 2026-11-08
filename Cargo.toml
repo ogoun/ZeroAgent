@@ -24,6 +24,9 @@ rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled
 tokio = { version = "1.54.1", default-features = false }
 thiserror = "2.0.21"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# Подписчик логов только в бинарнике: текст в stderr, фильтр из ZA_LOG/RUST_LOG
+# через `filter::Targets` (без regex и env-filter), без ANSI-цветов.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "registry"] }
 # Адресация blobs по содержимому (ARC-032).
 blake3 = "1.8.7"
 # HTTP-клиент к llama-server: без native TLS и OpenSSL, только rustls (ring).
