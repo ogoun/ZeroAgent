@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Канал и компоненты берутся из rust-toolchain.toml
+      - name: Тулчейн Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo xtask policy
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

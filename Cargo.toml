@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+rust-version = "1.92"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# Общие версии зависимостей; крейты подключают через `dep.workspace = true`.
+# Только crates.io (проверяется `cargo xtask policy` и `cargo deny`).
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

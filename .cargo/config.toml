@@ -1,0 +1,11 @@
+# Общие настройки cargo для workspace
+[term]
+color = "auto"
+
+# cargo xtask <команда>
+[alias]
+xtask = "run -p xtask --"
+
+# Статический CRT: exe не зависят от VC Redistributable на чистой Windows
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

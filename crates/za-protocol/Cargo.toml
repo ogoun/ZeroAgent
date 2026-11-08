@@ -1,0 +1,10 @@
+[package]
+name = "za-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-protocol"
+
+[lints]
+workspace = true
