@@ -149,6 +149,8 @@ queued → running ⇄ paused → done | partial | blocked | failed | cancelled
 
 Сбой провайдера, лимит и нехватка ресурса переводят run в `paused` с причиной, а не в `failed`.
 
+Дополнительно: отмена допустима из любого нетерминального статуса (`queued`, `running`, `pausing`, `paused`, `blocked_on_budget` → `cancelling`; `queued` → `cancelled` напрямую). Из `pausing` допустимы `running` (продолжение пришло раньше, чем пауза применилась), `paused` и `failed`. Таблица переходов — `za-protocol::RunStatus::can_transition`.
+
 ## 5. Данные
 
 ### 5.1. Расположение
