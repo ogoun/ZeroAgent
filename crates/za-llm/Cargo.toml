@@ -13,3 +13,10 @@ workspace = true
 za-protocol = { path = "../za-protocol" }
 serde_json.workspace = true
 blake3.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }

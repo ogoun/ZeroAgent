@@ -2,6 +2,10 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R0, задача 8: зонд llama.cpp
+
+`za-llm`: `probe_llama(base_url)` делает `GET {base}/props` (завершающий `/` в базе допустим), таймаут соединения 2 с, общий 5 с. `n_ctx` берётся из корня ответа, иначе из `default_generation_settings.n_ctx`; должен быть положительным u32. `model` — `model_alias`, иначе `model`, иначе имя файла из `model_path` без каталога (разделители `/` и `\`), иначе пустая строка. `total_slots` — из одноимённого поля, если есть. Ошибки: `ProbeError::Unreachable` (нет соединения, таймаут, обрыв, некорректный URL), `ProbeError::BadResponse` (не 2xx, тело не JSON, нет `n_ctx`). Положение полей на живом `llama-server` не проверено: тест `live_probe` под `#[ignore]`, запуск с `LLAMA_TEST_URL`. HTTP-клиент `reqwest 0.12.28` без default features, с `json` и `rustls-tls-native-roots` (rustls на ring, корни из хранилища ОС, без OpenSSL); вариант `rustls-tls` отклонён, так как тянет `webpki-roots` под лицензией CDLA-Permissive-2.0, которой нет в `deny.toml`. Поддельный сервер в тестах — `axum 0.8.9` (только dev). На Windows отказ в соединении приходит примерно за 2 с (ОС повторяет SYN), укладывается в таймаут соединения.
+
 ## 2026-11-09. R0, задача 7: стабильный префикс и его хэш
 
 `za-llm`: `render_tools` — инструменты, отсортированные по `name`, массивом объектов `{description, name, parameters}` в каноническом JSON (CTX-001); `render_system` — единственное system-сообщение из блоков core, adapter, overlay, agents_md через пустую строку, блоки из одних пробельных символов пропускаются (CTX-004). Во всех строках, включая строки внутри `parameters`, CRLF заменяется на LF, иначе хэш расходился бы между Windows и Linux. `prefix_hash` — BLAKE3 hex от тега формата `za-prefix-v1`, затем tools и system, каждая часть с префиксом длины (u64 LE), чтобы перенос текста между частями менял хэш. Золотой хэш фикстуры (три инструмента, короткие блоки) в `crates/za-llm/tests/golden/prefix.hash`, файл помечен `-text` в `.gitattributes`; при расхождении тест печатает новый хэш. `za-llm` зависит только от `za-protocol`, `serde_json`, `blake3`.
