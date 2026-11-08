@@ -16,6 +16,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # webpki-roots (встроенные корни TLS для reqwest/rustls): данные сертификатов Mozilla,
+    # разрешительная лицензия без копилефта.
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

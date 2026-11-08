@@ -37,12 +37,14 @@ pub enum ProbeError {
 }
 
 /// Опрашивает `GET {base_url}/props` (завершающий `/` в `base_url` допустим).
-/// Соединение — не дольше 2 с, весь запрос — не дольше 5 с.
+/// Соединение — не дольше 2 с, весь запрос — не дольше 5 с. Прокси из окружения
+/// (`HTTP_PROXY`, `ALL_PROXY`) не используются: сервер локальный, идти к нему надо напрямую.
 pub async fn probe_llama(base_url: &str) -> Result<LlamaProbe, ProbeError> {
     let url = format!("{}/props", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(TOTAL_TIMEOUT)
+        .no_proxy()
         .build()
         .map_err(|e| ProbeError::Unreachable(format!("HTTP-клиент: {e}")))?;
 

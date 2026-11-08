@@ -5,7 +5,7 @@
 ## Не выпущено
 
 ### Добавлено
-- `za-llm`: зонд llama.cpp `probe_llama` — `GET /props`, размер контекста `n_ctx` (из корня или `default_generation_settings`), имя модели, `total_slots`; ошибки `Unreachable` (соединение 2 с, всего 5 с) и `BadResponse`. Зависимости `reqwest` (rustls, корни ОС), в тестах `axum`.
+- `za-llm`: зонд llama.cpp `probe_llama` — `GET /props`, размер контекста `n_ctx` (из корня или `default_generation_settings`), имя модели, `total_slots`; ошибки `Unreachable` (соединение 2 с, всего 5 с) и `BadResponse`. Без прокси из окружения. Зависимости `reqwest` (rustls, встроенные корни webpki-roots), в тестах `axum`; в `deny.toml` разрешена CDLA-Permissive-2.0.
 - `za-llm`: рендер стабильного префикса промпта (`render_tools` с сортировкой и каноническим JSON, `render_system` — единственное system-сообщение, нормализация CRLF) и его хэш `prefix_hash` (BLAKE3) с золотым тестом.
 - `za-core`: протокол эффектов намерение → выполнение → квитанция (`RunCtx::effect`) с явным исходом в квитанции (`outcome` ok/error), отравление контекста после ошибки журнала (`EffectError::Poisoned`), повтор незавершённых `Pure`/`ReadOnly`/`Idempotent`, прерывание `unknown_outcome` с детерминированным id для `NonIdempotent`, `recover`.
 - `za-store`: хранилище эффектов и прерываний (`record_intent` с FULL для `NonIdempotent`, `record_receipt`, `effect`, `pending_effects`, `open_interrupt`, `interrupts`), ошибки `UnknownEffect` и `EffectConflict`.
