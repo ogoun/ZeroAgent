@@ -227,7 +227,8 @@ impl ProjectStore {
         let mut threads = Vec::new();
         let (readers, reader_threads) = reader::spawn(&path)?;
         threads.extend(reader_threads);
-        let (writer, writer_thread) = writer::spawn(conn, opts.durability)?;
+        let wal = dir.join(format!("{DB_FILE}-wal"));
+        let (writer, writer_thread) = writer::spawn(conn, opts.durability, wal)?;
         threads.push(writer_thread);
 
         tracing::info!(path = %path.display(), sqlite = rusqlite::version(), "журнал открыт");

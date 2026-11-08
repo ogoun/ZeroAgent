@@ -221,6 +221,49 @@ fn open_creates_missing_directory() {
     assert!(d.join("journal.lock").exists());
 }
 
+/// ARC-035: пока читатель держит снимок, WAL растёт; после закрытия читателя
+/// следующие записи писателя обрезают файл WAL.
+#[tokio::test]
+async fn wal_shrinks_after_long_reader_closes() {
+    const MIB: u64 = 1024 * 1024;
+    let d = dir("wal-growth");
+    let s = ProjectStore::open(&d).unwrap();
+    let wal = d.join("journal.db-wal");
+    s.append(ev()).await.unwrap();
+
+    // Отдельное соединение держит транзакцию чтения: WAL нельзя начать заново.
+    let reader = rusqlite::Connection::open(d.join("journal.db")).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let n: i64 = reader
+        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    let fill = "x".repeat(60 * 1024);
+    for i in 0..200 {
+        let mut e = ev();
+        e.payload = json!({"i": i, "fill": fill});
+        s.append(e).await.unwrap();
+    }
+    let grown = std::fs::metadata(&wal).unwrap().len();
+    assert!(grown > 10 * MIB, "WAL вырос до {grown} байт");
+
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    for _ in 0..40 {
+        s.append(ev()).await.unwrap();
+    }
+    let after = std::fs::metadata(&wal).map_or(0, |m| m.len());
+    assert!(
+        after < grown / 4,
+        "WAL не уменьшился: было {grown}, стало {after} байт"
+    );
+    assert_eq!(
+        s.read_after(Seq(0), usize::MAX).await.unwrap().len(),
+        241,
+        "данные на месте"
+    );
+}
+
 #[tokio::test]
 async fn disk_full_is_an_error_not_a_panic() {
     // Review Focus 1: маленький max_page_count имитирует заполненный диск.

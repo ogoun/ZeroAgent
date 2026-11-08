@@ -7,9 +7,19 @@
 //! `Normal` запись переживает падение процесса, но последние транзакции могут
 //! пропасть при отключении питания; при `Full` переживает и отключение питания.
 //! Пачка, где есть хотя бы одна команда «durable», целиком фиксируется с `FULL`.
+//!
+//! Рост WAL (ARC-035): авточекпоинт SQLite переносит страницы в БД, но файл WAL
+//! не обрезает, а пока читатель держит снимок, WAL не может начаться заново и
+//! растёт. Поэтому писатель каждые [`WAL_CHECK_EVERY`] пачек смотрит размер WAL
+//! и, если он больше [`WAL_TRUNCATE_THRESHOLD`], делает
+//! `wal_checkpoint(TRUNCATE)` без ожидания читателей. Занятый читателями
+//! чекпоинт пропускается до следующей проверки. `journal_size_limit`
+//! ([`JOURNAL_SIZE_LIMIT`]) ограничивает файл и при обычном перезапуске WAL.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use rusqlite::Connection;
 use tokio::sync::oneshot;
@@ -21,6 +31,19 @@ pub(crate) type JobSender = mpsc::Sender<Box<dyn Job>>;
 
 /// Наибольшее число команд в одной транзакции.
 pub(crate) const MAX_BATCH: usize = 256;
+
+/// `PRAGMA journal_size_limit`: до скольких байт SQLite обрезает WAL при его
+/// перезапуске (64 МиБ).
+pub(crate) const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
+/// Размер WAL в байтах, после которого писатель делает
+/// `wal_checkpoint(TRUNCATE)` (8 МиБ, вдвое больше авточекпоинта SQLite по
+/// умолчанию — 1000 страниц по 4 КиБ).
+pub(crate) const WAL_TRUNCATE_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+/// Через сколько зафиксированных пачек писатель проверяет размер WAL; проверка —
+/// один `stat` файла.
+pub(crate) const WAL_CHECK_EVERY: u32 = 16;
 
 /// Команда писателю.
 pub(crate) trait Job: Send {
@@ -95,22 +118,25 @@ pub(crate) fn configure(conn: &Connection, durability: Durability) -> Result<(),
     }
     conn.pragma_update(None, "synchronous", durability.pragma())?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT)?;
     Ok(())
 }
 
-/// Запускает поток-писатель на готовом соединении.
+/// Запускает поток-писатель на готовом соединении; `wal` — путь файла WAL.
 pub(crate) fn spawn(
     conn: Connection,
     durability: Durability,
+    wal: PathBuf,
 ) -> Result<(JobSender, JoinHandle<()>), StoreError> {
     let (tx, rx) = mpsc::channel::<Box<dyn Job>>();
     let handle = std::thread::Builder::new()
         .name("za-store-writer".into())
-        .spawn(move || run(&conn, &rx, durability))?;
+        .spawn(move || run(&conn, &rx, durability, &wal))?;
     Ok((tx, handle))
 }
 
-fn run(conn: &Connection, rx: &mpsc::Receiver<Box<dyn Job>>, durability: Durability) {
+fn run(conn: &Connection, rx: &mpsc::Receiver<Box<dyn Job>>, durability: Durability, wal: &Path) {
+    let mut since_check: u32 = 0;
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
@@ -126,8 +152,41 @@ fn run(conn: &Connection, rx: &mpsc::Receiver<Box<dyn Job>>, durability: Durabil
         for j in batch {
             j.finish(commit.clone());
         }
+        since_check += 1;
+        if since_check >= WAL_CHECK_EVERY {
+            since_check = 0;
+            limit_wal(conn, wal);
+        }
     }
     tracing::debug!("поток-писатель завершён");
+}
+
+/// Обрезает WAL чекпоинтом `TRUNCATE`, если файл больше
+/// [`WAL_TRUNCATE_THRESHOLD`]. Читателей не ждёт: на время чекпоинта
+/// `busy_timeout` снят, занятый чекпоинт откладывается до следующей проверки.
+fn limit_wal(conn: &Connection, wal: &Path) {
+    let size = std::fs::metadata(wal).map_or(0, |m| m.len());
+    if size <= WAL_TRUNCATE_THRESHOLD {
+        return;
+    }
+    if let Err(e) = conn.busy_timeout(Duration::ZERO) {
+        tracing::warn!(error = %e, "чекпоинт WAL пропущен: не снят busy_timeout");
+        return;
+    }
+    let r = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    match r {
+        Ok(0) => tracing::debug!(size, "WAL обрезан чекпоинтом"),
+        Ok(_) => tracing::warn!(
+            size,
+            "чекпоинт WAL занят долгим читателем, WAL продолжает расти"
+        ),
+        Err(e) => tracing::warn!(size, error = %e, "чекпоинт WAL не выполнен"),
+    }
+    if let Err(e) = conn.busy_timeout(BUSY_TIMEOUT) {
+        tracing::error!(error = %e, "не удалось вернуть busy_timeout писателя");
+    }
 }
 
 /// Фиксирует пачку; если в ней есть команда «durable», а по умолчанию `Normal`,
@@ -290,6 +349,10 @@ mod tests {
         assert_eq!(sync_of(&c), 1);
         configure(&c, Durability::Full).unwrap();
         assert_eq!(sync_of(&c), 2);
+        let limit: i64 = c
+            .pragma_query_value(None, "journal_size_limit", |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, JOURNAL_SIZE_LIMIT);
     }
 
     #[test]
