@@ -1,7 +1,7 @@
 //! Хранилище проекта zero-agent: журнал событий в SQLite (`journal.db`).
 //!
 //! Один поток-писатель с group commit и пул из четырёх читателей (ARC-030),
-//! WAL и `synchronous=FULL` (CORE-005), блокировка `journal.lock` от второго
+//! WAL с настраиваемой надёжностью фиксации [`Durability`] (CORE-005), блокировка `journal.lock` от второго
 //! процесса, миграции по `PRAGMA user_version`.
 
 mod events;
@@ -69,11 +69,37 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
-/// Параметры открытия хранилища.
+/// Надёжность фиксации транзакций писателя (`PRAGMA synchronous` в режиме WAL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// `NORMAL`: зафиксированное переживает падение и `kill -9` процесса (NFR-08),
+    /// но последние транзакции могут пропасть при отключении питания или сбое ОС.
+    /// Одиночная запись ~0,2 мс против ~32 мс у `Full` (замер 2026-11-08, NFR-02).
+    #[default]
+    Normal,
+    /// `FULL`: каждая транзакция переживает и отключение питания.
+    Full,
+}
+
+impl Durability {
+    /// Значение для `PRAGMA synchronous`.
+    pub(crate) fn pragma(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::Full => "FULL",
+        }
+    }
+}
+
+/// Параметры открытия хранилища. Создаются через `Default` и правку полей:
+/// новые поля не ломают вызывающих.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct StoreOptions {
     /// Лимит `PRAGMA max_page_count` для писателя; в тестах имитирует заполненный диск.
     pub max_page_count: Option<u64>,
+    /// Надёжность фиксации по умолчанию; [`ProjectStore::append_durable`] всегда `Full`.
+    pub durability: Durability,
 }
 
 /// Хранилище проекта. Клонирование дешёвое: все клоны делят потоки и соединения.
@@ -139,7 +165,7 @@ impl ProjectStore {
 
         let path = dir.join(DB_FILE);
         let mut conn = Connection::open(&path)?;
-        writer::configure(&conn)?;
+        writer::configure(&conn, opts.durability)?;
         migrate::migrate(&mut conn)?;
         if let Some(n) = opts.max_page_count {
             let n = i64::try_from(n).unwrap_or(i64::MAX);
@@ -149,7 +175,7 @@ impl ProjectStore {
         let mut threads = Vec::new();
         let (readers, reader_threads) = reader::spawn(&path)?;
         threads.extend(reader_threads);
-        let (writer, writer_thread) = writer::spawn(conn)?;
+        let (writer, writer_thread) = writer::spawn(conn, opts.durability)?;
         threads.push(writer_thread);
 
         tracing::info!(path = %path.display(), sqlite = rusqlite::version(), "журнал открыт");
@@ -169,14 +195,33 @@ impl ProjectStore {
         self.inner.sqlite_version.clone()
     }
 
-    /// Выполняет `f` в транзакции писателя; ответ приходит после COMMIT.
+    /// Выполняет `f` в транзакции писателя; ответ приходит после COMMIT
+    /// с надёжностью, заданной [`StoreOptions::durability`].
     pub(crate) async fn write<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
     {
+        self.submit(f, false).await
+    }
+
+    /// Как [`Self::write`], но транзакция фиксируется с `synchronous=FULL`
+    /// независимо от настройки: результат переживает отключение питания.
+    pub(crate) async fn write_durable<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+    {
+        self.submit(f, true).await
+    }
+
+    async fn submit<T, F>(&self, f: F, durable: bool) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+    {
         let (tx, rx) = oneshot::channel();
-        let job = writer::job(f, tx);
+        let job = writer::job(f, tx, durable);
         self.inner
             .writer
             .as_ref()

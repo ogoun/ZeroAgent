@@ -14,9 +14,17 @@ use za_protocol::{
 use crate::{ProjectStore, StoreError};
 
 impl ProjectStore {
-    /// Добавляет событие; `Ok` возвращается после фиксации на диске.
+    /// Добавляет событие; `Ok` возвращается после COMMIT с надёжностью
+    /// [`StoreOptions::durability`](crate::StoreOptions::durability): при `Normal`
+    /// событие переживает падение процесса, но может пропасть при отключении питания.
     pub async fn append(&self, e: NewEvent) -> Result<Seq, StoreError> {
         self.write(move |c| insert(c, &e)).await
+    }
+
+    /// Добавляет событие с фиксацией `synchronous=FULL`: `Ok` означает, что событие
+    /// переживает и отключение питания. Для намерений `NonIdempotent`-эффектов.
+    pub async fn append_durable(&self, e: NewEvent) -> Result<Seq, StoreError> {
+        self.write_durable(move |c| insert(c, &e)).await
     }
 
     /// Добавляет события атомарно, в одной транзакции; `seq` идут подряд по порядку.

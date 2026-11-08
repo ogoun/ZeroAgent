@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde_json::json;
 use za_protocol::{Actor, EventKind, NewEvent, RunId, Seq};
-use za_store::{ProjectStore, StoreError, StoreOptions};
+use za_store::{Durability, ProjectStore, StoreError, StoreOptions};
 
 /// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
 fn dir(name: &str) -> PathBuf {
@@ -153,6 +153,47 @@ async fn order_comes_from_seq_not_clock() {
     }
 }
 
+#[tokio::test]
+async fn append_durable_interleaves_with_normal_appends() {
+    // Durable- и обычные записи вперемешку: все подтверждены, seq уникальны и читаются.
+    let s = open("durable");
+    let mut tasks = Vec::new();
+    for i in 0..40 {
+        let s = s.clone();
+        tasks.push(tokio::spawn(async move {
+            if i % 4 == 0 {
+                s.append_durable(ev()).await.unwrap()
+            } else {
+                s.append(ev()).await.unwrap()
+            }
+        }));
+    }
+    let mut seqs = HashSet::new();
+    for t in tasks {
+        assert!(seqs.insert(t.await.unwrap()));
+    }
+    let got: HashSet<Seq> = s
+        .read_after(Seq(0), 100)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(got, seqs);
+}
+
+#[tokio::test]
+async fn full_durability_option_works() {
+    let mut opts = StoreOptions::default();
+    assert_eq!(opts.durability, Durability::Normal);
+    opts.durability = Durability::Full;
+    let s = ProjectStore::open_with(&dir("full-durability"), opts).unwrap();
+    let a = s.append(ev()).await.unwrap();
+    let b = s.append_durable(ev()).await.unwrap();
+    assert!(b > a);
+    assert_eq!(s.read_after(Seq(0), 10).await.unwrap().len(), 2);
+}
+
 #[test]
 fn second_open_is_locked() {
     let d = dir("lock");
@@ -179,13 +220,9 @@ fn open_creates_missing_directory() {
 async fn disk_full_is_an_error_not_a_panic() {
     // Review Focus 1: маленький max_page_count имитирует заполненный диск.
     let d = dir("full");
-    let s = ProjectStore::open_with(
-        &d,
-        StoreOptions {
-            max_page_count: Some(64),
-        },
-    )
-    .unwrap();
+    let mut opts = StoreOptions::default();
+    opts.max_page_count = Some(64);
+    let s = ProjectStore::open_with(&d, opts).unwrap();
     let before = s.append(ev()).await.unwrap();
     let mut big = ev();
     big.payload = json!({ "data": "x".repeat(1024 * 1024) });
