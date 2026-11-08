@@ -35,11 +35,17 @@ impl RunStatus {
         matches!(
             (self, to),
             (Queued, Running)
+                | (Queued, Cancelling)
+                | (Queued, Cancelled)
                 | (Running, Pausing)
                 | (Pausing, Paused)
+                | (Pausing, Running)
+                | (Pausing, Failed)
+                | (Pausing, Cancelling)
                 | (Paused, Running)
                 | (Running, Cancelling)
                 | (Paused, Cancelling)
+                | (BlockedOnBudget, Cancelling)
                 | (Cancelling, Cancelled)
                 | (Running, BlockedOnBudget)
                 | (BlockedOnBudget, Running)
@@ -84,6 +90,31 @@ mod tests {
         for from in all.into_iter().filter(|s| s.is_terminal()) {
             assert!(all.into_iter().all(|to| !from.can_transition(to)));
         }
+    }
+
+    #[test]
+    fn new_transitions_allowed() {
+        use RunStatus::*;
+        for (a, b) in [
+            (Queued, Cancelling),
+            (Queued, Cancelled),
+            (Pausing, Cancelling),
+            (BlockedOnBudget, Cancelling),
+            (Pausing, Running),
+            (Pausing, Paused),
+            (Pausing, Failed),
+        ] {
+            assert!(a.can_transition(b), "{a:?} -> {b:?}");
+        }
+    }
+
+    #[test]
+    fn every_non_terminal_can_reach_cancelling() {
+        use RunStatus::*;
+        for s in [Queued, Running, Pausing, Paused, BlockedOnBudget] {
+            assert!(s.can_transition(Cancelling), "{s:?}");
+        }
+        assert!(!Cancelling.can_transition(Cancelling));
     }
 
     #[test]
