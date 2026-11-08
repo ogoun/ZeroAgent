@@ -56,6 +56,11 @@ fn counted(
     }
 }
 
+/// Конверт квитанции успешного эффекта.
+fn ok(v: Value) -> Value {
+    json!({"outcome": "ok", "value": v})
+}
+
 /// Ключ первого эффекта шага 0.
 fn first_key(run: RunId) -> EffectKey {
     EffectKey::derive(run, 0, 0)
@@ -112,7 +117,7 @@ async fn effect_keys_follow_step_and_effect_seq() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.result, Some(json!(v)), "ключ {step}:{n}");
+        assert_eq!(row.result, Some(ok(json!(v))), "ключ {step}:{n}");
         assert!(row.receipt_seq.unwrap() > row.intent_seq);
     }
 }
@@ -138,7 +143,7 @@ async fn idempotent_intent_without_receipt_is_retried() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(r, json!("done"));
     let row = s.effect(run, &key).await.unwrap().unwrap();
-    assert_eq!(row.result, Some(json!("done")));
+    assert_eq!(row.result, Some(ok(json!("done"))));
     assert!(s.pending_effects(run).await.unwrap().is_empty());
     assert!(s.interrupts(run).await.unwrap().is_empty());
 }
@@ -259,7 +264,10 @@ async fn failed_effect_is_recorded_and_not_retried() {
     assert_eq!(err, EffectError::Failed("нет доступа".into()));
 
     let row = s.effect(run, &first_key(run)).await.unwrap().unwrap();
-    assert_eq!(row.result, Some(json!({"error": "нет доступа"})));
+    assert_eq!(
+        row.result,
+        Some(json!({"outcome": "error", "message": "нет доступа"}))
+    );
 
     // Завершённый с ошибкой эффект не выполняется заново.
     let mut b = RunCtx::new(s.clone(), run);
@@ -269,6 +277,44 @@ async fn failed_effect_is_recorded_and_not_retried() {
         .unwrap_err();
     assert_eq!(err, EffectError::Failed("нет доступа".into()));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn success_that_looks_like_error_replays_as_success() {
+    let (s, run) = setup("ok-like-error").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let v = json!({"error": "это данные, а не отказ"});
+    let mut a = RunCtx::new(s.clone(), run);
+    let r1 = a
+        .effect(spec(EffectClass::Idempotent), counted(&calls, v.clone()))
+        .await
+        .unwrap();
+    let mut b = RunCtx::new(s.clone(), run);
+    let r2 = b
+        .effect(spec(EffectClass::Idempotent), counted(&calls, json!(0)))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(r1, v);
+    assert_eq!(r2, v, "успех при повторе остаётся успехом");
+}
+
+#[tokio::test]
+async fn receipt_without_envelope_is_corruption() {
+    let (s, run) = setup("no-envelope").await;
+    let key = first_key(run);
+    s.record_intent(run, &key, EffectClass::Idempotent, "f", json!({}))
+        .await
+        .unwrap();
+    s.record_receipt(run, &key, json!({"error": "голое значение"}))
+        .await
+        .unwrap();
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let err = ctx
+        .effect(spec(EffectClass::Idempotent), || async { Ok(json!(1)) })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EffectError::Store(_)), "получено {err:?}");
 }
 
 #[tokio::test]
@@ -285,7 +331,7 @@ async fn large_result_round_trips() {
         .unwrap();
     assert_eq!(r, big);
     let row = s.effect(run, &first_key(run)).await.unwrap().unwrap();
-    assert_eq!(row.result, Some(big));
+    assert_eq!(row.result, Some(ok(big)));
 }
 
 #[tokio::test]

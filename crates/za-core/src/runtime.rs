@@ -4,7 +4,10 @@
 //! квитанция есть — вернуть записанный результат, не выполняя; намерение без
 //! квитанции — для `NonIdempotent` открыть прерывание `unknown_outcome`, для прочих
 //! классов выполнить заново; намерения нет — записать его и выполнить. Итог
-//! записывается квитанцией: значение при успехе, `{"error": сообщение}` при отказе.
+//! записывается квитанцией с явным исходом — конвертом
+//! `{"outcome":"ok","value":…}` или `{"outcome":"error","message":…}`, поэтому
+//! успешное значение любой формы при повторе остаётся успехом. Конверт для
+//! хранилища — обычное значение: большой конверт целиком уходит в blob.
 
 use std::future::Future;
 
@@ -79,7 +82,7 @@ impl RunCtx {
             Some(row) => {
                 if let Some(result) = row.result {
                     tracing::debug!(key = %key.0, "эффект завершён ранее, результат из журнала");
-                    return outcome(result);
+                    return decode(&key, result);
                 }
                 if row.class != spec.class {
                     tracing::warn!(key = %key.0, journal = ?row.class, spec = ?spec.class,
@@ -104,12 +107,17 @@ impl RunCtx {
 
         match f().await {
             Ok(v) => {
-                self.store.record_receipt(self.run, &key, v.clone()).await?;
+                let envelope = json!({ "outcome": OUTCOME_OK, "value": v });
+                self.store.record_receipt(self.run, &key, envelope).await?;
                 Ok(v)
             }
             Err(msg) => {
                 self.store
-                    .record_receipt(self.run, &key, json!({ "error": msg }))
+                    .record_receipt(
+                        self.run,
+                        &key,
+                        json!({ "outcome": OUTCOME_ERROR, "message": msg }),
+                    )
                     .await?;
                 Err(EffectError::Failed(msg))
             }
@@ -117,17 +125,29 @@ impl RunCtx {
     }
 }
 
-/// Итог по записанному результату: объект ровно с одним строковым полем `error` —
-/// отказ, остальное — успех.
-///
-/// Успешный результат такой же формы неотличим от отказа; типизированный исход —
-/// решение R1 вместе с `effect<T>`.
-fn outcome(result: Value) -> Result<Value, EffectError> {
-    if let Value::Object(m) = &result
-        && m.len() == 1
-        && let Some(Value::String(msg)) = m.get("error")
-    {
-        return Err(EffectError::Failed(msg.clone()));
+/// Исход успешного эффекта в конверте квитанции.
+const OUTCOME_OK: &str = "ok";
+/// Исход отказа в конверте квитанции.
+const OUTCOME_ERROR: &str = "error";
+
+/// Разбирает конверт квитанции; иная форма — повреждение журнала.
+fn decode(key: &EffectKey, mut envelope: Value) -> Result<Value, EffectError> {
+    let outcome = envelope.get("outcome").and_then(Value::as_str);
+    match outcome {
+        Some(OUTCOME_OK) => {
+            if let Some(v) = envelope.get_mut("value") {
+                return Ok(v.take());
+            }
+        }
+        Some(OUTCOME_ERROR) => {
+            if let Some(Value::String(msg)) = envelope.get_mut("message") {
+                return Err(EffectError::Failed(std::mem::take(msg)));
+            }
+        }
+        _ => {}
     }
-    Ok(result)
+    Err(EffectError::Store(StoreError::Sqlite(format!(
+        "повреждённые данные журнала: квитанция {} без конверта исхода",
+        key.0
+    ))))
 }
