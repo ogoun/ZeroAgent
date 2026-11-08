@@ -2,6 +2,10 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-08. R0, задача 4: устойчивость к `kill -9`
+
+Тестовый бинарник `za-store/src/bin/crash_writer.rs` пишет события из четырёх потоков (убийство попадает и в середину group commit) и печатает `seq` каждого подтверждённого с немедленным flush. `tests/crash.rs` убивает его через `Child::kill` (TerminateProcess на Windows, SIGKILL на Linux) через 50…753 мс после первого подтверждения, открывает журнал заново и проверяет, что все напечатанные `seq` на месте: 20 раундов с `Durability::Normal` и 5 раундов с `append_durable`. На Windows прошло без потерь; `journal.lock` после убийства свободен. За окно 50 мс подтверждается около 430 событий в режиме Normal и около 3 в режиме durable. Тест ловит потерю: при подмене печатаемого `seq` падает в первом раунде. Время теста около 21 с.
+
 ## 2026-11-08. R0, задача 3: журнал на SQLite
 
 Крейт `za-store`: `journal.db` в каталоге проекта, блокировка `journal.lock` (`File::try_lock`, второй `open` даёт `StoreError::Locked`), миграции по `PRAGMA user_version` (схема 0001: `runs`, `events`, `effects`, `interrupts`, `snapshots`, `blobs`, таблицы STRICT, `seq` с AUTOINCREMENT). Один поток-писатель: group commit до 256 команд в `BEGIN IMMEDIATE`, у каждой команды своя точка сохранения, ответ после COMMIT; SQLITE_FULL даёт `StoreError::Full`, писатель продолжает работу. Четыре читателя `query_only=ON` в своих потоках. `rusqlite 0.41.1` bundled, SQLite 3.54.1.
