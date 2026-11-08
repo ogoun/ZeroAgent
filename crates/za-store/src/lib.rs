@@ -40,6 +40,13 @@ const DB_FILE: &str = "journal.db";
 const LOCK_FILE: &str = "journal.lock";
 /// Минимальная версия SQLite (ARC-031: исправление WAL-reset bug).
 const MIN_SQLITE_VERSION: i32 = 3_051_003;
+/// Минимальная версия SQLite текстом, как её показывает [`sqlite_library_version`].
+pub const MIN_SQLITE: &str = "3.51.3";
+
+/// Версия встроенной в бинарник SQLite, например `3.54.1`; журнал не открывается.
+pub fn sqlite_library_version() -> &'static str {
+    rusqlite::version()
+}
 /// Ожидание занятой БД, например при чекпоинте WAL.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
