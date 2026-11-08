@@ -2,12 +2,19 @@
 //!
 //! Один поток-писатель с group commit и пул из четырёх читателей (ARC-030),
 //! WAL с настраиваемой надёжностью фиксации [`Durability`] (CORE-005), блокировка `journal.lock` от второго
-//! процесса, миграции по `PRAGMA user_version`.
+//! процесса, миграции по `PRAGMA user_version`. Большие payload и данные хранятся
+//! в blobs по BLAKE3 (ARC-032), runs меняют статус по таблице переходов с проверкой
+//! `generation` (SWM-064), снимки состояния служат для resume (CORE-006).
 
+mod blobs;
 mod events;
 mod migrate;
 mod reader;
+mod runs;
 mod writer;
+
+pub use blobs::BLOB_THRESHOLD;
+pub use runs::{NewRun, Run};
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
@@ -18,6 +25,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode};
 use tokio::sync::oneshot;
+use za_protocol::{RunId, RunStatus};
 
 use crate::reader::ReadJob;
 use crate::writer::JobSender;
@@ -52,6 +60,15 @@ pub enum StoreError {
     /// Потоки хранилища остановлены.
     #[error("хранилище закрыто")]
     Closed,
+    /// Run с таким идентификатором нет.
+    #[error("run {0} не найден")]
+    UnknownRun(RunId),
+    /// Переход статуса запрещён таблицей переходов.
+    #[error("переход статуса {from:?} -> {to:?} запрещён")]
+    InvalidTransition { from: RunStatus, to: RunStatus },
+    /// Команда основана на устаревшей `generation` run (SWM-064).
+    #[error("устаревшая generation, текущая {current}")]
+    StaleGeneration { current: u64 },
 }
 
 impl From<rusqlite::Error> for StoreError {
@@ -109,6 +126,8 @@ pub struct ProjectStore {
 }
 
 struct Inner {
+    /// Каталог проекта: `journal.db` и файлы `blobs/`.
+    dir: Arc<Path>,
     writer: Option<JobSender>,
     readers: Option<mpsc::Sender<ReadJob>>,
     threads: Vec<JoinHandle<()>>,
@@ -181,6 +200,7 @@ impl ProjectStore {
         tracing::info!(path = %path.display(), sqlite = rusqlite::version(), "журнал открыт");
         Ok(Self {
             inner: Arc::new(Inner {
+                dir: Arc::from(dir),
                 writer: Some(writer),
                 readers: Some(readers),
                 threads,
@@ -193,6 +213,11 @@ impl ProjectStore {
     /// Версия встроенной SQLite, например `3.54.1`.
     pub fn sqlite_version(&self) -> String {
         self.inner.sqlite_version.clone()
+    }
+
+    /// Каталог проекта (рядом с `journal.db` лежат файлы blobs).
+    pub(crate) fn dir(&self) -> Arc<Path> {
+        Arc::clone(&self.inner.dir)
     }
 
     /// Выполняет `f` в транзакции писателя; ответ приходит после COMMIT

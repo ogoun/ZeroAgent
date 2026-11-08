@@ -18,6 +18,8 @@ tracing.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 jiff.workspace = true
+blake3.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

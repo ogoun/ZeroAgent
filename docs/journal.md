@@ -2,6 +2,10 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R0, задача 5: blobs, runs, снимки
+
+`za-store`: blobs по BLAKE3 (`put_blob` идемпотентен; до 1 МиБ в строке `blobs`, больше — файл `blobs/<hash>` рядом с `journal.db`, запись через временный файл, `fsync` и переименование; при чтении хеш и размер сверяются). Payload события длиннее `BLOB_THRESHOLD` = 64 КиБ канонического JSON сохраняется blob в той же транзакции, в строке события `null` и `blob_ref`; `read_after` и `read_run` подставляют payload обратно (ARC-032). Runs: `create_run` (статус `queued`, `generation` 0, `root_id` от родителя, у корня свой `id`) и `set_status` (сверка `expected_generation`, затем таблица переходов, `generation + 1`) пишут `run.created` и `run.status {from, to, generation}` в той же транзакции. Снимки: `save_snapshot` (тот же `seq` заменяется), `latest_snapshot` по наибольшему `seq`. Новые ошибки: `UnknownRun`, `InvalidTransition`, `StaleGeneration`. Миграция схемы не понадобилась. Тест `disk_full` переведён на payload 512 КиБ: 1 МиБ теперь уходит в файл и БД не переполняет.
+
 ## 2026-11-08. R0, задача 4: устойчивость к `kill -9`
 
 Тестовый бинарник `za-store/src/bin/crash_writer.rs` пишет события из четырёх потоков (убийство попадает и в середину group commit) и печатает `seq` каждого подтверждённого с немедленным flush. `tests/crash.rs` убивает его через `Child::kill` (TerminateProcess на Windows, SIGKILL на Linux) через 50…753 мс после первого подтверждения, открывает журнал заново и проверяет, что все напечатанные `seq` на месте: 20 раундов с `Durability::Normal` и 5 раундов с `append_durable`. На Windows прошло без потерь; `journal.lock` после убийства свободен. За окно 50 мс подтверждается около 430 событий в режиме Normal и около 3 в режиме durable. Тест ловит потерю: при подмене печатаемого `seq` падает в первом раунде. Время теста около 21 с.

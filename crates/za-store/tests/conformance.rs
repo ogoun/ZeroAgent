@@ -4,14 +4,19 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde_json::json;
-use za_protocol::{Actor, EventKind, NewEvent, RunId, Seq};
-use za_store::{Durability, ProjectStore, StoreError, StoreOptions};
+use za_protocol::{Actor, BlobHash, EventKind, NewEvent, RunId, RunRole, RunStatus, Seq};
+use za_store::{BLOB_THRESHOLD, Durability, NewRun, ProjectStore, StoreError, StoreOptions};
+
+/// Путь каталога теста внутри `CARGO_TARGET_TMPDIR` без очистки.
+fn dir_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("za-store")
+        .join(name)
+}
 
 /// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("za-store")
-        .join(name);
+    let d = dir_path(name);
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -224,8 +229,9 @@ async fn disk_full_is_an_error_not_a_panic() {
     opts.max_page_count = Some(64);
     let s = ProjectStore::open_with(&d, opts).unwrap();
     let before = s.append(ev()).await.unwrap();
+    // Payload уходит в blob, но до 1 МиБ blob лежит в строке `blobs` и в БД не влезает.
     let mut big = ev();
-    big.payload = json!({ "data": "x".repeat(1024 * 1024) });
+    big.payload = json!({ "data": "x".repeat(512 * 1024) });
     assert!(matches!(s.append(big).await, Err(StoreError::Full)));
     // Подтверждённое событие на месте, писатель жив и принимает новые записи.
     let got = s.read_after(Seq(0), 10).await.unwrap();
@@ -259,4 +265,209 @@ fn sqlite_version_is_at_least_3_51_3() {
         "SQLite {} старше 3.51.3",
         s.sqlite_version()
     );
+}
+
+fn new_run(parent: Option<RunId>) -> NewRun {
+    NewRun {
+        id: RunId::new(),
+        project_id: "p".into(),
+        parent_id: parent,
+        role: if parent.is_some() {
+            RunRole::Worker
+        } else {
+            RunRole::Top
+        },
+        model_profile: None,
+    }
+}
+
+#[tokio::test]
+async fn large_payload_goes_to_blob_and_reads_back() {
+    let s = open("blob-payload");
+    let run = RunId::new();
+    let mut e = ev_for(run);
+    e.payload = json!({ "data": "y".repeat(100 * 1024) });
+    let seq = s.append(e.clone()).await.unwrap();
+    let small = s.append(ev_for(run)).await.unwrap();
+    let got = s.read_run(run, Seq(0), 10).await.unwrap();
+    assert_eq!(got[0].seq, seq);
+    let h = got[0].blob_ref.clone().expect("blob_ref не заполнен");
+    assert_eq!(got[0].payload, e.payload);
+    assert_eq!(got[1].seq, small);
+    assert_eq!(got[1].blob_ref, None);
+    let all = s.read_after(Seq(0), 10).await.unwrap();
+    assert_eq!(all[0].payload, e.payload);
+    assert_eq!(all[0].blob_ref, Some(h.clone()));
+    assert!(s.get_blob(&h).await.unwrap().unwrap().len() > BLOB_THRESHOLD);
+    drop(s);
+    // В строке события вместо payload лежит `null`.
+    let c = rusqlite::Connection::open(dir_path("blob-payload").join("journal.db")).unwrap();
+    let raw: String = c
+        .query_row(
+            "SELECT payload FROM events WHERE seq = ?1",
+            [i64::try_from(seq.0).unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, "null");
+}
+
+#[tokio::test]
+async fn payload_at_threshold_stays_inline() {
+    let s = open("blob-edge");
+    let run = RunId::new();
+    let mut e = ev_for(run);
+    // Канонический JSON `"…"` ровно BLOB_THRESHOLD байт: порог не превышен.
+    e.payload = json!("z".repeat(BLOB_THRESHOLD - 2));
+    s.append(e.clone()).await.unwrap();
+    let got = s.read_run(run, Seq(0), 1).await.unwrap();
+    assert_eq!(got[0].blob_ref, None);
+    assert_eq!(got[0].payload, e.payload);
+}
+
+#[tokio::test]
+async fn blob_is_content_addressed_and_idempotent() {
+    let s = open("blob-small");
+    let a = s.put_blob(b"hello").await.unwrap();
+    let b = s.put_blob(b"hello").await.unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a.0, blake3::hash(b"hello").to_hex().to_string());
+    assert_eq!(
+        s.get_blob(&a).await.unwrap().as_deref(),
+        Some(&b"hello"[..])
+    );
+    let missing = BlobHash("0".repeat(64));
+    assert_eq!(s.get_blob(&missing).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn blob_over_one_mib_is_a_file() {
+    let d = dir("blob-file");
+    let s = ProjectStore::open(&d).unwrap();
+    let data = vec![7u8; 1024 * 1024 + 1];
+    let h = s.put_blob(&data).await.unwrap();
+    assert_eq!(s.put_blob(&data).await.unwrap(), h);
+    assert!(d.join("blobs").join(&h.0).is_file());
+    assert_eq!(s.get_blob(&h).await.unwrap(), Some(data.clone()));
+    drop(s);
+    let s = ProjectStore::open(&d).unwrap();
+    assert_eq!(s.get_blob(&h).await.unwrap(), Some(data));
+}
+
+#[tokio::test]
+async fn create_run_writes_row_and_event() {
+    let s = open("run-create");
+    let nr = new_run(None);
+    let r = s.create_run(nr.clone()).await.unwrap();
+    assert_eq!(r.id, nr.id);
+    assert_eq!(r.root_id, nr.id);
+    assert_eq!(r.parent_id, None);
+    assert_eq!(r.role, RunRole::Top);
+    assert_eq!(r.status, RunStatus::Queued);
+    assert_eq!(r.generation, 0);
+    assert_eq!(s.get_run(nr.id).await.unwrap(), Some(r));
+    assert_eq!(s.get_run(RunId::new()).await.unwrap(), None);
+    let evs = s.read_run(nr.id, Seq(0), 10).await.unwrap();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].kind, EventKind::RunCreated);
+    assert_eq!(evs[0].actor, Actor::Runtime);
+    // Повторное создание с тем же id отклоняется и не пишет второе событие.
+    assert!(s.create_run(nr.clone()).await.is_err());
+    assert_eq!(s.read_run(nr.id, Seq(0), 10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn child_inherits_root() {
+    let s = open("run-root");
+    let top = s.create_run(new_run(None)).await.unwrap();
+    let mid = s.create_run(new_run(Some(top.id))).await.unwrap();
+    let leaf = s.create_run(new_run(Some(mid.id))).await.unwrap();
+    assert_eq!(mid.root_id, top.root_id);
+    assert_eq!(leaf.root_id, top.root_id);
+    assert_eq!(leaf.parent_id, Some(mid.id));
+    let orphan = new_run(Some(RunId::new()));
+    let parent = orphan.parent_id.unwrap();
+    assert_eq!(
+        s.create_run(orphan).await,
+        Err(StoreError::UnknownRun(parent))
+    );
+}
+
+#[tokio::test]
+async fn set_status_bumps_generation_and_logs_event() {
+    let s = open("run-status");
+    let r = s.create_run(new_run(None)).await.unwrap();
+    assert_eq!(s.set_status(r.id, RunStatus::Running, 0).await, Ok(1));
+    let got = s.get_run(r.id).await.unwrap().unwrap();
+    assert_eq!((got.status, got.generation), (RunStatus::Running, 1));
+    let evs = s.read_run(r.id, Seq(0), 10).await.unwrap();
+    assert_eq!(evs.len(), 2);
+    assert_eq!(evs[1].kind, EventKind::RunStatus);
+    assert_eq!(
+        evs[1].payload,
+        json!({"from": "queued", "to": "running", "generation": 1})
+    );
+    let unknown = RunId::new();
+    assert_eq!(
+        s.set_status(unknown, RunStatus::Running, 0).await,
+        Err(StoreError::UnknownRun(unknown))
+    );
+}
+
+#[tokio::test]
+async fn invalid_transition_is_rejected() {
+    let s = open("run-invalid");
+    let r = s.create_run(new_run(None)).await.unwrap();
+    let g = s.set_status(r.id, RunStatus::Cancelled, 0).await.unwrap();
+    assert_eq!(
+        s.set_status(r.id, RunStatus::Running, g).await,
+        Err(StoreError::InvalidTransition {
+            from: RunStatus::Cancelled,
+            to: RunStatus::Running
+        })
+    );
+    // Отказ ничего не меняет: generation та же, нового события нет.
+    let got = s.get_run(r.id).await.unwrap().unwrap();
+    assert_eq!((got.status, got.generation), (RunStatus::Cancelled, g));
+    assert_eq!(s.read_run(r.id, Seq(0), 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn stale_generation_is_rejected() {
+    // SWM-064: команда со старой generation отклоняется.
+    let s = open("run-stale");
+    let r = s.create_run(new_run(None)).await.unwrap();
+    s.set_status(r.id, RunStatus::Running, 0).await.unwrap();
+    assert_eq!(
+        s.set_status(r.id, RunStatus::Pausing, 0).await,
+        Err(StoreError::StaleGeneration { current: 1 })
+    );
+    let got = s.get_run(r.id).await.unwrap().unwrap();
+    assert_eq!((got.status, got.generation), (RunStatus::Running, 1));
+    assert_eq!(s.read_run(r.id, Seq(0), 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn latest_snapshot_is_the_highest_seq() {
+    let s = open("snapshots");
+    let r = s.create_run(new_run(None)).await.unwrap();
+    assert_eq!(s.latest_snapshot(r.id).await.unwrap(), None);
+    for n in [5u64, 9, 7] {
+        s.save_snapshot(r.id, Seq(n), json!({ "step": n }))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        s.latest_snapshot(r.id).await.unwrap(),
+        Some((Seq(9), json!({"step": 9})))
+    );
+    // Повторное сохранение того же seq заменяет снимок.
+    s.save_snapshot(r.id, Seq(9), json!({"step": "again"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.latest_snapshot(r.id).await.unwrap(),
+        Some((Seq(9), json!({"step": "again"})))
+    );
+    assert_eq!(s.latest_snapshot(RunId::new()).await.unwrap(), None);
 }
