@@ -238,10 +238,27 @@ impl<'a> Args<'a> {
         }
     }
 
-    /// Значение без кавычек до `,`, `}` или `]`.
+    /// Значение без кавычек до `,`, `}` или `]`; тег `<tool_call|>`, `<turn|>` или
+    /// `<|tool_call>` внутри — синтаксическая ошибка.
     fn bare(&self, pos: usize) -> Parsed<Value> {
         let rest = &self.s[pos..];
-        let Some(i) = rest.find([',', '}', ']']) else {
+        let mut stop = None;
+        for (i, b) in rest.bytes().enumerate() {
+            match b {
+                b',' | b'}' | b']' => {
+                    stop = Some(i);
+                    break;
+                }
+                // Тег формата внутри значения — разметка, а не значение (раунд 2):
+                // `{a:x<tool_call|>` не исполняется с мусором; одиночный `<` — часть
+                // значения.
+                b'<' if [CLOSE, TURN, OPEN].iter().any(|t| rest[i..].starts_with(t)) => {
+                    return Err(ParseError::Syntax(pos + i));
+                }
+                _ => {}
+            }
+        }
+        let Some(i) = stop else {
             return Err(ParseError::Eof);
         };
         let raw = rest[..i].trim();

@@ -1536,3 +1536,25 @@ fn p1_vllm_compat_details() {
         json!({"path": "C:\\new\\\"q", "content": "A\u{0}x"})
     );
 }
+
+/// Раунд 2: тег Gemma внутри значения без кавычек — не часть значения: `set` не
+/// исполняется с мусором, следующий настоящий вызов извлекается.
+#[test]
+fn gemma4_tag_inside_bare_value_is_not_value() {
+    let mut tools = tools();
+    tools.push(tool("set", json!({"type": "object"})));
+    let src = "<|tool_call>call:set{a:x<tool_call|> текст <|tool_call>call:read_file{path:<|\"|>a<|\"|>}<tool_call|>";
+    let out = normalize(&text(src), &tools, &[TextFormat::Gemma4]);
+    let names: Vec<&str> = out.calls.iter().map(|c| c.call.name.as_str()).collect();
+    assert_eq!(names, ["read_file"]);
+    assert!(matches!(
+        out.rejected[..],
+        [CallRejection::Unparseable { .. }]
+    ));
+    assert_eq!(out.text, "текст");
+    for tag in ["<turn|>", "<|tool_call>"] {
+        let src = format!("<|tool_call>call:set{{a:x{tag}}}");
+        let out = normalize(&text(&src), &tools, &[TextFormat::Gemma4]);
+        assert!(out.calls.is_empty(), "{src}: {:?}", out.calls);
+    }
+}
