@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 use tokio::sync::oneshot;
+use tracing::Level;
 
 use crate::{BUSY_TIMEOUT, Durability, StoreError};
 
@@ -137,6 +138,7 @@ pub(crate) fn spawn(
 
 fn run(conn: &Connection, rx: &mpsc::Receiver<Box<dyn Job>>, durability: Durability, wal: &Path) {
     let mut since_check: u32 = 0;
+    let mut busy = BusyCheckpoint::default();
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
@@ -155,16 +157,39 @@ fn run(conn: &Connection, rx: &mpsc::Receiver<Box<dyn Job>>, durability: Durabil
         since_check += 1;
         if since_check >= WAL_CHECK_EVERY {
             since_check = 0;
-            limit_wal(conn, wal);
+            limit_wal(conn, wal, &mut busy);
         }
     }
     tracing::debug!("поток-писатель завершён");
 }
 
+/// Серия подряд занятых чекпоинтов WAL; успешный чекпоинт её обнуляет.
+#[derive(Debug, Default)]
+struct BusyCheckpoint {
+    /// Сколько проверок подряд чекпоинт был занят читателем.
+    streak: u32,
+    /// Было ли в этой серии предупреждение о WAL больше [`JOURNAL_SIZE_LIMIT`].
+    warned_over_limit: bool,
+}
+
+/// Уровень лога для занятого чекпоинта: `warn` в начале серии и ещё раз, когда
+/// WAL впервые в серии перерос [`JOURNAL_SIZE_LIMIT`]; остальное — `debug`.
+/// Так постоянный читатель (SSE-клиент) не засоряет stderr каждые
+/// [`WAL_CHECK_EVERY`] пачек.
+pub(crate) fn busy_log_level(streak: u32, wal_size: u64, warned_over_limit: bool) -> Level {
+    let over_limit = wal_size > JOURNAL_SIZE_LIMIT.unsigned_abs();
+    if streak <= 1 || (over_limit && !warned_over_limit) {
+        Level::WARN
+    } else {
+        Level::DEBUG
+    }
+}
+
 /// Обрезает WAL чекпоинтом `TRUNCATE`, если файл больше
 /// [`WAL_TRUNCATE_THRESHOLD`]. Читателей не ждёт: на время чекпоинта
-/// `busy_timeout` снят, занятый чекпоинт откладывается до следующей проверки.
-fn limit_wal(conn: &Connection, wal: &Path) {
+/// `busy_timeout` снят, занятый чекпоинт откладывается до следующей проверки,
+/// а уровень его лога выбирает [`busy_log_level`].
+fn limit_wal(conn: &Connection, wal: &Path, busy: &mut BusyCheckpoint) {
     let size = std::fs::metadata(wal).map_or(0, |m| m.len());
     if size <= WAL_TRUNCATE_THRESHOLD {
         return;
@@ -177,11 +202,30 @@ fn limit_wal(conn: &Connection, wal: &Path) {
         r.get::<_, i64>(0)
     });
     match r {
-        Ok(0) => tracing::debug!(size, "WAL обрезан чекпоинтом"),
-        Ok(_) => tracing::warn!(
-            size,
-            "чекпоинт WAL занят долгим читателем, WAL продолжает расти"
-        ),
+        Ok(0) => {
+            tracing::debug!(size, "WAL обрезан чекпоинтом");
+            *busy = BusyCheckpoint::default();
+        }
+        Ok(_) => {
+            busy.streak = busy.streak.saturating_add(1);
+            let streak = busy.streak;
+            if busy_log_level(streak, size, busy.warned_over_limit) == Level::WARN {
+                tracing::warn!(
+                    size,
+                    streak,
+                    "чекпоинт WAL занят долгим читателем, WAL продолжает расти"
+                );
+            } else {
+                tracing::debug!(
+                    size,
+                    streak,
+                    "чекпоинт WAL занят долгим читателем, WAL продолжает расти"
+                );
+            }
+            if size > JOURNAL_SIZE_LIMIT.unsigned_abs() {
+                busy.warned_over_limit = true;
+            }
+        }
         Err(e) => tracing::warn!(size, error = %e, "чекпоинт WAL не выполнен"),
     }
     if let Err(e) = conn.busy_timeout(BUSY_TIMEOUT) {
@@ -380,5 +424,14 @@ mod tests {
         run_batch(&c, vec![d], Durability::Full);
         assert_eq!(rd.blocking_recv().unwrap(), Ok(2));
         assert_eq!(sync_of(&c), 2);
+    }
+
+    #[test]
+    fn busy_checkpoint_warns_once_per_streak() {
+        assert_eq!(busy_log_level(1, 9 << 20, false), Level::WARN);
+        assert_eq!(busy_log_level(2, 9 << 20, false), Level::DEBUG);
+        // Впервые больше JOURNAL_SIZE_LIMIT.
+        assert_eq!(busy_log_level(5, 65 << 20, false), Level::WARN);
+        assert_eq!(busy_log_level(6, 65 << 20, true), Level::DEBUG);
     }
 }

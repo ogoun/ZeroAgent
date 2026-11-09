@@ -12,6 +12,8 @@ mod demo;
 mod recovery;
 mod runtime;
 
-pub use demo::{CrashPoint, DemoConfig, DemoOutcome, NEEDS_DECISION, replay_hash, run_demo};
+pub use demo::{CrashPoint, DemoConfig, DemoOutcome, replay_hash, run_demo};
 pub use recovery::{Recovery, UNKNOWN_OUTCOME, recover};
 pub use runtime::{EffectError, EffectSpec, RunCtx};
+/// Прежнее имя причины паузы; значение живёт в [`za_protocol::pause_reason`].
+pub use za_protocol::pause_reason::NEEDS_DECISION;

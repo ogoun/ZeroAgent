@@ -165,8 +165,22 @@ fn write_file(path: &Path, data: &[u8]) -> Result<(), StoreError> {
 /// Сбрасывает на диск запись каталога (Unix); на других ОС ничего не делает.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> Result<(), StoreError> {
-    File::open(dir)?.sync_all()?;
+    tolerate_dir_sync(File::open(dir).and_then(|f| f.sync_all()))?;
     Ok(())
+}
+
+/// Итог `fsync` каталога: `EINVAL` (`InvalidInput`) терпится с `warn`, как в
+/// SQLite (`unixSync` игнорирует ошибку `fsync` каталога): часть сетевых и
+/// FUSE-ФС не умеет синхронизировать каталог, и падать на этом нельзя.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn tolerate_dir_sync(r: std::io::Result<()>) -> std::io::Result<()> {
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            tracing::warn!(error = %e, "fsync каталога не поддерживается файловой системой");
+            Ok(())
+        }
+        r => r,
+    }
 }
 
 /// Сбрасывает на диск запись каталога (Unix); на других ОС ничего не делает.
@@ -177,4 +191,18 @@ fn sync_dir(_dir: &Path) -> Result<(), StoreError> {
 
 fn corrupt(h: &BlobHash, what: &str) -> StoreError {
     StoreError::Corrupt(format!("blob {}: {what}", h.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::*;
+
+    #[test]
+    fn einval_on_dir_sync_is_tolerated() {
+        assert!(tolerate_dir_sync(Err(io::Error::from(io::ErrorKind::InvalidInput))).is_ok());
+        assert!(tolerate_dir_sync(Err(io::Error::from(io::ErrorKind::PermissionDenied))).is_err());
+        assert!(tolerate_dir_sync(Ok(())).is_ok());
+    }
 }

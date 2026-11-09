@@ -580,3 +580,21 @@ async fn latest_snapshot_is_the_highest_seq() {
     );
     assert_eq!(s.latest_snapshot(RunId::new()).await.unwrap(), None);
 }
+
+/// Файл `journal.db`, который не является базой SQLite, — повреждённый журнал,
+/// а не повторяемый сбой SQLite.
+#[test]
+fn garbage_file_is_corrupt_not_sqlite() {
+    let d = dir("garbage_db");
+    let garbage: Vec<u8> = b"not a database"
+        .iter()
+        .copied()
+        .cycle()
+        .take(8192)
+        .collect();
+    std::fs::write(d.join("journal.db"), garbage).unwrap();
+    match ProjectStore::open(&d) {
+        Err(StoreError::Corrupt(_)) => {}
+        other => panic!("ожидался Corrupt, получено {:?}", other.err()),
+    }
+}

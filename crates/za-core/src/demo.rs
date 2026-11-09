@@ -12,15 +12,18 @@
 //! Повтор run берёт завершённые эффекты из журнала, поэтому строка каждого шага
 //! пишется ровно один раз. Если исход `tool` неизвестен (намерение без
 //! квитанции после сбоя), run не продолжается: [`recover`] открывает
-//! прерывание, run переводится в `paused` с причиной [`NEEDS_DECISION`], и
-//! [`run_demo`] возвращает [`DemoOutcome::NeedsDecision`].
+//! прерывание, run переводится в `paused` с причиной
+//! [`NEEDS_DECISION`](pause_reason::NEEDS_DECISION), и [`run_demo`] возвращает
+//! [`DemoOutcome::NeedsDecision`].
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use za_llm::{PromptBlocks, prefix_hash};
-use za_protocol::{EffectClass, Event, EventKind, RunId, RunRole, RunStatus, Seq, canonical_json};
+use za_protocol::{
+    EffectClass, Event, EventKind, RunId, RunRole, RunStatus, Seq, canonical_json, pause_reason,
+};
 use za_store::{NewRun, ProjectStore, StoreError};
 
 use crate::recovery::{Recovery, recover};
@@ -36,9 +39,6 @@ const RUN_PLACEHOLDER: &str = "{run}";
 const REPLAY_TAG: &[u8] = b"za-replay-v1\0";
 /// Размер страницы чтения событий в [`replay_hash`].
 const PAGE: usize = 1000;
-
-/// Причина паузы run в событии `run.status`, когда нужно решение человека.
-pub const NEEDS_DECISION: &str = "needs_decision";
 
 /// Параметры демонстрационного run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +69,7 @@ pub enum DemoOutcome {
     /// Все шаги выполнены, run в статусе `done`.
     Done,
     /// Исход `NonIdempotent`-эффектов неизвестен; id открытых прерываний.
-    /// Run в статусе `paused` с причиной [`NEEDS_DECISION`].
+    /// Run в статусе `paused` с причиной [`NEEDS_DECISION`](pause_reason::NEEDS_DECISION).
     NeedsDecision(Vec<String>),
 }
 
@@ -77,16 +77,22 @@ pub enum DemoOutcome {
 ///
 /// Нет run — создаётся (`RunRole::Top`, статус `queued`) и переводится в
 /// `running`. Перед шагами run проходит [`recover`]: при неизвестном исходе
-/// run переводится `running → paused` с причиной [`NEEDS_DECISION`] и
+/// run переводится `running → paused` с причиной
+/// [`NEEDS_DECISION`](pause_reason::NEEDS_DECISION) и
 /// возвращается [`DemoOutcome::NeedsDecision`] без выполнения шагов; так же
 /// обрабатывается [`EffectError::Unknown`] во время шагов. Run в `paused`
 /// снова проходит [`recover`]: прерывания открыты — те же id без новых
 /// событий; открытых нет — `paused → running` и продолжение. Run в `done`
 /// возвращает [`DemoOutcome::Done`], ничего не выполняя и не записывая. Иной
 /// статус — [`StoreError::InvalidTransition`]. После всех шагов run
-/// переводится в `done`. Если записанные аргументы эффекта расходятся с
-/// текущими (например, хэш префикса промпта в `model` изменился), шаги не
-/// выполняются: [`EffectError::ReplayMismatch`], run остаётся в `running`.
+/// переводится в `done`. Если записанные имя или аргументы эффекта расходятся
+/// с текущими (например, хэш префикса промпта в `model` изменился), эффект не
+/// выполняется, run переводится `running → paused` с причиной
+/// [`REPLAY_MISMATCH`](pause_reason::REPLAY_MISMATCH) и возвращается
+/// [`EffectError::ReplayMismatch`]. Каждое следующее продолжение снова проходит
+/// `paused → running`, упирается в то же расхождение и снова ставит паузу.
+/// Если саму паузу записать не удалось, это пишется в лог `error`, а наружу
+/// всё равно уходит `ReplayMismatch`.
 pub async fn run_demo(
     store: &ProjectStore,
     run: RunId,
@@ -146,6 +152,10 @@ pub async fn run_demo(
             Err(EffectError::Unknown { interrupt_id }) => {
                 return pause_for_decision(store, run, generation, vec![interrupt_id]).await;
             }
+            Err(e @ EffectError::ReplayMismatch { .. }) => {
+                pause_on_mismatch(store, run, generation, &e).await;
+                return Err(e);
+            }
             Err(e) => return Err(e),
         }
     }
@@ -154,7 +164,8 @@ pub async fn run_demo(
     Ok(DemoOutcome::Done)
 }
 
-/// Переводит run `running → paused` с причиной [`NEEDS_DECISION`].
+/// Переводит run `running → paused` с причиной
+/// [`NEEDS_DECISION`](pause_reason::NEEDS_DECISION).
 async fn pause_for_decision(
     store: &ProjectStore,
     run: RunId,
@@ -162,10 +173,43 @@ async fn pause_for_decision(
     interrupt_ids: Vec<String>,
 ) -> Result<DemoOutcome, EffectError> {
     store
-        .set_status_with_reason(run, RunStatus::Paused, generation, Some(NEEDS_DECISION))
+        .set_status_with_reason(
+            run,
+            RunStatus::Paused,
+            generation,
+            Some(pause_reason::NEEDS_DECISION),
+        )
         .await?;
     tracing::warn!(%run, ?interrupt_ids, "демонстрационный run ждёт решения");
     Ok(DemoOutcome::NeedsDecision(interrupt_ids))
+}
+
+/// Переводит run `running → paused` с причиной
+/// [`REPLAY_MISMATCH`](pause_reason::REPLAY_MISMATCH). Ошибка перевода
+/// только логируется: вызывающий получает исходное расхождение `mismatch`.
+async fn pause_on_mismatch(
+    store: &ProjectStore,
+    run: RunId,
+    generation: u64,
+    mismatch: &EffectError,
+) {
+    let paused = store
+        .set_status_with_reason(
+            run,
+            RunStatus::Paused,
+            generation,
+            Some(pause_reason::REPLAY_MISMATCH),
+        )
+        .await;
+    match paused {
+        Ok(_) => tracing::warn!(%run, error = %mismatch, "run на паузе: расхождение с журналом"),
+        Err(e) => tracing::error!(
+            %run,
+            error = %e,
+            mismatch = %mismatch,
+            "не удалось поставить run на паузу после расхождения с журналом"
+        ),
+    }
 }
 
 /// Шаг `n`: эффект `model`, затем эффект `tool`.

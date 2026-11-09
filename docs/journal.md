@@ -2,6 +2,15 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-A, задача 1: остатки R0
+
+Источник: `.superpowers/sdd/2026-11-06-r0-foundation/final-re-review.md` (Н1–Н3, сомнение 4).
+
+- **Пауза при расхождении реплея.** `run_demo` на `EffectError::ReplayMismatch` переводит run `running → paused` с причиной `replay_mismatch` и возвращает исходную ошибку; сбой самого перевода пишется в `error`, наружу всё равно уходит `ReplayMismatch`. Повторное `--resume` проходит `paused → running`, упирается в то же расхождение и снова ставит паузу (статусы `running, paused, running, paused`); код выхода по-прежнему 1. Причины паузы собраны в `za_protocol::pause_reason`: `needs_decision`, `replay_mismatch`, `queue` (RES-007), `resource` (RES-012), `provider` (MDL-016); `za_core::NEEDS_DECISION` остаётся реэкспортом.
+- **Повреждённая БД (Н1).** `SQLITE_CORRUPT` и `SQLITE_NOTADB` отображаются в `StoreError::Corrupt`, а не в повторяемый `Sqlite`: файл `journal.db` из мусора при открытии даёт `Corrupt`.
+- **`fsync` каталога (Н2).** На Unix `EINVAL` от `fsync` каталога (часть сетевых и FUSE-ФС) терпится с `warn`, как в SQLite; прочие ошибки по-прежнему возвращаются.
+- **Шум чекпоинта WAL (Н3).** Занятый чекпоинт пишется в `warn` один раз за серию и ещё раз, когда WAL впервые в серии перерос `journal_size_limit` (64 МиБ); остальные повторы — `debug`. Успешный чекпоинт обнуляет серию.
+
 ## 2026-11-09. R0, финальный fix-раунд по итогам ревью ветки
 
 Источник: `.superpowers/sdd/2026-11-06-r0-foundation/final-review.md`. В1 (прогон CI на Linux) не делался: требует push, решает заказчик; слияние — после зелёного CI на обеих ОС.

@@ -39,6 +39,61 @@ async fn event_count(s: &ProjectStore, run: RunId) -> usize {
     s.read_run(run, Seq(0), usize::MAX).await.unwrap().len()
 }
 
+/// Значения `to` всех событий `run.status` run по порядку.
+async fn statuses(s: &ProjectStore, run: RunId) -> Vec<String> {
+    s.read_run(run, Seq(0), usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::RunStatus)
+        .map(|e| e.payload["to"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Поле `reason` последнего события `run.status` run.
+async fn last_status_reason(s: &ProjectStore, run: RunId) -> Option<String> {
+    s.read_run(run, Seq(0), usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == EventKind::RunStatus)
+        .and_then(|e| e.payload["reason"].as_str().map(str::to_owned))
+}
+
+/// Run в `running`, у которого `model` шага 1 записан с другим `prefix_hash`;
+/// возвращает ключ этого эффекта.
+async fn drifted_run(s: &ProjectStore, run: RunId) -> EffectKey {
+    s.create_run(NewRun {
+        id: run,
+        project_id: "demo".into(),
+        parent_id: None,
+        role: RunRole::Top,
+        model_profile: None,
+    })
+    .await
+    .unwrap();
+    s.set_status(run, RunStatus::Running, 0).await.unwrap();
+    let key = EffectKey::derive(run, 1, 0);
+    s.record_intent(
+        run,
+        &key,
+        EffectClass::Idempotent,
+        "model",
+        json!({"step": 1, "prefix_hash": "0".repeat(64)}),
+    )
+    .await
+    .unwrap();
+    s.record_receipt(
+        run,
+        &key,
+        json!({"outcome": "ok", "value": {"text": "ответ модели на шаг 1"}}),
+    )
+    .await
+    .unwrap();
+    key
+}
+
 #[tokio::test]
 async fn demo_writes_each_step_once() {
     let d = dir("each_step");
@@ -208,33 +263,7 @@ async fn prefix_drift_on_resume_is_an_error() {
     let s = ProjectStore::open(&d.join("project")).unwrap();
     let run = RunId::new();
     let work = d.join("work");
-    s.create_run(NewRun {
-        id: run,
-        project_id: "demo".into(),
-        parent_id: None,
-        role: RunRole::Top,
-        model_profile: None,
-    })
-    .await
-    .unwrap();
-    s.set_status(run, RunStatus::Running, 0).await.unwrap();
-    let key = EffectKey::derive(run, 1, 0);
-    s.record_intent(
-        run,
-        &key,
-        EffectClass::Idempotent,
-        "model",
-        json!({"step": 1, "prefix_hash": "0".repeat(64)}),
-    )
-    .await
-    .unwrap();
-    s.record_receipt(
-        run,
-        &key,
-        json!({"outcome": "ok", "value": {"text": "ответ модели на шаг 1"}}),
-    )
-    .await
-    .unwrap();
+    let key = drifted_run(&s, run).await;
 
     let err = run_demo(&s, run, &cfg(2, &work)).await.unwrap_err();
     assert_eq!(
@@ -245,4 +274,40 @@ async fn prefix_drift_on_resume_is_an_error() {
         }
     );
     assert!(!work.join("log.txt").exists(), "шаги не выполнены");
+    let r = s.get_run(run).await.unwrap().unwrap();
+    assert_eq!(r.status, RunStatus::Paused);
+    assert_eq!(
+        last_status_reason(&s, run).await,
+        Some("replay_mismatch".into())
+    );
+}
+
+/// Каждое продолжение с расхождением снова даёт `ReplayMismatch` и снова
+/// ставит run на паузу с причиной `replay_mismatch`.
+#[tokio::test]
+async fn replay_mismatch_pauses_run_every_time() {
+    let d = dir("replay_mismatch_twice");
+    let s = ProjectStore::open(&d.join("project")).unwrap();
+    let run = RunId::new();
+    let work = d.join("work");
+    let key = drifted_run(&s, run).await;
+    let want = EffectError::ReplayMismatch {
+        key: key.0,
+        field: "args",
+    };
+
+    for _ in 0..2 {
+        assert_eq!(run_demo(&s, run, &cfg(2, &work)).await.unwrap_err(), want);
+        let r = s.get_run(run).await.unwrap().unwrap();
+        assert_eq!(r.status, RunStatus::Paused);
+        assert_eq!(
+            last_status_reason(&s, run).await,
+            Some("replay_mismatch".into())
+        );
+    }
+    assert!(!work.join("log.txt").exists(), "шаги не выполнены");
+    assert_eq!(
+        statuses(&s, run).await,
+        ["running", "paused", "running", "paused"]
+    );
 }

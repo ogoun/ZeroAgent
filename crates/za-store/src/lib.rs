@@ -108,6 +108,10 @@ impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
         match e.sqlite_error_code() {
             Some(ErrorCode::DiskFull) => Self::Full,
+            // Файл журнала повреждён или вовсе не база SQLite: повтор не поможет.
+            Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => {
+                Self::Corrupt(e.to_string())
+            }
             _ => Self::Sqlite(e.to_string()),
         }
     }

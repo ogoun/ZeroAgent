@@ -11,4 +11,4 @@ pub use canonical::canonical_json;
 pub use effect::{EffectClass, EffectKey};
 pub use event::{Actor, Event, EventKind, NewEvent, SCHEMA_V};
 pub use ids::{BlobHash, EventId, RunId, Seq};
-pub use run::{RunRole, RunStatus};
+pub use run::{RunRole, RunStatus, pause_reason};
