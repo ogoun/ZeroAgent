@@ -219,9 +219,18 @@ pub type ResourceKindName = String;
 #[serde(rename_all = "snake_case")]
 pub enum WaitState {
     Queued,
-    WaitingResource { kind: ResourceKindName },
-    Cooldown { remaining_ms: u64 },
+    WaitingResource {
+        kind: ResourceKindName,
+    },
+    Cooldown {
+        remaining_ms: u64,
+    },
     Granted,
+    /// Заявка снята или отклонена очередью; `reason` — код `QueueError::code()`
+    /// (`cancelled`, `wait_timeout`, `budget_exhausted`, …).
+    Failed {
+        reason: String,
+    },
 }
 
 /// Положение заявки в очереди (RES-006).

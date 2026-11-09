@@ -3,9 +3,11 @@
 //! Время — на паузе (`start_paused`), сокетов нет.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
+use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -17,6 +19,28 @@ use za_protocol::{Priority, RunId};
 use za_res::{Admission, CpuSample, GpuStatus, MemSample, ResourceSnapshot, ResourcesConfig};
 
 const GIB: u64 = 1 << 30;
+
+/// Метка ожидаемых паник тестов: их сообщения не печатаются.
+const EXPECTED_PANIC: &str = "ожидаемая паника теста";
+
+/// Глушит вывод только ожидаемых паник; прочие идут в прежний обработчик.
+fn quiet_expected_panics() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str));
+            if msg.is_some_and(|m| m.contains(EXPECTED_PANIC)) {
+                return;
+            }
+            prev(info);
+        }));
+    });
+}
 
 fn local(n: u32) -> GroupLimits {
     GroupLimits {
@@ -42,7 +66,7 @@ fn gid(s: &str) -> GroupId {
 
 /// Очередь с одной локальной группой `g`.
 fn queue_with(n: u32) -> (ModelQueue, GroupId) {
-    let q = ModelQueue::new(None);
+    let q = ModelQueue::new(Handle::current(), None);
     let g = gid("local-a");
     q.configure(g.clone(), local(n));
     assert_eq!(q.snapshot().groups[0].max_parallel, n);
@@ -189,7 +213,7 @@ async fn last_local_slot_is_kept_for_foreground() {
 
 #[tokio::test(start_paused = true)]
 async fn background_limit_does_not_apply_to_cloud() {
-    let q = ModelQueue::new(None);
+    let q = ModelQueue::new(Handle::current(), None);
     let c = gid("cloud:openrouter:openrouter.ai");
     q.configure(c.clone(), cloud(2, None));
     let a = q.enqueue(&c, RunId::new(), Priority::Job, None).unwrap();
@@ -213,7 +237,7 @@ async fn pools_do_not_block_each_other() {
 
 #[tokio::test(start_paused = true)]
 async fn cooldown_until_retry_after() {
-    let q = ModelQueue::new(None);
+    let q = ModelQueue::new(Handle::current(), None);
     let c = gid("cloud:openai:api.openai.com");
     q.configure(c.clone(), cloud(4, None));
     q.cooldown(&c, Instant::now() + Duration::from_secs(10));
@@ -245,7 +269,8 @@ async fn cooldown_until_retry_after() {
 async fn budget_exhausted_fails_fast_and_resets_next_day() {
     let day = Arc::new(Mutex::new(jiff::civil::date(2026, 11, 9)));
     let d = day.clone();
-    let q = ModelQueue::new(None).with_today(Arc::new(move || *d.lock().unwrap()));
+    let q =
+        ModelQueue::new(Handle::current(), None).with_today(Arc::new(move || *d.lock().unwrap()));
     let c = gid("cloud:openrouter:openrouter.ai");
     q.configure(c.clone(), cloud(4, Some(1.0)));
     q.record_spend(&c, 0.4);
@@ -271,7 +296,7 @@ async fn budget_exhausted_fails_fast_and_resets_next_day() {
 
 #[tokio::test(start_paused = true)]
 async fn budget_exhaustion_fails_waiting_requests() {
-    let q = ModelQueue::new(None);
+    let q = ModelQueue::new(Handle::current(), None);
     let c = gid("cloud:openrouter:openrouter.ai");
     q.configure(c.clone(), cloud(1, Some(2.0)));
     let _p = q
@@ -337,7 +362,7 @@ fn gated(n: u32) -> GroupLimits {
 async fn resource_wait_and_auto_resume() {
     // Свободно 1 ГиБ: ниже запаса фоновых (2 ГиБ), выше пола интерактива (512 МиБ).
     let (tx, adm) = admission(snapshot_with_ram(GIB));
-    let q = ModelQueue::new(Some(adm));
+    let q = ModelQueue::new(Handle::current(), Some(adm));
     let g = gid("llama-local");
     q.configure(g.clone(), gated(4));
     let job = enq(&q, &g, Priority::Job);
@@ -357,9 +382,38 @@ async fn resource_wait_and_auto_resume() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn resource_wait_does_not_hold_the_only_slot() {
+    // Review: одно место; ждущая ресурса заявка его не держит, и её состояние не
+    // переключается на `Queued` из-за занятости слота.
+    let (tx, adm) = admission(snapshot_with_ram(GIB));
+    let q = ModelQueue::new(Handle::current(), Some(adm));
+    let g = gid("llama-local");
+    q.configure(g.clone(), gated(1));
+    let job = enq(&q, &g, Priority::Job);
+    let res = WaitState::WaitingResource { kind: "ram".into() };
+    assert_eq!(job.status().borrow().state, res);
+    assert_eq!(active(&q, &g), 0);
+    let inter = enq(&q, &g, Priority::Interactive);
+    assert_eq!(inter.status().borrow().state, WaitState::Granted);
+    assert_eq!(active(&q, &g), 1);
+    assert_eq!(job.status().borrow().state, res);
+    let pi = inter.granted().await.unwrap();
+    // Новый снимок без изменений ресурса: состояние прежнее.
+    tx.send(snapshot_with_ram(GIB)).unwrap();
+    settle().await;
+    assert_eq!(job.status().borrow().state, res);
+    // Ресурс есть, но место занято — теперь ждёт места.
+    tx.send(snapshot_with_ram(32 * GIB)).unwrap();
+    settle().await;
+    assert_eq!(job.status().borrow().state, WaitState::Queued);
+    drop(pi);
+    assert_eq!(job.status().borrow().state, WaitState::Granted);
+}
+
+#[tokio::test(start_paused = true)]
 async fn stopped_monitor_fails_resource_waiters() {
     let (tx, adm) = admission(snapshot_with_ram(GIB));
-    let q = ModelQueue::new(Some(adm));
+    let q = ModelQueue::new(Handle::current(), Some(adm));
     let g = gid("llama-local");
     q.configure(g.clone(), gated(4));
     let job = enq(&q, &g, Priority::Job);
@@ -442,11 +496,12 @@ async fn granted_but_unclaimed_ticket_releases_slot() {
 
 #[tokio::test(start_paused = true)]
 async fn permit_is_released_on_panic() {
+    quiet_expected_panics();
     let (q, g) = queue_with(1);
     let t = enq(&q, &g, Priority::Worker);
     let h = tokio::spawn(async move {
         let _p = t.granted().await.unwrap();
-        panic!("задача упала с местом");
+        panic!("{EXPECTED_PANIC}: задача упала с местом");
     });
     let err = h.await.unwrap_err();
     assert!(err.is_panic());
@@ -488,6 +543,42 @@ async fn max_wait_gives_wait_timeout() {
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(h.await.unwrap().err(), Some(QueueError::WaitTimeout));
     assert_eq!(waiting(&q, &g), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failure_is_visible_in_status() {
+    let (q, g) = queue_with(1);
+    let _holder = enq(&q, &g, Priority::Interactive).granted().await.unwrap();
+    let t = q
+        .enqueue(
+            &g,
+            RunId::new(),
+            Priority::Worker,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+    let mut status = t.status();
+    let h = tokio::spawn(t.granted());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    status.changed().await.unwrap();
+    let s = status.borrow().clone();
+    assert_eq!(
+        s.state,
+        WaitState::Failed {
+            reason: "wait_timeout".into()
+        }
+    );
+    assert_eq!(s.position, 0);
+    assert_eq!(h.await.unwrap().err(), Some(QueueError::WaitTimeout));
+    let run = RunId::new();
+    let c = q.enqueue(&g, run, Priority::Worker, None).unwrap();
+    q.cancel_run(run);
+    assert_eq!(
+        c.status().borrow().state,
+        WaitState::Failed {
+            reason: "cancelled".into()
+        }
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -539,7 +630,7 @@ async fn status_position_follows_aging() {
 
 #[tokio::test(start_paused = true)]
 async fn cloud_group_default_parallel_is_four() {
-    let q = ModelQueue::new(None);
+    let q = ModelQueue::new(Handle::current(), None);
     let c = gid("cloud:anthropic:api.anthropic.com");
     q.configure(c.clone(), cloud(DEFAULT_CLOUD_PARALLEL, None));
     let _ts: Vec<Ticket> = (0..6)
@@ -561,7 +652,7 @@ async fn set_parallel_grants_more() {
 
 #[tokio::test(start_paused = true)]
 async fn unknown_group_is_an_error() {
-    let q = ModelQueue::new(None);
+    let q = ModelQueue::new(Handle::current(), None);
     let g = gid("nope");
     assert_eq!(
         q.enqueue(&g, RunId::new(), Priority::Worker, None).err(),
@@ -579,4 +670,97 @@ async fn snapshot_serializes() {
     assert_eq!(v["groups"][0]["kind"], "local");
     assert_eq!(v["groups"][0]["waiting"][0]["priority"], "job");
     assert_eq!(v["groups"][0]["waiting"][0]["state"], "queued");
+}
+
+#[tokio::test(start_paused = true)]
+async fn crashed_driver_is_restarted() {
+    // Фоновая задача падает (паника в источнике даты при пересчёте по снимку); следующее
+    // обращение к очереди перезапускает её, и таймеры работают.
+    quiet_expected_panics();
+    let boom = Arc::new(AtomicBool::new(false));
+    let b = boom.clone();
+    let today = Arc::new(move || {
+        if b.swap(false, Ordering::SeqCst) {
+            panic!("{EXPECTED_PANIC}: источник даты");
+        }
+        jiff::civil::date(2026, 11, 9)
+    });
+    let (tx, adm) = admission(snapshot_with_ram(32 * GIB));
+    let q = ModelQueue::new(Handle::current(), Some(adm)).with_today(today);
+    let g = gid("llama-local");
+    q.configure(g.clone(), gated(1));
+    let _holder = enq(&q, &g, Priority::Interactive).granted().await.unwrap();
+    let _w = enq(&q, &g, Priority::Worker);
+    settle().await;
+    // Пересчёт по снимку делает только фоновая задача: паника — в ней.
+    boom.store(true, Ordering::SeqCst);
+    tx.send(snapshot_with_ram(32 * GIB)).unwrap();
+    settle().await;
+    assert!(
+        !boom.load(Ordering::SeqCst),
+        "фоновая задача не пересчитала"
+    );
+    let t = q
+        .enqueue(
+            &g,
+            RunId::new(),
+            Priority::Worker,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+    let h = tokio::spawn(t.granted());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    // Без перезапуска таймера нет: ожидание упрётся в предел теста, а не зависнет.
+    let r = tokio::time::timeout(Duration::from_secs(60), h).await;
+    assert_eq!(
+        r.expect("фоновая задача не перезапущена").unwrap().err(),
+        Some(QueueError::WaitTimeout)
+    );
+}
+
+#[test]
+fn stopped_runtime_fails_timed_requests() {
+    // Runtime очереди остановлен: заявки, которым нужен таймер, получают явную ошибку.
+    let first = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let q = ModelQueue::new(first.handle().clone(), None);
+    let g = gid("local-a");
+    q.configure(g.clone(), local(1));
+    drop(first);
+    let second = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    second.block_on(async {
+        let holder = enq(&q, &g, Priority::Interactive).granted().await.unwrap();
+        // Без таймера заявка ждёт и выдаётся синхронно.
+        let plain = enq(&q, &g, Priority::Worker);
+        assert_eq!(plain.status().borrow().state, WaitState::Queued);
+        let timed = q
+            .enqueue(
+                &g,
+                RunId::new(),
+                Priority::Worker,
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(5), timed.granted()).await;
+        assert_eq!(
+            r.expect("вечное ожидание").err(),
+            Some(QueueError::RuntimeStopped)
+        );
+        let c = gid("cloud:openai:api.openai.com");
+        q.configure(c.clone(), cloud(4, None));
+        q.cooldown(&c, Instant::now() + Duration::from_secs(10));
+        let cooled = q.enqueue(&c, RunId::new(), Priority::Worker, None).unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(5), cooled.granted()).await;
+        assert_eq!(
+            r.expect("вечное ожидание").err(),
+            Some(QueueError::RuntimeStopped)
+        );
+        drop(holder);
+        let _p = plain.granted().await.unwrap();
+    });
 }

@@ -12,36 +12,50 @@
 //! `cancel_run`, а фоновая задача очереди — по таймерам (конец cooldown, `max_wait`, границы
 //! старения для пересчёта позиций) и на каждом новом снимке ресурсов. Для каждой группы,
 //! пока есть свободные места, берётся первая по порядку заявка, которая проходит:
-//! 1. лимит фоновых (`Job`, `Arena`) в локальной группе — не больше `max(1, n − 1)` из `n`
-//!    мест: последнее место — под интерактивную работу;
+//! 1. дневной бюджет (D14, UTC-сутки) — исчерпан: все ожидающие заявки группы сразу
+//!    завершаются [`QueueError::BudgetExhausted`], не дожидаясь свободного места;
 //! 2. cooldown группы (429, исчерпанный лимит провайдера) — пока он идёт, выдачи нет,
 //!    состояние ожидающих `Cooldown { remaining_ms }`;
-//! 3. дневной бюджет (D14, UTC-сутки) — исчерпан: все ожидающие заявки группы сразу
-//!    завершаются [`QueueError::BudgetExhausted`], не дожидаясь свободного места;
-//! 4. допуск по ресурсам при `resource_gated` (`Need { local_gpu: true, .. }`) — не прошедшая
-//!    получает `WaitingResource { kind }` и не блокирует следующих (RES-012).
+//! 3. допуск по ресурсам при `resource_gated` (`Need { local_gpu: true, .. }`) — проверяется у
+//!    каждой ожидающей независимо от занятости мест, поэтому `WaitingResource { kind }`
+//!    отражает ресурс, а не слоты; не прошедшая не занимает места и не блокирует следующих
+//!    (RES-012);
+//! 4. лимит фоновых (`Job`, `Arena`) в локальной группе — не больше `max(1, n − 1)` из `n`
+//!    мест: последнее место — под интерактивную работу. При `n = 1` фон может занять
+//!    единственное место, пока нет ожидающего интерактива; уже выданное место не
+//!    вытесняется (D9) — пользователь ждёт конца фоновой генерации.
+//!
+//! **Голодание фона** допустимо (RES-013): пол ранга не-интерактивных — 1, поэтому при
+//! непрерывном потоке `Interactive` заявки прочих классов ждут без предела. Среди остальных
+//! классов ожидание ограничено старением. Выход для run — `max_wait` (D12) и показ `waited_ms`.
 //!
 //! **Ожидание** (D12). Без `max_wait` заявка по времени не снимается (RES-007); с `max_wait` —
 //! [`QueueError::WaitTimeout`]. Позиция — номер в отсортированном списке ожидающих группы
-//! с 1; у выданной — 0.
+//! с 1; у выданной и проваленной — 0. Провал виден и в статусе: `WaitState::Failed { reason }`
+//! с кодом [`QueueError::code`].
 //!
 //! **Освобождение** (Review Focus 5). Drop [`Ticket`] до выдачи снимает заявку; выданное, но
 //! не забранное `granted()` место возвращается. Drop [`Permit`] (в том числе при панике
 //! задачи и при брошенном стриме) освобождает место. [`ModelQueue::cancel_run`] снимает все
 //! незабранные заявки run (RES-003): ждущие `granted()` получают [`QueueError::Cancelled`].
 //!
-//! Время — `tokio::time::Instant`. Фоновая задача очереди запускается в текущем runtime
-//! tokio при создании очереди или при первой заявке; без неё таймеры и снимки ресурсов не
-//! обрабатываются (синхронная выдача работает).
+//! **Фоновая задача** (таймеры и снимки ресурсов) запускается в runtime, переданном в
+//! [`ModelQueue::new`], и находится под надзором: если она завершилась (паника, отмена), её
+//! перезапускает следующее обращение к очереди (`enqueue`, `configure`, `set_parallel`,
+//! `cooldown`, `record_spend`, `cancel_run`, `granted()`) с одним `warn` на перезапуск. Если
+//! runtime остановлен и перезапуск невозможен, заявки, которым нужен таймер или снимок
+//! (`max_wait`, cooldown группы, ожидание ресурса), получают [`QueueError::RuntimeStopped`];
+//! заявки без таймеров продолжают выдаваться синхронно. Время — `tokio::time::Instant`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use serde::Serialize;
+use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use za_protocol::{Priority, RunId};
 use za_res::{Admission, Need, ResourceSnapshot, Verdict};
@@ -97,6 +111,9 @@ pub enum QueueError {
     /// Монитор ресурсов остановлен, а заявка ждёт ресурса.
     #[error("monitor_stopped")]
     MonitorStopped,
+    /// Runtime очереди остановлен, а заявке нужен таймер или снимок ресурсов.
+    #[error("runtime_stopped")]
+    RuntimeStopped,
 }
 
 impl QueueError {
@@ -108,6 +125,7 @@ impl QueueError {
             Self::BudgetExhausted { .. } => "budget_exhausted",
             Self::UnknownGroup(_) => "unknown_group",
             Self::MonitorStopped => "monitor_stopped",
+            Self::RuntimeStopped => "runtime_stopped",
         }
     }
 }
@@ -180,6 +198,9 @@ struct Entry {
     enqueued: Instant,
     deadline: Option<Instant>,
     phase: Phase,
+    /// Последнее состояние статуса: снимок читает его, а не `watch` (без чтения `watch`
+    /// под замком очереди).
+    state: WaitState,
     status: watch::Sender<QueueStatus>,
     wake: Arc<Notify>,
 }
@@ -191,8 +212,9 @@ impl Entry {
 
     /// Обновляет статус; получатели уведомляются только при смене позиции или состояния,
     /// `waited_ms` обновляется молча.
-    fn set_status(&self, position: u32, state: WaitState, now: Instant) {
+    fn set_status(&mut self, position: u32, state: WaitState, now: Instant) {
         let waited_ms = millis(now.saturating_duration_since(self.enqueued));
+        self.state = state.clone();
         self.status.send_if_modified(|s| {
             let changed = s.position != position || s.state != state;
             s.position = position;
@@ -202,8 +224,10 @@ impl Entry {
         });
     }
 
-    fn fail(&mut self, e: QueueError) {
+    fn fail(&mut self, e: QueueError, now: Instant) {
+        let reason = e.code().to_owned();
         self.phase = Phase::Failed(e);
+        self.set_status(0, WaitState::Failed { reason }, now);
         self.wake.notify_one();
     }
 }
@@ -273,6 +297,8 @@ struct State {
     entries: HashMap<u64, Entry>,
     next_id: u64,
     monitor_stopped: bool,
+    /// Runtime остановлен: фоновой задачи нет и не будет.
+    driver_dead: bool,
     today: Today,
 }
 
@@ -304,21 +330,30 @@ impl State {
             g.cooldown_until = None;
         }
 
-        // Истёкший `max_wait` (D12) и исчерпанный бюджет (D14) — отказ сразу.
+        // Истёкший `max_wait` (D12) и исчерпанный бюджет (D14) — отказ сразу. Без фоновой
+        // задачи `max_wait` не сработает — отказ `RuntimeStopped`.
         let exhausted = g.exhausted(today);
+        let dead = self.driver_dead;
         let entries = &mut self.entries;
         g.waiting.retain(|id| {
             let Some(e) = entries.get_mut(id) else {
                 return false;
             };
-            if exhausted {
-                e.fail(QueueError::BudgetExhausted { group: gid.clone() });
-                false
+            let err = if exhausted {
+                Some(QueueError::BudgetExhausted { group: gid.clone() })
             } else if e.deadline.is_some_and(|d| d <= now) {
-                e.fail(QueueError::WaitTimeout);
-                false
+                Some(QueueError::WaitTimeout)
+            } else if dead && e.deadline.is_some() {
+                Some(QueueError::RuntimeStopped)
             } else {
-                true
+                None
+            };
+            match err {
+                Some(err) => {
+                    e.fail(err, now);
+                    false
+                }
+                None => true,
             }
         });
 
@@ -326,51 +361,52 @@ impl State {
         let cooldown = g.cooldown_left(now);
         let n = g.limits.max_parallel;
         let bg_limit = n.saturating_sub(1).max(1);
+        let need = Need {
+            local_gpu: true,
+            vram_mib: 0,
+            ram_mib: 0,
+        };
+        // Решение допуска зависит только от класса: одна проверка на класс за пересчёт.
+        let mut verdicts: HashMap<Priority, Verdict> = HashMap::new();
         let mut granted = Vec::new();
-        let mut failed = Vec::new();
+        let mut failed: Vec<(u64, QueueError)> = Vec::new();
         let mut states: HashMap<u64, WaitState> = HashMap::new();
         for &id in &order {
             let Some(e) = self.entries.get(&id) else {
                 continue;
             };
             if let Some(left) = cooldown {
-                states.insert(
-                    id,
-                    WaitState::Cooldown {
-                        remaining_ms: millis(left),
-                    },
-                );
-                continue;
-            }
-            if g.active >= n {
-                states.insert(id, WaitState::Queued);
-                continue;
-            }
-            if g.limits.kind == PoolKind::Local && e.background() && g.active_bg >= bg_limit {
-                states.insert(id, WaitState::Queued);
+                if dead {
+                    failed.push((id, QueueError::RuntimeStopped));
+                } else {
+                    let remaining_ms = millis(left);
+                    states.insert(id, WaitState::Cooldown { remaining_ms });
+                }
                 continue;
             }
             if g.limits.resource_gated
                 && let Some(adm) = admission
             {
-                let need = Need {
-                    local_gpu: true,
-                    vram_mib: 0,
-                    ram_mib: 0,
-                };
-                if let Verdict::Wait { kind, .. } = adm.check(e.priority, &need) {
+                let v = *verdicts
+                    .entry(e.priority)
+                    .or_insert_with(|| adm.check(e.priority, &need));
+                if let Verdict::Wait { kind, .. } = v {
                     if self.monitor_stopped {
-                        failed.push(id);
+                        failed.push((id, QueueError::MonitorStopped));
+                    } else if dead {
+                        failed.push((id, QueueError::RuntimeStopped));
                     } else {
-                        states.insert(
-                            id,
-                            WaitState::WaitingResource {
-                                kind: kind.as_str().into(),
-                            },
-                        );
+                        let kind = kind.as_str().into();
+                        states.insert(id, WaitState::WaitingResource { kind });
                     }
                     continue;
                 }
+            }
+            if g.active >= n
+                || (g.limits.kind == PoolKind::Local && e.background() && g.active_bg >= bg_limit)
+            {
+                states.insert(id, WaitState::Queued);
+                continue;
             }
             g.active += 1;
             if e.background() {
@@ -387,20 +423,20 @@ impl State {
                 tracing::debug!(group = %gid, run = %e.run, priority = ?e.priority, "место выдано");
             }
         }
-        for id in &failed {
+        for (id, err) in &failed {
             if let Some(e) = self.entries.get_mut(id) {
-                e.fail(QueueError::MonitorStopped);
+                e.fail(err.clone(), now);
             }
         }
         g.waiting
-            .retain(|id| !granted.contains(id) && !failed.contains(id));
+            .retain(|id| !granted.contains(id) && !failed.iter().any(|(f, _)| f == id));
 
         let mut position = 0u32;
         for id in order {
             let Some(state) = states.remove(&id) else {
                 continue;
             };
-            if let Some(e) = self.entries.get(&id) {
+            if let Some(e) = self.entries.get_mut(&id) {
                 position += 1;
                 e.set_status(position, state, now);
             }
@@ -410,6 +446,19 @@ impl State {
 
     fn dispatch_all(&mut self, admission: Option<&Admission>, now: Instant) {
         let ids: Vec<GroupId> = self.groups.keys().cloned().collect();
+        for gid in ids {
+            self.dispatch(&gid, admission, now);
+        }
+    }
+
+    /// Пересчёт по новому снимку ресурсов: только группы с допуском и ожидающими.
+    fn dispatch_gated(&mut self, admission: Option<&Admission>, now: Instant) {
+        let ids: Vec<GroupId> = self
+            .groups
+            .iter()
+            .filter(|(_, g)| g.limits.resource_gated && !g.waiting.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
         for gid in ids {
             self.dispatch(&gid, admission, now);
         }
@@ -444,7 +493,10 @@ struct Shared {
     admission: Option<Admission>,
     /// Будит фоновую задачу очереди: изменились сроки.
     driver_wake: Arc<Notify>,
-    driver_started: AtomicBool,
+    /// Runtime фоновой задачи.
+    rt: Handle,
+    /// Фоновая задача; `None` — не запущена или runtime остановлен.
+    driver: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Shared {
@@ -456,6 +508,48 @@ impl Shared {
     fn dispatch(&self, st: &mut State, gid: &GroupId) {
         st.dispatch(gid, self.admission.as_ref(), Instant::now());
     }
+
+    /// Надзор за фоновой задачей: запускает её, если она не запущена или завершилась.
+    /// Порядок замков: `driver`, затем `state` (обратного нигде нет).
+    fn ensure_driver(self: &Arc<Self>) {
+        let mut d = self.driver.lock().unwrap_or_else(|e| e.into_inner());
+        if d.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let (dead, monitor_stopped) = {
+            let st = self.lock();
+            (st.driver_dead, st.monitor_stopped)
+        };
+        if dead {
+            return;
+        }
+        let restart = d.take().is_some();
+        let snapshots = if monitor_stopped {
+            None
+        } else {
+            self.admission.as_ref().map(Admission::changed)
+        };
+        let h = self.rt.spawn(drive(
+            Arc::downgrade(self),
+            self.driver_wake.clone(),
+            snapshots,
+        ));
+        if h.is_finished() {
+            // Задача, порождённая в остановленном runtime, сразу отменена.
+            drop(d);
+            tracing::warn!(
+                "runtime очереди остановлен: заявки с таймерами и ожиданием ресурса завершаются"
+            );
+            let mut st = self.lock();
+            st.driver_dead = true;
+            st.dispatch_all(self.admission.as_ref(), Instant::now());
+            return;
+        }
+        if restart {
+            tracing::warn!("фоновая задача очереди завершилась, перезапущена");
+        }
+        *d = Some(h);
+    }
 }
 
 impl Drop for Shared {
@@ -465,40 +559,58 @@ impl Drop for Shared {
     }
 }
 
-/// Фоновая задача очереди: таймеры и снимки ресурсов.
+/// Причина пробуждения фоновой задачи.
+enum Wake {
+    /// Событие очереди или срок таймера: пересчёт всех групп.
+    All,
+    /// Новый снимок ресурсов: пересчёт групп с допуском и ожидающими.
+    Snapshot,
+    /// Монитор ресурсов остановлен.
+    MonitorStopped,
+}
+
+/// Фоновая задача очереди: таймеры и снимки ресурсов. Первый проход — сразу (после
+/// перезапуска нужно догнать пропущенные сроки и снимки).
 async fn drive(
     weak: Weak<Shared>,
     wake: Arc<Notify>,
     mut snapshots: Option<watch::Receiver<ResourceSnapshot>>,
 ) {
+    let mut reason = Wake::All;
     loop {
         let next = {
             let Some(s) = weak.upgrade() else { return };
-            s.lock().next_deadline(Instant::now())
+            let mut st = s.lock();
+            let now = Instant::now();
+            match reason {
+                Wake::All => st.dispatch_all(s.admission.as_ref(), now),
+                Wake::Snapshot => st.dispatch_gated(s.admission.as_ref(), now),
+                Wake::MonitorStopped => {
+                    tracing::warn!(
+                        "монитор ресурсов остановлен: заявки, ждущие ресурса, завершаются"
+                    );
+                    st.monitor_stopped = true;
+                    st.dispatch_all(s.admission.as_ref(), now);
+                }
+            }
+            st.next_deadline(Instant::now())
         };
-        let mut stopped = false;
-        tokio::select! {
-            _ = wake.notified() => {}
-            _ = tokio::time::sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {}
+        reason = tokio::select! {
+            _ = wake.notified() => Wake::All,
+            _ = tokio::time::sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => Wake::All,
             r = async {
                 match snapshots.as_mut() {
                     Some(rx) => rx.changed().await,
                     None => std::future::pending().await,
                 }
-            }, if snapshots.is_some() => {
-                if r.is_err() {
-                    stopped = true;
+            }, if snapshots.is_some() => match r {
+                Ok(()) => Wake::Snapshot,
+                Err(_) => {
                     snapshots = None;
+                    Wake::MonitorStopped
                 }
-            }
-        }
-        let Some(s) = weak.upgrade() else { return };
-        let mut st = s.lock();
-        if stopped {
-            tracing::warn!("монитор ресурсов остановлен: заявки, ждущие ресурса, завершаются");
-            st.monitor_stopped = true;
-        }
-        st.dispatch_all(s.admission.as_ref(), Instant::now());
+            },
+        };
     }
 }
 
@@ -509,8 +621,9 @@ pub struct ModelQueue {
 }
 
 impl ModelQueue {
-    /// `admission` — допуск для групп с `resource_gated`; `None` — без проверки ресурсов.
-    pub fn new(admission: Option<Admission>) -> Self {
+    /// `rt` — runtime фоновой задачи очереди (таймеры, снимки ресурсов); `admission` —
+    /// допуск для групп с `resource_gated`, `None` — без проверки ресурсов.
+    pub fn new(rt: Handle, admission: Option<Admission>) -> Self {
         let q = Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -518,14 +631,16 @@ impl ModelQueue {
                     entries: HashMap::new(),
                     next_id: 0,
                     monitor_stopped: false,
+                    driver_dead: false,
                     today: Arc::new(utc_today),
                 }),
                 admission,
                 driver_wake: Arc::new(Notify::new()),
-                driver_started: AtomicBool::new(false),
+                rt,
+                driver: Mutex::new(None),
             }),
         };
-        q.ensure_driver();
+        q.shared.ensure_driver();
         q
     }
 
@@ -535,27 +650,8 @@ impl ModelQueue {
         self
     }
 
-    /// Запускает фоновую задачу в текущем runtime, если она ещё не запущена.
-    fn ensure_driver(&self) {
-        if self.shared.driver_started.load(Ordering::Acquire) {
-            return;
-        }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        if self.shared.driver_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let snapshots = self.shared.admission.as_ref().map(Admission::changed);
-        handle.spawn(drive(
-            Arc::downgrade(&self.shared),
-            self.shared.driver_wake.clone(),
-            snapshots,
-        ));
-    }
-
     fn wake_driver(&self) {
-        self.ensure_driver();
+        self.shared.ensure_driver();
         self.shared.driver_wake.notify_one();
     }
 
@@ -576,6 +672,7 @@ impl ModelQueue {
     /// Новое число мест группы (D8: слоты сервера после зонда). Уже выданные места не
     /// отзываются.
     pub fn set_parallel(&self, g: &GroupId, n: u32) {
+        self.shared.ensure_driver();
         let mut st = self.shared.lock();
         let Some(group) = st.groups.get_mut(g) else {
             tracing::warn!(group = %g, "set_parallel: группа не настроена");
@@ -593,6 +690,7 @@ impl ModelQueue {
         p: Priority,
         max_wait: Option<Duration>,
     ) -> Result<Ticket, QueueError> {
+        self.shared.ensure_driver();
         let now = Instant::now();
         let mut st = self.shared.lock();
         if !st.groups.contains_key(g) {
@@ -615,6 +713,7 @@ impl ModelQueue {
                 enqueued: now,
                 deadline: max_wait.map(|w| now + w),
                 phase: Phase::Waiting,
+                state: WaitState::Queued,
                 status: tx,
                 wake: wake.clone(),
             },
@@ -624,7 +723,7 @@ impl ModelQueue {
         }
         self.shared.dispatch(&mut st, g);
         drop(st);
-        self.wake_driver();
+        self.shared.driver_wake.notify_one();
         Ok(Ticket {
             shared: self.shared.clone(),
             id,
@@ -637,6 +736,8 @@ impl ModelQueue {
     /// Снимает все незабранные заявки run (ожидающие и выданные, но не забранные
     /// `granted()`): они получают [`QueueError::Cancelled`] (RES-003). Возвращает их число.
     pub fn cancel_run(&self, run: RunId) -> usize {
+        self.shared.ensure_driver();
+        let now = Instant::now();
         let mut st = self.shared.lock();
         let mut touched: Vec<GroupId> = Vec::new();
         let mut count = 0;
@@ -655,7 +756,7 @@ impl ModelQueue {
                 Phase::Granted => group.release(e.background()),
                 Phase::Failed(_) => continue,
             }
-            e.fail(QueueError::Cancelled);
+            e.fail(QueueError::Cancelled, now);
             count += 1;
             if !touched.contains(&e.group) {
                 touched.push(e.group.clone());
@@ -688,6 +789,7 @@ impl ModelQueue {
             tracing::warn!(group = %g, usd, "record_spend: недопустимая сумма");
             return;
         }
+        self.shared.ensure_driver();
         let mut st = self.shared.lock();
         let today = (st.today)();
         let Some(group) = st.groups.get_mut(g) else {
@@ -718,7 +820,7 @@ impl ModelQueue {
                         priority: e.priority,
                         position: u32::try_from(i + 1).unwrap_or(u32::MAX),
                         waited_ms: millis(now.saturating_duration_since(e.enqueued)),
-                        state: e.status.borrow().state.clone(),
+                        state: e.state.clone(),
                     })
                     .collect();
                 GroupView {
@@ -749,7 +851,12 @@ pub struct Ticket {
 
 impl Ticket {
     /// Положение заявки (RES-006): уведомление при смене позиции или состояния;
-    /// `waited_ms` обновляется при каждом пересчёте очереди.
+    /// `waited_ms` обновляется при каждом пересчёте очереди молча. Провал заявки —
+    /// `WaitState::Failed { reason }`.
+    ///
+    /// Очередь пишет в этот `watch` под своим замком. Не держите `borrow()` (`watch::Ref`)
+    /// во время вызовов очереди и долгих операций: писатель ждёт освобождения `Ref`, а
+    /// вызов очереди — её замка (взаимоблокировка). Копируйте значение: `borrow().clone()`.
     pub fn status(&self) -> watch::Receiver<QueueStatus> {
         self.status.clone()
     }
@@ -757,6 +864,7 @@ impl Ticket {
     /// Ждёт места. Брошенный future снимает заявку (Drop билета).
     pub async fn granted(mut self) -> Result<Permit, QueueError> {
         loop {
+            self.shared.ensure_driver();
             {
                 let mut st = self.shared.lock();
                 let phase = st.entries.get(&self.id).map(|e| &e.phase);
