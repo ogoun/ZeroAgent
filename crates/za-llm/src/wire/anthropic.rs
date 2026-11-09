@@ -899,15 +899,6 @@ impl AnthropicDecoder {
             "content_block_stop" => self.block_stop(&v, &mut out),
             "message_delta" => {
                 if let Some(r) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                    if r == "model_context_window_exceeded" {
-                        // Ответ упёрся в окно контекста: тот же класс, что 400 о длине
-                        // запроса, — нужна компакция, а не повтор (решение контроллера).
-                        return Err(ModelError::new(
-                            ErrorClass::ContextOverflow,
-                            "ответ остановлен окном контекста модели \
-                             (stop_reason model_context_window_exceeded)",
-                        ));
-                    }
                     self.finish = Some(finish_reason(r));
                     if r == "refusal" {
                         let details = v
@@ -1166,7 +1157,10 @@ fn finish_reason(r: &str) -> FinishReason {
     match r {
         "end_turn" | "stop_sequence" => FinishReason::Stop,
         "tool_use" => FinishReason::ToolCalls,
-        "max_tokens" => FinishReason::Length,
+        // Ответ упёрся в окно контекста: по документации это обрезанный, но валидный
+        // ответ — обычное завершение по длине с расходом и частичным выводом.
+        // `ContextOverflow` — только для 400 о длине запроса.
+        "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
         "refusal" => FinishReason::Refusal,
         other => FinishReason::Other(other.to_owned()),
     }

@@ -879,14 +879,35 @@ async fn clear_at_instruction_carries_beta_header() {
 }
 
 #[test]
-fn context_window_stop_is_overflow_error() {
+fn context_window_stop_is_truncated_length() {
+    // Обрезанный, но валидный ответ: Length, расход и частичный текст сохраняются.
     let mut d = AnthropicDecoder::new(MODEL.into());
-    let e = d
-        .on_event(&sse(json!({"type": "message_delta",
-            "delta": {"stop_reason": "model_context_window_exceeded"},
-            "usage": {"output_tokens": 10}})))
-        .unwrap_err();
-    assert_eq!(e.class, ErrorClass::ContextOverflow);
+    d.on_event(&sse(json!({"type": "message_start", "message": {"usage":
+        {"input_tokens": 900, "output_tokens": 1}}})))
+        .unwrap();
+    d.on_event(&sse(json!({"type": "content_block_start", "index": 0,
+        "content_block": {"type": "text", "text": ""}})))
+        .unwrap();
+    d.on_event(&sse(json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "Начало ответа"}})))
+        .unwrap();
+    d.on_event(&sse(json!({"type": "message_delta",
+        "delta": {"stop_reason": "model_context_window_exceeded"},
+        "usage": {"output_tokens": 10}})))
+        .unwrap();
+    let evs = d.on_event(&sse(json!({"type": "message_stop"}))).unwrap();
+    let Some(StreamEvent::Finished {
+        message,
+        finish,
+        usage,
+    }) = evs.last()
+    else {
+        panic!("{evs:?}");
+    };
+    assert_eq!(finish, &FinishReason::Length);
+    assert_eq!(message.parts, vec![Part::Text("Начало ответа".into())]);
+    assert_eq!(usage.input, 900);
+    assert_eq!(usage.output, 10);
 }
 
 #[test]

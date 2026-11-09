@@ -48,7 +48,7 @@
   - `usage` из `message_start` и `message_delta`: `input_tokens` → `input`, `cache_read_input_tokens` → `cached`, `cache_creation_input_tokens` → `cache_write`, `output_tokens` → `output`, `output_tokens_details.thinking_tokens` → `reasoning` (ревью M4). В стриме `thinking_tokens` приходит только в последнем `message_delta`.
   - Блоки по `index`: `text`; `thinking` (`thinking_delta` → `ReasoningDelta`, `signature_delta` копится); `redacted_thinking` целиком; `tool_use` → `ToolCallStart` с номером вызова 0, 1, …; `input_json_delta` → `ToolCallArgs`. Прочие блоки (`server_tool_use`, `fallback` и т. п.) пропускаются с `debug` и в историю не возвращаются. Пока серверные инструменты не используются, это допустимо (ревью M1).
   - `stop_reason`: `end_turn` и `stop_sequence` → `Stop`, `tool_use` → `ToolCalls`, `max_tokens` → `Length`, `refusal` → `Refusal` (это не ошибка, `stop_details` пишется в `info`), `pause_turn` и прочие → `Other` как есть.
-  - `model_context_window_exceeded` → ошибка `ContextOverflow`, тот же класс, что у 400 о длине (ревью M3, решение контроллера).
+  - `model_context_window_exceeded` → `Length`: по документации это обрезанный, но валидный ответ, расход и частичный вывод сохраняются (ревью M3; решение раунда 1 о `ContextOverflow` контроллер отменил в раунде 2). `ContextOverflow` — только для 400 о длине запроса.
   - `message_stop` → `Finished`. Конец тела без `message_stop` — `StreamCut`; законченный `message_stop` без перевода строки — штатный конец.
   - Событие `error` классифицируется по `error.type`: `overloaded_error` → 529 → `Overloaded`, `rate_limit_error` → 429, `api_error` → 500 и т. д.
 - **Возврат рассуждения.**
