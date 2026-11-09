@@ -15,14 +15,25 @@
 //!   `RawArgs::Text` с исходной разметкой — конвейер превращает его в
 //!   `CallRejection::Unparseable`.
 //!
-//! P0 (задача 7): Hermes, Qwen XML, Harmony. P1 (`Dsml`, `Gemma4`,
-//! `MistralToolCalls`, `Pythonic`, `Llama3Json`) — задача 8; до неё `extract`
-//! возвращает текст без изменений.
+//! - **Форматы без маркеров** (`Pythonic`, `Llama3Json`) разбирают только весь
+//!   текст целиком (как парсеры vLLM) и извлекают вызовы, только если хотя бы одно
+//!   имя принято `accept_name` (D28, D39); иначе текст не меняется.
+//!
+//! P0 (задача 7): Hermes, Qwen XML, Harmony. P1 (задача 8): DSML, Gemma 4,
+//! Mistral `[TOOL_CALLS]`, pythonic, llama3_json.
 
+pub(crate) mod dsml;
+pub(crate) mod gemma4;
 mod harmony;
 mod hermes;
+mod llama3_json;
+mod mistral;
+mod pythonic;
 mod qwen_xml;
 
+pub(crate) use mistral::bodies as mistral_bodies;
+
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -75,12 +86,13 @@ impl Extraction {
     }
 }
 
-/// accept_name учитывается только форматами без маркеров (Pythonic, Llama3Json): при false
-/// вызов не извлекается, а remaining == text без изменений (D28, D39). Прочие форматы его игнорируют.
+/// accept_name учитывается форматами без маркеров (Pythonic, Llama3Json): при false
+/// вызов не извлекается, а remaining == text без изменений (D28, D39).
 ///
 /// Уточнение раунда исправлений 1 (I2): Qwen XML тоже требует принятого имени —
 /// `<function=ИМЯ>` с неизвестным и неисправимым именем считается текстом; Harmony —
-/// для обрезанного заголовка без `<|message|>`.
+/// для обрезанного заголовка без `<|message|>`. DSML, Gemma 4 и Mistral (задача 8) —
+/// для обрезанного вызова: без принятого имени он остаётся текстом.
 pub(crate) fn extract(
     format: TextFormat,
     text: &str,
@@ -90,16 +102,70 @@ pub(crate) fn extract(
         TextFormat::Hermes => hermes::extract(text),
         TextFormat::QwenXml => qwen_xml::extract(text, accept_name),
         TextFormat::Harmony => harmony::extract(text, accept_name),
-        // P1 — задача 8.
-        TextFormat::Dsml
-        | TextFormat::Gemma4
-        | TextFormat::MistralToolCalls
-        | TextFormat::Pythonic
-        | TextFormat::Llama3Json => {
-            let _ = accept_name;
-            Extraction::unchanged(text)
-        }
+        TextFormat::Dsml => dsml::extract(text, accept_name),
+        TextFormat::Gemma4 => gemma4::extract(text, accept_name),
+        TextFormat::MistralToolCalls => mistral::extract(text, accept_name),
+        TextFormat::Pythonic => pythonic::extract(text, accept_name),
+        TextFormat::Llama3Json => llama3_json::extract(text, accept_name),
     }
+}
+
+/// Ошибка разбора значения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseError {
+    /// Текст кончился посреди значения (обрыв).
+    Eof,
+    /// Синтаксическая ошибка в этой байтовой позиции.
+    Syntax(usize),
+}
+
+/// Одно JSON-значение, начинающееся в `from` (пробелы перед ним допускаются):
+/// (значение, конец значения). Текст после значения не читается.
+pub(crate) fn json_at<T: DeserializeOwned>(
+    text: &str,
+    from: usize,
+) -> Result<(T, usize), ParseError> {
+    let slice = &text[from..];
+    let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<T>();
+    match stream.next() {
+        Some(Ok(v)) => Ok((v, from + stream.byte_offset())),
+        Some(Err(e)) if e.is_eof() => Err(ParseError::Eof),
+        Some(Err(e)) => Err(ParseError::Syntax(from + error_offset(slice, &e))),
+        None => Err(ParseError::Eof),
+    }
+}
+
+/// Байтовая позиция ошибки `serde_json` (строка и столбец в байтах) в `slice`.
+fn error_offset(slice: &str, e: &serde_json::Error) -> usize {
+    let line_start = if e.line() <= 1 {
+        0
+    } else {
+        slice
+            .match_indices('\n')
+            .nth(e.line() - 2)
+            .map_or(slice.len(), |(i, _)| i + 1)
+    };
+    let mut at = (line_start + e.column()).min(slice.len());
+    while !slice.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// Символ имени инструмента в форматах, где имя не ограничено кавычками.
+pub(crate) fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// Длина имени инструмента (в байтах), начинающегося в `from`.
+pub(crate) fn name_len(text: &str, from: usize) -> usize {
+    let rest = &text[from..];
+    rest.find(|c: char| !is_name_char(c)).unwrap_or(rest.len())
+}
+
+/// Позиция первого непробельного символа не раньше `from`.
+pub(crate) fn skip_ws(text: &str, from: usize) -> usize {
+    text.len() - text[from..].trim_start().len()
 }
 
 /// Текст без вырезанных диапазонов `spans` (отсортированы, не пересекаются).

@@ -16,7 +16,7 @@
 
 use serde_json::{Map, Value};
 
-use super::{Extraction, Finder, RawArgs, RawCall, splice};
+use super::{Extraction, Finder, ParseError, RawArgs, RawCall, json_at, splice};
 
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
@@ -46,11 +46,11 @@ pub(super) fn extract(text: &str) -> Extraction {
                 calls.extend(values.into_iter().map(call_from_value));
                 end
             }
-            Err(JsonError::Eof) => {
+            Err(ParseError::Eof) => {
                 calls.push(RawCall::broken(&text[start..]));
                 text.len()
             }
-            Err(JsonError::Syntax(error_at)) => {
+            Err(ParseError::Syntax(error_at)) => {
                 let next_open = open.find(body_start);
                 match close.find(error_at) {
                     Some(c) if next_open.is_none_or(|o| c < o) => {
@@ -76,30 +76,14 @@ pub(super) fn extract(text: &str) -> Extraction {
     }
 }
 
-/// Ошибка разбора JSON блока.
-enum JsonError {
-    /// Текст кончился посреди JSON.
-    Eof,
-    /// Синтаксическая ошибка в этой позиции.
-    Syntax(usize),
-}
-
 /// JSON-объекты подряд от `from`: (значения, конец последнего) или ошибка.
-fn parse_values(text: &str, from: usize) -> Result<(Vec<Value>, usize), JsonError> {
+fn parse_values(text: &str, from: usize) -> Result<(Vec<Value>, usize), ParseError> {
     let mut values = Vec::new();
     let mut pos = from;
     loop {
-        let slice = &text[pos..];
-        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<Value>();
-        match stream.next() {
-            Some(Ok(v)) => {
-                pos += stream.byte_offset();
-                values.push(v);
-            }
-            Some(Err(e)) if e.is_eof() => return Err(JsonError::Eof),
-            Some(Err(e)) => return Err(JsonError::Syntax(pos + error_offset(slice, &e))),
-            None => break,
-        }
+        let (v, end) = json_at::<Value>(text, pos)?;
+        values.push(v);
+        pos = end;
         let rest = &text[pos..];
         let trimmed = rest.trim_start();
         if !trimmed.starts_with('{') {
@@ -110,24 +94,9 @@ fn parse_values(text: &str, from: usize) -> Result<(Vec<Value>, usize), JsonErro
     Ok((values, pos))
 }
 
-/// Байтовая позиция ошибки `serde_json` (строка и столбец в байтах) в `slice`.
-fn error_offset(slice: &str, e: &serde_json::Error) -> usize {
-    let line_start = if e.line() <= 1 {
-        0
-    } else {
-        slice
-            .match_indices('\n')
-            .nth(e.line() - 2)
-            .map_or(slice.len(), |(i, _)| i + 1)
-    };
-    let mut at = (line_start + e.column()).min(slice.len());
-    while !slice.is_char_boundary(at) {
-        at += 1;
-    }
-    at
-}
-
-fn call_from_value(v: Value) -> RawCall {
+/// Вызов из объекта `{"name": …, "arguments" | "parameters": …}` (Hermes, Mistral,
+/// llama3_json); без имени — нераспознанная разметка.
+pub(super) fn call_from_value(v: Value) -> RawCall {
     let Value::Object(mut obj) = v else {
         return RawCall::broken(&v.to_string());
     };

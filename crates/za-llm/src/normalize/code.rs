@@ -18,8 +18,10 @@
 //!
 //! Заборы и обратные кавычки внутри тел вызовов (блок `<tool_call>…</tool_call>`,
 //! `<function=…>…</function>`, вызов Harmony `to=functions.…<|message|>…<|call|>`
-//! или `…<|end|>`; сообщения обычных каналов — не тела вызовов) разметкой
-//! Markdown не считаются: нечётный забор в значении `write_file` иначе спарился бы
+//! или `…<|end|>`; сообщения обычных каналов — не тела вызовов; DSML
+//! `<｜DSML｜invoke name=…>…</｜DSML｜invoke>` или до закрытия обёртки; Gemma 4
+//! `<|tool_call>…<tool_call|>` или `…<turn|>`; Mistral `[TOOL_CALLS]…` до конца
+//! JSON аргументов) разметкой Markdown не считаются: нечётный забор в значении `write_file` иначе спарился бы
 //! с забором примера после вызова и открыл бы пример для исполнения. Тела ищутся по
 //! маркерам по исходному тексту: закрытие должно стоять раньше следующего открытия
 //! того же вида.
@@ -30,7 +32,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::formats::{Finder, RawArgs, RawCall, earliest};
+use super::formats::{Finder, RawArgs, RawCall, dsml, earliest, gemma4, mistral_bodies};
 
 const OPEN: char = '\u{E000}';
 const CLOSE: char = '\u{E001}';
@@ -247,7 +249,7 @@ fn inline_spans(
     }
 }
 
-/// Тела вызовов P0 в исходном тексте; запросы `contains` — с неубывающими позициями.
+/// Тела вызовов форматов с маркерами в исходном тексте; запросы `contains` — с неубывающими позициями.
 struct Bodies {
     spans: Vec<(usize, usize)>,
     next: usize,
@@ -259,6 +261,19 @@ impl Bodies {
         paired(text, "<tool_call>", &["</tool_call>"], &mut spans);
         paired(text, "<function=", &["</function>"], &mut spans);
         harmony_calls(text, &mut spans);
+        let dsml_closes = [
+            dsml::INVOKE_CLOSE,
+            dsml::WRAPPER_CLOSES[0],
+            dsml::WRAPPER_CLOSES[1],
+        ];
+        paired(text, dsml::INVOKE, &dsml_closes, &mut spans);
+        paired(
+            text,
+            gemma4::OPEN,
+            &[gemma4::CLOSE, gemma4::TURN],
+            &mut spans,
+        );
+        spans.extend(mistral_bodies(text));
         // Тела разных видов могут вкладываться (`<tool_call><function=…>…`): нужна
         // только принадлежность, поэтому они сливаются в непересекающиеся отрезки.
         spans.sort_unstable();

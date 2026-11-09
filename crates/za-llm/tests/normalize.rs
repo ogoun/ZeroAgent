@@ -1,10 +1,11 @@
 //! Конвейер нормализации вызовов инструментов (MDL-005, MDL-006) и форматы P0:
-//! Hermes, Qwen XML, Harmony (задача 7).
+//! Hermes, Qwen XML, Harmony (задача 7); форматы P1: DSML, Gemma 4, Mistral,
+//! pythonic, llama3_json (задача 8).
 
 use serde_json::{Value, json};
 use za_llm::normalize::{
-    CallRejection, CallSource, JsonType, MAX_EXTRACTED_CALLS, Repair, all_formats,
-    damerau_levenshtein, extracted_mutation_blocked, normalize, validate_and_coerce,
+    CallRejection, CallSource, JsonType, MAX_EXTRACTED_CALLS, NormalizeOutcome, Repair,
+    all_formats, damerau_levenshtein, extracted_mutation_blocked, normalize, validate_and_coerce,
 };
 use za_llm::{Message, Part, Role, TextFormat, ToolCall, ToolSchema};
 use za_protocol::EffectClass;
@@ -947,4 +948,449 @@ fn code_inside_harmony_channels_stays_hidden() {
     let out = normalize(&text(call), &tools(), all_formats());
     assert_eq!(out.calls.len(), 1);
     assert_eq!(out.calls[0].call.arguments["content"], "`x`");
+}
+
+// ---- Форматы P1 (задача 8): DSML, Gemma 4, Mistral, pythonic, llama3_json ----
+
+/// Нормализация одним форматом.
+fn only(src: &str, format: TextFormat) -> NormalizeOutcome {
+    normalize(&text(src), &tools(), &[format])
+}
+
+/// Похожий на вызов текст остаётся текстом и в одиночном формате, и во всех.
+fn assert_plain(src: &str, format: TextFormat) {
+    for out in [
+        only(src, format),
+        normalize(&text(src), &tools(), all_formats()),
+    ] {
+        assert!(
+            out.calls.is_empty() && out.rejected.is_empty(),
+            "{src}: {:?} {:?}",
+            out.calls,
+            out.rejected
+        );
+        assert_eq!(out.text, src);
+    }
+}
+
+fn dsml_call(name: &str, params: &[(&str, &str, &str)]) -> String {
+    let params: String = params
+        .iter()
+        .map(|(k, s, v)| {
+            format!("<｜DSML｜parameter name=\"{k}\" string=\"{s}\">{v}</｜DSML｜parameter>\n")
+        })
+        .collect();
+    format!(
+        "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"{name}\">\n{params}</｜DSML｜invoke>\n</｜DSML｜function_calls>"
+    )
+}
+
+#[test]
+fn dsml_string_false_is_json() {
+    let out = only(
+        &dsml_call("count", &[("n", "false", "5")]),
+        TextFormat::Dsml,
+    );
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].call.arguments, json!({"n": 5}));
+    assert!(
+        !out.calls[0]
+            .repairs
+            .iter()
+            .any(|r| matches!(r, Repair::TypeCoerced { .. }))
+    );
+    assert_eq!(out.text, "");
+
+    let out = only(&dsml_call("count", &[("n", "true", "5")]), TextFormat::Dsml);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].call.arguments, json!({"n": 5}));
+    assert!(out.calls[0].repairs.contains(&Repair::TypeCoerced {
+        path: "/n".into(),
+        to: JsonType::Integer
+    }));
+    assert!(out.calls[0].repairs.contains(&Repair::ExtractedFromText {
+        format: TextFormat::Dsml
+    }));
+}
+
+#[test]
+fn dsml_lookalike_is_text() {
+    assert_plain(
+        "пример тега <｜DSML｜invoke> без закрытия",
+        TextFormat::Dsml,
+    );
+    assert_plain(
+        "Вызов пишется как <｜DSML｜invoke name=\"read_file\"> и дальше параметры.",
+        TextFormat::Dsml,
+    );
+}
+
+#[test]
+fn dsml_two_invokes_v4_wrapper_and_text_around() {
+    let src = "Читаю.\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"count\">\n<｜DSML｜parameter name=\"n\" string=\"false\">2</｜DSML｜parameter>\n<｜DSML｜parameter name=\"tags\" string=\"false\">[\"x\"]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\nГотово.";
+    let out = only(src, TextFormat::Dsml);
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    let got: Vec<(&str, &Value)> = out
+        .calls
+        .iter()
+        .map(|c| (c.call.name.as_str(), &c.call.arguments))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("read_file", &json!({"path": "a.txt"})),
+            ("count", &json!({"n": 2, "tags": ["x"]}))
+        ]
+    );
+    assert_eq!(out.text, "Читаю.\nГотово.");
+}
+
+#[test]
+fn dsml_truncated_known_is_unparseable() {
+    let src = "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">a.t";
+    let out = only(src, TextFormat::Dsml);
+    assert!(out.calls.is_empty());
+    assert!(matches!(
+        out.rejected[..],
+        [CallRejection::Unparseable { .. }]
+    ));
+    assert_eq!(out.text, "");
+}
+
+#[test]
+fn gemma4_quoted_strings_and_turn_close() {
+    let src = "<|tool_call>call:read_file{path:<|\"|>a.txt<|\"|>}<turn|>";
+    let out = only(src, TextFormat::Gemma4);
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].call.name, "read_file");
+    assert_eq!(out.calls[0].call.arguments, json!({"path": "a.txt"}));
+    assert_eq!(out.text, "");
+}
+
+#[test]
+fn gemma4_lookalike_is_text() {
+    assert_plain("call:read_file{path:a.txt}", TextFormat::Gemma4);
+    assert_plain(
+        "Токен <|tool_call> открывает вызов, а <tool_call|> закрывает.",
+        TextFormat::Gemma4,
+    );
+}
+
+#[test]
+fn gemma4_nested_values_and_several_calls() {
+    let src = "Сейчас.\n<|tool_call>call:count{f:true,n:3,tags:[<|\"|>a,b<|\"|>,<|\"|>}c<|\"|>]}<tool_call|><|tool_call>call:write_file{content:<|\"|>x <tool_call|> y<|\"|>,path:<|\"|>p<|\"|>}<tool_call|>";
+    let out = only(src, TextFormat::Gemma4);
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 2);
+    assert_eq!(
+        out.calls[0].call.arguments,
+        json!({"f": true, "n": 3, "tags": ["a,b", "}c"]})
+    );
+    assert_eq!(
+        out.calls[1].call.arguments,
+        json!({"content": "x <tool_call|> y", "path": "p"})
+    );
+    assert_eq!(out.text, "Сейчас.");
+}
+
+#[test]
+fn gemma4_truncated_and_broken() {
+    let out = only(
+        "<|tool_call>call:read_file{path:<|\"|>a.t",
+        TextFormat::Gemma4,
+    );
+    assert!(out.calls.is_empty());
+    assert!(matches!(
+        out.rejected[..],
+        [CallRejection::Unparseable { .. }]
+    ));
+    assert_eq!(out.text, "");
+    // Синтаксическая ошибка до закрывающего тега — отклонение до него.
+    let out = only(
+        "<|tool_call>call:read_file{path:[}<tool_call|>\nдальше",
+        TextFormat::Gemma4,
+    );
+    assert!(matches!(
+        out.rejected[..],
+        [CallRejection::Unparseable { .. }]
+    ));
+    assert_eq!(out.text, "дальше");
+    // Обрыв с неизвестным именем — текст.
+    assert_plain("<|tool_call>call:frobnicate{x:<|\"|>a", TextFormat::Gemma4);
+}
+
+#[test]
+fn mistral_new_and_old_forms() {
+    for src in [
+        "[TOOL_CALLS]read_file[ARGS]{\"path\":\"a.txt\"}",
+        "[TOOL_CALLS][{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}]",
+        "[TOOL_CALLS]read_file[CALL_ID]a1B2c3D4e[ARGS]{\"path\":\"a.txt\"}",
+        "[TOOL_CALLS]read_file{\"path\":\"a.txt\"}",
+    ] {
+        let out = only(src, TextFormat::MistralToolCalls);
+        assert!(out.rejected.is_empty(), "{src}: {:?}", out.rejected);
+        assert_eq!(out.calls.len(), 1, "{src}");
+        assert_eq!(out.calls[0].call.name, "read_file");
+        assert_eq!(out.calls[0].call.arguments, json!({"path": "a.txt"}));
+        assert!(out.calls[0].repairs.contains(&Repair::ExtractedFromText {
+            format: TextFormat::MistralToolCalls
+        }));
+        assert_eq!(out.text, "");
+    }
+}
+
+#[test]
+fn mistral_lookalike_is_text() {
+    assert_plain(
+        "в логе было [TOOL_CALLS] без вызова",
+        TextFormat::MistralToolCalls,
+    );
+    assert_plain(
+        "[TOOL_CALLS][1, 2] — не вызов",
+        TextFormat::MistralToolCalls,
+    );
+}
+
+#[test]
+fn mistral_parallel_calls_and_trailing_text() {
+    let src =
+        "Делаю.[TOOL_CALLS]read_file[ARGS]{\"path\":\"a\"}[TOOL_CALLS]count[ARGS]{\"n\":1} и всё";
+    let out = only(src, TextFormat::MistralToolCalls);
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    let names: Vec<&str> = out.calls.iter().map(|c| c.call.name.as_str()).collect();
+    assert_eq!(names, ["read_file", "count"]);
+    assert_eq!(out.text, "Делаю. и всё");
+
+    let out = only(
+        "[TOOL_CALLS]read_file[ARGS]{\"path\":\"a",
+        TextFormat::MistralToolCalls,
+    );
+    assert!(matches!(
+        out.rejected[..],
+        [CallRejection::Unparseable { .. }]
+    ));
+    assert_eq!(out.text, "");
+}
+
+#[test]
+fn pythonic_literals() {
+    let src = "[count(n=5, tags=[\"a\",\"b\"], f=True)]";
+    let out = only(src, TextFormat::Pythonic);
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(
+        out.calls[0].call.arguments,
+        json!({"n": 5, "tags": ["a", "b"], "f": true})
+    );
+    assert_eq!(out.text, "");
+}
+
+#[test]
+fn pythonic_unknown_name_is_text() {
+    assert_plain("[print(x)]", TextFormat::Pythonic);
+    assert_plain(
+        "[read_file(path=\"a\")] — так выглядит вызов",
+        TextFormat::Pythonic,
+    );
+    assert_plain("[1, 2, 3]", TextFormat::Pythonic);
+}
+
+#[test]
+fn pythonic_strings_numbers_and_tokens() {
+    let src = "<|python_tag|>[write_file(path='a\\'b', content=\"\"\"line1\nline2 \\u00e9\"\"\"), count(n=1_000, tags=(), f=False,)]<|eot_id|>";
+    let out = only(src, TextFormat::Pythonic);
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 2);
+    assert_eq!(
+        out.calls[0].call.arguments,
+        json!({"path": "a'b", "content": "line1\nline2 é"})
+    );
+    assert_eq!(
+        out.calls[1].call.arguments,
+        json!({"n": 1000, "tags": [], "f": false})
+    );
+    assert_eq!(out.text, "");
+    // Обрыв с известным именем — отклонение.
+    let out = only("[read_file(path=\"a", TextFormat::Pythonic);
+    assert!(matches!(
+        out.rejected[..],
+        [CallRejection::Unparseable { .. }]
+    ));
+    assert_eq!(out.text, "");
+}
+
+#[test]
+fn llama3_json_whole_content_only() {
+    let out = only(
+        "<|python_tag|>{\"name\":\"read_file\",\"parameters\":{\"path\":\"a.txt\"}}",
+        TextFormat::Llama3Json,
+    );
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].call.arguments, json!({"path": "a.txt"}));
+    assert_eq!(out.text, "");
+    assert_plain(
+        "Ответ: {\"name\":\"read_file\",\"parameters\":{}} — пример",
+        TextFormat::Llama3Json,
+    );
+}
+
+#[test]
+fn llama3_json_unknown_name_is_text() {
+    assert_plain(
+        "{\"name\":\"Вася\",\"parameters\":{}}",
+        TextFormat::Llama3Json,
+    );
+    assert_plain("{\"name\":\"read_file\"}", TextFormat::Llama3Json);
+}
+
+#[test]
+fn llama3_json_several_and_truncated() {
+    let src = "{\"name\":\"read_file\",\"parameters\":{\"path\":\"a\"}}; {\"name\":\"count\",\"arguments\":{\"n\":2}}<|eom_id|>";
+    let out = only(src, TextFormat::Llama3Json);
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    let names: Vec<&str> = out.calls.iter().map(|c| c.call.name.as_str()).collect();
+    assert_eq!(names, ["read_file", "count"]);
+    assert_eq!(out.text, "");
+
+    let out = only(
+        "{\"name\": \"read_file\", \"parameters\": {\"path\": \"a",
+        TextFormat::Llama3Json,
+    );
+    assert!(matches!(
+        out.rejected[..],
+        [CallRejection::Unparseable { .. }]
+    ));
+    assert_eq!(out.text, "");
+    assert_plain(
+        "{\"name\": \"frobnicate\", \"parameters\": {",
+        TextFormat::Llama3Json,
+    );
+}
+
+/// Заборы и кавычки внутри тел вызовов P1 не считаются Markdown, а примеры в коде
+/// не исполняются.
+#[test]
+fn p1_call_bodies_and_code_examples() {
+    let gemma = "<|tool_call>call:write_file{content:<|\"|>```\nfn x() {}\n<|\"|>,path:<|\"|>a<|\"|>}<tool_call|>\n```\nпример\n```";
+    let out = normalize(&text(gemma), &tools(), all_formats());
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].call.arguments["content"], "```\nfn x() {}\n");
+    assert_eq!(out.text, "```\nпример\n```");
+
+    let mistral = "[TOOL_CALLS]write_file[ARGS]{\"path\":\"a\",\"content\":\"`\"}[TOOL_CALLS]write_file[ARGS]{\"path\":\"b\",\"content\":\"`\"}";
+    let out = normalize(&text(mistral), &tools(), all_formats());
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 2);
+
+    let dsml = format!(
+        "{}\n```\nпример\n```",
+        dsml_call(
+            "write_file",
+            &[("path", "true", "a"), ("content", "true", "```")]
+        )
+    );
+    let out = normalize(&text(&dsml), &tools(), all_formats());
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].call.arguments["content"], "```");
+    assert_eq!(out.text, "```\nпример\n```");
+
+    for example in [
+        "Пример:\n```\n[TOOL_CALLS]read_file[ARGS]{\"path\":\"x\"}\n```".to_owned(),
+        "Пример: `<|tool_call>call:read_file{path:<|\"|>x<|\"|>}<tool_call|>`".to_owned(),
+        format!(
+            "Пример:\n```\n{}\n```",
+            dsml_call("read_file", &[("path", "true", "x")])
+        ),
+    ] {
+        let out = normalize(&text(&example), &tools(), all_formats());
+        assert!(out.calls.is_empty() && out.rejected.is_empty(), "{example}");
+        assert_eq!(out.text, example);
+    }
+}
+
+/// Линейность форматов P1: ~1,2 МБ повторов меньше секунды в debug.
+#[test]
+fn megabyte_of_repeated_p1_markers_is_linear() {
+    let units: Vec<String> = vec![
+        // DSML
+        "<｜DSML｜invoke name=\"x\">".into(),
+        "<｜DSML｜invoke name=\"read_file\">".into(),
+        "<｜DSML｜invoke name=\"count\">\n<｜DSML｜parameter name=\"n\" string=\"false\">".into(),
+        "<｜DSML｜function_calls>".into(),
+        dsml_call("count", &[("n", "false", "1")]),
+        // Gemma 4
+        "<|tool_call>".into(),
+        "<|tool_call>call:x{".into(),
+        "<|tool_call>call:read_file{path:<|\"|>".into(),
+        "<|tool_call>call:count{n:[".into(),
+        "<|tool_call>call:count{n:1}<tool_call|>".into(),
+        // Mistral
+        "[TOOL_CALLS]".into(),
+        "[TOOL_CALLS][{\"name\":\"".into(),
+        "[TOOL_CALLS]x[ARGS]{".into(),
+        "[TOOL_CALLS]read_file[ARGS]{\"path\":\"a\"}".into(),
+        "[TOOL_CALLS]read_file[ARGS]{\"path\":[".into(),
+        // pythonic
+        "[read_file(path=\"a\"), ".into(),
+        "[".into(),
+        "[count(tags=[".into(),
+        "[count(n=\"".into(),
+        // llama3_json
+        "{\"name\":\"read_file\",\"parameters\":{\"path\":\"a\"}};".into(),
+        "{".into(),
+        "<|python_tag|>".into(),
+    ];
+    let tools = tools();
+    for unit in units {
+        let src = unit.repeat(1_200_000 / unit.len());
+        let started = std::time::Instant::now();
+        let out = normalize(&text(&src), &tools, all_formats());
+        let took = started.elapsed();
+        assert!(took.as_secs_f64() < 1.0, "{unit:?}: {took:?}");
+        assert!(
+            out.calls.len() + out.rejected.len() <= MAX_EXTRACTED_CALLS as usize + 1,
+            "{unit:?}"
+        );
+    }
+}
+
+/// Любой префикс ответа P1 (обрыв стрима) разбирается без паники; принятые
+/// вызовы проходят схему.
+#[test]
+fn every_truncation_point_is_safe_p1() {
+    let tools = tools();
+    for src in [
+        format!(
+            "Т ✓.\n{}",
+            dsml_call(
+                "count",
+                &[("n", "false", "5"), ("tags", "false", "[\"я\"]")]
+            )
+        ),
+        "Т ✓.\n<|tool_call>call:count{n:5,tags:[<|\"|>я<|\"|>]}<tool_call|>".to_owned(),
+        "Т ✓.[TOOL_CALLS]count[ARGS]{\"n\":5,\"tags\":[\"я\"]}".to_owned(),
+        "[count(n=5, tags=[\"я\"])]".to_owned(),
+        "<|python_tag|>{\"name\":\"count\",\"parameters\":{\"n\":5,\"tags\":[\"я\"]}}".to_owned(),
+    ] {
+        for (i, _) in src.char_indices() {
+            let out = normalize(&text(&src[..i]), &tools, all_formats());
+            assert!(out.calls.len() + out.rejected.len() <= 1, "{src} / {i}");
+            for c in &out.calls {
+                let schema = &tools
+                    .iter()
+                    .find(|t| t.name == c.call.name)
+                    .unwrap()
+                    .parameters;
+                let mut args = c.call.arguments.clone();
+                assert_eq!(validate_and_coerce(schema, &mut args), Ok(vec![]), "{i}");
+            }
+        }
+        let full = normalize(&text(&src), &tools, all_formats());
+        assert_eq!(full.calls.len(), 1, "{src}");
+        assert!(full.rejected.is_empty(), "{src}");
+    }
 }
