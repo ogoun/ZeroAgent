@@ -579,6 +579,32 @@ fn roles_use_run_role_names() {
 }
 
 #[test]
+fn key_refs_with_same_env_var_are_rejected() {
+    // Финальное ревью M4: `a.b`, `a-b`, `A_B` дают одну переменную `ZA_SECRET_A_B` —
+    // два эндпоинта молча делили бы один ключ.
+    let c = cfg(json!({"endpoints": [
+        {"id": "x", "backend": "openrouter", "model": "a/b", "key_ref": "team.a"},
+        {"id": "y", "backend": "openrouter", "model": "c/d", "key_ref": "team-a"}
+    ]}));
+    let err = c.validate().unwrap_err();
+    assert_eq!(
+        err,
+        ConfigError::KeyRefEnvCollision {
+            first: EndpointId("x".into()),
+            second: EndpointId("y".into())
+        }
+    );
+    let text = err.to_string();
+    assert!(!text.contains("team"), "значение key_ref в тексте: {text}");
+    // Одинаковый key_ref у двух эндпоинтов — один ключ намеренно, не ошибка.
+    let same = cfg(json!({"endpoints": [
+        {"id": "x", "backend": "openrouter", "model": "a/b", "key_ref": "team-a"},
+        {"id": "y", "backend": "openrouter", "model": "c/d", "key_ref": "team-a"}
+    ]}));
+    assert_eq!(same.validate(), Ok(vec![]));
+}
+
+#[test]
 fn budget_without_cost_source_is_config_error() {
     // Финальное ревью I2: стоимость сообщает только OpenRouter; у прочих бэкендов без
     // `price` расход не учитывается и бюджет не наступил бы никогда.

@@ -43,6 +43,8 @@ pub mod pause_reason {
     pub const RESOURCE: &str = "resource";
     /// Провайдер модели недоступен или отказал, повторы исчерпаны (MDL-016).
     pub const PROVIDER: &str = "provider";
+    /// Дневной бюджет облачной группы исчерпан (RES-004, `QueueError::BudgetExhausted`).
+    pub const BUDGET: &str = "budget";
 }
 
 impl RunStatus {

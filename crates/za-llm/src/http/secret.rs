@@ -74,22 +74,7 @@ pub fn missing_key_reason(key_ref: &str) -> String {
     )
 }
 
-/// Имя переменной окружения ключа: `ZA_SECRET_` и `key_ref` в верхнем регистре,
-/// где `-` и любой другой символ вне `[A-Za-z0-9_]` заменён на `_`.
-/// `"open-router"` → `"ZA_SECRET_OPEN_ROUTER"`.
-pub fn secret_env_name(key_ref: &str) -> String {
-    let tail: String = key_ref
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("ZA_SECRET_{tail}")
-}
+pub use crate::config::secret_env_name;
 
 /// Заменяет вхождения ключей на `***` и обрезает текст до 2 КиБ (по границе
 /// символа, с `…` в конце). Сначала замена, потом обрезка: обрезка не может

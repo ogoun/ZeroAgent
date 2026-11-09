@@ -49,8 +49,12 @@ pub use caps::{
     TextFormat, ThinkingSupport, TokenCountSource, ToolFormat, ToolIdFormat, Wire, default_caps,
 };
 pub use error::{ErrorClass, ModelError};
+// Явный список (D38): новый `pub` в `gateway` не расширяет поверхность крейта сам.
 #[cfg(feature = "gateway")]
-pub use gateway::*;
+pub use gateway::{
+    DEFAULT_LOCAL_PARALLEL, DEFAULT_PROBE_DEADLINE, DEFAULT_REPROBE_MAX, DEFAULT_REPROBE_MIN,
+    EndpointView, Gateway, GatewayOptions, ResourcesView, SelectError, Selection,
+};
 #[cfg(feature = "http")]
 pub use http::{EnvSecrets, Secret, SecretSource};
 pub use port::{AbortOnDrop, BoxFuture, ModelCall, ModelPort, ModelStream, RequestMeta};

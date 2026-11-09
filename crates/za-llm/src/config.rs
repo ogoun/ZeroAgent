@@ -120,6 +120,16 @@ pub enum ConfigError {
         "models.endpoints[{0}]: у группы задан daily_budget_usd, но стоимость запросов неизвестна —          этот бэкенд её не сообщает; задайте price (USD за миллион токенов: input_per_mtok, output_per_mtok)          или уберите бюджет"
     )]
     BudgetWithoutPrice(EndpointId),
+    /// Разные `key_ref` двух эндпоинтов дают одну переменную окружения
+    /// ([`secret_env_name`]: регистр, `-` и `.` не различаются) — эндпоинты молча делили
+    /// бы ключ. Значения `key_ref` не печатаются.
+    #[error(
+        "models.endpoints[{second}].key_ref: отличается от key_ref эндпоинта {first}, но даёт ту же переменную ZA_SECRET_… (регистр, `-` и `.` не различаются); задайте одинаковый key_ref или различимые имена"
+    )]
+    KeyRefEnvCollision {
+        first: EndpointId,
+        second: EndpointId,
+    },
 }
 
 /// Предупреждение конфигурации.
@@ -167,7 +177,31 @@ impl ModelsConfig {
             }
         }
         self.validate_budget_cost()?;
+        self.validate_key_env()?;
         Ok(self.budget_warnings())
+    }
+
+    /// Разные `key_ref` с одним именем переменной окружения — ошибка (финальное ревью M4).
+    fn validate_key_env(&self) -> Result<(), ConfigError> {
+        let mut seen: BTreeMap<String, (&str, &EndpointId)> = BTreeMap::new();
+        for ep in &self.endpoints {
+            let Some(k) = ep.key_ref.as_deref() else {
+                continue;
+            };
+            match seen.get(&secret_env_name(k)) {
+                Some((other, first)) if *other != k => {
+                    return Err(ConfigError::KeyRefEnvCollision {
+                        first: (*first).clone(),
+                        second: ep.id.clone(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(secret_env_name(k), (k, &ep.id));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Бюджет группы действует, только если стоимость известна для каждого эндпоинта
@@ -219,6 +253,24 @@ impl ModelsConfig {
             })
             .collect()
     }
+}
+
+/// Имя переменной окружения ключа: `ZA_SECRET_` и `key_ref` в верхнем регистре,
+/// где `-` и любой другой символ вне `[A-Za-z0-9_]` заменён на `_`.
+/// `"open-router"` → `"ZA_SECRET_OPEN_ROUTER"`. Здесь, а не в `http`: проверка
+/// конфигурации работает и без сетевых функций крейта.
+pub fn secret_env_name(key_ref: &str) -> String {
+    let tail: String = key_ref
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("ZA_SECRET_{tail}")
 }
 
 /// Роль по serde-имени.
