@@ -1,13 +1,16 @@
 //! Цикл агента zero-agent поверх примитивов `za-core` (ADR 0004, D1).
 //!
 //! Крейт держит код над примитивами: промпты приложения A ([`role_core`],
-//! [`render_env`], [`render_task`], [`render_control`], [`escape_untrusted`]) и порт
+//! [`render_env`], [`render_task`], [`render_control`], [`escape_untrusted`]), историю
+//! диалога ([`Conversation`], атомарная фиксация хода, D10) и порт
 //! памяти ([`MemoryPort`], режим L0 — [`NoMemory`]). Модель вызывается только через
 //! `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
+mod conversation;
 mod memory;
 mod prompt;
 
+pub use conversation::{Conversation, HistoryError, LoadError, Persisted};
 pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};
 pub use prompt::{
     AGENTS_MD_LIMIT, BRANCH_MAX_CHARS, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo, LEFT_ANGLES,
