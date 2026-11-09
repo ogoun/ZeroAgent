@@ -9,7 +9,7 @@ use za_core::{
     BoxFuture, Exit, Graph, GraphError, Interrupt, InterruptKind, Node, NodeId, Transition,
     pause_reason_for,
 };
-use za_protocol::{EffectKey, RunId, RunRole, pause_reason};
+use za_protocol::{EffectKey, EventKind, RunId, RunRole, Seq, pause_reason};
 use za_store::{NewRun, ProjectStore};
 
 /// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
@@ -181,6 +181,59 @@ fn graph_hash_depends_on_edges() {
     assert_ne!(h1, other_entry);
 }
 
+/// Граф без поведения: только структура для хэша.
+fn shape(entry: NodeId, nodes: &[NodeId], edges: &[(NodeId, NodeId)]) -> Graph<St, String> {
+    let mut g = Graph::new(entry);
+    for &n in nodes {
+        g = g.node(node(n, done));
+    }
+    for &(f, t) in edges {
+        g = g.edge(f, t);
+    }
+    g
+}
+
+#[test]
+fn graph_hash_depends_on_nodes() {
+    let h1 = shape("a", &["a", "b"], &[("a", "b")]).graph_hash();
+    // Добавление, удаление и переименование узла без изменения рёбер.
+    let added = shape("a", &["a", "b", "c"], &[("a", "b")]).graph_hash();
+    let removed = shape("a", &["a"], &[("a", "b")]).graph_hash();
+    let renamed = shape("a", &["a", "c"], &[("a", "b")]).graph_hash();
+    for other in [&added, &removed, &renamed] {
+        assert_ne!(&h1, other);
+    }
+    assert_ne!(added, removed);
+    assert_ne!(added, renamed);
+    assert_ne!(removed, renamed);
+}
+
+#[test]
+fn graph_hash_is_injective_on_structure() {
+    // Пара из ревью: при маркерах без счётчиков входы BLAKE3 совпадали.
+    let a = shape("a", &["a", "edges", "f", "g", "h"], &[]).graph_hash();
+    let b = shape("a", &["a"], &[("f", "g"), ("h", "edges")]).graph_hash();
+    assert_ne!(a, b);
+    // Узел против ребра с теми же строками.
+    let c = shape("a", &["a", "b"], &[]).graph_hash();
+    let d = shape("a", &["a"], &[("b", "b")]).graph_hash();
+    assert_ne!(c, d);
+}
+
+#[tokio::test]
+async fn duplicate_node_is_error() {
+    let g = Graph::new("a")
+        .node(node("a", done))
+        .node(node("b", done))
+        .node(node("a", to_b))
+        .edge("a", "b");
+    let exit = g.run_from("a", &mut St::default()).await;
+    assert!(
+        matches!(exit, Err(GraphError::DuplicateNode("a"))),
+        "{exit:?}"
+    );
+}
+
 #[test]
 fn interrupt_ids_are_deterministic() {
     let k = EffectKey("r:1:2".into());
@@ -237,9 +290,9 @@ fn interrupt_kinds_map_to_ids_and_reasons() {
     }
 }
 
-#[tokio::test]
-async fn interrupt_state_reads_resolution() {
-    let s = ProjectStore::open(&dir("state")).unwrap();
+/// Хранилище и созданный в нём run.
+async fn setup(name: &str) -> (ProjectStore, RunId) {
+    let s = ProjectStore::open(&dir(name)).unwrap();
     let run = RunId::new();
     s.create_run(NewRun {
         id: run,
@@ -250,6 +303,39 @@ async fn interrupt_state_reads_resolution() {
     })
     .await
     .unwrap();
+    (s, run)
+}
+
+#[tokio::test]
+async fn interrupt_open_is_idempotent() {
+    let (s, run) = setup("double-open").await;
+    let key = EffectKey(format!("{run}:2:1"));
+    let first = Interrupt::for_effect(InterruptKind::Approval, &key, json!({"call": "a"}));
+    interrupt::open(&s, run, &first).await.unwrap();
+    // Повтор с тем же payload и с другим (warn): действует первая запись.
+    interrupt::open(&s, run, &first).await.unwrap();
+    let changed = Interrupt::for_effect(InterruptKind::Approval, &key, json!({"call": "b"}));
+    interrupt::open(&s, run, &changed).await.unwrap();
+    assert_eq!(
+        interrupt::state(&s, &first.id).await.unwrap(),
+        Some(InterruptState::Open)
+    );
+    let rows = s.interrupts(run).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].payload, Some(json!({"call": "a"})));
+    let opened = s
+        .read_run(run, Seq(0), 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::InterruptOpened)
+        .count();
+    assert_eq!(opened, 1);
+}
+
+#[tokio::test]
+async fn interrupt_state_reads_resolution() {
+    let (s, run) = setup("state").await;
     let i = Interrupt::for_effect(
         InterruptKind::Input,
         &EffectKey(format!("{run}:1:0")),

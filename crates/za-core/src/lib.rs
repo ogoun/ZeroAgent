@@ -16,7 +16,7 @@
 //! журнала и протокола эффектов, [`replay_hash`] — хэш его значимых событий.
 
 mod demo;
-pub mod graph;
+mod graph;
 pub mod interrupt;
 mod recovery;
 mod runtime;

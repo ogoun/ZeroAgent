@@ -9,7 +9,7 @@
 
 use serde_json::{Value, json};
 use za_protocol::{EffectClass, EffectKey, RunId};
-use za_store::{EffectRow, ProjectStore, StoreError};
+use za_store::{EffectRow, INTERRUPT_OPEN, ProjectStore, StoreError};
 
 use crate::interrupt::{self, Interrupt, InterruptKind};
 use crate::runtime::{error_envelope, ok_envelope};
@@ -101,9 +101,6 @@ impl UnknownDecision {
 
 /// Текст отказа эффекта, который человек признал невыполненным; читает модель.
 pub const NOT_DONE_MESSAGE: &str = "not executed: the user decided the action did not happen";
-
-/// Состояние открытого прерывания в журнале.
-const INTERRUPT_OPEN: &str = "open";
 
 /// Закрывает эффект прерывания `unk-…` квитанцией (D16) и решает прерывание
 /// ответом `{"decision": "done" | "not_done"}`. Возвращает действующее решение.

@@ -24,10 +24,10 @@ use crate::{ProjectStore, StoreError};
 /// MIME-тип blob с результатом эффекта.
 const RESULT_MIME: &str = "application/json";
 
-/// Статус только что открытого прерывания.
-const INTERRUPT_OPEN: &str = "open";
-/// Статус решённого прерывания.
-const INTERRUPT_RESOLVED: &str = "resolved";
+/// Статус (`InterruptRow::status`) только что открытого прерывания.
+pub const INTERRUPT_OPEN: &str = "open";
+/// Статус (`InterruptRow::status`) решённого прерывания.
+pub const INTERRUPT_RESOLVED: &str = "resolved";
 
 /// Столбцы прерывания в порядке [`interrupt_from`].
 const INTERRUPT_COLS: &str = "SELECT id, run_id, kind, status, payload, response FROM interrupts";

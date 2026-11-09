@@ -54,6 +54,9 @@ pub enum GraphError<E> {
     /// `Goto` по ребру, которое не объявлено.
     #[error("переход {from} -> {to} не объявлен")]
     UndeclaredEdge { from: NodeId, to: NodeId },
+    /// Два узла объявлены с одним id.
+    #[error("узел {0} объявлен дважды")]
+    DuplicateNode(NodeId),
 }
 
 /// Граф: узлы, рёбра и вход.
@@ -61,6 +64,8 @@ pub struct Graph<S, E> {
     nodes: BTreeMap<NodeId, Box<dyn Node<S, E>>>,
     edges: BTreeSet<(NodeId, NodeId)>,
     entry: NodeId,
+    /// Первый повторно объявленный id; [`Graph::run_from`] отвечает на него ошибкой.
+    duplicate: Option<NodeId>,
 }
 
 impl<S: Send, E: std::fmt::Display + std::fmt::Debug> Graph<S, E> {
@@ -70,12 +75,20 @@ impl<S: Send, E: std::fmt::Display + std::fmt::Debug> Graph<S, E> {
             nodes: BTreeMap::new(),
             edges: BTreeSet::new(),
             entry,
+            duplicate: None,
         }
     }
 
-    /// Добавляет узел; узел с тем же id заменяет прежний.
+    /// Добавляет узел. Повторный id — ошибка программиста: остаётся первый узел,
+    /// а [`Self::run_from`] возвращает [`GraphError::DuplicateNode`].
     pub fn node(mut self, n: Box<dyn Node<S, E>>) -> Self {
-        self.nodes.insert(n.id(), n);
+        let id = n.id();
+        if self.nodes.contains_key(id) {
+            tracing::warn!(node = id, "узел графа объявлен дважды");
+            self.duplicate.get_or_insert(id);
+        } else {
+            self.nodes.insert(id, n);
+        }
         self
     }
 
@@ -87,23 +100,29 @@ impl<S: Send, E: std::fmt::Display + std::fmt::Debug> Graph<S, E> {
 
     /// BLAKE3 hex от `"za-graph-v1\0"`, входа, отсортированных id узлов и рёбер
     /// (CORE-008 в R2). Порядок вызовов [`Self::node`] и [`Self::edge`] не влияет.
-    /// Каждая строка пишется с длиной (u64 LE), чтобы границы были однозначны.
+    ///
+    /// Формат v1 инъективен: после метки версии идут вход, число узлов, id узлов,
+    /// число рёбер и пары рёбер; числа — u64 LE, строка — длина u64 LE и байты.
+    /// Разные графы дают разные входы BLAKE3.
     pub fn graph_hash(&self) -> String {
+        fn put_u64(h: &mut blake3::Hasher, n: usize) {
+            h.update(&(n as u64).to_le_bytes());
+        }
+        fn put_str(h: &mut blake3::Hasher, s: &str) {
+            put_u64(h, s.len());
+            h.update(s.as_bytes());
+        }
         let mut h = blake3::Hasher::new();
         h.update(b"za-graph-v1\0");
-        let mut put = |s: &str| {
-            h.update(&(s.len() as u64).to_le_bytes());
-            h.update(s.as_bytes());
-        };
-        put(self.entry);
-        put("nodes");
+        put_str(&mut h, self.entry);
+        put_u64(&mut h, self.nodes.len());
         for id in self.nodes.keys() {
-            put(id);
+            put_str(&mut h, id);
         }
-        put("edges");
+        put_u64(&mut h, self.edges.len());
         for (from, to) in &self.edges {
-            put(from);
-            put(to);
+            put_str(&mut h, from);
+            put_str(&mut h, to);
         }
         h.finalize().to_hex().to_string()
     }
@@ -112,8 +131,16 @@ impl<S: Send, E: std::fmt::Display + std::fmt::Debug> Graph<S, E> {
     ///
     /// Неизвестный узел (в том числе цель объявленного ребра) —
     /// [`GraphError::UnknownNode`], `Goto` без ребра — [`GraphError::UndeclaredEdge`],
-    /// ошибка узла — [`GraphError::Node`].
+    /// ошибка узла — [`GraphError::Node`], повторно объявленный узел —
+    /// [`GraphError::DuplicateNode`] до запуска первого узла.
+    ///
+    /// Предела числа шагов нет: цикл без `Done` и `Suspend` идёт бесконечно.
+    /// Ограничивает его вызывающий — бюджетом в состоянии `S`, по которому узел
+    /// возвращает `Done`.
     pub async fn run_from(&self, at: NodeId, st: &mut S) -> Result<Exit, GraphError<E>> {
+        if let Some(id) = self.duplicate {
+            return Err(GraphError::DuplicateNode(id));
+        }
         let mut current = at;
         loop {
             let node = self

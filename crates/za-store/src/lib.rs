@@ -19,7 +19,7 @@ mod usage;
 mod writer;
 
 pub use blobs::BLOB_THRESHOLD;
-pub use effects::{EffectRow, InterruptRow};
+pub use effects::{EffectRow, INTERRUPT_OPEN, INTERRUPT_RESOLVED, InterruptRow};
 pub use runs::{NewRun, Run};
 pub use usage::{UsageRow, UsageTotals};
 

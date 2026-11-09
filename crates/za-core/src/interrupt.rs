@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 use za_protocol::{EffectKey, RunId, pause_reason};
-use za_store::{ProjectStore, StoreError};
+use za_store::{INTERRUPT_OPEN, INTERRUPT_RESOLVED, ProjectStore, StoreError};
 
 /// Вид прерывания; [`InterruptKind::as_str`] — значение поля `kind` в журнале.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,30 +79,44 @@ pub enum InterruptState {
     Resolved(Value),
 }
 
-/// Состояние открытого прерывания в таблице `interrupts`.
-const STATUS_OPEN: &str = "open";
-/// Состояние решённого прерывания.
-const STATUS_RESOLVED: &str = "resolved";
-
-/// Открывает прерывание run; повторное открытие того же id ничего не меняет.
+/// Открывает прерывание run; повторное открытие того же id ничего не меняет:
+/// действует первая запись. Если записанные вид или payload отличаются от `i`
+/// (узел построил прерывание недетерминированно), пишется `warn`, ошибки нет.
 /// Неизвестный run — [`StoreError::UnknownRun`].
 pub async fn open(store: &ProjectStore, run: RunId, i: &Interrupt) -> Result<(), StoreError> {
     store
         .open_interrupt(&i.id, run, i.kind.as_str(), i.payload.clone())
-        .await
+        .await?;
+    if let Some(row) = store.interrupt(&i.id).await?
+        && (row.kind != i.kind.as_str() || row.payload.as_ref() != Some(&i.payload))
+    {
+        tracing::warn!(
+            id = %i.id,
+            recorded_kind = %row.kind,
+            kind = i.kind.as_str(),
+            "прерывание уже открыто с другим видом или payload, действует первая запись"
+        );
+    }
+    Ok(())
 }
 
-/// Состояние прерывания по id; `None`, если его нет. Решённое прерывание без
-/// ответа или с неизвестным статусом — [`StoreError::Corrupt`].
+/// Состояние прерывания по id; `None`, если его нет. Невозможные сочетания —
+/// открытое с ответом, решённое без ответа, неизвестный статус —
+/// [`StoreError::Corrupt`].
 pub async fn state(store: &ProjectStore, id: &str) -> Result<Option<InterruptState>, StoreError> {
     let Some(row) = store.interrupt(id).await? else {
         return Ok(None);
     };
     match (row.status.as_str(), row.response) {
-        (STATUS_OPEN, _) => Ok(Some(InterruptState::Open)),
-        (STATUS_RESOLVED, Some(v)) => Ok(Some(InterruptState::Resolved(v))),
-        (status, _) => Err(StoreError::Corrupt(format!(
-            "прерывание {id}: статус {status} без ответа или неизвестен"
+        (INTERRUPT_OPEN, None) => Ok(Some(InterruptState::Open)),
+        (INTERRUPT_RESOLVED, Some(v)) => Ok(Some(InterruptState::Resolved(v))),
+        (status, response) => Err(StoreError::Corrupt(format!(
+            "прерывание {id}: статус {status}, ответ {}",
+            if response.is_some() {
+                "есть"
+            } else {
+                "нет"
+            }
         ))),
     }
 }
