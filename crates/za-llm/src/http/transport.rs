@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 
 use super::limits::classify_status;
@@ -17,6 +17,8 @@ use crate::error::{ErrorClass, ModelError};
 
 /// Сколько тела ответа с ошибкой читается для сообщения.
 const ERROR_BODY_LIMIT: usize = 64 * 1024;
+/// Предел паузы между чанками тела ответа с ошибкой: класс уже известен по статусу.
+const ERROR_BODY_IDLE: Duration = Duration::from_secs(10);
 /// Предел тела JSON-ответа (`/models`, `/props` и т. п.).
 const JSON_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
@@ -108,7 +110,8 @@ impl HttpTransport {
     }
 
     /// `POST` с телом JSON и ответом `text/event-stream`. Статус ≠ 2xx — `Err` по
-    /// [`classify_status`] с телом, очищенным от ключей `redact`.
+    /// [`classify_status`] с телом, очищенным от ключей `redact`. Ответ 200 с
+    /// `application/json` вместо стрима — `Malformed`.
     pub async fn post_sse(
         &self,
         url: &str,
@@ -121,7 +124,20 @@ impl HttpTransport {
         }
         let req = self.client(redact)?.post(url).json(body);
         let resp = self.send(req, headers, redact).await?;
-        let resp = self.check_status(resp, redact).await?;
+        let mut resp = self.check_status(resp, redact).await?;
+        let is_json = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.trim_start().starts_with("application/json"));
+        if is_json {
+            // 200 с JSON вместо стрима (прокси, сервер проигнорировал `stream`).
+            let body = self.error_body(&mut resp, redact).await;
+            return Err(ModelError::new(
+                ErrorClass::Malformed,
+                format!("ожидался text/event-stream, получен application/json: {body}"),
+            ));
+        }
         Ok(SseResponse {
             headers: resp.headers().clone(),
             resp,
@@ -199,20 +215,25 @@ impl HttpTransport {
             return Ok(resp);
         }
         let headers = resp.headers().clone();
-        // Тело ошибки — для сообщения; не дочитанное до конца тело не мешает.
-        let body = read_body(
-            &mut resp,
-            self.timeouts.idle,
-            ERROR_BODY_LIMIT,
-            true,
-            secrets,
-        )
-        .await
-        .unwrap_or_default();
-        let text = redact(&String::from_utf8_lossy(&body), secrets);
+        let text = self.error_body(&mut resp, secrets).await;
         let err = classify_status(status.as_u16(), &headers, &text);
         tracing::debug!(status = status.as_u16(), class = ?err.class, "ответ HTTP с ошибкой");
         Err(err)
+    }
+
+    /// Тело ответа для сообщения об ошибке: до 64 КиБ, пауза между чанками не дольше
+    /// 10 с, очищено от ключей и обрезано до 2 КиБ. Сбой чтения не мешает: класс
+    /// ошибки уже известен, причина пишется в `debug`.
+    async fn error_body(&self, resp: &mut reqwest::Response, secrets: &[&Secret]) -> String {
+        let idle = self.timeouts.idle.min(ERROR_BODY_IDLE);
+        let body = match read_body(resp, idle, ERROR_BODY_LIMIT, true, secrets).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(error = %e, "тело ответа с ошибкой не дочитано");
+                Vec::new()
+            }
+        };
+        redact(&String::from_utf8_lossy(&body), secrets)
     }
 
     async fn read_json(
@@ -250,8 +271,8 @@ pub struct SseResponse {
 
 impl SseResponse {
     /// Следующее событие; `Ok(None)` — поток закрыт сервером штатно. Пауза перед
-    /// каждым чанком не дольше idle-таймаута (`Timeout`); обрыв тела — `StreamCut`;
-    /// невалидный UTF-8 или слишком длинная строка — `Malformed`. После ошибки
+    /// каждым чанком не дольше idle-таймаута (`Timeout`); обрыв тела, в том числе
+    /// штатный конец посреди строки, — `StreamCut`; невалидный UTF-8 или слишком длинная строка — `Malformed`. После ошибки
     /// следующие вызовы дают `Ok(None)`.
     pub async fn next_event(&mut self) -> Result<Option<SseEvent>, ModelError> {
         loop {
@@ -276,11 +297,22 @@ impl SseResponse {
                 }
                 Ok(Err(e)) => {
                     self.end();
-                    return Err(from_reqwest(&e, true, &[]));
+                    // Ключей в ответе нет, поэтому URL (в нём может быть ключ в query)
+                    // убирается из текста целиком.
+                    return Err(from_reqwest(&e.without_url(), true, &[]));
                 }
                 Ok(Ok(Some(bytes))) => {
                     let evs = self.parser.push(&bytes);
                     self.pending.extend(evs);
+                }
+                Ok(Ok(None)) if self.parser.has_partial_line() => {
+                    // Соединение закрылось посреди строки (ответ без chunked и без
+                    // `Content-Length`): обрезанная строка — обрыв, а не событие.
+                    self.end();
+                    return Err(ModelError::new(
+                        ErrorClass::StreamCut,
+                        "стрим закрыт посреди строки SSE",
+                    ));
                 }
                 Ok(Ok(None)) => {
                     self.ended = true;

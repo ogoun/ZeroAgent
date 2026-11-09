@@ -483,3 +483,83 @@ fn timeout_presets() {
         }
     );
 }
+
+/// Тело кончилось штатно, но посреди строки SSE: это обрыв, а не событие.
+#[tokio::test]
+async fn clean_eof_mid_line_is_stream_cut() {
+    let srv = FakeServer::start(vec![(
+        ROUTE,
+        vec![Reply::Raw(
+            200,
+            vec![("content-type".into(), "text/event-stream".into())],
+            "data: 1\n\ndata: {\"t\":\"при".as_bytes().to_vec(),
+        )],
+    )])
+    .await;
+    let t = HttpTransport::local(short(2000, 2000));
+    let mut resp = t
+        .post_sse(
+            &srv.url("/v1/chat/completions"),
+            HeaderMap::new(),
+            &json!({}),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.next_event().await.unwrap().unwrap().data, "1");
+    let err = resp.next_event().await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::StreamCut, "{err:?}");
+    assert!(err.class.retryable());
+    assert_eq!(resp.next_event().await.unwrap(), None);
+}
+
+/// Ключ в query: ошибка чтения стрима его не показывает.
+#[tokio::test]
+async fn stream_error_hides_key_in_url() {
+    let key = "sk-live-123";
+    let srv = FakeServer::start(vec![(
+        ROUTE,
+        vec![Reply::Sse {
+            chunks: vec![b"data: 1\n\n".to_vec(), b"data: 2\n\n".to_vec()],
+            delay: Duration::ZERO,
+            cut_after: Some(1),
+            then_hang: false,
+        }],
+    )])
+    .await;
+    let s = Secret::new(key.into());
+    let t = HttpTransport::cloud(short(2000, 2000));
+    let mut resp = t
+        .post_sse(
+            &srv.url(&format!("/v1/chat/completions?key={key}")),
+            HeaderMap::new(),
+            &json!({}),
+            &[&s],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.next_event().await.unwrap().unwrap().data, "1");
+    let err = resp.next_event().await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::StreamCut, "{err:?}");
+    assert!(!err.message.contains(key), "{}", err.message);
+    assert!(srv.requests(ROUTE)[0].path_and_query.contains(key));
+}
+
+/// 200 с JSON вместо стрима (прокси, сервер без `stream`) — `Malformed`.
+#[tokio::test]
+async fn json_instead_of_stream_is_malformed() {
+    let srv = FakeServer::start(vec![(ROUTE, vec![Reply::Json(200, json!({"ok": 1}))])]).await;
+    let t = HttpTransport::local(short(2000, 2000));
+    let err = t
+        .post_sse(
+            &srv.url("/v1/chat/completions"),
+            HeaderMap::new(),
+            &json!({}),
+            &[],
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.class, ErrorClass::Malformed, "{err:?}");
+    assert!(err.message.contains("text/event-stream"), "{}", err.message);
+}

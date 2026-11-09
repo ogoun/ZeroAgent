@@ -113,6 +113,11 @@ impl SseParser {
         ev
     }
 
+    /// В буфере есть строка без конца строки: если тело на этом кончилось, это обрыв.
+    pub fn has_partial_line(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
     /// Причина отказа разбора (невалидный UTF-8, слишком длинная строка).
     pub fn malformed(&self) -> Option<&str> {
         self.malformed.as_deref()

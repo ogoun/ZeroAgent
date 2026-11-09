@@ -13,14 +13,15 @@ const MESSAGE_BODY_LIMIT: usize = 2048;
 /// Признаки переполнения контекста в теле ответа 400/413 (в нижнем регистре).
 /// llama.cpp: `exceed_context_size_error` («the request exceeds the available context
 /// size»); OpenAI, vLLM, OpenRouter: «maximum context length», `context_length_exceeded`;
-/// Anthropic: «prompt is too long».
+/// Anthropic: «prompt is too long», «input length and `max_tokens` exceed context limit».
 const OVERFLOW_MARKERS: &[&str] = &[
     "exceed_context_size",
     "exceeds the available context size",
     "context_length_exceeded",
     "maximum context length",
     "prompt is too long",
-    "context window",
+    "exceeds the context window",
+    "exceed context limit",
 ];
 
 /// Лимиты, которые провайдер сообщил в заголовках ответа.
@@ -76,34 +77,77 @@ fn is_context_overflow(body: &str) -> bool {
     OVERFLOW_MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Потолок любой паузы, названной провайдером (`Retry-After`, сброс лимитов).
+///
+/// Значения из заголовков выбирает удалённая сторона, поэтому они не должны вызывать
+/// панику. Правило единое: значение, которое не разобралось, отрицательное или
+/// `NaN`, игнорируется (`None`); слишком большое (в том числе `1e30`, `inf`, момент
+/// за пределами `Duration`) насыщается до 24 ч. Потолок намного больше 120 с, поэтому
+/// ретраер (D19) ведёт себя как при любом долгом `Retry-After`: повторов нет.
+pub const MAX_PROVIDER_PAUSE: Duration = Duration::from_secs(24 * 3600);
+
+/// Секунды из заголовка → пауза по правилу [`MAX_PROVIDER_PAUSE`].
+fn secs_hint(secs: f64) -> Option<Duration> {
+    if secs.is_nan() || secs < 0.0 {
+        return None;
+    }
+    Some(
+        Duration::try_from_secs_f64(secs)
+            .unwrap_or(MAX_PROVIDER_PAUSE)
+            .min(MAX_PROVIDER_PAUSE),
+    )
+}
+
+/// Пауза от `now` до момента `target_ns` (наносекунды эпохи Unix, без `SystemTime`
+/// для момента: на Windows `SystemTime` не вмещает даты раньше 1601 года).
+/// Момент в прошлом — нулевая пауза, далёкий — потолок.
+fn until_ns(target_ns: i128, now: SystemTime) -> Duration {
+    let now_ns = match now.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i128,
+        Err(e) => -(e.duration().as_nanos() as i128),
+    };
+    let diff = target_ns.saturating_sub(now_ns);
+    if diff <= 0 {
+        return Duration::ZERO;
+    }
+    let cap = MAX_PROVIDER_PAUSE.as_nanos() as i128;
+    Duration::from_nanos(diff.min(cap) as u64)
+}
+
 /// `retry-after-ms` (OpenAI) приоритетнее `Retry-After`.
 fn header_retry_after(h: &HeaderMap) -> Option<Duration> {
-    if let Some(ms) = header_str(h, "retry-after-ms").and_then(|v| v.trim().parse::<f64>().ok())
-        && ms.is_finite()
-        && ms >= 0.0
+    if let Some(d) = header_str(h, "retry-after-ms")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .and_then(|ms| secs_hint(ms / 1000.0))
     {
-        return Some(Duration::from_secs_f64(ms / 1000.0));
+        return Some(d);
     }
     header_str(h, "retry-after").and_then(|v| parse_retry_after(v, SystemTime::now()))
 }
 
 /// Значение `Retry-After`: число секунд (допускается дробное) или HTTP-дата
-/// (RFC 9110, `Wed, 21 Oct 2026 07:28:00 GMT`). Дата в прошлом — нулевая пауза.
+/// (RFC 9110, `Wed, 21 Oct 2026 07:28:00 GMT`). Дата в прошлом — нулевая пауза;
+/// пределы — [`MAX_PROVIDER_PAUSE`].
 pub fn parse_retry_after(v: &str, now: SystemTime) -> Option<Duration> {
     let v = v.trim();
     if v.is_empty() {
         return None;
     }
     if v.bytes().all(|b| b.is_ascii_digit()) {
-        return v.parse::<u64>().ok().map(Duration::from_secs);
+        return Some(
+            v.parse::<u64>()
+                .map(Duration::from_secs)
+                .unwrap_or(MAX_PROVIDER_PAUSE)
+                .min(MAX_PROVIDER_PAUSE),
+        );
     }
     if let Ok(secs) = v.parse::<f64>() {
-        return (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs));
+        return secs_hint(secs);
     }
     let ts = jiff::fmt::rfc2822::DateTimeParser::new()
         .parse_timestamp(v)
         .ok()?;
-    Some(until(SystemTime::from(ts), now))
+    Some(until_ns(ts.as_nanosecond(), now))
 }
 
 /// Лимиты из заголовков OpenAI (`x-ratelimit-*-requests|tokens`), Anthropic
@@ -161,14 +205,10 @@ fn first_u64(h: &HeaderMap, names: &[&str]) -> Option<u64> {
         .find_map(|n| header_str(h, n).and_then(|v| v.trim().parse::<u64>().ok()))
 }
 
-fn until(t: SystemTime, now: SystemTime) -> Duration {
-    t.duration_since(now).unwrap_or(Duration::ZERO)
-}
-
 /// Момент RFC 3339 (`2026-10-21T07:28:00Z`) → пауза от `now`.
 fn rfc3339_in(v: &str, now: SystemTime) -> Option<Duration> {
     let ts: jiff::Timestamp = v.trim().parse().ok()?;
-    Some(until(SystemTime::from(ts), now))
+    Some(until_ns(ts.as_nanosecond(), now))
 }
 
 /// OpenRouter: `x-ratelimit-reset` — момент в миллисекундах эпохи Unix.
@@ -176,12 +216,9 @@ fn rfc3339_in(v: &str, now: SystemTime) -> Option<Duration> {
 fn openrouter_reset(v: &str, now: SystemTime) -> Option<Duration> {
     let n: u64 = v.trim().parse().ok()?;
     if n >= 100_000_000_000 {
-        Some(until(
-            SystemTime::UNIX_EPOCH + Duration::from_millis(n),
-            now,
-        ))
+        Some(until_ns(i128::from(n) * 1_000_000, now))
     } else {
-        Some(Duration::from_secs(n))
+        Some(Duration::from_secs(n).min(MAX_PROVIDER_PAUSE))
     }
 }
 
@@ -192,7 +229,7 @@ fn parse_go_duration(v: &str) -> Option<Duration> {
         return None;
     }
     if let Ok(secs) = v.parse::<f64>() {
-        return (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs));
+        return secs_hint(secs);
     }
     let mut total = 0.0_f64;
     let mut rest = v;
@@ -220,7 +257,7 @@ fn parse_go_duration(v: &str) -> Option<Duration> {
         rest = &rest[unit_len..];
         total += n * scale;
     }
-    total.is_finite().then(|| Duration::from_secs_f64(total))
+    secs_hint(total)
 }
 
 #[cfg(test)]
@@ -276,6 +313,58 @@ mod tests {
             classify_status(413, &h, "payload too large").class,
             ErrorClass::BadRequest
         );
+    }
+
+    /// Значения заголовков от удалённой стороны не вызывают панику (ревью задачи 3).
+    #[test]
+    fn hostile_header_values_do_not_panic() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_567_670);
+        let cap = Some(MAX_PROVIDER_PAUSE);
+        // 1e30: насыщение до потолка.
+        assert_eq!(parse_retry_after("1e30", now), cap);
+        assert_eq!(parse_go_duration("99999999999999999999999s"), cap);
+        assert_eq!(parse_retry_after("99999999999999999999999", now), cap);
+        assert_eq!(parse_retry_after("inf", now), cap);
+        // NaN и отрицательные: игнор.
+        assert_eq!(parse_retry_after("NaN", now), None);
+        assert_eq!(parse_retry_after("-1", now), None);
+        assert_eq!(parse_go_duration("-1"), None);
+        assert_eq!(parse_go_duration("NaN"), None);
+        // Огромный момент в мс эпохи: потолок.
+        assert_eq!(openrouter_reset(&u64::MAX.to_string(), now), cap);
+        // Дата раньше 1601 года (на Windows вне `SystemTime`): прошлое — ноль.
+        assert_eq!(
+            rfc3339_in("1500-01-01T00:00:00Z", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            rfc3339_in("0001-01-01T00:00:00Z", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            parse_retry_after("01 Jan 1500 00:00:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        // Далёкое будущее — потолок.
+        assert_eq!(rfc3339_in("9000-01-01T00:00:00Z", now), cap);
+
+        let mut h = HeaderMap::new();
+        h.insert("retry-after-ms", HeaderValue::from_static("1e30"));
+        assert_eq!(classify_status(429, &h, "").retry_after, cap);
+        let mut h = HeaderMap::new();
+        h.insert("retry-after-ms", HeaderValue::from_static("NaN"));
+        h.insert("retry-after", HeaderValue::from_static("-1"));
+        h.insert(
+            "x-ratelimit-reset",
+            HeaderValue::from_static("18446744073709551615"),
+        );
+        h.insert(
+            "anthropic-ratelimit-tokens-reset",
+            HeaderValue::from_static("0001-01-01T00:00:00Z"),
+        );
+        let e = classify_status(429, &h, "");
+        assert_eq!(e.retry_after, cap);
+        assert_eq!(parse_rate_limits(&h).reset_after, cap);
     }
 
     #[test]
