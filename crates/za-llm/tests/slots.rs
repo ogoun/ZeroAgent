@@ -148,20 +148,53 @@ fn release_of_unknown_slot_is_ignored() {
 
 #[test]
 fn lease_releases_slot_on_drop() {
-    // Отмена во время save (drop будущего) не оставляет слот занятым.
-    let m = Arc::new(Mutex::new(SlotManager::new(1)));
-    let (lease, plan) = SlotManager::lease(&m, Some("a"));
-    assert_eq!(lease.slot(), plan.slot);
-    drop(lease);
-    let (_lease, again) = SlotManager::lease(&m, Some("a"));
+    // Отмена во время save (drop будущего) не оставляет слот занятым: слот b после
+    // drop свободен, и a, чей домашний слот 0 занят, получает слот 1 с сохранением b.
+    // Без освобождения свободных слотов нет — запасной путь дал бы слот 0 без save.
+    let m = Arc::new(Mutex::new(SlotManager::new(2)));
+    let (lease_a, plan_a) = SlotManager::lease(&m, Some("a"));
+    assert_eq!((lease_a.slot(), plan_a.slot), (0, 0));
+    let (lease_b, plan_b) = SlotManager::lease(&m, Some("b"));
+    assert_eq!((lease_b.slot(), plan_b.slot), (1, 1));
+    drop(lease_b);
+    let (_again, plan) = SlotManager::lease(&m, Some("a"));
     assert_eq!(
-        again,
+        plan,
         SlotPlan {
-            slot: 0,
-            save_evicted: None,
+            slot: 1,
+            save_evicted: Some((1, slot_file("b"))),
             restore: None
         }
     );
+    drop(lease_a);
+}
+
+#[tokio::test]
+async fn save_bad_request_is_not_unsupported() {
+    // 400 у save — ошибка запроса (неверное имя, слот), а не «сохранение не поддержано».
+    let srv = FakeServer::start(vec![(
+        SLOT1,
+        vec![Reply::Json(
+            400,
+            json!({"error": {"code": 400, "type": "invalid_request_error",
+                "message": "Invalid filename"}}),
+        )],
+    )])
+    .await;
+    let slots = LlamaSlots::new(srv.base_url.clone(), transport());
+    let err = slots.save(1, &slot_file("a")).await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::BadRequest);
+    assert!(!save_unsupported(&err));
+}
+
+#[tokio::test]
+async fn missing_slots_route_is_unsupported() {
+    // Нет маршрута /slots (404) — сохранение не поддержано и для save, и для restore.
+    let srv = FakeServer::start(vec![]).await;
+    let slots = LlamaSlots::new(srv.base_url.clone(), transport());
+    let err = slots.save(1, &slot_file("a")).await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::NotFound);
+    assert!(save_unsupported(&err) && restore_unsupported(&err));
 }
 
 #[test]
