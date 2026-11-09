@@ -619,6 +619,16 @@ fn budget_without_cost_source_is_config_error() {
             text.contains("price") && text.contains("daily_budget_usd"),
             "{text}"
         );
+        // Текст целиком: без разрывов и двойных пробелов на переносах литерала.
+        assert_eq!(
+            text,
+            concat!(
+                "models.endpoints[c]: у группы задан daily_budget_usd, но стоимость запросов ",
+                "неизвестна — этот бэкенд её не сообщает; задайте price (USD за миллион ",
+                "токенов: input_per_mtok, output_per_mtok) или уберите бюджет"
+            )
+        );
+        assert!(!text.contains("  "), "двойные пробелы: {text}");
     }
     let c = cfg(json!({"endpoints": [
         {"id": "v", "backend": "openai_compatible", "base_url": "https://api.example.com/v1",

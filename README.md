@@ -74,7 +74,7 @@ zero-agent doctor                          # + GPU и состояние каж�
 
 Живые проверки бэкендов: `LLAMA_TEST_URL=http://127.0.0.1:8080 cargo test -p za-llm --test live -- --ignored` (также `VLLM_TEST_URL`, `OPENROUTER_TEST_KEY`, `ANTHROPIC_TEST_KEY`, `OPENAI_TEST_KEY`, модель — `ZA_TEST_<PROVIDER>_MODEL`).
 
-Тесты `Gateway` идут в реальном времени; на медленной машине длительности тестов растягивает `ZA_TEST_TIME_SCALE` (целое 1–8, по умолчанию 1, в CI — 4).
+Тесты `Gateway` идут в реальном времени; на медленной машине длительности тестов растягивает `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1, в CI — 4).
 
 Логи пишутся в stderr, по умолчанию уровень `warn`. Фильтр задаётся `ZA_LOG` (приоритетнее) или `RUST_LOG`: например, `ZA_LOG=info` или `ZA_LOG=warn,za_store=debug`.
 

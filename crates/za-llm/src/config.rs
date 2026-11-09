@@ -117,7 +117,7 @@ pub enum ConfigError {
     /// нет `price`, и бэкенд не сообщает стоимость (её сообщает только OpenRouter).
     /// Расход такого эндпоинта не учитывался бы, и бюджет не наступил бы никогда.
     #[error(
-        "models.endpoints[{0}]: у группы задан daily_budget_usd, но стоимость запросов неизвестна —          этот бэкенд её не сообщает; задайте price (USD за миллион токенов: input_per_mtok, output_per_mtok)          или уберите бюджет"
+        "models.endpoints[{0}]: у группы задан daily_budget_usd, но стоимость запросов неизвестна — этот бэкенд её не сообщает; задайте price (USD за миллион токенов: input_per_mtok, output_per_mtok) или уберите бюджет"
     )]
     BudgetWithoutPrice(EndpointId),
     /// Разные `key_ref` двух эндпоинтов дают одну переменную окружения
