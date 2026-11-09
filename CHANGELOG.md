@@ -5,6 +5,7 @@
 ## Не выпущено
 
 ### Исправлено
+- `za-llm`: функция `http` включает `tokio/macros` — без dev-зависимостей тестов крейт не собирался. Коннектор Chat Completions: `ReasoningMode::Off` у OpenAI и OpenRouter не отправляет полей рассуждения; `strict: true` только для схем, совместимых со strict-режимом OpenAI; разные вызовы под одним `index` с разными `id` не сливаются; запасной `id` вызова уникален; пустые аргументы — `{}`; `parallel_tool_calls` из возможностей провайдера.
 - `za-core`: при `ReplayMismatch` демонстрационный run переводится в `paused` с причиной `replay_mismatch`, а не остаётся в `running`.
 - `za-store`: повреждённый файл журнала (`SQLITE_CORRUPT`, `SQLITE_NOTADB`) — `StoreError::Corrupt`, а не `Sqlite`; `EINVAL` от `fsync` каталога на Unix терпится с `warn`; предупреждение о занятом чекпоинте WAL — один раз за серию и при первом превышении 64 МиБ, остальное в `debug`.
 - `za-core`: расхождение имени или аргументов эффекта с журналом при повторе (в том числе дрейф `prefix_hash` у `model` демонстрации) — ошибка `EffectError::ReplayMismatch { key, field }` вместо `warn`; `demo-run --resume` завершается кодом 1. `EffectError::Unknown` и `ReplayMismatch` отравляют `RunCtx`, как ошибка журнала. `serde_json` с функцией `float_roundtrip`: дробные аргументы читаются из журнала точно и не дают ложного расхождения.
