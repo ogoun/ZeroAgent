@@ -1,0 +1,1154 @@
+//! Ход модели (D7, D8, D13, D27): эффект `model`, события журнала хода, сигналы
+//! цикла и разбор ответа перед фиксацией в истории.
+//!
+//! [`model_turn`] выполняет один вызов модели как эффект класса `Idempotent` с
+//! аргументами `{endpoint, request, prefix}`. Вживую замыкание слота пишет
+//! `model.request`, читает стрим, склеивает дельты ([`DeltaBuffer`]) в `model.delta`,
+//! пишет `agent.heartbeat` и, на `Finished`, `model.usage` вместе со строкой `usage`.
+//! Итог хода — квитанция-успех с [`TurnOutput`]; ошибка модели — квитанция-отказ
+//! `model_error:{json}`; обрыв сигналом — `interrupted:pause|cancel|input`. Реплей
+//! получает тот же итог из журнала без вызова модели и без событий хода.
+//!
+//! История в этом модуле не меняется: ход фиксирует драйвер, и только по
+//! завершённому ответу (D10, D13). [`review`] готовит ответ к фиксации:
+//! нормализация вызовов (MDL-005), id, отказы и nudge для модели (D27).
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
+use za_core::{EffectError, EffectSource, EffectSpec, Journal, RunCtx};
+use za_llm::normalize::{
+    CallRejection, CallSource, NormalizedCall, extracted_mutation_blocked, normalize,
+};
+use za_llm::{
+    ErrorClass, FinishReason, Message, ModelCall, ModelError, ModelPort, Part, QueueStatus, Role,
+    StreamEvent, ToolCall, ToolSchema, Usage, WaitState,
+};
+use za_protocol::{Actor, BlobHash, EffectClass, EventKind, NewEvent, RunId};
+use za_store::{StoreError, UsageRow};
+
+use crate::prompt::{PROMPT_VERSION, escape_untrusted};
+use crate::request::request_hash;
+
+// ---- Сигналы цикла (D9, D25, D26) ----
+
+/// Живой сигнал циклу (D9, D25, D26): пауза, отмена, ввод в режиме interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Pause,
+    Cancel,
+    Input,
+}
+
+impl Signal {
+    /// Имя в квитанции обрыва `interrupted:{name}` (D7).
+    fn as_str(self) -> &'static str {
+        match self {
+            Signal::Pause => "pause",
+            Signal::Cancel => "cancel",
+            Signal::Input => "input",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pause" => Some(Signal::Pause),
+            "cancel" => Some(Signal::Cancel),
+            "input" => Some(Signal::Input),
+            _ => None,
+        }
+    }
+}
+
+/// Флаги управления (D26): последнее значение не теряется.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControlFlags {
+    pub pause: bool,
+    pub cancel: bool,
+}
+
+/// Отправляющая сторона: её держит RunControl (задача 12).
+#[derive(Clone)]
+pub struct SignalTx {
+    flags: Arc<watch::Sender<ControlFlags>>,
+    input: mpsc::Sender<()>,
+}
+
+impl fmt::Debug for SignalTx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignalTx")
+            .field("flags", &*self.flags.borrow())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SignalTx {
+    /// `flags.pause = true`; повтор безвреден.
+    pub fn pause(&self) {
+        self.flags.send_modify(|f| f.pause = true);
+    }
+
+    /// `flags.cancel = true`; повтор безвреден.
+    pub fn cancel(&self) {
+        self.flags.send_modify(|f| f.cancel = true);
+    }
+
+    /// Сигнал ввода. Полный канал — сигнал уже ждёт, не ошибка; закрытый — цикла
+    /// уже нет.
+    pub fn input(&self) {
+        let _ = self.input.try_send(());
+    }
+}
+
+/// Принимающая сторона цикла.
+#[derive(Debug)]
+pub struct Signals {
+    flags: watch::Receiver<ControlFlags>,
+    input: mpsc::Receiver<()>,
+    /// Флаги, уже отданные циклу.
+    seen: ControlFlags,
+}
+
+impl Signals {
+    /// Непрочитанный Cancel или Pause по текущим флагам; помечает его прочитанным.
+    /// Снятый флаг снимает и отметку: повторная пауза после снятия снова сигнал.
+    fn unseen_flag(&mut self) -> Option<Signal> {
+        let cur = *self.flags.borrow_and_update();
+        if !cur.cancel {
+            self.seen.cancel = false;
+        }
+        if !cur.pause {
+            self.seen.pause = false;
+        }
+        if cur.cancel && !self.seen.cancel {
+            self.seen.cancel = true;
+            return Some(Signal::Cancel);
+        }
+        if cur.pause && !self.seen.pause {
+            self.seen.pause = true;
+            return Some(Signal::Pause);
+        }
+        None
+    }
+
+    /// Следующий ещё не прочитанный сигнал; приоритет Cancel, Pause, Input. Отменобезопасен (для select!).
+    /// Все отправители брошены — ждёт вечно (std::future::pending).
+    pub async fn recv(&mut self) -> Signal {
+        let mut flags_open = true;
+        let mut input_open = true;
+        loop {
+            if let Some(s) = self.unseen_flag() {
+                return s;
+            }
+            if !flags_open && !input_open {
+                return std::future::pending().await;
+            }
+            // Обе ветви отменобезопасны: `changed` и `recv` ничего не теряют при drop.
+            tokio::select! {
+                biased;
+                r = self.flags.changed(), if flags_open => {
+                    if r.is_err() {
+                        flags_open = false;
+                    }
+                }
+                r = self.input.recv(), if input_open => match r {
+                    Some(()) => return Signal::Input,
+                    None => input_open = false,
+                },
+            }
+        }
+    }
+
+    /// Без ожидания, на границе (D9): непрочитанный Cancel или Pause (помечается прочитанным);
+    /// накопленный Input выбрасывается; иначе None.
+    pub fn drain(&mut self) -> Option<Signal> {
+        // Ввод прочитает сама граница, сигнал о нём устарел.
+        while self.input.try_recv().is_ok() {}
+        self.unseen_flag()
+    }
+
+    /// Клон watch::Receiver — для наблюдения флагов рядом с future пакета инструментов (D26).
+    pub fn flags(&self) -> watch::Receiver<ControlFlags> {
+        self.flags.clone()
+    }
+}
+
+/// Канал сигналов цикла: флаги в `watch` (D26), ввод — `mpsc` ёмкостью 1.
+pub fn signal_channel() -> (SignalTx, Signals) {
+    let (flags_tx, flags_rx) = watch::channel(ControlFlags::default());
+    let (input_tx, input_rx) = mpsc::channel(1);
+    (
+        SignalTx {
+            flags: Arc::new(flags_tx),
+            input: input_tx,
+        },
+        Signals {
+            flags: flags_rx,
+            input: input_rx,
+            seen: ControlFlags::default(),
+        },
+    )
+}
+
+// ---- Склейка дельт (D8, D38) ----
+
+/// Размер склейки дельт: при достижении буфер записывается (D8).
+pub const DELTA_FLUSH_BYTES: usize = 2048;
+/// Возраст склейки дельт от первой дельты буфера (D8).
+pub const DELTA_FLUSH_AFTER: Duration = Duration::from_millis(200);
+/// Смена только позиции в очереди пишется в `agent.heartbeat` не чаще этого (D8).
+pub const HEARTBEAT_POSITION_EVERY: Duration = Duration::from_secs(1);
+
+/// Склейка дельт D8, D38: до 2048 байт или 200 мс от первой дельты буфера. Instant — tokio::time::Instant.
+#[derive(Debug, Default)]
+pub struct DeltaBuffer {
+    text: String,
+    since: Option<Instant>,
+}
+
+impl DeltaBuffer {
+    /// Some(текст) — пора записать: после добавления ≥ 2048 байт или now − since ≥ 200 мс.
+    pub fn push(&mut self, s: &str, now: Instant) -> Option<String> {
+        if s.is_empty() && self.text.is_empty() {
+            return None;
+        }
+        let since = *self.since.get_or_insert(now);
+        self.text.push_str(s);
+        if self.text.len() >= DELTA_FLUSH_BYTES
+            || now.saturating_duration_since(since) >= DELTA_FLUSH_AFTER
+        {
+            self.take()
+        } else {
+            None
+        }
+    }
+
+    /// since + 200 мс — момент сброса по таймеру; None — буфер пуст.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.since.map(|t| t + DELTA_FLUSH_AFTER)
+    }
+
+    /// Всё накопленное (по таймеру, перед Restart, Finished и ошибкой); None — пусто.
+    pub fn take(&mut self) -> Option<String> {
+        self.since = None;
+        if self.text.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.text))
+        }
+    }
+}
+
+/// output × 1000 / (duration_ms − ttft_ms); None, если ttft_ms нет или duration_ms <= ttft_ms (D8).
+pub fn output_tps(output: u64, ttft_ms: Option<u64>, duration_ms: u64) -> Option<f64> {
+    let ttft = ttft_ms?;
+    if duration_ms <= ttft {
+        return None;
+    }
+    Some(output as f64 * 1000.0 / (duration_ms - ttft) as f64)
+}
+
+// ---- Эффект model (D7) ----
+
+/// Имя эффекта вызова модели (D7).
+pub const MODEL_EFFECT: &str = "model";
+/// Префикс квитанции-отказа с ошибкой модели (D7).
+const MODEL_ERROR: &str = "model_error:";
+/// Префикс квитанции обрыва сигналом (D7).
+const INTERRUPTED: &str = "interrupted:";
+/// Префикс квитанции-отказа, записанной после ошибки журнала внутри хода: реплей
+/// отдаёт её как [`EffectError::Failed`], драйвер — `LoopError` (D11).
+const STORE_ERROR: &str = "store_error:";
+
+/// Итог хода модели — значение квитанции эффекта `model` (D7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnOutput {
+    /// Служебные сообщения последней попытки (`Role::System`, D10).
+    pub service: Vec<Message>,
+    pub message: Message,
+    pub finish: FinishReason,
+    pub usage: Usage,
+    /// Время до первого события ответа последней попытки от начала хода, мс.
+    pub ttft_ms: Option<u64>,
+    /// Длительность хода от запроса до `Finished`, мс.
+    pub duration_ms: u64,
+}
+
+/// Ошибка хода модели.
+#[derive(Debug)]
+pub enum TurnError {
+    /// Ошибка модели или очереди; `last_wait` — последний `WaitState` стрима
+    /// (для причины паузы D11).
+    Model {
+        error: ModelError,
+        last_wait: Option<WaitState>,
+    },
+    /// Обрыв сигналом; source == Journal — квитанция `interrupted:*` прочитана при реплее (D7).
+    Aborted {
+        signal: Signal,
+        source: EffectSource,
+    },
+    /// Ошибка протокола эффектов (журнал, неизвестный исход, расхождение с журналом).
+    Effect(EffectError),
+    /// Запрос хода не сериализуется для `request_hash`: ключ эффекта не занят,
+    /// драйвер превращает ошибку в `LoopError`.
+    Request(serde_json::Error),
+}
+
+impl fmt::Display for TurnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TurnError::Model { error, .. } => write!(f, "ошибка модели: {error}"),
+            TurnError::Aborted { signal, source } => {
+                write!(f, "ход прерван сигналом {signal:?} ({source:?})")
+            }
+            TurnError::Effect(e) => write!(f, "{e}"),
+            TurnError::Request(e) => write!(f, "запрос хода не сериализуется: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TurnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TurnError::Model { error, .. } => Some(error),
+            TurnError::Effect(e) => Some(e),
+            TurnError::Request(e) => Some(e),
+            TurnError::Aborted { .. } => None,
+        }
+    }
+}
+
+impl From<EffectError> for TurnError {
+    fn from(e: EffectError) -> Self {
+        TurnError::Effect(e)
+    }
+}
+
+/// Хэши блобов для model.request (D8): FrozenPrefix (пишет драйвер при старте run) и сообщения истории.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestRefs {
+    pub frozen: BlobHash,
+    pub messages: Vec<BlobHash>,
+    /// Хэш стабильного префикса (аргумент эффекта `prefix`).
+    pub prefix: String,
+}
+
+/// Тело квитанции `model_error:` (D7).
+#[derive(Serialize, Deserialize)]
+struct ModelFailure {
+    error: ModelError,
+    last_wait: Option<WaitState>,
+}
+
+/// Эффект `model` (D7): стрим, события D8 (дельты, restart, heartbeat, usage — только вживую), итог.
+/// `sig` — сигналы цикла; первый пришедший обрывает стрим (drop) и записывает `interrupted:*`.
+pub async fn model_turn(
+    ctx: &mut RunCtx,
+    j: &Journal,
+    model: &dyn ModelPort,
+    call: ModelCall,
+    refs: &RequestRefs,
+    turn: u32,
+    sig: &mut Signals,
+) -> Result<TurnOutput, TurnError> {
+    // До резервирования: ошибка хэша не занимает ключ эффекта.
+    let request = request_hash(&call.request).map_err(TurnError::Request)?;
+    let slot = ctx.reserve()?;
+    let key = slot.key().0.clone();
+    let spec = EffectSpec {
+        class: EffectClass::Idempotent,
+        name: MODEL_EFFECT.into(),
+        args: json!({
+            "endpoint": call.endpoint.0,
+            "request": request,
+            "prefix": refs.prefix,
+        }),
+    };
+    let live = LiveTurn {
+        j,
+        run: ctx.run_id(),
+        turn,
+        key: &key,
+        request: &request,
+        refs,
+    };
+    let mut store_failure: Option<StoreError> = None;
+    let failure = &mut store_failure;
+    let (r, source) = slot
+        .run_traced(spec, move || async move {
+            match live.run(model, call, sig).await {
+                Ok(out) => serde_json::to_value(&out)
+                    .map_err(|e| format!("{STORE_ERROR} итог хода не сериализуется: {e}")),
+                Err(Live::Model { error, last_wait }) => {
+                    let body = ModelFailure { error, last_wait };
+                    Err(match serde_json::to_string(&body) {
+                        Ok(s) => format!("{MODEL_ERROR}{s}"),
+                        Err(e) => format!("{STORE_ERROR} ошибка модели не сериализуется: {e}"),
+                    })
+                }
+                Err(Live::Signal(s)) => Err(format!("{INTERRUPTED}{}", s.as_str())),
+                Err(Live::Store(e)) => {
+                    let msg = format!("{STORE_ERROR} {e}");
+                    *failure = Some(e);
+                    Err(msg)
+                }
+            }
+        })
+        .await;
+    ctx.observe(&r);
+    // Ошибка журнала посреди хода: квитанция-отказ (если записалась) лишь фиксирует
+    // факт, сам ход — ошибка журнала, контекст отравлен.
+    if let Some(e) = store_failure {
+        let err = EffectError::Store(e);
+        ctx.observe::<()>(&Err(err.clone()));
+        return Err(err.into());
+    }
+    match r {
+        Ok(v) => serde_json::from_value::<TurnOutput>(v).map_err(|e| {
+            let err = EffectError::Store(StoreError::Corrupt(format!(
+                "итог хода {key} не разбирается: {e}"
+            )));
+            ctx.observe::<()>(&Err(err.clone()));
+            err.into()
+        }),
+        Err(EffectError::Failed(msg)) => Err(decode_failure(msg, source)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Квитанция-отказ эффекта `model` обратно в ошибку хода (D7).
+fn decode_failure(msg: String, source: EffectSource) -> TurnError {
+    if let Some(body) = msg.strip_prefix(MODEL_ERROR) {
+        match serde_json::from_str::<ModelFailure>(body) {
+            Ok(f) => {
+                return TurnError::Model {
+                    error: f.error,
+                    last_wait: f.last_wait,
+                };
+            }
+            Err(e) => tracing::warn!(error = %e, "квитанция model_error не разбирается"),
+        }
+    } else if let Some(signal) = msg.strip_prefix(INTERRUPTED).and_then(Signal::parse) {
+        return TurnError::Aborted { signal, source };
+    }
+    TurnError::Effect(EffectError::Failed(msg))
+}
+
+/// Исход живого хода внутри замыкания слота.
+enum Live {
+    Model {
+        error: ModelError,
+        last_wait: Option<WaitState>,
+    },
+    Signal(Signal),
+    Store(StoreError),
+}
+
+impl From<StoreError> for Live {
+    fn from(e: StoreError) -> Self {
+        Live::Store(e)
+    }
+}
+
+/// Что пришло первым в цикле стрима.
+enum Step {
+    Signal(Signal),
+    Event(Option<Result<StreamEvent, ModelError>>),
+    Timer,
+}
+
+/// Последний записанный heartbeat.
+struct Beat {
+    state: &'static str,
+    position: Option<u32>,
+    at: Instant,
+}
+
+/// Живой ход: события журнала и стрим.
+#[derive(Clone, Copy)]
+struct LiveTurn<'a> {
+    j: &'a Journal,
+    run: RunId,
+    turn: u32,
+    key: &'a str,
+    request: &'a str,
+    refs: &'a RequestRefs,
+}
+
+/// Состояние стрима одного хода.
+struct StreamState {
+    attempt: u32,
+    text: DeltaBuffer,
+    reasoning: DeltaBuffer,
+    service: Vec<Message>,
+    last_wait: Option<WaitState>,
+    beat: Option<Beat>,
+    ttft_ms: Option<u64>,
+}
+
+impl LiveTurn<'_> {
+    async fn append(&self, actor: Actor, kind: EventKind, payload: Value) -> Result<(), Live> {
+        self.j
+            .append(NewEvent {
+                run_id: self.run,
+                parent_seq: None,
+                actor,
+                kind,
+                payload,
+                tainted: false,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn run(
+        self,
+        model: &dyn ModelPort,
+        call: ModelCall,
+        sig: &mut Signals,
+    ) -> Result<TurnOutput, Live> {
+        let endpoint = call.endpoint.0.clone();
+        self.append(
+            Actor::Runtime,
+            EventKind::ModelRequest,
+            json!({
+                "turn": self.turn,
+                "endpoint": endpoint,
+                "effect_key": self.key,
+                "request": self.request,
+                "prefix": self.refs.prefix,
+                "frozen": self.refs.frozen,
+                "messages": self.refs.messages,
+                "prompt_version": PROMPT_VERSION,
+            }),
+        )
+        .await?;
+        let started = Instant::now();
+        let mut st = StreamState {
+            attempt: 1,
+            text: DeltaBuffer::default(),
+            reasoning: DeltaBuffer::default(),
+            service: Vec::new(),
+            last_wait: None,
+            beat: None,
+            ttft_ms: None,
+        };
+        let mut stream = match model.stream(call).await {
+            Ok(s) => s,
+            Err(error) => {
+                return Err(Live::Model {
+                    error,
+                    last_wait: None,
+                });
+            }
+        };
+        loop {
+            let deadline = min_deadline(st.text.deadline(), st.reasoning.deadline());
+            let step = tokio::select! {
+                // Сигналы первыми: поток событий стрима не задерживает обрыв (NFR-03).
+                biased;
+                s = sig.recv() => Step::Signal(s),
+                ev = stream.next() => Step::Event(ev),
+                _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)),
+                    if deadline.is_some() => Step::Timer,
+            };
+            match step {
+                Step::Signal(s) => {
+                    // Drop закрывает соединение (D2 R1-A) до записи квитанции.
+                    drop(stream);
+                    tracing::info!(run = %self.run, turn = self.turn, signal = ?s, "ход модели прерван сигналом");
+                    self.flush(&mut st).await?;
+                    return Err(Live::Signal(s));
+                }
+                Step::Timer => self.flush_due(&mut st, Instant::now()).await?,
+                Step::Event(None) => {
+                    self.flush(&mut st).await?;
+                    return Err(Live::Model {
+                        error: ModelError::new(
+                            ErrorClass::StreamCut,
+                            "стрим закрыт до события Finished",
+                        ),
+                        last_wait: st.last_wait,
+                    });
+                }
+                Step::Event(Some(Err(error))) => {
+                    self.flush(&mut st).await?;
+                    return Err(Live::Model {
+                        error,
+                        last_wait: st.last_wait,
+                    });
+                }
+                Step::Event(Some(Ok(ev))) => {
+                    if let Some(out) = self.on_event(&mut st, ev, &endpoint, started).await? {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Одно событие стрима; `Some` — итог хода.
+    async fn on_event(
+        &self,
+        st: &mut StreamState,
+        ev: StreamEvent,
+        endpoint: &str,
+        started: Instant,
+    ) -> Result<Option<TurnOutput>, Live> {
+        let now = Instant::now();
+        match ev {
+            StreamEvent::Queued(q) => {
+                st.last_wait = Some(q.state.clone());
+                self.heartbeat_queued(st, &q, now).await?;
+            }
+            StreamEvent::Started { .. } => self.heartbeat_generating(st, now).await?,
+            StreamEvent::Restart { attempt, reason } => {
+                self.flush(st).await?;
+                self.append(
+                    Actor::Model,
+                    EventKind::ModelDelta,
+                    json!({"turn": self.turn, "attempt": st.attempt, "restart": reason}),
+                )
+                .await?;
+                // Всё накопленное прежней попыткой отбрасывается (D20 R1-A).
+                st.attempt = attempt;
+                st.service.clear();
+                st.ttft_ms = None;
+            }
+            StreamEvent::Progress { .. } => {}
+            StreamEvent::TextDelta(t) => {
+                mark_ttft(st, started, now);
+                if let Some(chunk) = st.text.push(&t, now) {
+                    self.write_delta(st.attempt, "text", chunk).await?;
+                }
+            }
+            StreamEvent::ReasoningDelta(t) => {
+                mark_ttft(st, started, now);
+                if let Some(chunk) = st.reasoning.push(&t, now) {
+                    self.write_delta(st.attempt, "reasoning", chunk).await?;
+                }
+            }
+            StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallArgs { .. } => {
+                mark_ttft(st, started, now);
+            }
+            StreamEvent::ServiceMessage(m) => st.service.push(m),
+            StreamEvent::Finished {
+                message,
+                finish,
+                usage,
+            } => {
+                self.flush(st).await?;
+                let duration_ms = millis(now.saturating_duration_since(started));
+                let tps = output_tps(usage.output, st.ttft_ms, duration_ms);
+                let row = UsageRow {
+                    model: endpoint.to_owned(),
+                    input: usage.input,
+                    cached: usage.cached,
+                    output: usage.output,
+                    reasoning: usage.reasoning,
+                    gpu_ms: usage.gpu_ms,
+                    cost_usd: usage.cost_usd,
+                };
+                let payload = json!({
+                    "turn": self.turn,
+                    "endpoint": endpoint,
+                    "effect_key": self.key,
+                    "usage": usage,
+                    "finish": finish,
+                    "ttft_ms": st.ttft_ms,
+                    "duration_ms": duration_ms,
+                    "output_tps": tps,
+                });
+                self.j.record_usage(self.run, row, payload).await?;
+                return Ok(Some(TurnOutput {
+                    service: std::mem::take(&mut st.service),
+                    message,
+                    finish,
+                    usage,
+                    ttft_ms: st.ttft_ms,
+                    duration_ms,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn write_delta(&self, attempt: u32, field: &str, chunk: String) -> Result<(), Live> {
+        let mut payload = json!({"turn": self.turn, "attempt": attempt});
+        payload[field] = Value::String(chunk);
+        self.append(Actor::Model, EventKind::ModelDelta, payload)
+            .await
+    }
+
+    /// Сброс обоих буферов: рассуждение, затем текст.
+    async fn flush(&self, st: &mut StreamState) -> Result<(), Live> {
+        if let Some(chunk) = st.reasoning.take() {
+            self.write_delta(st.attempt, "reasoning", chunk).await?;
+        }
+        if let Some(chunk) = st.text.take() {
+            self.write_delta(st.attempt, "text", chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// Сброс буферов, чей срок истёк к `now`.
+    async fn flush_due(&self, st: &mut StreamState, now: Instant) -> Result<(), Live> {
+        if st.reasoning.deadline().is_some_and(|d| d <= now)
+            && let Some(chunk) = st.reasoning.take()
+        {
+            self.write_delta(st.attempt, "reasoning", chunk).await?;
+        }
+        if st.text.deadline().is_some_and(|d| d <= now)
+            && let Some(chunk) = st.text.take()
+        {
+            self.write_delta(st.attempt, "text", chunk).await?;
+        }
+        Ok(())
+    }
+
+    async fn heartbeat_queued(
+        &self,
+        st: &mut StreamState,
+        q: &QueueStatus,
+        now: Instant,
+    ) -> Result<(), Live> {
+        let state = wait_state_name(&q.state);
+        let kind = match &q.state {
+            WaitState::WaitingResource { kind } => Value::String(kind.clone()),
+            _ => Value::Null,
+        };
+        let payload = json!({
+            "turn": self.turn,
+            "state": state,
+            "position": q.position,
+            "waited_ms": q.waited_ms,
+            "kind": kind,
+        });
+        self.heartbeat(st, state, Some(q.position), payload, now)
+            .await
+    }
+
+    async fn heartbeat_generating(&self, st: &mut StreamState, now: Instant) -> Result<(), Live> {
+        let payload = json!({
+            "turn": self.turn,
+            "state": GENERATING,
+            "position": null,
+            "waited_ms": null,
+            "kind": null,
+        });
+        self.heartbeat(st, GENERATING, None, payload, now).await
+    }
+
+    /// D8: смена `state` пишется сразу, смена только позиции — не чаще раза в секунду.
+    async fn heartbeat(
+        &self,
+        st: &mut StreamState,
+        state: &'static str,
+        position: Option<u32>,
+        payload: Value,
+        now: Instant,
+    ) -> Result<(), Live> {
+        let due = match &st.beat {
+            None => true,
+            Some(b) => {
+                b.state != state
+                    || (b.position != position
+                        && now.saturating_duration_since(b.at) >= HEARTBEAT_POSITION_EVERY)
+            }
+        };
+        if due {
+            self.append(Actor::Runtime, EventKind::AgentHeartbeat, payload)
+                .await?;
+            st.beat = Some(Beat {
+                state,
+                position,
+                at: now,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Состояние heartbeat при `Started` (D8).
+const GENERATING: &str = "generating";
+
+/// Имя `WaitState` в snake_case (D8).
+fn wait_state_name(s: &WaitState) -> &'static str {
+    match s {
+        WaitState::Queued => "queued",
+        WaitState::WaitingResource { .. } => "waiting_resource",
+        WaitState::Cooldown { .. } => "cooldown",
+        WaitState::Granted => "granted",
+        WaitState::Failed { .. } => "failed",
+    }
+}
+
+fn mark_ttft(st: &mut StreamState, started: Instant, now: Instant) {
+    if st.ttft_ms.is_none() {
+        st.ttft_ms = Some(millis(now.saturating_duration_since(started)));
+    }
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn min_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+// ---- Разбор ответа (D27) ----
+
+/// Решение по вызову: исполнить или ответить моделью результатом-ошибкой.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallVerdict {
+    Run,
+    /// Не исполнять; текст — результат-ошибка для модели (английский, D23).
+    Reject(String),
+}
+
+/// Вызов из ответа модели с решением.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedCall {
+    pub call: ToolCall,
+    pub source: CallSource,
+    pub verdict: CallVerdict,
+}
+
+/// Ответ модели, подготовленный к фиксации в истории (D27).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reviewed {
+    /// Сообщение ассистента для истории: текст и рассуждение без разметки вызовов,
+    /// вызовы — все из `calls` (каждому нужен результат).
+    pub assistant: Message,
+    pub calls: Vec<PlannedCall>,
+    /// Управляющие сообщения для модели (оборачивает драйвер, `ControlAction::Nudge`).
+    pub nudges: Vec<String>,
+    /// Неразобранные вызовы (MDL-018): для [`report_parse_errors`].
+    pub parse_errors: u32,
+    /// Текст ответа без разметки вызовов.
+    pub text: String,
+    /// Исправления нормализации у принятых вызовов (`turn.finished.repairs`, D8).
+    pub repairs: u32,
+    /// Отказы нормализации (`turn.finished.rejected`, D8).
+    pub rejected: u32,
+}
+
+/// Результат извлечённой из текста мутации (D27).
+const BLOCKED: &str = "blocked: calls that change state must use the tool-calling interface; this call was not executed";
+/// Nudge извлечённой мутации (D23, D27).
+const MUTATION_NUDGE: &str = "The tool call in your text was not executed: calls that change state must use the tool-calling interface. Make the call again as a tool call.";
+/// Результат вызова в ответе, обрезанном по длине (D27).
+const LENGTH_CUT: &str = "not executed: response cut by output limit (finish_reason=length). Repeat the call with shorter arguments or split the work.";
+/// Сколько символов исходной разметки показывается модели.
+const RAW_SHOWN: usize = 200;
+
+/// D27. `classes` — класс эффекта по имени инструмента. Нативные с пустым id получают `nc-{turn}-{i}` до normalize.
+/// `calls`: нативные в порядке сообщения (принятые и отвергнутые), затем извлечённые из текста и рассуждения.
+///
+/// Повтор id нативного вызова в одном ответе тоже заменяется на `nc-{turn}-{i}`:
+/// иначе сопоставление отказов по id и фиксация хода (`DuplicateCallId`) ломаются.
+/// Инструмент без класса в `classes` считается `NonIdempotent` (строже).
+pub fn review(
+    out: &TurnOutput,
+    tools: &[ToolSchema],
+    classes: &BTreeMap<String, EffectClass>,
+    turn: u32,
+) -> Reviewed {
+    let mut msg = out.message.clone();
+    let mut ids: HashSet<String> = HashSet::new();
+    let mut i = 0usize;
+    for p in &mut msg.parts {
+        if let Part::ToolCall(c) = p {
+            if c.id.is_empty() || ids.contains(&c.id) {
+                c.id = format!("nc-{turn}-{i}");
+            }
+            ids.insert(c.id.clone());
+            i += 1;
+        }
+    }
+
+    let norm = normalize(&msg, tools, &[]);
+    let accepted: HashMap<&str, &NormalizedCall> = norm
+        .calls
+        .iter()
+        .filter(|c| c.source == CallSource::Native)
+        .map(|c| (c.call.id.as_str(), c))
+        .collect();
+    let mut rejected = norm.rejected.iter();
+    let mut calls = Vec::new();
+    let mut nudges = Vec::new();
+    let mut parse_errors = 0u32;
+    let mut repairs = 0u32;
+
+    // Нативные: по порядку сообщения; отвергнутым — первые отказы по порядку (D27).
+    for p in &msg.parts {
+        let Part::ToolCall(c) = p else { continue };
+        if let Some(nc) = accepted.get(c.id.as_str()) {
+            repairs += count(nc.repairs.len());
+            calls.push(PlannedCall {
+                call: nc.call.clone(),
+                source: CallSource::Native,
+                verdict: CallVerdict::Run,
+            });
+            continue;
+        }
+        let text = match rejected.next() {
+            Some(r) => {
+                if matches!(r, CallRejection::Unparseable { .. }) {
+                    parse_errors += 1;
+                }
+                rejection_text(r)
+            }
+            None => {
+                tracing::warn!(id = %c.id, "нативный вызов не принят, но отказа для него нет");
+                "not executed: the tool call was rejected".to_owned()
+            }
+        };
+        calls.push(PlannedCall {
+            call: c.clone(),
+            source: CallSource::Native,
+            verdict: CallVerdict::Reject(text),
+        });
+    }
+
+    // Извлечённые из текста и рассуждения: id `xc-{turn}-{n}`, мутации не исполняются.
+    let mut blocked = false;
+    for (n, nc) in norm
+        .calls
+        .iter()
+        .filter(|c| c.source != CallSource::Native)
+        .enumerate()
+    {
+        repairs += count(nc.repairs.len());
+        let mut call = nc.call.clone();
+        call.id = format!("xc-{turn}-{n}");
+        let class = classes
+            .get(&call.name)
+            .copied()
+            .unwrap_or(EffectClass::NonIdempotent);
+        let verdict = if extracted_mutation_blocked(nc.source, class) {
+            blocked = true;
+            CallVerdict::Reject(BLOCKED.to_owned())
+        } else {
+            CallVerdict::Run
+        };
+        calls.push(PlannedCall {
+            call,
+            source: nc.source,
+            verdict,
+        });
+    }
+    if blocked {
+        nudges.push(MUTATION_NUDGE.to_owned());
+    }
+
+    // Остальные отказы относятся к извлечённым (D27).
+    for r in rejected {
+        match r {
+            CallRejection::Unparseable { raw } => {
+                parse_errors += 1;
+                nudges.push(format!(
+                    "Your tool call could not be parsed: {}. Call the tool again with valid JSON arguments.",
+                    shown(raw)
+                ));
+            }
+            other => tracing::debug!(rejection = ?other, "отклонён вызов, извлечённый из текста"),
+        }
+    }
+
+    if out.finish == FinishReason::Length {
+        for c in &mut calls {
+            c.verdict = CallVerdict::Reject(LENGTH_CUT.to_owned());
+        }
+    }
+
+    let assistant = assistant_message(&out.message, &norm.text, &norm.reasoning, &calls);
+    Reviewed {
+        assistant,
+        calls,
+        nudges,
+        parse_errors,
+        text: norm.text,
+        repairs,
+        rejected: count(norm.rejected.len()),
+    }
+}
+
+/// Сообщение ассистента для истории: рассуждение, текст, вызовы.
+///
+/// Рассуждение с данными провайдера (`replay`: подпись thinking и т. п.) остаётся
+/// как пришло: изменённый текст сделал бы подпись недействительной. Иначе —
+/// одной частью без разметки вызовов.
+fn assistant_message(
+    original: &Message,
+    text: &str,
+    reasoning: &str,
+    calls: &[PlannedCall],
+) -> Message {
+    let mut parts = Vec::new();
+    let has_replay = original.parts.iter().any(|p| {
+        matches!(
+            p,
+            Part::Reasoning {
+                replay: Some(_),
+                ..
+            }
+        )
+    });
+    if has_replay {
+        parts.extend(
+            original
+                .parts
+                .iter()
+                .filter(|p| matches!(p, Part::Reasoning { .. }))
+                .cloned(),
+        );
+    } else if !reasoning.is_empty() {
+        parts.push(Part::Reasoning {
+            text: reasoning.to_owned(),
+            replay: None,
+        });
+    }
+    if !text.is_empty() {
+        parts.push(Part::Text(text.to_owned()));
+    }
+    parts.extend(calls.iter().map(|c| Part::ToolCall(c.call.clone())));
+    Message {
+        role: Role::Assistant,
+        parts,
+    }
+}
+
+/// Результат-ошибка отвергнутого нативного вызова (D23, английский). Текст модели
+/// экранируется ([`escape_untrusted`]).
+fn rejection_text(r: &CallRejection) -> String {
+    match r {
+        CallRejection::UnknownTool { name, nearest } => {
+            let near: Vec<&str> = nearest
+                .iter()
+                .filter(|k| is_near(name, k))
+                .map(String::as_str)
+                .collect();
+            let near = if near.is_empty() {
+                "none".to_owned()
+            } else {
+                near.join(", ")
+            };
+            format!(
+                "unknown tool \"{}\"; nearest: {}",
+                escape_untrusted(name),
+                near
+            )
+        }
+        CallRejection::InvalidArgs { name, errors } => {
+            let errs: Vec<String> = errors
+                .iter()
+                .map(|e| {
+                    if e.path.is_empty() {
+                        e.message.clone()
+                    } else {
+                        format!("{}: {}", e.path, e.message)
+                    }
+                })
+                .collect();
+            format!(
+                "invalid arguments for \"{}\": {}",
+                escape_untrusted(name),
+                escape_untrusted(&errs.join("; "))
+            )
+        }
+        CallRejection::Unparseable { raw } => {
+            format!("could not parse tool call arguments: {}", shown(raw))
+        }
+        CallRejection::TooManyCalls { limit, skipped } => {
+            format!("not executed: too many tool calls (limit {limit}, skipped {skipped})")
+        }
+    }
+}
+
+/// Близкое имя для подсказки: есть хоть один общий символ (без учёта регистра).
+/// Полностью чужое имя (`zzz` при `read_file`) подсказкой не считается — модель
+/// получает `nearest: none`. Порядок и отбор до трёх — от нормализации (D28).
+fn is_near(name: &str, known: &str) -> bool {
+    let name = name.to_lowercase();
+    known.to_lowercase().chars().any(|c| name.contains(c))
+}
+
+/// Первые [`RAW_SHOWN`] символов разметки модели, экранированные.
+fn shown(raw: &str) -> String {
+    let head: String = raw.chars().take(RAW_SHOWN).collect();
+    escape_untrusted(&head)
+}
+
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// MDL-018, R1-A D43: при n > 0 один вызов model.record_parse_error(run, call).
+pub fn report_parse_errors(model: &dyn ModelPort, run: RunId, call: &ModelCall, n: u32) {
+    if n > 0 {
+        model.record_parse_error(run, call);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_buffer_flushes_by_size_and_time() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut b = DeltaBuffer::default();
+        assert_eq!(b.push("a", ms(0)), None);
+        assert_eq!(b.deadline(), Some(ms(200)));
+        assert_eq!(b.push("a", ms(150)), None);
+        assert_eq!(b.take(), Some("aa".into())); // таймер в 200 мс
+        assert_eq!(b.deadline(), None);
+        assert_eq!(b.push("a", ms(300)), None);
+        assert_eq!(b.push("a", ms(520)), Some("aa".into())); // таймер опоздал
+        assert_eq!(b.push(&"x".repeat(2048), ms(600)), Some("x".repeat(2048)));
+        assert_eq!(b.push("a", ms(610)), None);
+        assert_eq!(b.take(), Some("a".into())); // перед Finished
+        assert_eq!(b.take(), None);
+    }
+
+    #[test]
+    fn output_tps_guards() {
+        assert_eq!(output_tps(100, Some(500), 1500), Some(100.0));
+        assert_eq!(output_tps(100, None, 1500), None);
+        assert_eq!(output_tps(100, Some(1500), 1500), None);
+    }
+
+    #[test]
+    fn near_names_share_something() {
+        assert!(is_near("raed_fil", "write"));
+        assert!(!is_near("zzz", "read_file"));
+    }
+
+    #[test]
+    fn decode_failure_round_trips_signals_and_errors() {
+        for s in [Signal::Pause, Signal::Cancel, Signal::Input] {
+            let msg = format!("{INTERRUPTED}{}", s.as_str());
+            assert!(matches!(
+                decode_failure(msg, EffectSource::Journal),
+                TurnError::Aborted { signal, source: EffectSource::Journal } if signal == s
+            ));
+        }
+        let other = decode_failure("boom".into(), EffectSource::Live);
+        assert!(matches!(other, TurnError::Effect(EffectError::Failed(m)) if m == "boom"));
+        let store = decode_failure(format!("{STORE_ERROR} x"), EffectSource::Journal);
+        assert!(matches!(store, TurnError::Effect(EffectError::Failed(_))));
+    }
+}
