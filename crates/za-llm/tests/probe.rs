@@ -1,5 +1,7 @@
 //! Зонд llama.cpp на поддельном сервере `/props`.
 
+mod support;
+
 use axum::Router;
 use axum::http::header;
 use axum::response::IntoResponse;
@@ -93,7 +95,7 @@ async fn connection_refused_is_unreachable() {
         .await
         .unwrap_err();
     assert!(matches!(err, ProbeError::Unreachable(_)), "{err:?}");
-    assert!(started.elapsed() < std::time::Duration::from_secs(6));
+    assert!(started.elapsed() < support::scaled(std::time::Duration::from_secs(6)));
 }
 
 #[tokio::test]

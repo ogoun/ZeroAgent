@@ -16,8 +16,10 @@
 //! **Путь запроса** ([`ModelPort::stream`]):
 //! 1. До стрима: эндпоинт `Inactive` (по завершённому зонду) — ошибка `Inactive` без
 //!    сети; идентичный запрос после ошибки разбора — `RepeatedAfterParseError` (D21,
-//!    D43); у готового эндпоинта предохранитель не пускает — `CircuitOpen` (D22,
-//!    переход в `HalfOpen` запускает повторный зонд); заявка встаёт в очередь группы.
+//!    D43); у готового эндпоинта пауза открытого предохранителя не истекла —
+//!    `CircuitOpen` с `retry_after`, эндпоинт выключен — `Auth` (D22; разрешение здесь
+//!    не берётся); заявка встаёт в очередь группы с пределом `RequestMeta::max_wait`
+//!    (D12, M1; `None` — без предела).
 //! 2. Стрим возвращается сразу; его guard — [`AbortOnDrop`] фоновой задачи (D2). Первое
 //!    событие — всегда `Queued`. Пока эндпоинт не готов, его заявки стоят в очереди
 //!    приостановленными ([`ModelQueue::hold`] по id эндпоинта): с позицией и старением
@@ -30,7 +32,12 @@
 //!    зонда: запрос не отправлялся, предохранителю не считается.
 //!    Затем — каждое изменение статуса заявки, пока она ждёт места (D31). Отказ
 //!    очереди: `cancelled` → `Cancelled`, прочие — `Queue` с кодом [`QueueError::code`].
-//! 3. Место выдано: если эндпоинт за время ожидания стал недоступен — место отпускается, дальше — как в п. 2.
+//! 3. Место выдано: если эндпоинт за время ожидания стал недоступен — место отпускается,
+//!    дальше — как в п. 2; повторная постановка получает остаток `max_wait` от первой.
+//!    Иначе в момент выдачи берётся разрешение предохранителя — на обоих путях (готовый
+//!    эндпоинт и ожидание зонда), до выдачи заявка его не держит (M6). Переход в
+//!    `HalfOpen` запускает повторный зонд; отказ — место отпускается, заявка
+//!    кончается `CircuitOpen` (или `Auth`).
 //!    У llama.cpp слот (`SlotManager`, ключ `"{bundle_key}:{session}"`), порядок `save`
 //!    вытесненной сессии → `restore` → запрос (D29); каждое действие со слотом — до
 //!    30 с, вместе до 60 с, место очереди при этом занято, событий потребителю нет.
@@ -492,6 +499,11 @@ impl ModelPort for Gateway {
     fn record_parse_error(&self, run: RunId, call: &ModelCall) {
         let fp = request_fingerprint(&call.endpoint, &call.request);
         lock(&self.inner.parse_guard).record(run, fp);
+    }
+
+    /// [`Gateway::finish_run`]: отпечатки run после ошибок разбора забываются.
+    fn finish_run(&self, run: RunId) {
+        Gateway::finish_run(self, run);
     }
 }
 
@@ -965,22 +977,18 @@ impl Inner {
         lock(&self.parse_guard).check(run, &fp)?;
         // Заявка встаёт в очередь сразу, с меткой эндпоинта: пока он не готов, она
         // приостановлена (I6) — сохраняет позицию и старение, но места не занимает.
-        // Разрешение предохранителя у неготового эндпоинта берётся после зонда.
-        let permit = if ready { Some(self.allow(ep)?) } else { None };
+        // Разрешение предохранителя берётся при выдаче места (M6); здесь — только отказ,
+        // который ожидание не изменит: пауза открытого предохранителя или выключенный
+        // эндпоинт.
+        if ready && let Some(err) = lock(&ep.breaker).refusal(Instant::now()) {
+            return Err(err);
+        }
         let tag = Some(ep.cfg.id.0.clone());
-        let ticket = match self
+        let enqueued = Instant::now();
+        let ticket = self
             .queue
-            .enqueue_tagged(&ep.group, run, call.meta.priority, None, tag)
-        {
-            Ok(t) => t,
-            Err(e) => {
-                let err = queue_error(&e);
-                if let Some(p) = permit {
-                    lock(&ep.breaker).on_failure(p, &err, Instant::now());
-                }
-                return Err(err);
-            }
-        };
+            .enqueue_tagged(&ep.group, run, call.meta.priority, call.meta.max_wait, tag)
+            .map_err(|e| queue_error(&e))?;
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let outside = Arc::new(AtomicBool::new(false));
@@ -1002,11 +1010,12 @@ impl Inner {
             call,
             fp,
             seen,
+            enqueued,
             tx,
             outside,
             _reg: reg,
         };
-        let handle = self.rt.spawn(task.run(ticket, permit, cancel_rx));
+        let handle = self.rt.spawn(task.run(ticket, cancel_rx));
         Ok(ModelStream::from_channel(rx, Box::new(AbortOnDrop(handle))))
     }
 
@@ -1208,20 +1217,17 @@ struct CallTask {
     tx: mpsc::Sender<Ev>,
     /// Применённый зонд на момент постановки заявки.
     seen: u64,
+    /// Момент первой постановки: отсчёт `max_wait` при повторной постановке (M1).
+    enqueued: Instant,
     outside: Arc<AtomicBool>,
     _reg: Registration,
 }
 
 impl CallTask {
-    async fn run(
-        self,
-        ticket: Ticket,
-        permit: Option<BreakerPermit>,
-        mut cancel: watch::Receiver<bool>,
-    ) {
-        // Разрешение предохранителя общее с задачей попытки: успех сообщается, когда
-        // пришёл `Finished`, до передачи его потребителю.
-        let verdict: Verdict = Arc::new(Mutex::new(permit));
+    async fn run(self, ticket: Ticket, mut cancel: watch::Receiver<bool>) {
+        // Разрешение предохранителя берётся при выдаче места и общее с задачей попытки:
+        // успех сообщается, когда пришёл `Finished`, до передачи его потребителю.
+        let verdict: Verdict = Arc::new(Mutex::new(None));
         let Some(ep) = self.inner.endpoints.get(&self.call.endpoint) else {
             return;
         };
@@ -1282,10 +1288,12 @@ impl CallTask {
                     announce = true;
                     let meta = &self.call.meta;
                     let tag = Some(ep.cfg.id.0.clone());
+                    // Предел ожидания общий для всех постановок заявки (M1).
+                    let left = remaining_wait(meta.max_wait, self.enqueued.elapsed());
                     let t = self
                         .inner
                         .queue
-                        .enqueue_tagged(&ep.group, meta.run_id, meta.priority, None, tag)
+                        .enqueue_tagged(&ep.group, meta.run_id, meta.priority, left, tag)
                         .map_err(|e| Failure::unsent(queue_error(&e)))?;
                     ticket.insert(t)
                 }
@@ -1305,17 +1313,22 @@ impl CallTask {
                     .await
                     .map_err(Failure::unsent)?;
             }
-            let deferred = lock(verdict).is_none();
-            if deferred {
-                let p = self.inner.allow(ep).map_err(Failure::unsent)?;
-                *lock(verdict) = Some(p);
-            }
             match wait_place(t, status, &self.tx, ep).await? {
                 Waited::NotReady => continue,
                 Waited::Granted(place) => {
                     ticket = None;
                     self.outside.store(true, Ordering::SeqCst);
                     if ep.ready_now() {
+                        // Разрешение предохранителя — в момент выдачи места (M6): до
+                        // выдачи заявка ждёт без него и не держит пробу `HalfOpen`.
+                        // Отказ — место отпускается сразу, заявка кончается отказом.
+                        match self.inner.allow(ep) {
+                            Ok(p) => *lock(verdict) = Some(p),
+                            Err(e) => {
+                                drop(place);
+                                return Err(Failure::unsent(e));
+                            }
+                        }
                         break place;
                     }
                     // Место отпускается, дальше — зонд по правилам `ensure_ready`.
@@ -1598,6 +1611,12 @@ fn tool_choice_rejected(err: &ModelError, choice: &ToolChoice) -> bool {
         && err.message.to_ascii_lowercase().contains("tool_choice")
 }
 
+/// Остаток предела ожидания после `waited` (повторная постановка заявки, M1);
+/// `Some(ZERO)` — предел исчерпан, очередь откажет `wait_timeout` сразу.
+fn remaining_wait(max_wait: Option<Duration>, waited: Duration) -> Option<Duration> {
+    max_wait.map(|m| m.saturating_sub(waited))
+}
+
 /// Отказ очереди наружу: `cancelled` → `Cancelled`, прочие → `Queue` с кодом (D12).
 fn queue_error(e: &QueueError) -> ModelError {
     match e {
@@ -1661,5 +1680,23 @@ fn warning_text(w: &ConfigWarning) -> String {
             "models: у эндпоинтов облачной группы {group} разные daily_budget_usd, \
              действует минимум {used} USD (D34)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remaining_wait_after_requeue() {
+        assert_eq!(
+            remaining_wait(Some(Duration::from_millis(100)), Duration::from_millis(60)),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            remaining_wait(Some(Duration::from_millis(100)), Duration::from_millis(150)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(remaining_wait(None, Duration::from_secs(5)), None);
     }
 }

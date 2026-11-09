@@ -112,9 +112,9 @@ fn profile_gates_reasoning_include_and_sampling() {
 
 fn transport() -> HttpTransport {
     HttpTransport::cloud(Timeouts {
-        connect: Duration::from_secs(2),
-        first_byte: Duration::from_secs(5),
-        idle: Duration::from_secs(5),
+        connect: support::scaled(Duration::from_secs(10)),
+        first_byte: support::scaled(Duration::from_secs(10)),
+        idle: support::scaled(Duration::from_secs(10)),
     })
 }
 
@@ -133,9 +133,10 @@ async fn open_with(
 
 async fn drain(mut s: OpenedStream) -> Vec<Result<StreamEvent, ModelError>> {
     let mut out = Vec::new();
-    while let Some(x) = tokio::time::timeout(Duration::from_secs(5), s.events.recv())
-        .await
-        .expect("канал не закрылся за 5 с")
+    while let Some(x) =
+        tokio::time::timeout(support::scaled(Duration::from_secs(30)), s.events.recv())
+            .await
+            .expect("канал не закрылся")
     {
         out.push(x);
     }

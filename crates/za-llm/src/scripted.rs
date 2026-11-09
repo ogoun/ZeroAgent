@@ -1,18 +1,35 @@
 //! Детерминированная модель для тестов R1-B, без сети.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use za_protocol::RunId;
 
 use crate::caps::ProviderCapabilities;
 use crate::error::{ErrorClass, ModelError};
-use crate::port::{BoxFuture, ModelCall, ModelPort, ModelStream};
+use crate::port::{AbortOnDrop, BoxFuture, ModelCall, ModelPort, ModelStream};
 use crate::types::{EndpointId, StreamEvent};
 
-/// Сценарий одного вызова: события стрима по порядку.
-type Script = Vec<Result<StreamEvent, ModelError>>;
+type Ev = Result<StreamEvent, ModelError>;
+
+/// Как сценарий отдаёт события.
+enum Mode {
+    /// Все события сразу, затем канал закрыт.
+    Closed,
+    /// Все события сразу, канал открыт, пока стрим не брошен.
+    Open,
+    /// Первое событие сразу, каждое следующее — через `gap` после предыдущего.
+    Paced(Duration),
+}
+
+/// Сценарий одного вызова: события стрима по порядку и способ их отдачи.
+struct Script {
+    events: Vec<Ev>,
+    mode: Mode,
+}
 
 /// Модель, отвечающая заранее заданными сценариями по порядку вызовов.
 /// Возможности одинаковы для любого эндпоинта.
@@ -22,11 +39,37 @@ pub struct ScriptedModel {
     scripts: Mutex<VecDeque<Script>>,
     calls: Mutex<Vec<ModelCall>>,
     parse_errors: Mutex<Vec<(RunId, ModelCall)>>,
+    finished: Mutex<Vec<RunId>>,
+    /// Число живых стримов (guard ещё не уничтожен).
+    open: Arc<AtomicUsize>,
 }
 
 /// Отравленный мьютекс не мешает тестовой модели: данные — простые списки.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Guard стрима: считает живые стримы и держит то, что живёт вместе со стримом
+/// (отправитель открытого канала, задача размеренной отдачи).
+struct StreamGuard {
+    open: Arc<AtomicUsize>,
+    _keep: Box<dyn Send + Sync>,
+}
+
+impl StreamGuard {
+    fn new(open: &Arc<AtomicUsize>, keep: Box<dyn Send + Sync>) -> Self {
+        open.fetch_add(1, Ordering::SeqCst);
+        Self {
+            open: open.clone(),
+            _keep: keep,
+        }
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl ScriptedModel {
@@ -37,6 +80,8 @@ impl ScriptedModel {
             scripts: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
             parse_errors: Mutex::new(Vec::new()),
+            finished: Mutex::new(Vec::new()),
+            open: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -46,9 +91,26 @@ impl ScriptedModel {
         self
     }
 
-    /// Добавить сценарий в конец очереди.
+    fn push_script(&self, events: Vec<Ev>, mode: Mode) {
+        lock(&self.scripts).push_back(Script { events, mode });
+    }
+
+    /// Добавить сценарий в конец очереди: события сразу, затем канал закрыт.
     pub fn push(&self, events: Vec<Result<StreamEvent, ModelError>>) {
-        lock(&self.scripts).push_back(events);
+        self.push_script(events, Mode::Closed);
+    }
+
+    /// Сценарий, канал которого остаётся открытым после событий, пока стрим не брошен
+    /// (модель «молчит» после последнего события).
+    pub fn push_open(&self, events: Vec<Result<StreamEvent, ModelError>>) {
+        self.push_script(events, Mode::Open);
+    }
+
+    /// Первое событие сразу, следующие — через `gap` каждое (`tokio::time::sleep`,
+    /// поэтому `pause`/`advance` им управляют); после последнего канал закрыт. Задача
+    /// отдачи — [`AbortOnDrop`]: drop стрима её отменяет.
+    pub fn push_paced(&self, events: Vec<Result<StreamEvent, ModelError>>, gap: Duration) {
+        self.push_script(events, Mode::Paced(gap));
     }
 
     /// Все вызовы `stream` по порядку, включая те, на которые сценария не нашлось.
@@ -60,6 +122,54 @@ impl ScriptedModel {
     pub fn parse_errors(&self) -> Vec<(RunId, ModelCall)> {
         lock(&self.parse_errors).clone()
     }
+
+    /// Живые стримы (guard ещё не уничтожен).
+    pub fn open_streams(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    /// Вызовы `finish_run` по порядку.
+    pub fn finished_runs(&self) -> Vec<RunId> {
+        lock(&self.finished).clone()
+    }
+}
+
+/// Стрим сценария. Ёмкость канала вмещает весь сценарий: отправка не ждёт получателя,
+/// а получатель жив (он в стриме), поэтому `try_send` не падает.
+fn open_script(script: Script, open: &Arc<AtomicUsize>) -> ModelStream {
+    let Script { events, mode } = script;
+    let (tx, rx) = mpsc::channel(events.len().max(1));
+    let keep: Box<dyn Send + Sync> = match mode {
+        Mode::Closed | Mode::Open => {
+            for ev in events {
+                let _ = tx.try_send(ev);
+            }
+            match mode {
+                Mode::Open => Box::new(tx),
+                _ => Box::new(()),
+            }
+        }
+        Mode::Paced(gap) => {
+            // Моменты отсчитываются от вызова `stream`, а не от первого опроса задачи:
+            // на паузе времени они не зависят от планировщика.
+            let mut at = tokio::time::Instant::now();
+            let mut rest = events.into_iter();
+            if let Some(first) = rest.next() {
+                let _ = tx.try_send(first);
+            }
+            let handle = tokio::spawn(async move {
+                for ev in rest {
+                    at += gap;
+                    tokio::time::sleep_until(at).await;
+                    if tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Box::new(AbortOnDrop(handle))
+        }
+    };
+    ModelStream::from_channel(rx, Box::new(StreamGuard::new(open, keep)))
 }
 
 impl ModelPort for ScriptedModel {
@@ -67,15 +177,9 @@ impl ModelPort for ScriptedModel {
         lock(&self.calls).push(call);
         let script = lock(&self.scripts).pop_front();
         Box::pin(async move {
-            let events =
+            let script =
                 script.ok_or_else(|| ModelError::new(ErrorClass::Inactive, "сценарий исчерпан"))?;
-            // Ёмкость канала вмещает весь сценарий: отправка не ждёт получателя.
-            let (tx, rx) = mpsc::channel(events.len().max(1));
-            for ev in events {
-                // Получатель жив (он ниже), а места хватает, поэтому отправка не падает.
-                let _ = tx.try_send(ev);
-            }
-            Ok(ModelStream::from_channel(rx, Box::new(())))
+            Ok(open_script(script, &self.open))
         })
     }
 
@@ -89,6 +193,10 @@ impl ModelPort for ScriptedModel {
 
     fn record_parse_error(&self, run: RunId, call: &ModelCall) {
         lock(&self.parse_errors).push((run, call.clone()));
+    }
+
+    fn finish_run(&self, run: RunId) {
+        lock(&self.finished).push(run);
     }
 }
 
@@ -111,6 +219,7 @@ mod tests {
                 run_id: RunId::new(),
                 priority: Priority::Worker,
                 session: None,
+                max_wait: None,
             },
             request: ChatRequest {
                 system: "s".into(),
@@ -200,5 +309,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.message.parts, vec![Part::Text("a".into())]);
+    }
+
+    #[tokio::test]
+    async fn push_open_keeps_stream_until_drop() {
+        let m = ScriptedModel::new(default_caps(BackendKind::LlamaCpp));
+        m.push_open(vec![Ok(StreamEvent::TextDelta("a".into()))]);
+        let mut s = m.stream(call("local", "q")).await.unwrap();
+        assert!(matches!(s.next().await, Some(Ok(StreamEvent::TextDelta(t))) if t == "a"));
+        let more = tokio::time::timeout(Duration::from_millis(50), s.next()).await;
+        assert!(more.is_err(), "канал должен оставаться открытым: {more:?}");
+        assert_eq!(m.open_streams(), 1);
+        drop(s);
+        assert_eq!(m.open_streams(), 0);
+    }
+
+    /// Уже пришедшие события стрима без ожидания: нулевой предел опрашивает стрим один
+    /// раз, прежде чем истечь.
+    async fn ready_events(s: &mut ModelStream) -> usize {
+        let mut n = 0;
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::ZERO, s.next()).await {
+            n += 1;
+        }
+        n
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn push_paced_spaces_events() {
+        let m = ScriptedModel::new(default_caps(BackendKind::LlamaCpp));
+        m.push_paced(
+            vec![
+                Ok(StreamEvent::TextDelta("a".into())),
+                Ok(StreamEvent::TextDelta("b".into())),
+            ],
+            Duration::from_secs(1),
+        );
+        let mut s = m.stream(call("local", "q")).await.unwrap();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let mut got = ready_events(&mut s).await;
+        assert_eq!(got, 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        got += ready_events(&mut s).await;
+        assert_eq!(got, 2);
+        assert_eq!(m.open_streams(), 1);
+        drop(s);
+        assert_eq!(m.open_streams(), 0);
+    }
+
+    #[test]
+    fn finish_run_recorded() {
+        let m = ScriptedModel::new(default_caps(BackendKind::LlamaCpp));
+        let r = RunId::new();
+        m.finish_run(r);
+        assert_eq!(m.finished_runs(), vec![r]);
     }
 }

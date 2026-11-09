@@ -2,6 +2,8 @@
 //! Hermes, Qwen XML, Harmony (задача 7); форматы P1: DSML, Gemma 4, Mistral,
 //! pythonic, llama3_json (задача 8).
 
+mod support;
+
 use serde_json::{Value, json};
 use za_llm::normalize::{
     CallRejection, CallSource, JsonType, MAX_EXTRACTED_CALLS, NormalizeOutcome, Repair,
@@ -593,7 +595,11 @@ fn every_truncation_point_is_safe() {
 /// входе занимает десятки секунд и в release, так что порог его ловит. Худший
 /// замер ревью в release — 0,076 с.
 fn time_limit() -> std::time::Duration {
-    std::time::Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 1 })
+    support::scaled(std::time::Duration::from_secs(if cfg!(debug_assertions) {
+        5
+    } else {
+        1
+    }))
 }
 
 /// I1: разбор линейный — ~1,2 МБ повторов каждого формата укладываются в

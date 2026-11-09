@@ -962,3 +962,30 @@ async fn service_message_alone_does_not_count_as_partial_output() {
     assert_eq!(events[0], Ok(service));
     assert!(matches!(events[1], Ok(StreamEvent::Finished { .. })));
 }
+
+#[test]
+fn refusal_does_not_take_permit() {
+    // M6 R1-B1: проверка до постановки в очередь — только отказ, который ожидание не
+    // изменит; разрешения не берёт, занятая проба `HalfOpen` отказом не считается.
+    let t0 = Instant::now();
+    assert!(breaker().refusal(t0).is_none());
+    let mut b = opened(t0);
+    let e = b.refusal(t0 + secs(10)).expect("пауза не истекла");
+    assert_eq!(e.class, ErrorClass::CircuitOpen);
+    assert_eq!(e.retry_after, Some(secs(20)));
+    assert_eq!(
+        b.state(),
+        BreakerState::Open {
+            until: t0 + secs(30)
+        }
+    );
+    // Пауза истекла: отказа нет, а проба остаётся свободной для `allow`.
+    let t1 = t0 + secs(30);
+    assert!(b.refusal(t1).is_none());
+    let probe = b.allow(t1).unwrap();
+    assert!(probe.is_probe());
+    assert!(b.refusal(t1).is_none(), "занятая проба — не отказ");
+    assert!(b.allow(t1).is_err());
+    b.on_failure(probe, &err(ErrorClass::Auth), t1);
+    assert_eq!(b.refusal(t1).map(|e| e.class), Some(ErrorClass::Auth));
+}

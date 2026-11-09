@@ -5,6 +5,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -24,6 +25,10 @@ pub struct RequestMeta {
     pub priority: Priority,
     /// Сессия для привязки к слоту llama.cpp (MDL-011).
     pub session: Option<String>,
+    /// Предел ожидания в очереди (D12 R1-A); `None` — без предела (RES-007). Истёк —
+    /// ошибка `Queue` с текстом `wait_timeout`.
+    #[serde(default)]
+    pub max_wait: Option<Duration>,
 }
 
 /// Вызов модели: куда, от кого и что.
@@ -45,6 +50,10 @@ pub trait ModelPort: Send + Sync {
     /// Цикл сообщает, что вызов инструмента из ответа на `call` не разобран
     /// (D43, MDL-018): идентичный повтор запроса будет отвергнут.
     fn record_parse_error(&self, run: RunId, call: &ModelCall);
+    /// Run в конечном состоянии: забыть отпечатки запросов после ошибок разбора
+    /// (`ParseGuard`). Цикл вызывает при любом конечном состоянии run. По умолчанию
+    /// ничего не делает.
+    fn finish_run(&self, _run: RunId) {}
 }
 
 /// Guard фоновой задачи стрима: `Drop` вызывает `JoinHandle::abort()` (D2).

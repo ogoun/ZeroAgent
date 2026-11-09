@@ -218,10 +218,7 @@ impl CircuitBreaker {
                 generation: self.generation,
                 probe: None,
             }),
-            BreakerState::Open { until } if now < *until => Err(ModelError {
-                retry_after: Some(*until - now),
-                ..ModelError::new(ErrorClass::CircuitOpen, "предохранитель эндпоинта открыт")
-            }),
+            BreakerState::Open { until } if now < *until => Err(open_error(*until, now)),
             BreakerState::HalfOpen if self.probe.strong_count() > 0 => Err(ModelError::new(
                 ErrorClass::CircuitOpen,
                 "предохранитель эндпоинта: идёт пробная заявка",
@@ -235,10 +232,7 @@ impl CircuitBreaker {
                     probe: Some(token),
                 })
             }
-            BreakerState::Disabled { reason } => Err(ModelError::new(
-                ErrorClass::Auth,
-                format!("эндпоинт выключен до сброса: {reason}"),
-            )),
+            BreakerState::Disabled { reason } => Err(disabled_error(reason)),
         }
     }
 
@@ -343,6 +337,34 @@ impl CircuitBreaker {
     pub fn state(&self) -> BreakerState {
         self.state.clone()
     }
+
+    /// Отказ, который `allow` дал бы в момент `now` при любом исходе других заявок:
+    /// пауза открытого предохранителя не истекла (`CircuitOpen` с `retry_after`) или
+    /// эндпоинт выключен (`Auth`). Разрешения не берёт и состояние не меняет; занятая
+    /// проба `HalfOpen` отказом не считается — к выдаче места она может освободиться.
+    pub fn refusal(&self, now: Instant) -> Option<ModelError> {
+        match &self.state {
+            BreakerState::Open { until } if now < *until => Some(open_error(*until, now)),
+            BreakerState::Disabled { reason } => Some(disabled_error(reason)),
+            _ => None,
+        }
+    }
+}
+
+/// Отказ открытого предохранителя: пауза до `until`.
+fn open_error(until: Instant, now: Instant) -> ModelError {
+    ModelError {
+        retry_after: Some(until - now),
+        ..ModelError::new(ErrorClass::CircuitOpen, "предохранитель эндпоинта открыт")
+    }
+}
+
+/// Отказ выключенного эндпоинта (ключ отвергнут, D22).
+fn disabled_error(reason: &str) -> ModelError {
+    ModelError::new(
+        ErrorClass::Auth,
+        format!("эндпоинт выключен до сброса: {reason}"),
+    )
 }
 
 /// Отпечаток запроса для [`ParseGuard`] и джиттера (D21, D44): BLAKE3 от id эндпоинта

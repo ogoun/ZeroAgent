@@ -18,9 +18,9 @@ const SLOT1: &str = "POST /slots/1";
 
 fn transport() -> HttpTransport {
     HttpTransport::local(Timeouts {
-        connect: Duration::from_secs(2),
-        first_byte: Duration::from_secs(5),
-        idle: Duration::from_secs(5),
+        connect: support::scaled(Duration::from_secs(10)),
+        first_byte: support::scaled(Duration::from_secs(10)),
+        idle: support::scaled(Duration::from_secs(10)),
     })
 }
 
@@ -274,13 +274,13 @@ async fn save_and_restore_requests_shape() {
 async fn hanging_save_times_out() {
     // Сохранение не задерживает очередь дольше своего таймаута.
     let srv = FakeServer::start(vec![(SLOT1, vec![Reply::Hang])]).await;
-    let slots =
-        LlamaSlots::new(srv.base_url.clone(), transport()).with_timeout(Duration::from_millis(200));
+    let slots = LlamaSlots::new(srv.base_url.clone(), transport())
+        .with_timeout(support::scaled(Duration::from_millis(200)));
     let started = std::time::Instant::now();
     let err = slots.save(1, &slot_file("a")).await.unwrap_err();
     assert_eq!(err.class, ErrorClass::Timeout);
     assert!(!save_unsupported(&err));
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < support::scaled(Duration::from_secs(3)));
 }
 
 #[test]

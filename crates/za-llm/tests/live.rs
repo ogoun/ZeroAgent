@@ -113,6 +113,7 @@ async fn ask(g: &Gateway, name: &str) -> ModelResponse {
             run_id: RunId::new(),
             priority: Priority::Interactive,
             session: None,
+            max_wait: None,
         },
         request: request(),
     };

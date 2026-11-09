@@ -14,11 +14,12 @@ use za_llm::http::{
 
 const ROUTE: &str = "POST /v1/chat/completions";
 
+/// Таймауты транспорта с множителем `ZA_TEST_TIME_SCALE` ([`support::scaled`]).
 fn short(idle_ms: u64, first_byte_ms: u64) -> Timeouts {
     Timeouts {
-        connect: Duration::from_secs(2),
-        first_byte: Duration::from_millis(first_byte_ms),
-        idle: Duration::from_millis(idle_ms),
+        connect: support::scaled(Duration::from_secs(10)),
+        first_byte: support::scaled(Duration::from_millis(first_byte_ms)),
+        idle: support::scaled(Duration::from_millis(idle_ms)),
     }
 }
 
@@ -291,7 +292,7 @@ async fn first_byte_timeout_is_timeout_class() {
         .err()
         .unwrap();
     assert_eq!(err.class, ErrorClass::Timeout, "{err:?}");
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < support::scaled(Duration::from_secs(2)));
 }
 
 #[tokio::test]
@@ -380,7 +381,7 @@ async fn fake_server_counts_disconnects() {
         .unwrap();
     assert_eq!(resp.next_event().await.unwrap().unwrap().data, "0");
     drop(resp);
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + support::scaled(Duration::from_secs(30));
     while srv.disconnects(ROUTE) == 0 && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

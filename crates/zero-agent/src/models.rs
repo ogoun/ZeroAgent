@@ -324,6 +324,7 @@ pub async fn cmd_ask(home: &Path, args: AskArgs) -> Result<ExitCode, CommandErro
             run_id: RunId::new(),
             priority: args.priority,
             session: None,
+            max_wait: None,
         },
         request: ChatRequest {
             messages: vec![Message {

@@ -21,6 +21,8 @@
 - `deny.toml`: убрана неиспользуемая лицензия `Zlib`.
 
 ### Изменено
+- `za-llm`: разрешение предохранителя `Gateway` берёт в момент выдачи места очереди, а не до постановки: заявки к полуоткрытому предохранителю ждут места, а не получают `CircuitOpen` сразу; отказ при выдаче отпускает место. До постановки `CircuitOpen` — только пока не истекла пауза открытого предохранителя.
+- Тесты `za-llm`: ожидания событий — щедрый предел (30 с × `ZA_TEST_TIME_SCALE`), таймауты транспорта и пороги длительности — с множителем; каталоги профилей тестов `Gateway` — по id процесса.
 - `za-store`: `set_status` и `set_status_with_reason` возвращают `StatusChange { from, generation }` вместо `generation`; `run_status_payload` — payload события `run.status`.
 - `za-protocol`: `Budget` отвергает незнакомые поля (`deny_unknown_fields`): опечатка в имени предела — ошибка разбора, а не снятое ограничение.
 - CI: `actions/checkout@v7` (Node 24) вместо `@v4`.
@@ -33,6 +35,7 @@
 - `za-store`: `StoreError` помечен `#[non_exhaustive]`, новые варианты `Corrupt` (повреждение журнала), `SchemaTooNew { found, supported }`, `Serde` вместо общего `Sqlite`.
 
 ### Добавлено
+- `za-llm`: предел ожидания в очереди `RequestMeta.max_wait` (`None` — без предела; истёк — `Queue` с текстом `wait_timeout`, повторная постановка получает остаток); `ModelPort::finish_run(run)` (по умолчанию ничего, `Gateway` забывает отпечатки `ParseGuard`); `ScriptedModel::{push_open, push_paced, open_streams, finished_runs}`; `CircuitBreaker::refusal(now)` — отказ без взятия разрешения.
 - `za-llm`: роль `Role::System` — служебное system-сообщение в истории — и событие `StreamEvent::ServiceMessage(Message)`: коннектор Anthropic, эмулирующий принудительный `tool_choice` system-сообщением с `clear_at`, отдаёт его первым событием стрима, чтобы цикл сохранил его в истории. Anthropic пересылает такие сообщения из истории без изменений (с заголовком beta `clear_at`) моделям, принимающим mid-conversation system, остальным и коннекторам Chat Completions и Responses они не отправляются.
 - `za-core`: инструменты (`Tool`, `ToolSpec`, `ToolKind::{Read, Edit, Exec, Control}`, `Approval::{Mode, Always, Never}`, `ToolOutput`, `ToolCx`), гейт режима `gate(mode, spec)` по таблице D14 (`Deny("read-only mode")`, `Deny("plan mode")`), реестр `ToolRegistry` (`register` с ошибкой `DuplicateTool`, `get`, `for_run(role, tier)`); `Capability` с хуками границы шага `Hook`/`BoundaryInfo`; шина событий `EventBus` (`broadcast`, ёмкость по умолчанию 1024, D35) и `Journal` — запись в журнал и публикация после COMMIT, `run.status` с `seq = None` и тем же payload, что в журнале (D34). Зависимости `za-core`: `tokio` с функцией `sync`, `serde`.
 - `za-core`: граф узлов `Graph` (`node`, `edge`, `run_from`, `graph_hash`) с переходами `Goto`, `Suspend`, `Done` и ошибками `UndeclaredEdge`, `UnknownNode`, `DuplicateNode`, `Node`; `graph_hash` инъективен (счётчики узлов и рёбер, длины строк); параллельные ветви `Fan` отложены до R2. Прерывания `Interrupt` с детерминированными id `{appr|input|ext|timer|unk}-{effect_key}`, `interrupt::open`, `interrupt::state` (`Open` / `Resolved(response)`), `pause_reason_for`. `za-store`: публичные `INTERRUPT_OPEN`, `INTERRUPT_RESOLVED`.

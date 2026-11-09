@@ -62,12 +62,17 @@ fn secs(n: u64) -> Duration {
     support::scaled(Duration::from_secs(n))
 }
 
-/// D41: повторы 1–5 мс, таймауты 500 мс, пауза предохранителя 50 мс.
+/// D41: повторы 1–5 мс, таймауты 10 с, зонд до 30 с, пауза предохранителя 500 мс.
+/// Таймауты и предел зонда здесь не проверяются (для этого — `wire`-тесты и
+/// `start_returns_without_waiting_for_probes` со своими значениями), поэтому они
+/// щедрые: под нагрузкой медленный ответ поддельного сервера не превращается в
+/// `Timeout`, повтор или `Unreachable`. Пауза предохранителя должна с запасом
+/// перекрывать промежуток между отказом и следующей заявкой теста.
 fn opts() -> GatewayOptions {
     let t = Timeouts {
-        connect: ms(500),
-        first_byte: ms(500),
-        idle: ms(500),
+        connect: secs(10),
+        first_byte: secs(10),
+        idle: secs(10),
     };
     GatewayOptions {
         retry: RetryPolicy {
@@ -78,10 +83,10 @@ fn opts() -> GatewayOptions {
         timeouts_local: t,
         timeouts_cloud: t,
         breaker: BreakerOptions {
-            cooldown: ms(50),
+            cooldown: ms(500),
             ..BreakerOptions::default()
         },
-        probe_deadline: secs(2),
+        probe_deadline: patience(),
         reprobe_min: DEFAULT_REPROBE_MIN,
         reprobe_max: DEFAULT_REPROBE_MAX,
     }
@@ -101,10 +106,13 @@ fn opts_long_idle() -> GatewayOptions {
     o
 }
 
+/// Хранилище профилей теста. В пути — id процесса: одновременные прогоны одного
+/// тестового бинарника (два `cargo test` в одном `target`) не стирают друг другу
+/// каталоги.
 fn store(name: &str) -> ProfileStore {
     let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("gateway")
-        .join(name);
+        .join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     ProfileStore::open(&d).unwrap()
 }
@@ -171,7 +179,7 @@ async fn started(
     o: GatewayOptions,
 ) -> Result<Gateway, ConfigError> {
     let g = Gateway::start(cfg, secrets, admission, store, o).await?;
-    assert!(g.wait_probed(secs(5)).await, "зонды не завершены");
+    assert!(g.wait_probed(patience()).await, "зонды не завершены");
     Ok(g)
 }
 
@@ -203,27 +211,36 @@ fn call_on(ep: &str, run: RunId, text: &str) -> ModelCall {
             run_id: run,
             priority: Priority::Interactive,
             session: None,
+            max_wait: None,
         },
         request: request(text),
     }
 }
 
-/// Все события стрима до закрытия канала (не дольше 10 с × множитель).
+/// Все события стрима до закрытия канала (не дольше [`patience`]).
 async fn drain(mut s: ModelStream) -> Vec<Ev> {
     let mut out = Vec::new();
-    tokio::time::timeout(secs(10), async {
+    tokio::time::timeout(patience(), async {
         while let Some(ev) = s.next().await {
             out.push(ev);
         }
     })
     .await
-    .expect("стрим не закрылся за 10 с");
+    .expect("стрим не закрылся");
     out
 }
 
-/// Ждёт условия до `limit`, проверяя каждые 10 мс.
-async fn eventually(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let until = Instant::now() + limit;
+/// Предел ожидания события, которое должно произойти (зонд, запись профиля, закрытие
+/// соединения, освобождение места). Успех возвращается сразу, поэтому предел щедрый:
+/// он ловит только зависание, а не медленную машину. Окна «событие НЕ произошло» и
+/// соотношения длительностей задаются отдельно, через [`ms`].
+fn patience() -> Duration {
+    secs(30)
+}
+
+/// Ждёт условия до [`patience`], проверяя каждые 10 мс.
+async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+    let until = Instant::now() + patience();
     while Instant::now() < until {
         if cond() {
             return true;
@@ -315,7 +332,7 @@ async fn stream_goes_through_queue() {
     assert!(matches!(evs.last(), Some(StreamEvent::Finished { .. })));
     // Место освобождено.
     assert!(
-        eventually(ms(500), || g.view().queue.groups[0].active == 0).await,
+        eventually(|| g.view().queue.groups[0].active == 0).await,
         "место очереди не освобождено"
     );
 }
@@ -570,7 +587,7 @@ async fn breaker_opens_and_reset_closes_body(name: &str) {
     assert_eq!(srv.requests(CHAT).len(), 5);
     assert_eq!(view_of(&g, "local").state, "open");
 
-    tokio::time::sleep(ms(60)).await;
+    tokio::time::sleep(ms(520)).await;
     g.stream(call_on("local", RunId::new(), "проба"))
         .await
         .unwrap()
@@ -694,7 +711,7 @@ async fn drop_stream_releases_slot_and_cancels_http_body(name: &str) {
     }
     drop(s);
     assert!(
-        eventually(secs(2), || srv.disconnects(CHAT) == 1).await,
+        eventually(|| srv.disconnects(CHAT) == 1).await,
         "соединение не закрыто"
     );
     let evs = drain(
@@ -767,7 +784,7 @@ async fn cancel_run_drops_waiting_requests_body(name: &str) {
             .all(|gr| gr.waiting.iter().all(|w| w.run_id != run))
     );
     // `Started` уходит до отправки запроса: на многопоточном runtime он доходит позже.
-    assert!(eventually(secs(2), || srv.requests(CHAT).len() == 1).await);
+    assert!(eventually(|| srv.requests(CHAT).len() == 1).await);
     tokio::time::sleep(ms(50)).await;
     assert_eq!(srv.requests(CHAT).len(), 1);
     drop(holder);
@@ -800,9 +817,7 @@ async fn cancel_run_stops_running_request() {
     let err = s.collect().await.unwrap_err();
     assert_eq!(err.class, ErrorClass::Cancelled);
     assert!(
-        eventually(secs(2), || srv.disconnects(CHAT) == 1
-            && g.view().queue.groups[0].active == 0)
-        .await
+        eventually(|| srv.disconnects(CHAT) == 1 && g.view().queue.groups[0].active == 0).await
     );
 }
 
@@ -843,9 +858,7 @@ async fn reprobe_after_stream_cut_picks_new_bundle() {
         .unwrap_err();
     assert_eq!(err.class, ErrorClass::StreamCut);
     assert!(
-        eventually(secs(2), || view_of(&g, "local").model.as_deref()
-            == Some(MODEL_B))
-        .await,
+        eventually(|| view_of(&g, "local").model.as_deref() == Some(MODEL_B)).await,
         "профиль не обновлён повторным зондом"
     );
     // Хранилище пишется сразу после применения зонда.
@@ -854,7 +867,7 @@ async fn reprobe_after_stream_cut_picks_new_bundle() {
             .and_then(|f| st.load(&f.bundle_key))
             .is_some_and(|p| p.bundle.model == MODEL_B)
     };
-    assert!(eventually(secs(2), stored_b).await, "профиль B не сохранён");
+    assert!(eventually(stored_b).await, "профиль B не сохранён");
     assert_eq!(srv.requests(PROPS).len(), 2);
 }
 
@@ -1126,7 +1139,7 @@ async fn slot_save_unsupported_is_recorded() {
     assert_eq!(srv.total_requests() - before, 2);
     assert_eq!(srv.requests(CHAT).len(), 1);
     assert!(
-        eventually(secs(2), || st
+        eventually(|| st
             .load_endpoint(&id("local"))
             .is_some_and(|f| f.slot_save == Some(false)))
         .await,
@@ -1256,7 +1269,7 @@ async fn start_returns_without_waiting_for_probes() {
     assert!(matches!(evs.last(), Some(Ok(StreamEvent::Finished { .. }))));
     assert_eq!(local.requests(PROPS).len(), 1);
     // Общий предел зонда облака → Unreachable.
-    assert!(eventually(secs(10), || view_of(&g, "cloud").state == "unreachable").await);
+    assert!(eventually(|| view_of(&g, "cloud").state == "unreachable").await);
     assert!(g.wait_probed(ms(100)).await);
 }
 
@@ -1280,7 +1293,7 @@ async fn reprobe_without_changes_keeps_slot_map() {
         started_slot(&drain(g.stream(session_call(Some("b"), "два")).await.unwrap()).await);
     assert!(slot_a.is_some() && slot_b.is_some() && slot_a != slot_b);
     assert!(
-        eventually(secs(2), || st
+        eventually(|| st
             .load_endpoint(&id("local"))
             .is_some_and(|f| f.slot_save == Some(false)))
         .await
@@ -1481,7 +1494,7 @@ async fn slot_auth_failure_disables_slot_save() {
     c.meta.session = Some("sess-1".into());
     g.stream(c.clone()).await.unwrap().collect().await.unwrap();
     assert!(
-        eventually(secs(2), || st
+        eventually(|| st
             .load_endpoint(&id("local"))
             .is_some_and(|f| f.slot_save == Some(false)))
         .await,
@@ -1526,7 +1539,7 @@ async fn panic_in_request_task_is_internal_error() {
         .unwrap_err();
     assert_eq!(err.class, ErrorClass::Internal);
     assert!(
-        eventually(ms(500), || g.view().queue.groups[0].active == 0).await,
+        eventually(|| g.view().queue.groups[0].active == 0).await,
         "место не освобождено"
     );
     assert_eq!(srv.requests(CHAT).len(), 0);
@@ -1583,8 +1596,8 @@ async fn reprobe_interval_doubles_and_resets_on_success() {
     )
     .await;
     let mut o = opts();
-    o.reprobe_min = ms(100);
-    o.reprobe_max = ms(250);
+    o.reprobe_min = ms(300);
+    o.reprobe_max = ms(750);
     let g = start(llama_cfg(&srv.base_url, json!({})), "reprobe_backoff", o).await;
     let fail = |g: &Gateway| {
         let g = g.clone();
@@ -1597,13 +1610,15 @@ async fn reprobe_interval_doubles_and_resets_on_success() {
                 .unwrap_err()
         }
     };
-    let e1 = fail(&g).await; // зонд №2, интервал 100 мс
-    assert!(e1.retry_after.unwrap() <= ms(100));
-    tokio::time::sleep(ms(120)).await;
-    let e2 = fail(&g).await; // зонд №3, интервал 200 мс
-    assert!(e2.retry_after.unwrap() > ms(100), "{:?}", e2.retry_after);
+    let e1 = fail(&g).await; // зонд №2, интервал 300 мс
+    assert!(e1.retry_after.unwrap() <= ms(300));
+    tokio::time::sleep(ms(320)).await;
+    // Зонд №3, интервал 600 мс: остаток больше прежнего интервала, если от конца зонда
+    // до ответа прошло меньше 300 мс.
+    let e2 = fail(&g).await;
+    assert!(e2.retry_after.unwrap() > ms(300), "{:?}", e2.retry_after);
     assert_eq!(srv.requests(PROPS).len(), 3);
-    tokio::time::sleep(ms(220)).await;
+    tokio::time::sleep(ms(620)).await;
     // Зонд №4 успешен: запрос проходит, интервал сброшен.
     g.stream(call_on("local", RunId::new(), "ok"))
         .await
@@ -1619,7 +1634,7 @@ async fn drain_timed(s: ModelStream) -> (Option<Instant>, Vec<Ev>) {
     let mut s = s;
     let mut started = None;
     let mut out = Vec::new();
-    tokio::time::timeout(secs(10), async {
+    tokio::time::timeout(patience(), async {
         while let Some(ev) = s.next().await {
             if started.is_none() && matches!(ev, Ok(StreamEvent::Started { .. })) {
                 started = Some(Instant::now());
@@ -1628,7 +1643,7 @@ async fn drain_timed(s: ModelStream) -> (Option<Instant>, Vec<Ev>) {
         }
     })
     .await
-    .expect("стрим не закрылся за 10 с");
+    .expect("стрим не закрылся");
     (started, out)
 }
 
@@ -1646,7 +1661,7 @@ async fn probe_wait_keeps_priority_and_aging() {
     };
     let srv = llama_server(
         vec![Reply::Delayed(
-            ms(600),
+            ms(700),
             Box::new(props("probe/llama_props.json")),
         )],
         vec![slow],
@@ -1702,18 +1717,18 @@ async fn probe_wait_keeps_priority_and_aging() {
 
 #[tokio::test]
 async fn reprobe_interval_counts_from_probe_end() {
-    // Раунд 3: долгий зонд (300 мс) при интервале 100 мс — `retry_after` после него
-    // около 100 мс, а не ноль (отсчёт от конца зонда, не от запуска).
+    // Раунд 3: долгий зонд (500 мс) при интервале 300 мс — `retry_after` после него
+    // около 300 мс, а не ноль (отсчёт от конца зонда, не от запуска).
     let slow_down = || {
         Reply::Delayed(
-            ms(300),
+            ms(500),
             Box::new(Reply::Json(503, json!({"error": "загрузка модели"}))),
         )
     };
     let srv = llama_server(vec![slow_down()], vec![llama_text()]).await;
     let mut o = opts();
-    o.reprobe_min = ms(100);
-    o.reprobe_max = ms(400);
+    o.reprobe_min = ms(300);
+    o.reprobe_max = ms(1200);
     let g = start(llama_cfg(&srv.base_url, json!({})), "reprobe_from_end", o).await;
     let err = g
         .stream(call_on("local", RunId::new(), "x"))
@@ -1724,6 +1739,184 @@ async fn reprobe_interval_counts_from_probe_end() {
         .unwrap_err();
     assert_eq!(err.class, ErrorClass::Unreachable);
     let after = err.retry_after.unwrap();
-    assert!(after > ms(50) && after <= ms(100), "{after:?}");
+    assert!(after > ms(150) && after <= ms(300), "{after:?}");
     assert_eq!(srv.requests(PROPS).len(), 2);
+}
+
+// ---- Задача 6 R1-B1: `max_wait`, разрешение предохранителя при выдаче места ----
+
+/// Ошибка вызова: отказ до стрима или итог стрима.
+async fn call_error(g: &Gateway, c: ModelCall) -> ModelError {
+    match g.stream(c).await {
+        Err(e) => e,
+        Ok(s) => s.collect().await.expect_err("ожидалась ошибка"),
+    }
+}
+
+#[tokio::test]
+async fn max_wait_times_out_in_queue() {
+    // M1: заявка с `max_wait` не ждёт места дольше предела — `Queue` / `wait_timeout`.
+    // Первый запрос висит без ответа: место занято, пока тест не бросит его стрим.
+    let srv = llama_server(vec![props("probe/llama_props.json")], vec![Reply::Hang]).await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({"max_parallel": 1})),
+        "max_wait",
+        opts_long_first_byte(),
+    )
+    .await;
+    let mut holder = g
+        .stream(call_on("local", RunId::new(), "держит"))
+        .await
+        .unwrap();
+    until_started(&mut holder).await;
+    let mut c = call_on("local", RunId::new(), "ждёт");
+    c.meta.max_wait = Some(ms(50));
+    let err = call_error(&g, c).await;
+    assert_eq!(err.class, ErrorClass::Queue, "{err:?}");
+    assert_eq!(err.message, "wait_timeout");
+    drop(holder);
+    assert!(
+        eventually(|| g.view().queue.groups[0].active == 0).await,
+        "место не освобождено"
+    );
+    assert_eq!(srv.requests(CHAT).len(), 1);
+}
+
+/// Долгий `first_byte`: висящий или медленный сервер держит место без таймаута.
+fn opts_long_first_byte() -> GatewayOptions {
+    let mut o = opts_no_retry();
+    o.timeouts_local.first_byte = secs(30);
+    o.timeouts_cloud.first_byte = secs(30);
+    o
+}
+
+#[tokio::test]
+async fn breaker_permit_taken_at_grant() {
+    // M6: два облачных эндпоинта одной группы (один хост, одно место). Предохранитель x
+    // открыт, место группы держит запрос к y. После паузы заявки A и B к x ждут места без
+    // разрешения: ни одна не получает `CircuitOpen`; A берёт пробу при выдаче, проба
+    // успешна, B обслужен при закрытом предохранителе.
+    let mut x_chat = vec![Reply::Json(500, json!({"error": "сбой"})); 5];
+    x_chat.push(Reply::sse(sse_events(&fixture("chat/openrouter_cost.sse"))));
+    let x = openrouter_server(x_chat).await;
+    // Запрос к y висит без ответа: место группы занято, пока тест не бросит его стрим.
+    let y = openrouter_server(vec![Reply::Hang]).await;
+    let cfg = models(json!({
+        "endpoints": [
+            {"id": "x", "backend": "openrouter", "base_url": x.base_url,
+             "model": "qwen/qwen3.8-235b", "key_ref": "openrouter", "max_parallel": 1},
+            {"id": "y", "backend": "openrouter", "base_url": y.base_url,
+             "model": "qwen/qwen3.8-235b", "key_ref": "openrouter", "max_parallel": 1}
+        ]
+    }));
+    let mut o = opts_long_first_byte();
+    o.breaker.cooldown = ms(20);
+    let g = started(
+        cfg,
+        secrets(&[("openrouter", "sk-or-test-key")]),
+        None,
+        store("breaker_at_grant"),
+        o,
+    )
+    .await
+    .unwrap();
+    assert_eq!(g.view().queue.groups.len(), 1, "x и y — одна группа");
+    for i in 0..5 {
+        let err = call_error(&g, call_on("x", RunId::new(), &format!("сбой {i}"))).await;
+        assert_eq!(err.class, ErrorClass::Server);
+    }
+    assert_eq!(view_of(&g, "x").state, "open");
+    let mut holder = g
+        .stream(call_on("y", RunId::new(), "держит"))
+        .await
+        .unwrap();
+    until_started(&mut holder).await;
+    tokio::time::sleep(ms(30)).await;
+    let a = g.stream(call_on("x", RunId::new(), "A")).await.unwrap();
+    let b = g.stream(call_on("x", RunId::new(), "B")).await.unwrap();
+    let a = tokio::spawn(a.collect());
+    let b = tokio::spawn(b.collect());
+    tokio::time::sleep(ms(100)).await;
+    assert!(
+        !a.is_finished() && !b.is_finished(),
+        "заявка завершилась до выдачи места"
+    );
+    drop(holder);
+    let (a, b) = tokio::join!(a, b);
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(a.is_ok(), "A: {a:?}");
+    assert!(b.is_ok(), "B: {b:?}");
+    assert_eq!(x.requests("POST /chat/completions").len(), 7);
+    assert_eq!(view_of(&g, "x").state, "ready");
+}
+
+#[tokio::test]
+async fn breaker_refusal_at_grant_releases_place() {
+    // M6: проба A (взята при выдаче места) отвечает отказом — предохранитель снова
+    // открыт. B получает место и `CircuitOpen` при выдаче; место B отпущено: C после
+    // паузы получает место и ответ.
+    let mut chat = vec![Reply::Json(500, json!({"error": "сбой"})); 5];
+    chat.push(Reply::Delayed(
+        ms(1000),
+        Box::new(Reply::Json(500, json!({"error": "сбой пробы"}))),
+    ));
+    chat.push(llama_text());
+    let srv = llama_server(vec![props("probe/llama_props.json")], chat).await;
+    let mut o = opts_long_first_byte();
+    o.breaker.cooldown = ms(250);
+    let g = start(
+        llama_cfg(&srv.base_url, json!({"max_parallel": 1})),
+        "breaker_refusal_at_grant",
+        o,
+    )
+    .await;
+    for i in 0..5 {
+        let err = call_error(&g, call_on("local", RunId::new(), &format!("сбой {i}"))).await;
+        assert_eq!(err.class, ErrorClass::Server);
+    }
+    tokio::time::sleep(ms(270)).await;
+    let mut a = g.stream(call_on("local", RunId::new(), "A")).await.unwrap();
+    until_started(&mut a).await;
+    let mut b = g
+        .stream(call_on("local", RunId::new(), "B"))
+        .await
+        .expect("B ждёт места без разрешения предохранителя");
+    assert!(matches!(b.next().await, Some(Ok(StreamEvent::Queued(_)))));
+    let a_err = a.collect().await.unwrap_err();
+    assert_eq!(a_err.class, ErrorClass::Server);
+    let b_err = b.collect().await.unwrap_err();
+    assert_eq!(b_err.class, ErrorClass::CircuitOpen, "{b_err:?}");
+    assert!(
+        eventually(|| g.view().queue.groups[0].active == 0).await,
+        "место B не отпущено"
+    );
+    // Пауза после отказа пробы — удвоенная (500 мс).
+    tokio::time::sleep(ms(520)).await;
+    let evs = drain(g.stream(call_on("local", RunId::new(), "C")).await.unwrap()).await;
+    assert!(
+        matches!(evs.last(), Some(Ok(StreamEvent::Finished { .. }))),
+        "{evs:?}"
+    );
+    assert_eq!(srv.requests(CHAT).len(), 7);
+}
+
+#[tokio::test]
+async fn finish_run_through_trait() {
+    // Carry R1-A progress:183: `finish_run` доступен через `ModelPort`.
+    let srv = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({})),
+        "finish_run_trait",
+        opts(),
+    )
+    .await;
+    let run = RunId::new();
+    let call = call_on("local", run, "Привет");
+    g.record_parse_error(run, &call);
+    let err = g.stream(call.clone()).await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::RepeatedAfterParseError);
+    let port: &dyn ModelPort = &g;
+    port.finish_run(run);
+    g.stream(call).await.unwrap().collect().await.unwrap();
+    assert_eq!(srv.requests(CHAT).len(), 1);
 }
