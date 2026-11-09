@@ -14,11 +14,13 @@
 //! 5. Схема и приведение типов (D5, [`validate_and_coerce`]).
 //! 6. Проверки политики — R1-C.
 
+mod code;
 mod formats;
 mod names;
 mod schema;
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -29,7 +31,7 @@ use crate::prefix::ToolSchema;
 use crate::types::{Message, Part, ToolCall};
 
 use formats::{RawArgs, RawCall};
-use names::{NameMatch, resolve_name};
+use names::{NameMatch, is_known_or_fixable, resolve_name};
 
 pub use names::damerau_levenshtein;
 pub use schema::{JsonType, SchemaError, validate_and_coerce};
@@ -203,7 +205,17 @@ pub fn normalize(msg: &Message, tools: &[ToolSchema], formats: &[TextFormat]) ->
     }
 
     // 2. Скан текста и рассуждения (D39).
-    let accept_name = |n: &str| !matches!(resolve_name(n, &known), NameMatch::Unknown(_));
+    // Кэш по имени в пределах одного вызова: повтор одного имени на мегабайты не
+    // пересчитывает расстояния (Minor A раунда 2).
+    let accepted: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
+    let accept_name = |n: &str| {
+        if let Some(&hit) = accepted.borrow().get(n) {
+            return hit;
+        }
+        let ok = is_known_or_fixable(n, &known);
+        accepted.borrow_mut().insert(n.to_owned(), ok);
+        ok
+    };
     let (text, from_text) = scan(&text, formats, &accept_name);
     let (reasoning, from_reasoning) = scan(&reasoning, formats, &accept_name);
     out.text = text;
@@ -305,13 +317,15 @@ fn reject(out: &mut NormalizeOutcome, rejection: CallRejection) {
 }
 
 /// Последовательный разбор текста форматами: каждый следующий видит текст без
-/// разметки предыдущих.
+/// разметки предыдущих. Код Markdown заменён заглушками до разбора ([`code`]) и
+/// возвращается в оставшийся текст и аргументы вызовов после.
 fn scan(
     text: &str,
     formats: &[TextFormat],
     accept_name: &dyn Fn(&str) -> bool,
 ) -> (String, Vec<(TextFormat, RawCall)>) {
-    let mut remaining = text.to_owned();
+    let masked = code::Masked::new(text);
+    let mut remaining = masked.text.clone();
     let mut found = Vec::new();
     for &format in formats {
         if remaining.is_empty() {
@@ -321,7 +335,11 @@ fn scan(
         found.extend(e.calls.into_iter().map(|c| (format, c)));
         remaining = e.remaining;
     }
-    (remaining, found)
+    let found = found
+        .into_iter()
+        .map(|(f, c)| (f, masked.restore_call(c)))
+        .collect();
+    (masked.restore(&remaining), found)
 }
 
 /// Шаг 3 для нативного вызова: `Null` с исходной строкой — попытка разбора;

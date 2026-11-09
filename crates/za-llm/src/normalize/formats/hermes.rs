@@ -7,13 +7,16 @@
 //!   после конца JSON: закрывающий тег внутри строкового аргумента вызов не ломает.
 //! - Внутри блока допускается несколько JSON-объектов подряд.
 //! - Целый JSON без `</tool_call>` принимается (сервер мог остановиться на стоп-строке),
-//!   текст после него остаётся текстом. Битый или обрезанный JSON — отклонение до
-//!   ближайшего `</tool_call>` после места ошибки или до конца текста.
+//!   текст после него остаётся текстом.
+//! - JSON оборвался концом текста — обрезанный вызов, отклонение до конца.
+//! - Синтаксическая ошибка: если до следующего `<tool_call>` есть `</tool_call>` —
+//!   битый блок, отклонение до него; иначе тег — обычный текст (`<tool_call>{...}` в
+//!   прозе), ничего не вырезается (решение контроллера, раунд 2, R2).
 //! - `arguments` (или `parameters`): объект — `Json`, строка — `Text`, нет — `{}`.
 
 use serde_json::{Map, Value};
 
-use super::{CodeFences, Extraction, Finder, RawArgs, RawCall, splice};
+use super::{Extraction, Finder, RawArgs, RawCall, splice};
 
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
@@ -21,15 +24,10 @@ const CLOSE: &str = "</tool_call>";
 pub(super) fn extract(text: &str) -> Extraction {
     let mut open = Finder::new(text, OPEN);
     let mut close = Finder::new(text, CLOSE);
-    let mut fences = CodeFences::new(text);
     let mut calls = Vec::new();
     let mut spans = Vec::new();
     let mut cur = 0;
     while let Some(start) = open.find(cur) {
-        if let Some(code_end) = fences.code_end(cur, start) {
-            cur = code_end;
-            continue;
-        }
         let body_start = start + OPEN.len();
         let json_start = text.len() - text[body_start..].trim_start().len();
         if !text[json_start..].starts_with('{') {
@@ -48,10 +46,25 @@ pub(super) fn extract(text: &str) -> Extraction {
                 calls.extend(values.into_iter().map(call_from_value));
                 end
             }
-            Err(error_at) => {
-                let end = close.find(error_at).map_or(text.len(), |c| c + CLOSE.len());
-                calls.push(RawCall::broken(&text[start..end]));
-                end
+            Err(JsonError::Eof) => {
+                calls.push(RawCall::broken(&text[start..]));
+                text.len()
+            }
+            Err(JsonError::Syntax(error_at)) => {
+                let next_open = open.find(body_start);
+                match close.find(error_at) {
+                    Some(c) if next_open.is_none_or(|o| c < o) => {
+                        let end = c + CLOSE.len();
+                        calls.push(RawCall::broken(&text[start..end]));
+                        end
+                    }
+                    _ => {
+                        // Не вызов. Маркеры до места ошибки разбор уже прошёл как
+                        // JSON — с них не начинать (линейность).
+                        cur = error_at.max(body_start);
+                        continue;
+                    }
+                }
             }
         };
         spans.push((start, end));
@@ -63,8 +76,16 @@ pub(super) fn extract(text: &str) -> Extraction {
     }
 }
 
-/// JSON-объекты подряд от `from`: (значения, конец последнего) или позиция ошибки.
-fn parse_values(text: &str, from: usize) -> Result<(Vec<Value>, usize), usize> {
+/// Ошибка разбора JSON блока.
+enum JsonError {
+    /// Текст кончился посреди JSON.
+    Eof,
+    /// Синтаксическая ошибка в этой позиции.
+    Syntax(usize),
+}
+
+/// JSON-объекты подряд от `from`: (значения, конец последнего) или ошибка.
+fn parse_values(text: &str, from: usize) -> Result<(Vec<Value>, usize), JsonError> {
     let mut values = Vec::new();
     let mut pos = from;
     loop {
@@ -75,7 +96,8 @@ fn parse_values(text: &str, from: usize) -> Result<(Vec<Value>, usize), usize> {
                 pos += stream.byte_offset();
                 values.push(v);
             }
-            Some(Err(e)) => return Err(pos + error_offset(slice, &e)),
+            Some(Err(e)) if e.is_eof() => return Err(JsonError::Eof),
+            Some(Err(e)) => return Err(JsonError::Syntax(pos + error_offset(slice, &e))),
             None => break,
         }
         let rest = &text[pos..];
@@ -90,9 +112,6 @@ fn parse_values(text: &str, from: usize) -> Result<(Vec<Value>, usize), usize> {
 
 /// Байтовая позиция ошибки `serde_json` (строка и столбец в байтах) в `slice`.
 fn error_offset(slice: &str, e: &serde_json::Error) -> usize {
-    if e.is_eof() {
-        return slice.len();
-    }
     let line_start = if e.line() <= 1 {
         0
     } else {

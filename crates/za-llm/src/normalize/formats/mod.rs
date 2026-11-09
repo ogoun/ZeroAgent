@@ -7,8 +7,8 @@
 //! - **Линейность.** Каждый маркер ищется от текущей позиции не больше одного раза
 //!   на вхождение ([`Finder`]): повтор маркера на мегабайты (зацикленная модель)
 //!   разбирается за O(n).
-//! - **Блоки кода Markdown** (```` ``` ```` в начале строки, незакрытый — до конца
-//!   текста) не сканируются ([`CodeFences`]): пример вызова в ответе не исполняется.
+//! - **Код Markdown** форматы не видят: конвейер заменяет его заглушками до
+//!   разбора и возвращает после (`normalize::code`).
 //! - **Признак вызова.** Маркер без валидного продолжения — обычный текст: не
 //!   вырезается и не даёт отклонения. Битая или обрезанная разметка, начало которой
 //!   похоже на настоящий вызов, вырезается и возвращается вызовом с пустым `name` и
@@ -210,81 +210,6 @@ pub(crate) fn earliest(finders: &mut [Finder<'_>], from: usize) -> Option<(usize
         .iter_mut()
         .filter_map(|f| f.find(from).map(|p| (p, f.needle())))
         .min_by_key(|(p, _)| *p)
-}
-
-/// Блоки кода Markdown: ```` ``` ```` в начале строки (до трёх пробелов отступа)
-/// открывает блок, следующий такой же закрывает; незакрытый блок тянется до конца
-/// текста. Запросы — с неубывающими позициями, работа линейна.
-pub(crate) struct CodeFences<'a> {
-    text: &'a str,
-    fence: Finder<'a>,
-    /// Дальше этой позиции блоки ещё не разбирались.
-    pos: usize,
-    /// Последний найденный блок [начало, конец).
-    block: Option<(usize, usize)>,
-}
-
-impl<'a> CodeFences<'a> {
-    pub(crate) fn new(text: &'a str) -> Self {
-        Self {
-            text,
-            fence: Finder::new(text, "```"),
-            pos: 0,
-            block: None,
-        }
-    }
-
-    /// Конец блока кода, внутри которого стоит `at`; `None` — `at` вне кода.
-    /// `cur` — текущая позиция разбора: забор, попавший внутрь уже вырезанного
-    /// вызова, блоком не считается.
-    pub(crate) fn code_end(&mut self, cur: usize, at: usize) -> Option<usize> {
-        loop {
-            if let Some((start, end)) = self.block
-                && start >= cur
-            {
-                if at < start {
-                    return None;
-                }
-                if at < end {
-                    return Some(end);
-                }
-            }
-            let Some(open) = self.line_fence(self.pos.max(cur)) else {
-                self.block = None;
-                self.pos = self.text.len();
-                return None;
-            };
-            let end = self.block_end(open);
-            self.block = Some((open, end));
-            self.pos = end;
-        }
-    }
-
-    /// Конец блока, открытого забором `open`: после закрывающего забора или конец текста.
-    fn block_end(&mut self, open: usize) -> usize {
-        match self.line_fence(open + 3) {
-            Some(close) => close + 3,
-            None => self.text.len(),
-        }
-    }
-
-    /// Ближайший забор в начале строки не раньше `from`.
-    fn line_fence(&mut self, from: usize) -> Option<usize> {
-        let mut from = from;
-        loop {
-            let p = self.fence.find(from)?;
-            // Отступ — не больше трёх пробелов от начала строки (CommonMark).
-            let bytes = self.text.as_bytes();
-            let mut i = p;
-            while i > 0 && bytes[i - 1] == b' ' && p - i < 4 {
-                i -= 1;
-            }
-            if p - i <= 3 && (i == 0 || bytes[i - 1] == b'\n') {
-                return Some(p);
-            }
-            from = p + 3;
-        }
-    }
 }
 
 #[cfg(test)]

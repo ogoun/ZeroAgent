@@ -1,9 +1,11 @@
 //! Qwen XML (Qwen3-Coder, шаблон чата модели):
 //! `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>\n</tool_call>`.
 //!
-//! - Признак вызова: `<function=ИМЯ>`, имя известно или исправимо (`accept_name`, D28),
-//!   а тело после пробелов начинается с `<parameter=` или `</function>` (или обрывается).
-//!   Иначе — обычный текст.
+//! - Признак вызова: `<function=ИМЯ>`, тело после пробелов начинается с `<parameter=`
+//!   или `</function>` (или обрывается). Иначе — обычный текст.
+//! - Полный вызов (с `</function>`) — вызов при любом имени: неизвестное имя даёт
+//!   `UnknownTool` с ближайшими (D28). Обрезанный вызов без `</function>` — отклонение,
+//!   только если имя известно или исправимо (`accept_name`), иначе текст (раунд 2, R1).
 //! - Внешний `<tool_call>` необязателен; `</tool_call>` после `</function>` вырезается.
 //! - У значения снимается по одному краевому переводу строки с каждой стороны
 //!   (шаблон ставит `\n` после `>` и перед `</parameter>`).
@@ -14,7 +16,7 @@
 //! - Известное ограничение (как у парсера vLLM): значение, содержащее `</parameter>`
 //!   или `<function=`, режется.
 
-use super::{CodeFences, Extraction, Finder, RawArgs, RawCall, splice};
+use super::{Extraction, Finder, RawArgs, RawCall, splice};
 
 const OUTER_OPEN: &str = "<tool_call>";
 const OUTER_CLOSE: &str = "</tool_call>";
@@ -27,15 +29,10 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
     let mut fn_open = Finder::new(text, FN_OPEN);
     let mut fn_close = Finder::new(text, FN_CLOSE);
     let mut outer_close = Finder::new(text, OUTER_CLOSE);
-    let mut fences = CodeFences::new(text);
     let mut calls = Vec::new();
     let mut spans = Vec::new();
     let mut cur = 0;
     while let Some(fstart) = fn_open.find(cur) {
-        if let Some(code_end) = fences.code_end(cur, fstart) {
-            cur = code_end;
-            continue;
-        }
         let name_start = fstart + FN_OPEN.len();
         let Some(name_end) = tag_end(text, name_start) else {
             cur = name_start;
@@ -49,7 +46,7 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
             // Обрыв посреди первого тега тела.
             || P_OPEN.starts_with(lead)
             || FN_CLOSE.starts_with(lead);
-        if name.is_empty() || !looks_like_body || !accept_name(name) {
+        if name.is_empty() || !looks_like_body {
             cur = name_start;
             continue;
         }
@@ -66,6 +63,10 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
             .find(body_start)
             .filter(|c| next_fn.is_none_or(|n| *c < n));
         let Some(close) = close else {
+            if !accept_name(name) {
+                cur = name_start;
+                continue;
+            }
             // Обрезанный вызов: до `</tool_call>` (если была обёртка), следующего
             // `<function=` или конца текста.
             let limit = next_fn.unwrap_or(text.len());

@@ -762,3 +762,154 @@ fn text_parts_do_not_stick_together() {
     ]);
     assert_eq!(normalize(&msg, &tools(), all_formats()).text, "A\nB");
 }
+
+// ---- Раунд исправлений 2 ----
+
+/// R1: полный вызов Qwen XML с неизвестным именем — `UnknownTool` с ближайшими (D28),
+/// как у Hermes; обрезанный вызов с неизвестным именем — текст.
+#[test]
+fn complete_qwen_call_with_unknown_name_is_rejected_with_nearest() {
+    let src = "<tool_call>\n<function=delete_everything>\n<parameter=path>\n/\n</parameter>\n</function>\n</tool_call>";
+    let out = normalize(&text(src), &tools(), all_formats());
+    assert!(out.calls.is_empty());
+    assert!(
+        matches!(&out.rejected[..], [CallRejection::UnknownTool { name, nearest }] if name == "delete_everything" && nearest.len() == 3),
+        "{:?}",
+        out.rejected
+    );
+    assert_eq!(out.text, "");
+
+    let truncated = "Текст <function=delete_everything>\n<parameter=path>\n/";
+    let out = normalize(&text(truncated), &tools(), all_formats());
+    assert!(out.calls.is_empty() && out.rejected.is_empty());
+    assert_eq!(out.text, truncated);
+}
+
+/// R2: `<tool_call>{...}` в прозе без `</tool_call>` — текст; обрезанный концом
+/// текста JSON — отклонение.
+#[test]
+fn hermes_syntax_error_without_close_is_plain_text() {
+    let src = "Модель пишет <tool_call>{...} в ответ. Дальше важный текст.";
+    let out = normalize(&text(src), &tools(), all_formats());
+    assert!(out.calls.is_empty() && out.rejected.is_empty());
+    assert_eq!(out.text, src);
+    // Упоминание в прозе не захватывает настоящий вызов после него.
+    let second = normalize(
+        &text(
+            "Формат: <tool_call>{\"name\": ...} и так далее.\n<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\"}}</tool_call>",
+        ),
+        &tools(),
+        all_formats(),
+    );
+    assert_eq!(second.calls.len(), 1);
+    assert_eq!(
+        second.text,
+        "Формат: <tool_call>{\"name\": ...} и так далее."
+    );
+    // Синтаксическая ошибка, но блок закрыт — битый вызов.
+    let closed = normalize(
+        &text("A <tool_call>{\"name\": oops}</tool_call> B"),
+        &tools(),
+        all_formats(),
+    );
+    assert!(matches!(
+        &closed.rejected[..],
+        [CallRejection::Unparseable { .. }]
+    ));
+    assert_eq!(closed.text, "A B");
+}
+
+/// Minor A: путь `accept_name` с 33 инструментами, опечатками и длинными именами —
+/// линейный и быстрый (кэш по имени, отсев по разнице длин).
+#[test]
+fn megabyte_with_many_tools_and_long_names() {
+    let mut tools = tools();
+    tools.extend((0..30).map(|i| {
+        tool(
+            &format!("long_tool_name_number_{i:02}_for_testing_purposes"),
+            json!({"type": "object"}),
+        )
+    }));
+    let long = "x".repeat(250);
+    let units = [
+        "<function=read_filx><parameter=path>a</parameter></function>\n".to_owned(),
+        "<function=frobnicate_tool><parameter=path>a</parameter></function>\n".to_owned(),
+        "<function=read_filx><parameter=".to_owned(),
+        format!("<|channel|>commentary to=functions.{long} "),
+        format!("<function={}><parameter=", "y".repeat(200)),
+        format!("<function=long_tool_name_number_0{}><parameter=", "z"),
+    ];
+    for unit in units {
+        let src = unit.repeat(1_200_000 / unit.len());
+        let started = std::time::Instant::now();
+        let out = normalize(&text(&src), &tools, all_formats());
+        let took = started.elapsed();
+        assert!(
+            took.as_secs_f64() < 1.0,
+            "{}: {took:?}",
+            &unit[..unit.len().min(40)]
+        );
+        assert!(out.calls.len() + out.rejected.len() <= MAX_EXTRACTED_CALLS as usize + 1);
+    }
+}
+
+/// Minor B: вызов в инлайн-коде не исполняется, текст не меняется.
+#[test]
+fn call_in_inline_code_is_not_extracted() {
+    let src = format!(
+        "Пример: `{}` — так выглядит вызов.",
+        hermes("read_file", json!({"path": "/etc/passwd"})).replace('\n', "")
+    );
+    let out = normalize(&text(&src), &tools(), all_formats());
+    assert!(out.calls.is_empty() && out.rejected.is_empty());
+    assert_eq!(out.text, src);
+    // Обратные кавычки внутри аргумента настоящего вызова — не код.
+    let real = hermes(
+        "write_file",
+        json!({"path": "a", "content": "use `x` and `y`"}),
+    );
+    let out = normalize(&text(&real), &tools(), all_formats());
+    assert_eq!(out.calls[0].call.arguments["content"], "use `x` and `y`");
+}
+
+/// Minor C: области кода — по исходному тексту, вырезание вызовов их не сдвигает;
+/// забор внутри значения вызова не спаривается с забором примера после него.
+#[test]
+fn code_regions_are_not_shifted_by_cut_calls() {
+    let example = "```\n<|channel|>commentary to=functions.read_file<|message|>{\"path\":\"EXAMPLE\"}<|call|>\n```";
+    // Значение Qwen XML с нечётным числом заборов (кусок Markdown).
+    let src = format!(
+        "<function=write_file>\n<parameter=path>\nREADME.md\n</parameter>\n<parameter=content>\nначало\n```\n</parameter>\n</function>\nПример:\n{example}"
+    );
+    let out = normalize(&text(&src), &tools(), all_formats());
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].call.name, "write_file");
+    assert_eq!(out.calls[0].call.arguments["content"], "начало\n```");
+    assert_eq!(out.text, format!("Пример:\n{example}"));
+
+    // Тот же формат в примере: раньше забор значения спаривался с открывающим
+    // забором примера, и пример исполнялся.
+    let qwen_example =
+        "```\n<function=read_file>\n<parameter=path>\nEXAMPLE\n</parameter>\n</function>\n```";
+    let src = format!(
+        "<function=write_file>\n<parameter=content>\nначало\n```\n</parameter>\n</function>\nПример:\n{qwen_example}"
+    );
+    let out = normalize(&text(&src), &tools(), all_formats());
+    assert_eq!(out.calls.len(), 1, "{:?}", out.calls);
+    assert_eq!(out.calls[0].call.name, "write_file");
+    assert_eq!(out.text, format!("Пример:\n{qwen_example}"));
+
+    // Полный блок кода в значении: восстанавливается в аргументе, пример после
+    // вызова защищён, и все форматы видят одни и те же области.
+    let src = format!(
+        "<function=write_file>\n<parameter=content>\n```rs\nlet a = `b`;\n```\n</parameter>\n</function>\n{example}\n```\n{}\n```",
+        hermes("read_file", json!({"path": "EXAMPLE2"}))
+    );
+    let out = normalize(&text(&src), &tools(), all_formats());
+    assert_eq!(out.calls.len(), 1, "{:?}", out.calls);
+    assert_eq!(
+        out.calls[0].call.arguments["content"],
+        "```rs\nlet a = `b`;\n```"
+    );
+}

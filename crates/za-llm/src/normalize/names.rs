@@ -74,35 +74,59 @@ pub(crate) enum NameMatch {
     Unknown(Vec<String>),
 }
 
+/// Порог исправления для имени длиной `len` символов: min(2, len / 4) при длине ≥ 5,
+/// иначе 0 (решение контроллера I4).
+fn max_fix(len: usize) -> usize {
+    if (MIN_FIX_LEN..=MAX_NAME_CHARS).contains(&len) {
+        MAX_FIX.min(len / 4)
+    } else {
+        0
+    }
+}
+
+/// Единственный кандидат на расстоянии ≤ порога. Разность длин — нижняя граница
+/// расстояния, поэтому далёкие по длине имена отсеиваются без подсчёта (Minor A).
+fn single_fix<'a>(name: &str, len: usize, known: &[&'a str]) -> Option<&'a str> {
+    let limit = max_fix(len);
+    if limit == 0 {
+        return None;
+    }
+    let mut found: Option<&str> = None;
+    for k in known {
+        if k.chars().count().abs_diff(len) > limit || found == Some(*k) {
+            continue;
+        }
+        if damerau_levenshtein(name, k) <= limit {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(k);
+        }
+    }
+    found
+}
+
+/// Имя известно или однозначно исправимо (для `accept_name` форматов).
+pub(crate) fn is_known_or_fixable(name: &str, known: &[&str]) -> bool {
+    known.contains(&name) || single_fix(name, name.chars().count(), known).is_some()
+}
+
 /// Проверка имени по списку известных (D28 с порогом по длине — решение контроллера I4).
 pub(crate) fn resolve_name(name: &str, known: &[&str]) -> NameMatch {
     if known.contains(&name) {
         return NameMatch::Exact;
     }
     let len = name.chars().count();
+    if let Some(only) = single_fix(name, len, known) {
+        return NameMatch::Corrected(only.to_owned());
+    }
     let probe: String = name.chars().take(MAX_NAME_CHARS).collect();
-    // Порог относительно длины: d ≤ min(2, len / 4), имя не короче 5 символов.
-    let max_fix = if (MIN_FIX_LEN..=MAX_NAME_CHARS).contains(&len) {
-        MAX_FIX.min(len / 4)
-    } else {
-        0
-    };
     let mut ranked: Vec<(usize, &str)> = known
         .iter()
         .map(|k| (damerau_levenshtein(&probe, k), *k))
         .collect();
     ranked.sort_unstable();
     ranked.dedup();
-    let fixable: Vec<&str> = ranked
-        .iter()
-        .filter(|(d, _)| *d <= max_fix)
-        .map(|(_, k)| *k)
-        .collect();
-    if let [only] = fixable[..]
-        && max_fix > 0
-    {
-        return NameMatch::Corrected(only.to_owned());
-    }
     NameMatch::Unknown(
         ranked
             .into_iter()

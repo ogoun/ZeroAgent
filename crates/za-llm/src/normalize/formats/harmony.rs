@@ -17,7 +17,7 @@
 
 use serde_json::Value;
 
-use super::{CodeFences, Extraction, Finder, RawArgs, RawCall, earliest, splice};
+use super::{Extraction, Finder, RawArgs, RawCall, earliest, splice};
 
 const TO: &str = "to=functions.";
 const START: &str = "<|start|>";
@@ -46,7 +46,6 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
         Finder::new(text, RETURN),
         Finder::new(text, START),
     ];
-    let mut fences = CodeFences::new(text);
     let mut calls = Vec::new();
     let mut spans = Vec::new();
     let mut cur = 0;
@@ -66,10 +65,6 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
             .or_else(|| head.rfind(CHANNEL))
             .map(|i| boundary + i);
         let start = header_start.unwrap_or(p);
-        if let Some(code_end) = fences.code_end(cur, start) {
-            cur = code_end.max(p + 1);
-            continue;
-        }
 
         let name_start = p + TO.len();
         let name_len = text[name_start..]
