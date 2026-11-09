@@ -189,6 +189,9 @@ async fn volumes_loop(
     loop {
         tick.tick().await;
         let cats = categories.clone();
+        // Монотонная отметка — начало замера: замер отражает только то, что записано до него
+        // (по ней резерв диска снимает ожидающие байты).
+        let started = Instant::now();
         let res = tokio::task::spawn_blocking(move || {
             let v = probe.sample(&cats, Instant::now());
             (probe, v)
@@ -199,7 +202,7 @@ async fn volumes_loop(
                 probe = p;
                 tx.send_modify(|snap| {
                     snap.volumes_sampled_at = Some(jiff::Timestamp::now());
-                    snap.volumes_sampled_mono = Some(Instant::now());
+                    snap.volumes_sampled_mono = Some(started);
                     snap.volumes = volumes;
                 });
             }
@@ -283,9 +286,9 @@ pub fn host_sample_once(cfg: &MonitorConfig) -> ResourceSnapshot {
     let ram = sampler.memory();
     let sampled_at = jiff::Timestamp::now();
     let sampled_mono = Some(Instant::now());
+    let volumes_sampled_mono = Some(Instant::now());
     let volumes = VolumeSampler::new().sample(&categories, now);
     let volumes_sampled_at = Some(jiff::Timestamp::now());
-    let volumes_sampled_mono = Some(Instant::now());
     let categories = measure_categories(&categories, CATEGORY_MAX_ENTRIES);
     ResourceSnapshot {
         sampled_at,

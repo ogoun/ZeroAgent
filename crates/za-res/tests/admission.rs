@@ -527,13 +527,23 @@ async fn disk_reservation_waits_and_notifies_once() {
         caches: vec![],
     }));
 
+    // Drop переводит 4 ГиБ в ожидающие: до нового замера тома место не возвращается (I3).
     drop(first);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!second.is_finished());
+    assert_eq!(res.reserved_on(&mount()), 0);
+    assert_eq!(res.pending_on(&mount()), 4 * GIB);
+    // Новый замер тома (запись не состоялась, свободно по-прежнему 10 ГиБ).
+    let mut s = snap();
+    s.volumes = vec![volume(10 * GIB)];
+    tx.send(s).unwrap();
     let second = tokio::time::timeout(Duration::from_secs(5), second)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     assert_eq!(res.reserved_on(&mount()), 2 * GIB);
+    assert_eq!(res.pending_on(&mount()), 0);
     assert_eq!(disk_wait_count(&mut notices), 0);
     drop(second);
     assert_eq!(res.reserved_on(&mount()), 0);
@@ -1011,36 +1021,57 @@ fn invalid_config_falls_back_to_defaults() {
     assert_eq!(a.check(Priority::Job, &none()), Verdict::Admit);
 }
 
-// Резерв: учёт записанного.
+// Резерв: учёт записанного (I3).
+
+fn with_volume(available: u64) -> ResourceSnapshot {
+    let mut s = snap();
+    s.volumes = vec![volume(available)];
+    s
+}
 
 #[tokio::test]
-async fn consumed_bytes_release_reservation() {
-    let mut s = snap();
-    s.volumes = vec![volume(10 * GIB)];
-    let (_tx, a) = setup(s);
+async fn consumed_bytes_stay_pending_until_volume_resampled() {
+    // Том 20 ГиБ, запас 5. Запись 12 ГиБ — больше запаса.
+    let (tx, a) = setup(with_volume(20 * GIB));
     let res = DiskReservations::new(a);
-    let path = mount().join("x");
-    let mut first = res.reserve(&path, 4 * GIB, Priority::Worker).await.unwrap();
+    let path = mount().join("model.gguf");
+    let mut first = res
+        .reserve(&path, 12 * GIB, Priority::Worker)
+        .await
+        .unwrap();
+    first.consume(12 * GIB);
+    assert_eq!(first.bytes(), 0);
+    assert_eq!(res.reserved_on(&mount()), 0);
+    assert_eq!(res.pending_on(&mount()), 12 * GIB);
+    // Замер тома ещё старый (20 ГиБ): на деле свободно 8 ГиБ, заявке нужно 4 + 5 = 9.
     let second = {
         let res = res.clone();
         let path = path.clone();
-        tokio::spawn(async move { res.reserve(&path, 2 * GIB, Priority::Worker).await })
+        tokio::spawn(async move { res.reserve(&path, 4 * GIB, Priority::Worker).await })
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!second.is_finished(), "перерасход до нового замера тома");
+    // Старый замер с новой отметкой из прошлого (раньше снятия) ожидающие не снимает.
+    let mut old = with_volume(20 * GIB);
+    old.volumes_sampled_mono = Some(Instant::now() - Duration::from_secs(1));
+    tx.send(old).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!second.is_finished());
-    // Записано 3 ГиБ: резерв первой — 1 ГиБ, свободно 10 − 1 = 9 ≥ 2 + 5.
-    first.consume(3 * GIB);
-    assert_eq!(first.bytes(), GIB);
+    // Новый замер отразил запись: 8 ГиБ свободно — всё ещё мало (8 < 9), ожидающих нет.
+    tx.send(with_volume(8 * GIB)).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!second.is_finished());
+    assert_eq!(res.pending_on(&mount()), 0);
+    // Освободилось место: 9 ГиБ ≥ 9 — допуск.
+    tx.send(with_volume(9 * GIB)).unwrap();
     let second = tokio::time::timeout(Duration::from_secs(5), second)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(res.reserved_on(&mount()), 3 * GIB);
-    first.consume(10 * GIB);
-    assert_eq!(first.bytes(), 0);
+    assert_eq!(res.reserved_on(&mount()), 4 * GIB);
     drop(first);
-    assert_eq!(res.reserved_on(&mount()), 2 * GIB);
     drop(second);
     assert_eq!(res.reserved_on(&mount()), 0);
+    assert_eq!(res.pending_on(&mount()), 4 * GIB);
 }
