@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 use support::{FakeServer, Reply, fixture};
 use za_llm::config::{
-    ConfigError, ConfigWarning, EndpointConfig, ModelsConfig, Price, compute_cost,
+    ConfigError, ConfigParseError, ConfigWarning, EndpointConfig, ModelsConfig, Price, compute_cost,
 };
 use za_llm::http::{HttpTransport, Secret, SecretSource, Timeouts};
 use za_llm::profile::{
-    CONSERVATIVE_CONTEXT, EndpointState, ModelProfile, ProfileStore, parse_context_limit,
+    CONSERVATIVE_CONTEXT, EndpointState, ProbedEndpoint, ProfileStore, parse_context_limit,
     quant_from_filename, resolve_context,
 };
 use za_llm::{
@@ -47,7 +47,7 @@ fn fixture_json(path: &str) -> Value {
     serde_json::from_slice(&fixture(path)).unwrap()
 }
 
-fn ready(state: EndpointState) -> ModelProfile {
+fn ready(state: EndpointState) -> ProbedEndpoint {
     match state {
         EndpointState::Ready(p) => p,
         other => panic!("ожидался Ready: {other:?}"),
@@ -84,22 +84,25 @@ fn llama_ep(base: &str) -> EndpointConfig {
 async fn llama_profile_from_props() {
     let srv = llama_server("probe/llama_props.json", vec!["a", "b"]).await;
     let p = ready(probe_endpoint(&llama_ep(&srv.base_url), &http(), &MapSecrets::default()).await);
-    assert_eq!(p.context_tokens, 32768);
+    assert_eq!(p.facts.context_tokens, 32768);
     assert_eq!(
-        p.caps.context_source,
+        p.caps().context_source,
         ContextSource::Runtime {
             path: "/props".into()
         }
     );
-    assert_eq!(p.slots, Some(4));
-    assert_eq!(p.bundle.quant.as_deref(), Some("Q4_K_M"));
-    assert_eq!(p.bundle.runtime_version.as_deref(), Some("b7100-abc"));
-    assert_eq!(p.bundle.runtime, BackendKind::LlamaCpp);
-    assert_eq!(p.bundle.model, "Qwen3.8-27B-Q4_K_M.gguf");
-    assert_eq!(p.endpoint, EndpointId("local".into()));
+    assert_eq!(p.facts.slots, Some(4));
+    assert_eq!(p.profile.bundle.quant.as_deref(), Some("Q4_K_M"));
+    assert_eq!(
+        p.profile.bundle.runtime_version.as_deref(),
+        Some("b7100-abc")
+    );
+    assert_eq!(p.profile.bundle.runtime, BackendKind::LlamaCpp);
+    assert_eq!(p.profile.bundle.model, "Qwen3.8-27B-Q4_K_M.gguf");
+    assert_eq!(p.facts.endpoint, EndpointId("local".into()));
     // `chat_template_caps.supports_parallel_tool_calls` из `/props`.
-    assert!(p.caps.parallel_tools);
-    assert_eq!(p.max_output_tokens, None);
+    assert!(p.profile.caps.parallel_tools);
+    assert_eq!(p.profile.max_output_tokens, None);
     assert_eq!(srv.requests("GET /props").len(), 1);
 }
 
@@ -107,7 +110,7 @@ async fn llama_profile_from_props() {
 async fn apply_template_decides_reasoning_roundtrip() {
     let srv = llama_server("probe/llama_props.json", vec!["P1", "P2"]).await;
     let p = ready(probe_endpoint(&llama_ep(&srv.base_url), &http(), &MapSecrets::default()).await);
-    assert!(p.caps.reasoning_roundtrip);
+    assert!(p.profile.caps.reasoning_roundtrip);
     let reqs = srv.requests("POST /apply-template");
     assert_eq!(reqs.len(), 2);
     // Два диалога различаются только рассуждением прошлого ответа ассистента.
@@ -124,7 +127,7 @@ async fn apply_template_decides_reasoning_roundtrip() {
 
     let srv = llama_server("probe/llama_props.json", vec!["same", "same"]).await;
     let p = ready(probe_endpoint(&llama_ep(&srv.base_url), &http(), &MapSecrets::default()).await);
-    assert!(!p.caps.reasoning_roundtrip);
+    assert!(!p.profile.caps.reasoning_roundtrip);
 }
 
 #[tokio::test]
@@ -135,11 +138,11 @@ async fn apply_template_failure_keeps_default_with_note() {
     )])
     .await;
     let p = ready(probe_endpoint(&llama_ep(&srv.base_url), &http(), &MapSecrets::default()).await);
-    assert!(!p.caps.reasoning_roundtrip);
+    assert!(!p.profile.caps.reasoning_roundtrip);
     assert!(
-        p.notes.iter().any(|n| n.contains("apply-template")),
+        p.profile.notes.iter().any(|n| n.contains("apply-template")),
         "{:?}",
-        p.notes
+        p.profile.notes
     );
 }
 
@@ -158,9 +161,9 @@ async fn vllm_max_model_len() {
     .await;
     let e = ep(json!({"id": "v", "backend": "vllm", "base_url": srv.url("/v1")}));
     let p = ready(probe_endpoint(&e, &http(), &MapSecrets::default()).await);
-    assert_eq!(p.context_tokens, 65536);
-    assert_eq!(p.bundle.model, "Qwen/Qwen3.8-27B-AWQ");
-    assert_eq!(p.bundle.runtime_version.as_deref(), Some("0.11.2"));
+    assert_eq!(p.facts.context_tokens, 65536);
+    assert_eq!(p.profile.bundle.model, "Qwen/Qwen3.8-27B-AWQ");
+    assert_eq!(p.profile.bundle.runtime_version.as_deref(), Some("0.11.2"));
     assert_eq!(srv.requests("GET /version").len(), 1);
     assert_eq!(srv.requests("GET /v1/version").len(), 0);
 }
@@ -177,10 +180,10 @@ async fn anthropic_models_api_capabilities() {
                       "model": "claude-opus-5-5", "key_ref": "anthropic"}),
     );
     let p = ready(probe_endpoint(&e, &http(), &MapSecrets::with("anthropic", "sk-ant-k1")).await);
-    assert_eq!(p.context_tokens, 1_000_000);
-    assert_eq!(p.max_output_tokens, Some(64000));
+    assert_eq!(p.facts.context_tokens, 1_000_000);
+    assert_eq!(p.profile.max_output_tokens, Some(64000));
     assert_eq!(
-        p.thinking,
+        p.profile.thinking,
         ThinkingSupport {
             adaptive: true,
             effort: true,
@@ -190,7 +193,7 @@ async fn anthropic_models_api_capabilities() {
             sampling: false,
         }
     );
-    assert!(p.caps.strict_schema);
+    assert!(p.profile.caps.strict_schema);
     let reqs = srv.requests("GET /v1/models/claude-opus-5-5");
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0].header("x-api-key"), Some("sk-ant-k1"));
@@ -212,14 +215,15 @@ async fn openrouter_supported_parameters() {
                       "model": "qwen/qwen3.8-235b", "key_ref": "openrouter"}),
     );
     let p = ready(probe_endpoint(&e, &http(), &MapSecrets::with("openrouter", "sk-or-1")).await);
-    assert!(p.caps.strict_schema);
-    assert!(p.caps.tool_choice_required);
-    assert_eq!(p.context_tokens, 131072);
+    assert!(p.profile.caps.strict_schema);
+    assert!(p.profile.caps.tool_choice_required);
+    assert_eq!(p.facts.context_tokens, 131072);
     assert_eq!(
-        p.price,
+        p.profile.price,
         Some(Price {
             input_per_mtok: 3.0,
             cached_per_mtok: None,
+            cache_write_per_mtok: None,
             output_per_mtok: 15.0
         })
     );
@@ -246,8 +250,8 @@ async fn overflow_probe_reads_limit_from_error() {
     .await;
     let e = ep(json!({"id": "c", "backend": "openai_compatible", "base_url": srv.url("/v1")}));
     let p = ready(probe_endpoint(&e, &http(), &MapSecrets::default()).await);
-    assert_eq!(p.context_tokens, 16384);
-    assert_eq!(p.caps.context_source, ContextSource::OverflowProbe);
+    assert_eq!(p.facts.context_tokens, 16384);
+    assert_eq!(p.caps().context_source, ContextSource::OverflowProbe);
     let reqs = srv.requests("POST /v1/chat/completions");
     assert_eq!(reqs.len(), 1);
     let body = reqs[0].json();
@@ -269,9 +273,9 @@ async fn compatible_context_from_models() {
     .await;
     let e = ep(json!({"id": "c", "backend": "openai_compatible", "base_url": srv.url("/v1")}));
     let p = ready(probe_endpoint(&e, &http(), &MapSecrets::default()).await);
-    assert_eq!(p.context_tokens, 24576);
+    assert_eq!(p.facts.context_tokens, 24576);
     assert_eq!(
-        p.caps.context_source,
+        p.caps().context_source,
         ContextSource::Runtime {
             path: "/models".into()
         }
@@ -294,18 +298,20 @@ async fn cloud_never_overflow_probes() {
                       "model": "gpt-6-astra", "key_ref": "openai"}),
     );
     let p = ready(probe_endpoint(&e, &http(), &MapSecrets::with("openai", "sk-oai")).await);
-    assert_eq!(p.context_tokens, CONSERVATIVE_CONTEXT);
-    assert_eq!(p.context_tokens, 8192);
-    assert_eq!(p.caps.context_source, ContextSource::Conservative);
+    assert_eq!(p.facts.context_tokens, CONSERVATIVE_CONTEXT);
+    assert_eq!(p.facts.context_tokens, 8192);
+    assert_eq!(p.caps().context_source, ContextSource::Conservative);
     assert!(
-        p.notes.iter().any(|n| n.contains("context_tokens")),
+        p.facts.notes.iter().any(|n| n.contains("context_tokens")),
         "{:?}",
-        p.notes
+        p.facts.notes
     );
     // POST-запросов нет: всего один запрос — GET модели.
     assert_eq!(srv.total_requests(), 1);
     // Возможности рассуждения OpenAI — по имени модели (API их не сообщает).
-    assert!(p.thinking.effort && p.thinking.effort_max && !p.thinking.sampling);
+    assert!(
+        p.profile.thinking.effort && p.profile.thinking.effort_max && !p.profile.thinking.sampling
+    );
 }
 
 #[tokio::test]
@@ -323,10 +329,10 @@ async fn openai_context_from_config() {
                       "model": "gpt-4.1", "key_ref": "openai", "context_tokens": 1000000}),
     );
     let p = ready(probe_endpoint(&e, &http(), &MapSecrets::with("openai", "sk-oai")).await);
-    assert_eq!(p.context_tokens, 1_000_000);
-    assert_eq!(p.caps.context_source, ContextSource::Config);
+    assert_eq!(p.facts.context_tokens, 1_000_000);
+    assert_eq!(p.caps().context_source, ContextSource::Config);
     // Модель без рассуждений: sampling принимается, effort нет.
-    assert!(!p.thinking.effort && p.thinking.sampling);
+    assert!(!p.profile.thinking.effort && p.profile.thinking.sampling);
 }
 
 #[tokio::test]
@@ -362,7 +368,7 @@ async fn openai_chat_profile_has_sampling_flag() {
                       "model": "o4-mini", "key_ref": "openai"}),
     );
     let p = ready(probe_endpoint(&e, &http(), &MapSecrets::with("openai", "sk-oai")).await);
-    assert!(!p.thinking.sampling && p.thinking.effort);
+    assert!(!p.profile.thinking.sampling && p.profile.thinking.effort);
 }
 
 #[tokio::test]
@@ -405,15 +411,19 @@ async fn bundle_change_gives_new_profile() {
     let srv2 = llama_server("probe/llama_props_other_model.json", vec!["a", "b"]).await;
     let new =
         ready(probe_endpoint(&llama_ep(&srv2.base_url), &http(), &MapSecrets::default()).await);
-    assert_ne!(old.bundle.key(), new.bundle.key());
-    assert_eq!(old.bundle.key().len(), 16);
-    assert_eq!(new.bundle.quant.as_deref(), Some("IQ3_XXS"));
+    assert_ne!(old.profile.bundle.key(), new.profile.bundle.key());
+    assert_eq!(old.profile.bundle.key().len(), 16);
+    assert_eq!(old.facts.bundle_key, old.profile.bundle.key());
+    assert_eq!(new.profile.bundle.quant.as_deref(), Some("IQ3_XXS"));
 
     let store = ProfileStore::open(&store_dir("bundle_change")).unwrap();
-    store.save(&old).unwrap();
-    store.save(&new).unwrap();
-    assert_eq!(store.load(&old.bundle.key()), Some(old.clone()));
-    assert_eq!(store.load(&new.bundle.key()), Some(new));
+    store.save_probed(&old).unwrap();
+    store.save_probed(&new).unwrap();
+    assert_eq!(
+        store.load(&old.profile.bundle.key()),
+        Some(old.profile.clone())
+    );
+    assert_eq!(store.load(&new.profile.bundle.key()), Some(new.profile));
     // Ключ вне формата не выходит за каталог.
     assert_eq!(store.load("../x"), None);
     assert_eq!(store.load("0123456789abcdef"), None);
@@ -451,11 +461,16 @@ async fn profile_file_never_contains_key() {
 
     let dir = store_dir("never_contains_key");
     let store = ProfileStore::open(&dir).unwrap();
-    store.save(&p).unwrap();
-    for f in std::fs::read_dir(&dir).unwrap() {
-        let text = std::fs::read_to_string(f.unwrap().path()).unwrap();
-        assert!(!text.contains(KEY), "{text}");
+    store.save_probed(&p).unwrap();
+    let mut files = 0;
+    for sub in ["profiles", "endpoints"] {
+        for f in std::fs::read_dir(dir.join(sub)).unwrap() {
+            let text = std::fs::read_to_string(f.unwrap().path()).unwrap();
+            assert!(!text.contains(KEY), "{text}");
+            files += 1;
+        }
     }
+    assert_eq!(files, 2);
 
     let e = ep(
         json!({"id": "oai", "backend": "openai_responses", "base_url": srv.url("/v1"),
@@ -688,6 +703,7 @@ fn computed_cost() {
     let price = Price {
         input_per_mtok: 3.0,
         cached_per_mtok: None,
+        cache_write_per_mtok: None,
         output_per_mtok: 15.0,
     };
     let u = Usage {
@@ -707,4 +723,362 @@ fn computed_cost() {
         ..Usage::default()
     };
     assert!((compute_cost(&price, &u) - (1.5 + 0.15)).abs() < 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// Раунд исправлений 1.
+
+#[tokio::test]
+async fn cloud_backend_cannot_be_local_pool() {
+    let c = cfg(json!({
+        "default": "claude",
+        "endpoints": [{"id": "claude", "backend": "anthropic", "model": "claude-opus-5-5",
+                       "pool": "local"}]
+    }));
+    let err = c.validate().unwrap_err();
+    assert_eq!(err, ConfigError::CloudPool(EndpointId("claude".into())));
+    assert!(err.to_string().contains("pool"));
+    // Даже без `validate` эндпоинт облачный: без ключа зонда нет.
+    assert_eq!(c.endpoints[0].pool(), PoolKind::Cloud);
+    assert_eq!(
+        c.endpoints[0].group_key(),
+        "cloud:anthropic:api.anthropic.com"
+    );
+    let srv = FakeServer::start(vec![(
+        "GET /v1/models/claude-opus-5-5",
+        vec![Reply::Json(200, fixture_json("probe/anthropic_model.json"))],
+    )])
+    .await;
+    let e = ep(
+        json!({"id": "claude", "backend": "anthropic", "base_url": srv.url("/v1"),
+                      "model": "claude-opus-5-5", "pool": "local"}),
+    );
+    let st = probe_endpoint(&e, &http(), &MapSecrets::default()).await;
+    assert!(matches!(st, EndpointState::Inactive { .. }), "{st:?}");
+    assert_eq!(srv.total_requests(), 0);
+    // Для локальных видов переопределение действует.
+    let e = ep(json!({"id": "g", "backend": "openai_compatible",
+                      "base_url": "https://gpu.lan/v1", "pool": "local"}));
+    assert_eq!(e.pool(), PoolKind::Local);
+}
+
+/// Разбор TOML так, как это делает рабочий код: только `message()` и `span()`.
+fn toml_models(src: &str) -> Result<ModelsConfig, ConfigParseError> {
+    toml::from_str::<ModelsConfig>(src)
+        .map_err(|e| ConfigParseError::from_message(e.message(), e.span().map(|r| r.start), src))
+}
+
+#[test]
+fn toml_parse_errors_never_show_source() {
+    const KEY: &str = "sk-literal-1";
+    // Неизвестное поле `api_key`.
+    let src = format!(
+        "[[endpoints]]\nid = \"c\"\nbackend = \"anthropic\"\nmodel = \"m\"\napi_key = \"{KEY}\"\n"
+    );
+    // `Display` самой ошибки toml печатает строку источника — поэтому он не используется.
+    let raw = toml::from_str::<ModelsConfig>(&src).unwrap_err();
+    assert!(raw.to_string().contains(KEY));
+    let e = toml_models(&src).unwrap_err();
+    let shown = format!("{e} {e:?}");
+    assert!(!shown.contains(KEY), "{shown}");
+    assert!(shown.contains("api_key"), "{shown}");
+    assert_eq!(e.line, Some(5));
+
+    // Синтаксическая ошибка рядом с ключом: незакрытая строка и мусор.
+    for src in [
+        format!("[[endpoints]]\nid = \"c\"\napi_key = \"{KEY}\nbackend = \"anthropic\"\n"),
+        format!("[[endpoints]]\napi_key = \"{KEY}\" ]]] = \n"),
+        format!("[[endpoints]]\nid = \"c\"\nbackend = \"anthropic\"\ncontext_tokens = \"{KEY}\"\n"),
+        format!("[[endpoints]]\nid = \"c\"\nbackend = \"{KEY}\"\n"),
+    ] {
+        let e = toml_models(&src).unwrap_err();
+        let shown = format!("{e} {e:?}");
+        assert!(!shown.contains(KEY), "{shown}");
+        assert!(e.line.is_some(), "{shown}");
+    }
+}
+
+#[test]
+fn json_parse_errors_never_show_values() {
+    const KEY: &str = "sk-literal-1";
+    for src in [
+        format!(r#"{{"endpoints": [{{"id": "c", "backend": "anthropic", "api_key": "{KEY}"}}]}}"#),
+        format!(
+            r#"{{"endpoints": [{{"id": "c", "backend": "anthropic", "context_tokens": "{KEY}"}}]}}"#
+        ),
+        format!(r#"{{"endpoints": [{{"id": "c", "backend": "{KEY}"}}]}}"#),
+        format!(r#"{{"endpoints": [{{"id": "c", "key_ref": "{KEY}"#),
+    ] {
+        let e = ModelsConfig::from_json_str(&src).unwrap_err();
+        let shown = format!("{e} {e:?}");
+        assert!(!shown.contains(KEY), "{shown}");
+        assert!(e.line.is_some(), "{shown}");
+    }
+}
+
+async fn llama_with_ctx(n_ctx: u32, slots: u32) -> FakeServer {
+    let mut props = fixture_json("probe/llama_props.json");
+    props["default_generation_settings"]["n_ctx"] = json!(n_ctx);
+    props["total_slots"] = json!(slots);
+    FakeServer::start(vec![
+        ("GET /props", vec![Reply::Json(200, props)]),
+        (
+            "POST /apply-template",
+            vec![Reply::Json(200, json!({"prompt": "same"}))],
+        ),
+    ])
+    .await
+}
+
+#[tokio::test]
+async fn endpoints_of_one_bundle_keep_own_facts() {
+    let s1 = llama_with_ctx(32768, 4).await;
+    let s2 = llama_with_ctx(8192, 1).await;
+    let e1 = ep(json!({"id": "big", "backend": "llama_cpp", "base_url": s1.base_url}));
+    let e2 = ep(
+        json!({"id": "small", "backend": "llama_cpp", "base_url": s2.base_url,
+                       "context_tokens": 4096}),
+    );
+    let a = ready(probe_endpoint(&e1, &http(), &MapSecrets::default()).await);
+    let b = ready(probe_endpoint(&e2, &http(), &MapSecrets::default()).await);
+    assert_eq!(a.profile.bundle.key(), b.profile.bundle.key());
+
+    let store = ProfileStore::open(&store_dir("one_bundle_two_endpoints")).unwrap();
+    store.save_probed(&a).unwrap();
+    store.save_probed(&b).unwrap();
+    let fa = store.load_endpoint(&EndpointId("big".into())).unwrap();
+    let fb = store.load_endpoint(&EndpointId("small".into())).unwrap();
+    assert_eq!(
+        (fa.context_tokens, fa.runtime_context, fa.slots),
+        (32768, Some(32768), Some(4))
+    );
+    assert_eq!(
+        fa.context_source,
+        ContextSource::Runtime {
+            path: "/props".into()
+        }
+    );
+    assert_eq!(
+        (fb.context_tokens, fb.runtime_context, fb.slots),
+        (4096, Some(8192), Some(1))
+    );
+    assert_eq!(fb.context_source, ContextSource::Config);
+    assert_eq!(fa.bundle_key, fb.bundle_key);
+    assert_eq!(store.load(&fa.bundle_key), Some(b.profile.clone()));
+    assert_eq!(b.caps().context_source, ContextSource::Config);
+}
+
+#[tokio::test]
+async fn parallel_saves_do_not_corrupt() {
+    let srv = llama_server("probe/llama_props.json", vec!["a", "b"]).await;
+    let p = ready(probe_endpoint(&llama_ep(&srv.base_url), &http(), &MapSecrets::default()).await);
+    let dir = store_dir("parallel");
+    let store = ProfileStore::open(&dir).unwrap();
+    std::thread::scope(|sc| {
+        for _ in 0..6 {
+            sc.spawn(|| {
+                for _ in 0..10 {
+                    store.save_probed(&p).unwrap();
+                }
+            });
+        }
+    });
+    assert_eq!(store.load(&p.facts.bundle_key), Some(p.profile.clone()));
+    assert_eq!(
+        store.load_endpoint(&p.facts.endpoint),
+        Some(p.facts.clone())
+    );
+    // Временных файлов не осталось.
+    for sub in ["profiles", "endpoints"] {
+        let names: Vec<String> = std::fs::read_dir(dir.join(sub))
+            .unwrap()
+            .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+    }
+}
+
+#[tokio::test]
+async fn corrupt_or_foreign_files_are_ignored() {
+    let s1 = llama_server("probe/llama_props.json", vec!["a", "b"]).await;
+    let s2 = llama_server("probe/llama_props_other_model.json", vec!["a", "b"]).await;
+    let a = ready(probe_endpoint(&llama_ep(&s1.base_url), &http(), &MapSecrets::default()).await);
+    let mut e2 = llama_ep(&s2.base_url);
+    e2.id = EndpointId("other".into());
+    let b = ready(probe_endpoint(&e2, &http(), &MapSecrets::default()).await);
+    let dir = store_dir("corrupt");
+    let store = ProfileStore::open(&dir).unwrap();
+    store.save_probed(&a).unwrap();
+    store.save_probed(&b).unwrap();
+    let ka = a.facts.bundle_key.clone();
+    let kb = b.facts.bundle_key.clone();
+    let prof = |k: &str| dir.join("profiles").join(format!("{k}.json"));
+    let epf = |k: &str| dir.join("endpoints").join(format!("{k}.json"));
+
+    // Чужой профиль под именем другой связки.
+    std::fs::copy(prof(&kb), prof(&ka)).unwrap();
+    assert_eq!(store.load(&ka), None);
+    // Повреждённый профиль.
+    std::fs::write(prof(&kb), b"{\"bundle\": ").unwrap();
+    assert_eq!(store.load(&kb), None);
+    // Чужие и повреждённые факты эндпоинта.
+    std::fs::copy(epf("other"), epf("local")).unwrap();
+    assert_eq!(store.load_endpoint(&EndpointId("local".into())), None);
+    std::fs::write(epf("other"), b"not json").unwrap();
+    assert_eq!(store.load_endpoint(&EndpointId("other".into())), None);
+    // Перезапись чинит.
+    store.save_probed(&a).unwrap();
+    assert_eq!(store.load(&ka), Some(a.profile.clone()));
+    // Id с недопустимыми для имени файла символами не выходит за каталог.
+    let mut odd = a.facts.clone();
+    odd.endpoint = EndpointId("../evil/x".into());
+    store.save_endpoint(&odd).unwrap();
+    assert_eq!(store.load_endpoint(&odd.endpoint), Some(odd));
+    assert!(!dir.join("evil").exists());
+}
+
+#[test]
+fn local_address_ranges() {
+    let pool = |u: &str| ep(json!({"id": "v", "backend": "vllm", "base_url": u}));
+    for u in [
+        "http://[::ffff:127.0.0.1]:8000/v1",
+        "http://[::1]:8000/v1",
+        "http://localhost:8000/v1",
+    ] {
+        assert!(pool(u).on_host(), "{u}");
+        assert_eq!(pool(u).pool(), PoolKind::Local, "{u}");
+    }
+    for u in [
+        "http://100.64.0.1:8000/v1",
+        "http://100.127.255.254:8000/v1",
+        "http://169.254.1.2:8000/v1",
+        "http://[fe80::1]:8000/v1",
+        "http://[::ffff:192.168.1.5]:8000/v1",
+    ] {
+        assert!(!pool(u).on_host(), "{u}");
+        assert_eq!(pool(u).pool(), PoolKind::Local, "{u}");
+    }
+    for u in ["http://100.128.0.1:8000/v1", "http://8.8.8.8:8000/v1"] {
+        assert_eq!(pool(u).pool(), PoolKind::Cloud, "{u}");
+    }
+}
+
+#[tokio::test]
+async fn model_name_is_escaped_in_path() {
+    let srv = FakeServer::start(vec![(
+        "GET /v1/models/org%2Fmodel%20x",
+        vec![Reply::Json(200, json!({"id": "org/model x"}))],
+    )])
+    .await;
+    let e = ep(
+        json!({"id": "oai", "backend": "openai_chat", "base_url": srv.url("/v1"),
+                      "model": "org/model x", "key_ref": "openai"}),
+    );
+    let p = ready(probe_endpoint(&e, &http(), &MapSecrets::with("openai", "sk-oai")).await);
+    assert_eq!(p.profile.bundle.model, "org/model x");
+}
+
+#[tokio::test]
+async fn openrouter_variant_suffix() {
+    let srv = FakeServer::start(vec![(
+        "GET /api/v1/models",
+        vec![Reply::Json(
+            200,
+            fixture_json("probe/openrouter_models.json"),
+        )],
+    )])
+    .await;
+    let e = ep(
+        json!({"id": "or", "backend": "openrouter", "base_url": srv.url("/api/v1"),
+                      "model": "qwen/qwen3.8-235b:nitro", "key_ref": "openrouter"}),
+    );
+    let p = ready(probe_endpoint(&e, &http(), &MapSecrets::with("openrouter", "k")).await);
+    assert_eq!(p.facts.context_tokens, 131072);
+    assert_eq!(p.profile.bundle.model, "qwen/qwen3.8-235b:nitro");
+    let e = ep(
+        json!({"id": "or", "backend": "openrouter", "base_url": srv.url("/api/v1"),
+                      "model": "nope/x:nitro", "key_ref": "openrouter"}),
+    );
+    let st = probe_endpoint(&e, &http(), &MapSecrets::with("openrouter", "k")).await;
+    assert!(matches!(st, EndpointState::Inactive { .. }), "{st:?}");
+}
+
+#[test]
+fn cache_write_is_billed_by_its_price() {
+    // Anthropic: вход 3.0, чтение 0.3, запись 3.75 (×1,25).
+    let price = Price {
+        input_per_mtok: 3.0,
+        cached_per_mtok: Some(0.3),
+        cache_write_per_mtok: Some(3.75),
+        output_per_mtok: 15.0,
+    };
+    let u = Usage {
+        input: 3_000_000,
+        cached: 1_000_000,
+        cache_write: 1_000_000,
+        ..Usage::default()
+    };
+    assert!((compute_cost(&price, &u) - (3.0 + 0.3 + 3.75)).abs() < 1e-9);
+    // Без цены записи — по цене входа.
+    let price = Price {
+        cache_write_per_mtok: None,
+        ..price
+    };
+    assert!((compute_cost(&price, &u) - (3.0 + 0.3 + 3.0)).abs() < 1e-9);
+}
+
+#[test]
+fn validate_ranges_and_credentials() {
+    let one = |extra: Value| {
+        let mut e = json!({"id": "l", "backend": "llama_cpp"});
+        e.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        cfg(json!({"endpoints": [e]})).validate()
+    };
+    for (extra, field) in [
+        (json!({"max_parallel": 0}), "max_parallel"),
+        (json!({"context_tokens": 0}), "context_tokens"),
+        (json!({"daily_budget_usd": -1.0}), "daily_budget_usd"),
+        (
+            json!({"price": {"input_per_mtok": -1.0, "output_per_mtok": 1.0}}),
+            "price",
+        ),
+    ] {
+        assert_eq!(
+            one(extra),
+            Err(ConfigError::BadValue(format!(
+                "models.endpoints[l].{field}"
+            )))
+        );
+    }
+    for u in [
+        "http://user:sk-x@127.0.0.1:8080",
+        "http://127.0.0.1:8080/?key=sk-x",
+    ] {
+        let err = one(json!({"base_url": u})).unwrap_err();
+        assert_eq!(err, ConfigError::BadBaseUrl(EndpointId("l".into())));
+        assert!(!err.to_string().contains("sk-x"));
+    }
+    let c = cfg(json!({"roles": {"worker": "nope"},
+                       "endpoints": [{"id": "l", "backend": "llama_cpp"}]}));
+    let err = c.validate().unwrap_err();
+    assert_eq!(
+        err,
+        ConfigError::UnknownRoleTarget {
+            role: "worker".into(),
+            id: EndpointId("nope".into())
+        }
+    );
+    assert!(err.to_string().contains("models.roles.worker"));
+}
+
+#[tokio::test]
+async fn literal_key_ref_without_validate_is_not_echoed() {
+    let e = ep(json!({"id": "claude", "backend": "anthropic", "model": "m",
+                      "key_ref": "sk-ant-api03-literal"}));
+    let st = probe_endpoint(&e, &http(), &MapSecrets::default()).await;
+    let shown = format!("{st:?}");
+    assert!(matches!(st, EndpointState::Inactive { .. }), "{shown}");
+    assert!(!shown.contains("sk-ant-api03-literal"), "{shown}");
 }

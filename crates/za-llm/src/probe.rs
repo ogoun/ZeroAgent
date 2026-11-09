@@ -21,8 +21,9 @@ use crate::config::{EndpointConfig, Price};
 use crate::error::{ErrorClass, ModelError};
 use crate::http::{HttpTransport, Secret, SecretSource, Timeouts, redact};
 use crate::profile::{
-    CONSERVATIVE_CONTEXT, EndpointState, ModelBundle, ModelProfile, OVERFLOW_PROBE_CHARS,
-    parse_context_limit, quant_from_filename, resolve_context,
+    CONSERVATIVE_CONTEXT, EndpointFacts, EndpointState, ModelBundle, ModelProfile,
+    OVERFLOW_PROBE_CHARS, ProbedEndpoint, parse_context_limit, quant_from_filename,
+    resolve_context,
 };
 use crate::wire::ANTHROPIC_VERSION;
 
@@ -184,8 +185,8 @@ pub async fn probe_endpoint(
     match result {
         Ok(found) => {
             let p = probe.profile(found, &secrets_list);
-            tracing::debug!(endpoint = %ep.id, bundle = %p.bundle.key(),
-                            context = p.context_tokens, "зонд эндпоинта");
+            tracing::debug!(endpoint = %ep.id, bundle = %p.facts.bundle_key,
+                            context = p.facts.context_tokens, "зонд эндпоинта");
             EndpointState::Ready(p)
         }
         Err(Fail::Inactive(m)) => EndpointState::Inactive {
@@ -203,6 +204,11 @@ fn endpoint_secret(
     secrets: &dyn SecretSource,
 ) -> Result<Option<Secret>, String> {
     match &ep.key_ref {
+        // Без `validate` значение могло быть самим ключом: в причину оно не попадает.
+        Some(k) if !crate::config::valid_key_ref(k) => Err(format!(
+            "key_ref эндпоинта {} недопустим: ожидается имя ключа",
+            ep.id
+        )),
         Some(k) => secrets
             .get(k)
             .map(Some)
@@ -244,7 +250,10 @@ struct Found {
     max_output_tokens: Option<u32>,
     price: Option<Price>,
     slots: Option<u32>,
+    /// Заметки о модели (в профиль связки).
     notes: Vec<String>,
+    /// Заметки об эндпоинте: контекст, проба переполнения (в факты эндпоинта).
+    ep_notes: Vec<String>,
 }
 
 impl Found {
@@ -261,6 +270,7 @@ impl Found {
             price: None,
             slots: None,
             notes: Vec::new(),
+            ep_notes: Vec::new(),
         }
     }
 }
@@ -316,38 +326,50 @@ impl Probe<'_> {
         self.ep.model.clone().unwrap_or_default()
     }
 
-    /// Итоговый профиль: контекст по порядку MDL-004, заметки очищены от ключа.
-    fn profile(&self, f: Found, secrets: &[&Secret]) -> ModelProfile {
+    /// Итог зонда: профиль связки и факты эндпоинта (контекст по порядку MDL-004);
+    /// заметки очищены от ключа.
+    fn profile(&self, f: Found, secrets: &[&Secret]) -> ProbedEndpoint {
         let (context_tokens, source) =
             resolve_context(self.ep.context_tokens, f.runtime_ctx.clone(), f.overflow);
-        let mut caps = f.caps;
-        caps.context_source = source;
-        let mut notes = f.notes;
+        let mut ep_notes = f.ep_notes;
         if let (Some(cfg), Some((rt, _))) = (self.ep.context_tokens, &f.runtime_ctx)
             && cfg > *rt
         {
-            notes.push(format!(
+            ep_notes.push(format!(
                 "context_tokens из конфигурации ({cfg}) больше контекста рантайма ({rt})"
             ));
         }
-        ModelProfile {
+        let clean = |v: Vec<String>| v.iter().map(|n| redact(n, secrets)).collect();
+        let probed_at = jiff::Timestamp::now();
+        let bundle = ModelBundle {
+            model: f.model,
+            quant: f.quant,
+            runtime: self.ep.backend,
+            runtime_version: f.runtime_version,
+        };
+        let mut caps = f.caps;
+        caps.context_source = source.clone();
+        let facts = EndpointFacts {
             endpoint: self.ep.id.clone(),
-            bundle: ModelBundle {
-                model: f.model,
-                quant: f.quant,
-                runtime: self.ep.backend,
-                runtime_version: f.runtime_version,
-            },
-            caps,
-            thinking: f.thinking,
+            bundle_key: bundle.key(),
             context_tokens,
-            max_output_tokens: f.max_output_tokens,
-            price: f.price,
+            context_source: source,
+            runtime_context: f.runtime_ctx.map(|(n, _)| n),
             slots: f.slots,
             slot_save: None,
-            probed_at: jiff::Timestamp::now(),
-            notes: notes.iter().map(|n| redact(n, secrets)).collect(),
-        }
+            probed_at,
+            notes: clean(ep_notes),
+        };
+        let profile = ModelProfile {
+            bundle,
+            caps,
+            thinking: f.thinking,
+            max_output_tokens: f.max_output_tokens,
+            price: f.price,
+            probed_at,
+            notes: clean(f.notes),
+        };
+        ProbedEndpoint { profile, facts }
     }
 
     /// llama.cpp: `/props` (через [`parse_props`]) и тест `/apply-template` (MDL-010).
@@ -439,9 +461,17 @@ impl Probe<'_> {
     async fn openrouter(&self) -> Result<Found, Fail> {
         let models = self.get_bearer("/models").await?;
         let want = self.configured_model();
-        let entry = find_model(&models, &want).ok_or_else(|| {
-            Fail::Inactive(format!("модель {want} не найдена в каталоге OpenRouter"))
-        })?;
+        // Варианты `:nitro`, `:floor`, `:online` и т. п. — ярлыки маршрутизации, в
+        // каталоге их нет: ищется запись без суффикса. `:free` и другие варианты со своей
+        // записью находятся точным совпадением раньше.
+        let entry = find_model(&models, &want)
+            .or_else(|| {
+                want.rsplit_once(':')
+                    .and_then(|(base, _)| find_model(&models, base))
+            })
+            .ok_or_else(|| {
+                Fail::Inactive(format!("модель {want} не найдена в каталоге OpenRouter"))
+            })?;
         let mut f = Found::new(self.ep, want);
         f.runtime_ctx = u32_field(entry, "context_length").map(|n| (n, "/models".to_owned()));
         let params: Vec<&str> = entry
@@ -468,7 +498,7 @@ impl Probe<'_> {
     /// `capabilities` (поля `context_window` в API нет).
     async fn anthropic(&self) -> Result<Found, Fail> {
         let model = self.configured_model();
-        let path = format!("/models/{model}");
+        let path = format!("/models/{}", path_segment(&model));
         let mut h = HeaderMap::new();
         if let Some(s) = self.secret {
             let v = s
@@ -519,10 +549,11 @@ impl Probe<'_> {
     /// OpenAI: `{base}/models/{model}` — только существование модели.
     async fn openai(&self) -> Result<Found, Fail> {
         let model = self.configured_model();
-        self.get_bearer(&format!("/models/{model}")).await?;
+        self.get_bearer(&format!("/models/{}", path_segment(&model)))
+            .await?;
         let mut f = Found::new(self.ep, model.clone());
         if self.ep.context_tokens.is_none() {
-            f.notes.push(format!(
+            f.ep_notes.push(format!(
                 "OpenAI не сообщает контекст модели: задайте context_tokens \
                  (сейчас {CONSERVATIVE_CONTEXT})"
             ));
@@ -571,7 +602,7 @@ impl Probe<'_> {
             }
             // Списка моделей нет (404 и т. п.): контекст ищется пробой.
             Err(e) => f
-                .notes
+                .ep_notes
                 .push(format!("GET /models: {:?}: {}", e.class, e.message)),
         }
         self.overflow_if_needed(&mut f).await;
@@ -593,13 +624,13 @@ impl Probe<'_> {
             body["model"] = json!(f.model);
         }
         match self.post("/chat/completions", &body).await {
-            Ok(_) => f.notes.push(format!(
+            Ok(_) => f.ep_notes.push(format!(
                 "проба переполнения: сервер принял {OVERFLOW_PROBE_CHARS} символов, \
                  контекст не определён"
             )),
             Err(e) => match parse_context_limit(&e.message) {
                 Some(n) => f.overflow = Some(n),
-                None => f.notes.push(format!(
+                None => f.ep_notes.push(format!(
                     "проба переполнения: предел не найден в ответе ({:?})",
                     e.class
                 )),
@@ -623,6 +654,21 @@ impl Probe<'_> {
             ))
         })
     }
+}
+
+/// Сегмент пути URL: всё вне `[A-Za-z0-9-._~:@!$&'()*+,;=]` кодируется `%XX`, в
+/// том числе `/` (`ft:gpt-4o:org::id` остаётся как есть, `org/model` → `org%2Fmodel`).
+fn path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let keep = b.is_ascii_alphanumeric() || b"-._~:@!$&'()*+,;=".contains(&b);
+        if keep {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Текст пробы переполнения: однобуквенные слова через пробел — около токена на два
@@ -675,6 +721,7 @@ fn openrouter_price(entry: &Value) -> Option<Price> {
     Some(Price {
         input_per_mtok: get("prompt")?,
         cached_per_mtok: get("input_cache_read"),
+        cache_write_per_mtok: get("input_cache_write"),
         output_per_mtok: get("completion")?,
     })
 }
@@ -728,6 +775,7 @@ fn shift_decimal(s: &str, k: usize) -> Option<String> {
 /// - `gpt-6*` — `xhigh` и `max` (страница «Models»: GPT-6 Astra, 6.1 Sol/Terra, 6 Luna);
 /// - неизвестное имя — рассуждающая модель без `xhigh`/`max` и без сэмплирования
 ///   (лишнее поле даёт 400, его отсутствие — нет).
+#[doc(hidden)]
 pub fn openai_thinking(model: &str) -> ThinkingSupport {
     let m = model.to_ascii_lowercase();
     if m.starts_with("gpt-4") || m.starts_with("gpt-3.5") || m.starts_with("chatgpt-") {

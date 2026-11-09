@@ -1,11 +1,21 @@
-//! Профили моделей на связку «модель, квант, рантайм, версия» (MDL-003, MDL-004, D13).
+//! Профили моделей на связку «модель, квант, рантайм, версия» и факты эндпоинтов
+//! (MDL-003, MDL-004, D13).
 //!
-//! Профиль пишет зонд ([`crate::probe_endpoint`]) и хранит [`ProfileStore`] в
-//! `ZA_HOME/models/profiles/<bundle_key>.json`. Смена модели, кванта или версии
-//! рантайма даёт новый ключ: старый профиль к новой связке не применяется. Ключей и
-//! токенов в профиле нет — только возможности, контекст, цены и заметки.
+//! Зонд ([`crate::probe_endpoint`]) даёт две части:
+//! - [`ModelProfile`] — возможности модели, общие для всех эндпоинтов одной связки:
+//!   `ZA_HOME/models/profiles/<bundle_key>.json`. Смена модели, кванта или версии
+//!   рантайма даёт новый ключ: старый профиль к новой связке не применяется;
+//! - [`EndpointFacts`] — то, что зависит от запуска сервера и конфигурации эндпоинта
+//!   (контекст сервера и из конфигурации, проба переполнения, слоты, сохранение
+//!   слотов): `ZA_HOME/models/endpoints/<endpoint_id>.json`. Два эндпоинта одной
+//!   связки с разными `-c`/`-np` друг друга не перезаписывают.
+//!
+//! Ключей и токенов в файлах нет. Запись атомарная: уникальный временный файл рядом,
+//! `sync_all`, `rename`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -60,36 +70,69 @@ fn canonical_json(v: &serde_json::Value) -> String {
     }
 }
 
-/// Профиль модели: реальные возможности по зонду.
+/// Профиль связки: возможности модели по зонду, без данных конкретного эндпоинта.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelProfile {
-    pub endpoint: EndpointId,
     pub bundle: ModelBundle,
+    /// Возможности модели. `caps.context_source` здесь не источник истины: контекст —
+    /// факт эндпоинта, действующие возможности даёт [`ProbedEndpoint::caps`].
     pub caps: ProviderCapabilities,
-    /// Способ мышления: Anthropic — Models API, OpenAI Responses — по имени модели,
-    /// прочие — `Default`.
+    /// Способ мышления: Anthropic — Models API, OpenAI — по имени модели, прочие —
+    /// `Default`.
     pub thinking: ThinkingSupport,
-    pub context_tokens: u32,
     /// Предел вывода: Anthropic Models API `max_tokens`; у прочих `None`.
     pub max_output_tokens: Option<u32>,
     /// Цены OpenRouter (USD за токен × 1e6). `Gateway` берёт `config.price.or(profile.price)`.
     pub price: Option<Price>,
+    pub probed_at: jiff::Timestamp,
+    /// Заметки зонда о модели (подсказки, частичные отказы).
+    pub notes: Vec<String>,
+}
+
+/// Факты эндпоинта: зависят от запуска сервера и конфигурации, а не от связки.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EndpointFacts {
+    pub endpoint: EndpointId,
+    /// Ключ связки, которую обслуживает эндпоинт ([`ModelBundle::key`]).
+    pub bundle_key: String,
+    /// Действующий контекст по порядку MDL-004.
+    pub context_tokens: u32,
+    pub context_source: ContextSource,
+    /// Контекст, который сообщил рантайм (`n_ctx` сервера, `max_model_len`, Models API),
+    /// до учёта конфигурации.
+    pub runtime_context: Option<u32>,
     /// Слоты llama.cpp (`total_slots`).
     pub slots: Option<u32>,
     /// Сохранение слотов работает (D29); `None` — ещё не проверялось.
     pub slot_save: Option<bool>,
     pub probed_at: jiff::Timestamp,
-    /// Заметки зонда для `models` и `doctor` (подсказки, частичные отказы).
+    /// Заметки зонда об эндпоинте (контекст, проба переполнения).
     pub notes: Vec<String>,
 }
 
+/// Результат успешного зонда: профиль связки и факты эндпоинта.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbedEndpoint {
+    pub profile: ModelProfile,
+    pub facts: EndpointFacts,
+}
+
+impl ProbedEndpoint {
+    /// Действующие возможности: профиль связки с источником контекста эндпоинта.
+    pub fn caps(&self) -> ProviderCapabilities {
+        let mut c = self.profile.caps.clone();
+        c.context_source = self.facts.context_source.clone();
+        c
+    }
+}
+
 /// Состояние эндпоинта после зонда.
-// Форма задана интерфейсом задачи 9; состояние одно на эндпоинт и меняется только
-// зондом, лишние байты вариантов без профиля не стоят упаковки в `Box`.
+// Состояние одно на эндпоинт и меняется только зондом: лишние байты вариантов без
+// профиля не стоят упаковки в `Box`.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum EndpointState {
-    Ready(ModelProfile),
+    Ready(ProbedEndpoint),
     /// Не используется до действия пользователя: нет ключа, ключ отвергнут, нет модели.
     Inactive {
         reason: String,
@@ -100,58 +143,156 @@ pub enum EndpointState {
     },
 }
 
-/// Каталог профилей (D13).
+/// Хранилище профилей связок и фактов эндпоинтов (D13): каталог `ZA_HOME/models`,
+/// внутри `profiles/` и `endpoints/`.
 #[derive(Debug, Clone)]
 pub struct ProfileStore {
-    dir: PathBuf,
+    profiles: PathBuf,
+    endpoints: PathBuf,
 }
 
+/// Счётчик временных файлов процесса: имя временного файла уникально и для
+/// параллельной записи одного ключа.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Запись файлов профилей внутри процесса идёт по одной: `rename` поверх файла,
+/// который в этот миг заменяет другой поток, на Windows даёт `PermissionDenied`.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
 impl ProfileStore {
-    /// Открывает каталог, создавая его при необходимости.
+    /// Открывает каталог моделей (`ZA_HOME/models`), создавая `profiles/` и `endpoints/`.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        let profiles = dir.join("profiles");
+        let endpoints = dir.join("endpoints");
+        std::fs::create_dir_all(&profiles)?;
+        std::fs::create_dir_all(&endpoints)?;
         Ok(Self {
-            dir: dir.to_path_buf(),
+            profiles,
+            endpoints,
         })
     }
 
-    /// Профиль по ключу связки. Нет файла, файл повреждён или ключ не из 16 hex —
-    /// `None` (повреждение пишется в `warn`: профиль будет снят заново).
+    /// Профиль по ключу связки. Нет файла, ключ не из 16 hex — `None`; файл повреждён
+    /// или принадлежит другой связке — `warn` и `None` (профиль снимется заново).
     pub fn load(&self, key: &str) -> Option<ModelProfile> {
-        let path = self.path(key)?;
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "профиль не прочитан");
-                return None;
-            }
-        };
-        match serde_json::from_slice(&bytes) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "профиль повреждён");
-                None
-            }
+        let path = self.profile_path(key)?;
+        let p: ModelProfile = read_json(&path)?;
+        if p.bundle.key() != key {
+            tracing::warn!(path = %path.display(), "профиль другой связки, не используется");
+            return None;
         }
+        Some(p)
     }
 
-    /// Атомарная запись: `<key>.json.tmp` рядом, затем `rename` (D13).
+    /// Атомарная запись профиля связки.
     pub fn save(&self, p: &ModelProfile) -> std::io::Result<()> {
         let key = p.bundle.key();
         let path = self
-            .path(&key)
+            .profile_path(&key)
             .ok_or_else(|| std::io::Error::other("ключ связки не из 16 hex"))?;
-        let tmp = self.dir.join(format!("{key}.json.tmp"));
-        let body = serde_json::to_vec_pretty(p).map_err(std::io::Error::other)?;
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, &path)
+        write_atomic(&path, p)
     }
 
-    fn path(&self, key: &str) -> Option<PathBuf> {
-        let ok = key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        ok.then(|| self.dir.join(format!("{key}.json")))
+    /// Факты эндпоинта по id; чужой или повреждённый файл — `warn` и `None`.
+    pub fn load_endpoint(&self, id: &EndpointId) -> Option<EndpointFacts> {
+        let path = self.endpoint_path(id);
+        let f: EndpointFacts = read_json(&path)?;
+        if &f.endpoint != id {
+            tracing::warn!(path = %path.display(), "факты другого эндпоинта, не используются");
+            return None;
+        }
+        Some(f)
     }
+
+    /// Атомарная запись фактов эндпоинта.
+    pub fn save_endpoint(&self, f: &EndpointFacts) -> std::io::Result<()> {
+        write_atomic(&self.endpoint_path(&f.endpoint), f)
+    }
+
+    /// Профиль связки и факты эндпоинта одного зонда.
+    pub fn save_probed(&self, p: &ProbedEndpoint) -> std::io::Result<()> {
+        self.save(&p.profile)?;
+        self.save_endpoint(&p.facts)
+    }
+
+    fn profile_path(&self, key: &str) -> Option<PathBuf> {
+        let ok = key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        ok.then(|| self.profiles.join(format!("{key}.json")))
+    }
+
+    /// Имя файла эндпоинта: id, если он из `[A-Za-z0-9_-]` (до 64 символов), иначе
+    /// `id-<blake3[..16]>` — без выхода за каталог и без зарезервированных имён.
+    fn endpoint_path(&self, id: &EndpointId) -> PathBuf {
+        let s = &id.0;
+        let plain = !s.is_empty()
+            && s.len() <= 64
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        let name = if plain {
+            s.clone()
+        } else {
+            format!("id-{}", &blake3::hash(s.as_bytes()).to_hex()[..16])
+        };
+        self.endpoints.join(format!("{name}.json"))
+    }
+}
+
+/// JSON из файла: нет файла — `None`, ошибка чтения или разбора — `warn` и `None`.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "файл профиля не прочитан");
+            return None;
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "файл профиля повреждён");
+            None
+        }
+    }
+}
+
+/// Атомарная запись (D13): уникальный временный файл рядом
+/// (`<имя>.<pid>.<n>.tmp`), `sync_all`, `rename`. Внутри процесса записи идут по
+/// одной ([`WRITE_LOCK`]); от другого процесса на Windows `rename` может получить
+/// `PermissionDenied` — повторы с паузой 2, 4 … 64 мс, всего около 0,5 с.
+fn write_atomic<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
+    use std::io::Write;
+    let body = serde_json::to_vec_pretty(v).map_err(std::io::Error::other)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::other("имя файла профиля"))?;
+    let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{name}.{}.{n}.tmp", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&body)?;
+        f.sync_all()?;
+        drop(f);
+        let _guard = WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut attempt: u32 = 0;
+        loop {
+            match std::fs::rename(&tmp, path) {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < 10 => {
+                    attempt += 1;
+                    let ms = 1u64 << attempt.min(6);
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                r => return r,
+            }
+        }
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Размер контекста по порядку MDL-004: конфигурация → рантайм (значение и поле
