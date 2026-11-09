@@ -1,0 +1,1118 @@
+//! `Gateway` (задача 15): единственный путь к модели — зонды, очередь, слоты, повторы,
+//! предохранитель, защита от повтора после ошибки разбора, стоимость, выбор модели.
+//! Поддельный axum-сервер, реальное время с короткими параметрами `GatewayOptions` (D41),
+//! облачных ключей нет.
+
+mod support;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use support::{FakeServer, Reply, fixture};
+use tokio::sync::watch;
+use tokio::time::Instant;
+use za_llm::config::{ConfigError, ModelsConfig};
+use za_llm::http::{Secret, SecretSource, Timeouts};
+use za_llm::profile::ProfileStore;
+use za_llm::resilience::{BreakerOptions, RetryPolicy};
+use za_llm::{
+    ChatRequest, CostSource, EndpointId, ErrorClass, Gateway, GatewayOptions, Message, ModelCall,
+    ModelError, ModelPort, ModelStream, Part, RequestMeta, Role, SelectError, Selection,
+    StreamEvent, WaitState,
+};
+use za_protocol::{Priority, RunId, RunRole};
+use za_res::{Admission, CpuSample, GpuStatus, MemSample, ResourceSnapshot, ResourcesConfig};
+
+type Ev = Result<StreamEvent, ModelError>;
+
+const CHAT: &str = "POST /v1/chat/completions";
+const PROPS: &str = "GET /props";
+const MODEL_A: &str = "Qwen3.8-27B-Q4_K_M.gguf";
+const MODEL_B: &str = "gemma-4-12b-it-IQ3_XXS.gguf";
+
+/// Ключи теста по `key_ref`.
+#[derive(Default)]
+struct MapSecrets(HashMap<String, String>);
+
+impl SecretSource for MapSecrets {
+    fn get(&self, key_ref: &str) -> Option<Secret> {
+        self.0.get(key_ref).cloned().map(Secret::new)
+    }
+}
+
+fn secrets(pairs: &[(&str, &str)]) -> Arc<dyn SecretSource> {
+    Arc::new(MapSecrets(
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+    ))
+}
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+/// D41: повторы 1–5 мс, таймауты 500 мс, пауза предохранителя 50 мс.
+fn opts() -> GatewayOptions {
+    let t = Timeouts {
+        connect: ms(500),
+        first_byte: ms(500),
+        idle: ms(500),
+    };
+    GatewayOptions {
+        retry: RetryPolicy {
+            base: ms(1),
+            cap: ms(5),
+            ..RetryPolicy::default()
+        },
+        timeouts_local: t,
+        timeouts_cloud: t,
+        breaker: BreakerOptions {
+            cooldown: ms(50),
+            ..BreakerOptions::default()
+        },
+    }
+}
+
+/// Без повторов.
+fn opts_no_retry() -> GatewayOptions {
+    let mut o = opts();
+    o.retry.max_retries = 0;
+    o
+}
+
+/// Долгий idle: зависший стрим держит место, пока тест его не отпустит.
+fn opts_long_idle() -> GatewayOptions {
+    let mut o = opts();
+    o.timeouts_local.idle = Duration::from_secs(30);
+    o
+}
+
+fn store(name: &str) -> ProfileStore {
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("gateway")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&d);
+    ProfileStore::open(&d).unwrap()
+}
+
+fn models(v: Value) -> ModelsConfig {
+    serde_json::from_value(v).unwrap()
+}
+
+fn fixture_json(path: &str) -> Value {
+    serde_json::from_slice(&fixture(path)).unwrap()
+}
+
+fn props(path: &str) -> Reply {
+    Reply::Json(200, fixture_json(path))
+}
+
+/// Фикстура SSE, разрезанная по событиям (`\n\n`).
+fn sse_events(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    text.split_inclusive("\n\n")
+        .map(|s| s.as_bytes().to_vec())
+        .collect()
+}
+
+fn llama_text() -> Reply {
+    Reply::sse(sse_events(&fixture("chat/llama_text.sse")))
+}
+
+/// SSE: первый чанк (роль и первый текст) сразу, остальные — через 10 с каждый. Сервер
+/// считает отключением drop тела до последнего чанка.
+fn hang_after_first() -> Reply {
+    let ev = sse_events(&fixture("chat/llama_text.sse"));
+    let mut chunks = vec![[ev[0].clone(), ev[1].clone()].concat()];
+    chunks.extend(ev[2..].iter().cloned());
+    Reply::Sse {
+        chunks,
+        delay: Duration::from_secs(10),
+        cut_after: None,
+        then_hang: false,
+    }
+}
+
+/// Сервер llama.cpp: `/props` и `/v1/chat/completions`.
+async fn llama_server(props_replies: Vec<Reply>, chat: Vec<Reply>) -> FakeServer {
+    FakeServer::start(vec![(PROPS, props_replies), (CHAT, chat)]).await
+}
+
+fn llama_cfg(base: &str, extra: Value) -> ModelsConfig {
+    let mut ep = json!({"id": "local", "backend": "llama_cpp", "base_url": base});
+    if let (Some(o), Some(e)) = (ep.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            o.insert(k.clone(), v.clone());
+        }
+    }
+    models(json!({"default": "local", "endpoints": [ep]}))
+}
+
+async fn start(cfg: ModelsConfig, name: &str, o: GatewayOptions) -> Gateway {
+    Gateway::start(cfg, secrets(&[]), None, store(name), o)
+        .await
+        .unwrap()
+}
+
+fn id(s: &str) -> EndpointId {
+    EndpointId(s.to_owned())
+}
+
+fn request(text: &str) -> ChatRequest {
+    ChatRequest {
+        system: "Ты агент.".into(),
+        messages: vec![Message {
+            role: Role::User,
+            parts: vec![Part::Text(text.into())],
+        }],
+        ..ChatRequest::default()
+    }
+}
+
+fn call_on(ep: &str, run: RunId, text: &str) -> ModelCall {
+    ModelCall {
+        endpoint: id(ep),
+        meta: RequestMeta {
+            run_id: run,
+            priority: Priority::Interactive,
+            session: None,
+        },
+        request: request(text),
+    }
+}
+
+/// Все события стрима до закрытия канала (не дольше 10 с).
+async fn drain(mut s: ModelStream) -> Vec<Ev> {
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(ev) = s.next().await {
+            out.push(ev);
+        }
+    })
+    .await
+    .expect("стрим не закрылся за 10 с");
+    out
+}
+
+/// Ждёт условия до `limit`, проверяя каждые 10 мс.
+async fn eventually(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let until = Instant::now() + limit;
+    while Instant::now() < until {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(ms(10)).await;
+    }
+    cond()
+}
+
+fn view_of(g: &Gateway, ep: &str) -> za_llm::EndpointView {
+    g.endpoints()
+        .into_iter()
+        .find(|v| v.id == id(ep))
+        .expect("эндпоинт в списке")
+}
+
+/// Снимок «всего вдоволь» для допуска.
+fn fresh_snapshot() -> ResourceSnapshot {
+    let now = jiff::Timestamp::now();
+    ResourceSnapshot {
+        sampled_at: now,
+        sampled_mono: Some(Instant::now()),
+        cpu: CpuSample {
+            usage_percent: 5.0,
+            cores: 16,
+            busy_ms: 0,
+        },
+        ram: MemSample {
+            total: 64 << 30,
+            available: 32 << 30,
+        },
+        gpu_sampled_at: Some(now),
+        gpu_sampled_mono: Some(Instant::now()),
+        gpu: GpuStatus::Unavailable {
+            reason: "тест".into(),
+        },
+        volumes_sampled_at: None,
+        volumes_sampled_mono: None,
+        volumes: vec![],
+        categories_sampled_at: None,
+        categories_sampled_mono: None,
+        categories: vec![],
+    }
+}
+
+#[tokio::test]
+async fn stream_goes_through_queue() {
+    let srv = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let (_snap_tx, snap_rx) = watch::channel(fresh_snapshot());
+    let admission = Admission::new(
+        snap_rx,
+        ResourcesConfig::default(),
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")),
+    );
+    let g = Gateway::start(
+        llama_cfg(&srv.base_url, json!({})),
+        secrets(&[]),
+        Some(admission),
+        store("through_queue"),
+        opts(),
+    )
+    .await
+    .unwrap();
+    let s = g
+        .stream(call_on("local", RunId::new(), "Привет"))
+        .await
+        .unwrap();
+    let evs = drain(s).await;
+    assert!(evs.iter().all(Result::is_ok), "ошибки в стриме: {evs:?}");
+    let evs: Vec<StreamEvent> = evs.into_iter().map(Result::unwrap).collect();
+    let queued = evs
+        .iter()
+        .take_while(|e| matches!(e, StreamEvent::Queued(_)))
+        .count();
+    assert!(queued >= 1, "первым событием должен быть Queued: {evs:?}");
+    match &evs[queued] {
+        StreamEvent::Started {
+            endpoint,
+            slot,
+            attempt,
+        } => {
+            assert_eq!(endpoint, &id("local"));
+            assert!(slot.is_some());
+            assert_eq!(*attempt, 1);
+        }
+        other => panic!("после Queued ожидался Started: {other:?}"),
+    }
+    assert!(matches!(evs[queued + 1], StreamEvent::TextDelta(_)));
+    assert!(matches!(evs.last(), Some(StreamEvent::Finished { .. })));
+    // Место освобождено.
+    assert!(
+        eventually(ms(500), || g.view().queue.groups[0].active == 0).await,
+        "место очереди не освобождено"
+    );
+}
+
+#[tokio::test]
+async fn inactive_cloud_is_rejected_without_network() {
+    let cloud = FakeServer::start(vec![]).await;
+    let local = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let cfg = models(json!({
+        "default": "local",
+        "endpoints": [
+            {"id": "local", "backend": "llama_cpp", "base_url": local.base_url},
+            {"id": "cloud", "backend": "openrouter", "base_url": cloud.base_url,
+             "model": "qwen/qwen3.8-235b", "key_ref": "openrouter"}
+        ]
+    }));
+    let g = start(cfg, "inactive_cloud", opts()).await;
+    let err = g
+        .stream(call_on("cloud", RunId::new(), "Привет"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::Inactive);
+    assert_eq!(cloud.total_requests(), 0);
+    assert_eq!(view_of(&g, "cloud").state, "inactive");
+}
+
+#[tokio::test]
+async fn no_automatic_fallback() {
+    let local = llama_server(
+        vec![props("probe/llama_props.json")],
+        vec![Reply::Json(500, json!({"error": "сбой"}))],
+    )
+    .await;
+    let cloud = FakeServer::start(vec![
+        ("GET /models", vec![props("probe/openrouter_models.json")]),
+        (
+            "POST /chat/completions",
+            vec![Reply::sse(sse_events(&fixture("chat/openrouter_cost.sse")))],
+        ),
+    ])
+    .await;
+    let cfg = models(json!({
+        "default": "local",
+        "endpoints": [
+            {"id": "local", "backend": "llama_cpp", "base_url": local.base_url},
+            {"id": "cloud", "backend": "openrouter", "base_url": cloud.base_url,
+             "model": "qwen/qwen3.8-235b", "key_ref": "openrouter"}
+        ]
+    }));
+    let g = Gateway::start(
+        cfg,
+        secrets(&[("openrouter", "sk-or-test-key")]),
+        None,
+        store("no_fallback"),
+        opts(),
+    )
+    .await
+    .unwrap();
+    // Облако готово (зонд прошёл), но запрос к нему не уходит ни при каком исходе.
+    assert_eq!(view_of(&g, "cloud").state, "ready");
+    let cloud_before = cloud.total_requests();
+    let err = g
+        .stream(call_on("local", RunId::new(), "Привет"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::Server);
+    assert_eq!(local.requests(CHAT).len(), 6);
+    assert_eq!(cloud.total_requests() - cloud_before, 0);
+    assert_eq!(cloud.requests("POST /chat/completions").len(), 0);
+}
+
+#[tokio::test]
+async fn stream_cut_midtool_then_success() {
+    let ev = sse_events(&fixture("chat/llama_tool_calls.sse"));
+    let cut = Reply::Sse {
+        chunks: ev.clone(),
+        delay: Duration::ZERO,
+        cut_after: Some(2),
+        then_hang: false,
+    };
+    let srv = llama_server(
+        vec![props("probe/llama_props.json")],
+        vec![cut, Reply::sse(ev)],
+    )
+    .await;
+    let g = start(llama_cfg(&srv.base_url, json!({})), "cut_midtool", opts()).await;
+    let evs = drain(
+        g.stream(call_on("local", RunId::new(), "Прочитай"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(evs.iter().all(Result::is_ok), "{evs:?}");
+    let evs: Vec<StreamEvent> = evs.into_iter().map(Result::unwrap).collect();
+    let restart = evs
+        .iter()
+        .position(|e| matches!(e, StreamEvent::Restart { attempt: 2, .. }))
+        .expect("нет Restart { attempt: 2 }");
+    // Частичный вызов ушёл до Restart.
+    assert!(
+        evs[..restart]
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+    );
+    let Some(StreamEvent::Finished { message, .. }) = evs.last() else {
+        panic!("нет Finished: {evs:?}");
+    };
+    let calls: Vec<_> = message
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            Part::ToolCall(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "read_file");
+    assert_eq!(calls[0].arguments, json!({"path": "a.txt"}));
+    assert_eq!(srv.requests(CHAT).len(), 2);
+}
+
+/// Облако OpenRouter на поддельном сервере.
+async fn openrouter_server(chat: Vec<Reply>) -> FakeServer {
+    FakeServer::start(vec![
+        ("GET /models", vec![props("probe/openrouter_models.json")]),
+        ("POST /chat/completions", chat),
+    ])
+    .await
+}
+
+fn openrouter_cfg(base: &str) -> ModelsConfig {
+    models(json!({
+        "endpoints": [
+            {"id": "cloud", "backend": "openrouter", "base_url": base,
+             "model": "qwen/qwen3.8-235b", "key_ref": "openrouter"}
+        ]
+    }))
+}
+
+async fn start_cloud(base: &str, name: &str, o: GatewayOptions) -> Gateway {
+    Gateway::start(
+        openrouter_cfg(base),
+        secrets(&[("openrouter", "sk-or-test-key")]),
+        None,
+        store(name),
+        o,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn rate_limit_sets_group_cooldown() {
+    let srv = openrouter_server(vec![Reply::JsonWithHeaders(
+        429,
+        vec![("retry-after".into(), "3".into())],
+        json!({"error": {"message": "rate limited"}}),
+    )])
+    .await;
+    let g = start_cloud(&srv.base_url, "rate_limit", opts_no_retry()).await;
+    let err = g
+        .stream(call_on("cloud", RunId::new(), "раз"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::RateLimited);
+    let mut s = g
+        .stream(call_on("cloud", RunId::new(), "два"))
+        .await
+        .unwrap();
+    match s.next().await {
+        Some(Ok(StreamEvent::Queued(st))) => match st.state {
+            WaitState::Cooldown { remaining_ms } => assert!(remaining_ms > 2000, "{remaining_ms}"),
+            other => panic!("ожидался Cooldown: {other:?}"),
+        },
+        other => panic!("ожидался Queued: {other:?}"),
+    }
+    tokio::time::sleep(ms(100)).await;
+    assert_eq!(srv.requests("POST /chat/completions").len(), 1);
+}
+
+#[tokio::test]
+async fn exhausted_limits_set_cooldown_after_success() {
+    let body: Vec<u8> = fixture("chat/openrouter_cost.sse");
+    let srv = openrouter_server(vec![Reply::Raw(
+        200,
+        vec![
+            ("content-type".into(), "text/event-stream".into()),
+            ("x-ratelimit-remaining-requests".into(), "0".into()),
+            ("x-ratelimit-reset-requests".into(), "2s".into()),
+        ],
+        body,
+    )])
+    .await;
+    let g = start_cloud(&srv.base_url, "exhausted_limits", opts()).await;
+    g.stream(call_on("cloud", RunId::new(), "раз"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut s = g
+        .stream(call_on("cloud", RunId::new(), "два"))
+        .await
+        .unwrap();
+    match s.next().await {
+        Some(Ok(StreamEvent::Queued(st))) => match st.state {
+            WaitState::Cooldown { remaining_ms } => assert!(remaining_ms > 1000, "{remaining_ms}"),
+            other => panic!("ожидался Cooldown: {other:?}"),
+        },
+        other => panic!("ожидался Queued: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn breaker_opens_and_reset_closes() {
+    let mut chat = vec![Reply::Json(500, json!({"error": "сбой"})); 5];
+    chat.push(llama_text());
+    chat.push(Reply::Json(401, json!({"error": "ключ отвергнут"})));
+    let srv = llama_server(vec![props("probe/llama_props.json")], chat).await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({})),
+        "breaker",
+        opts_no_retry(),
+    )
+    .await;
+    for i in 0..5 {
+        let err = g
+            .stream(call_on("local", RunId::new(), &format!("запрос {i}")))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Server);
+    }
+    let err = g
+        .stream(call_on("local", RunId::new(), "шестой"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::CircuitOpen);
+    assert_eq!(srv.requests(CHAT).len(), 5);
+    assert_eq!(view_of(&g, "local").state, "open");
+
+    tokio::time::sleep(ms(60)).await;
+    g.stream(call_on("local", RunId::new(), "проба"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(view_of(&g, "local").state, "ready");
+
+    let err = g
+        .stream(call_on("local", RunId::new(), "ключ"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::Auth);
+    assert_eq!(view_of(&g, "local").state, "disabled");
+    g.reset(&id("local"));
+    assert_eq!(view_of(&g, "local").state, "ready");
+}
+
+#[tokio::test]
+async fn same_request_after_malformed_is_refused() {
+    let bad = Reply::sse(vec![b"data: {not json\n\n".to_vec()]);
+    let srv = llama_server(
+        vec![props("probe/llama_props.json")],
+        vec![bad, llama_text()],
+    )
+    .await;
+    let g = start(llama_cfg(&srv.base_url, json!({})), "malformed", opts()).await;
+    let run = RunId::new();
+    let err = g
+        .stream(call_on("local", run, "Привет"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::Malformed);
+    assert_eq!(srv.requests(CHAT).len(), 1);
+    let err = g.stream(call_on("local", run, "Привет")).await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::RepeatedAfterParseError);
+    assert_eq!(srv.requests(CHAT).len(), 1);
+    // Изменённый запрос уходит.
+    g.stream(call_on("local", run, "Привет, исправлено"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(srv.requests(CHAT).len(), 2);
+    // После завершения run отпечатки забыты (ParseGuard::clear).
+    g.finish_run(run);
+    g.stream(call_on("local", run, "Привет"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(srv.requests(CHAT).len(), 3);
+}
+
+#[tokio::test]
+async fn parse_error_reported_by_loop_blocks_repeat() {
+    let srv = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({})),
+        "loop_parse_error",
+        opts(),
+    )
+    .await;
+    let run = RunId::new();
+    let call = call_on("local", run, "Привет");
+    g.stream(call.clone())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(srv.requests(CHAT).len(), 1);
+    g.record_parse_error(run, &call);
+    let err = g.stream(call).await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::RepeatedAfterParseError);
+    assert_eq!(srv.requests(CHAT).len(), 1);
+}
+
+#[tokio::test]
+async fn drop_stream_releases_slot_and_cancels_http() {
+    let srv = llama_server(
+        vec![props("probe/llama_props.json")],
+        vec![hang_after_first(), llama_text()],
+    )
+    .await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({"max_parallel": 1})),
+        "drop_stream",
+        opts_long_idle(),
+    )
+    .await;
+    assert_eq!(g.view().queue.groups[0].max_parallel, 1);
+    let mut s = g
+        .stream(call_on("local", RunId::new(), "раз"))
+        .await
+        .unwrap();
+    loop {
+        match s.next().await {
+            Some(Ok(StreamEvent::TextDelta(_))) => break,
+            Some(Ok(_)) => continue,
+            other => panic!("ожидался TextDelta: {other:?}"),
+        }
+    }
+    drop(s);
+    assert!(
+        eventually(Duration::from_secs(2), || srv.disconnects(CHAT) == 1).await,
+        "соединение не закрыто"
+    );
+    let evs = drain(
+        g.stream(call_on("local", RunId::new(), "два"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, Ok(StreamEvent::Started { slot: Some(_), .. }))),
+        "{evs:?}"
+    );
+    assert!(matches!(evs.last(), Some(Ok(StreamEvent::Finished { .. }))));
+}
+
+#[tokio::test]
+async fn cancel_run_drops_waiting_requests() {
+    let srv = llama_server(
+        vec![props("probe/llama_props.json")],
+        vec![hang_after_first()],
+    )
+    .await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({"max_parallel": 1})),
+        "cancel_run",
+        opts_long_idle(),
+    )
+    .await;
+    let mut holder = g
+        .stream(call_on("local", RunId::new(), "держит"))
+        .await
+        .unwrap();
+    loop {
+        match holder.next().await {
+            Some(Ok(StreamEvent::Started { .. })) => break,
+            Some(Ok(_)) => continue,
+            other => panic!("ожидался Started: {other:?}"),
+        }
+    }
+    let run = RunId::new();
+    let mut waiting = Vec::new();
+    for i in 0..2 {
+        let mut s = g
+            .stream(call_on("local", run, &format!("ждёт {i}")))
+            .await
+            .unwrap();
+        assert!(matches!(s.next().await, Some(Ok(StreamEvent::Queued(_)))));
+        waiting.push(s);
+    }
+    assert_eq!(g.cancel_run(run), 2);
+    for s in waiting {
+        let err = s.collect().await.unwrap_err();
+        assert_eq!(err.class, ErrorClass::Cancelled);
+    }
+    let q = g.view().queue;
+    assert!(
+        q.groups
+            .iter()
+            .all(|gr| gr.waiting.iter().all(|w| w.run_id != run))
+    );
+    assert_eq!(srv.requests(CHAT).len(), 1);
+    drop(holder);
+}
+
+#[tokio::test]
+async fn cancel_run_stops_running_request() {
+    let srv = llama_server(
+        vec![props("probe/llama_props.json")],
+        vec![hang_after_first()],
+    )
+    .await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({})),
+        "cancel_running",
+        opts_long_idle(),
+    )
+    .await;
+    let run = RunId::new();
+    let mut s = g.stream(call_on("local", run, "долго")).await.unwrap();
+    loop {
+        match s.next().await {
+            Some(Ok(StreamEvent::TextDelta(_))) => break,
+            Some(Ok(_)) => continue,
+            other => panic!("ожидался TextDelta: {other:?}"),
+        }
+    }
+    // Забранное место и слот освобождаются при отмене run.
+    assert_eq!(g.cancel_run(run), 1);
+    let err = s.collect().await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::Cancelled);
+    assert!(
+        eventually(Duration::from_secs(2), || srv.disconnects(CHAT) == 1
+            && g.view().queue.groups[0].active == 0)
+        .await
+    );
+}
+
+#[tokio::test]
+async fn reprobe_after_stream_cut_picks_new_bundle() {
+    let ev = sse_events(&fixture("chat/llama_text.sse"));
+    let cut = Reply::Sse {
+        chunks: ev,
+        delay: Duration::ZERO,
+        cut_after: Some(2),
+        then_hang: false,
+    };
+    let srv = llama_server(
+        vec![
+            props("probe/llama_props.json"),
+            props("probe/llama_props_other_model.json"),
+        ],
+        vec![cut],
+    )
+    .await;
+    let st = store("reprobe_bundle");
+    let g = Gateway::start(
+        llama_cfg(&srv.base_url, json!({})),
+        secrets(&[]),
+        None,
+        st.clone(),
+        opts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(view_of(&g, "local").model.as_deref(), Some(MODEL_A));
+    let err = g
+        .stream(call_on("local", RunId::new(), "Привет"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::StreamCut);
+    assert!(
+        eventually(Duration::from_secs(2), || view_of(&g, "local")
+            .model
+            .as_deref()
+            == Some(MODEL_B))
+        .await,
+        "профиль не обновлён повторным зондом"
+    );
+    let facts = st.load_endpoint(&id("local")).expect("факты эндпоинта");
+    let profile = st.load(&facts.bundle_key).expect("профиль связки B");
+    assert_eq!(profile.bundle.model, MODEL_B);
+    assert_eq!(srv.requests(PROPS).len(), 2);
+}
+
+#[tokio::test]
+async fn unreachable_endpoint_gets_one_reprobe() {
+    let down = || Reply::Json(503, json!({"error": "загрузка модели"}));
+    let srv = llama_server(
+        vec![down(), props("probe/llama_props.json")],
+        vec![llama_text()],
+    )
+    .await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({})),
+        "unreachable_ok",
+        opts(),
+    )
+    .await;
+    assert_eq!(view_of(&g, "local").state, "unreachable");
+    g.stream(call_on("local", RunId::new(), "Привет"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(srv.requests(PROPS).len(), 2);
+
+    let srv = llama_server(vec![down()], vec![llama_text()]).await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({})),
+        "unreachable_down",
+        opts(),
+    )
+    .await;
+    let err = g
+        .stream(call_on("local", RunId::new(), "Привет"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::Transport);
+    assert_eq!(srv.requests(PROPS).len(), 2);
+    assert_eq!(srv.requests(CHAT).len(), 0);
+}
+
+#[tokio::test]
+async fn selection_order() {
+    let srv = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let ep = |name: &str| json!({"id": name, "backend": "llama_cpp", "base_url": srv.base_url});
+    let cfg = models(json!({
+        "default": "d",
+        "endpoints": [ep("d"), ep("w"), ep("j"), ep("r")],
+        "roles": {"worker": "w"}
+    }));
+    let g = start(cfg.clone(), "selection", opts()).await;
+    let sel = |run: Option<&str>, job: Option<&str>, role: Option<RunRole>| Selection {
+        run_choice: run.map(id),
+        job_choice: job.map(id),
+        role,
+    };
+    assert_eq!(
+        g.select(&sel(Some("r"), Some("j"), Some(RunRole::Worker))),
+        Ok(id("r"))
+    );
+    assert_eq!(
+        g.select(&sel(None, Some("j"), Some(RunRole::Worker))),
+        Ok(id("j"))
+    );
+    assert_eq!(
+        g.select(&sel(None, None, Some(RunRole::Worker))),
+        Ok(id("w"))
+    );
+    assert_eq!(g.select(&sel(None, None, Some(RunRole::Top))), Ok(id("d")));
+    assert_eq!(g.select(&sel(None, None, None)), Ok(id("d")));
+    assert_eq!(
+        g.select(&sel(Some("nope"), None, None)),
+        Err(SelectError::Unknown(id("nope")))
+    );
+
+    let mut no_default = cfg.clone();
+    no_default.default = None;
+    let g = start(no_default, "selection_no_default", opts()).await;
+    assert_eq!(
+        g.select(&sel(None, None, None)),
+        Err(SelectError::NoDefault)
+    );
+
+    let cloud = models(json!({
+        "default": "c",
+        "endpoints": [{"id": "c", "backend": "anthropic", "model": "claude-opus-5-5",
+                       "key_ref": "anthropic"}]
+    }));
+    let r = Gateway::start(cloud, secrets(&[]), None, store("selection_cloud"), opts()).await;
+    assert!(matches!(r, Err(ConfigError::CloudDefault(_))));
+}
+
+/// SSE Anthropic: вход 1000, выход 2000 токенов, без кэша.
+fn anthropic_sse() -> Vec<u8> {
+    let events = [
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1000,"output_tokens":1}}}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Да."}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2000}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ];
+    events
+        .iter()
+        .map(|(e, d)| format!("event: {e}\ndata: {d}\n\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+#[tokio::test]
+async fn usage_has_cost() {
+    let with_cost = openrouter_server(vec![Reply::sse(sse_events(&fixture(
+        "chat/openrouter_cost.sse",
+    )))])
+    .await;
+    let no_cost_body = String::from_utf8(fixture("chat/openrouter_cost.sse"))
+        .unwrap()
+        .replace("\"cost\":0.00042,", "");
+    let without_cost =
+        openrouter_server(vec![Reply::sse(sse_events(no_cost_body.as_bytes()))]).await;
+    let anthropic = FakeServer::start(vec![
+        (
+            "GET /models/claude-opus-5-5",
+            vec![props("probe/anthropic_model.json")],
+        ),
+        ("POST /messages", vec![Reply::sse(vec![anthropic_sse()])]),
+    ])
+    .await;
+    let cfg = models(json!({
+        "endpoints": [
+            {"id": "or", "backend": "openrouter", "base_url": with_cost.base_url,
+             "model": "qwen/qwen3.8-235b", "key_ref": "openrouter"},
+            {"id": "or2", "backend": "openrouter", "base_url": without_cost.base_url,
+             "model": "qwen/qwen3.8-235b", "key_ref": "openrouter"},
+            {"id": "an", "backend": "anthropic", "base_url": anthropic.base_url,
+             "model": "claude-opus-5-5", "key_ref": "anthropic",
+             "price": {"input_per_mtok": 3.0, "output_per_mtok": 15.0}}
+        ]
+    }));
+    let g = Gateway::start(
+        cfg,
+        secrets(&[
+            ("openrouter", "sk-or-test-key"),
+            ("anthropic", "sk-ant-test-key"),
+        ]),
+        None,
+        store("usage_cost"),
+        opts(),
+    )
+    .await
+    .unwrap();
+    let usage = |ep: &'static str| {
+        let g = g.clone();
+        async move {
+            g.stream(call_on(ep, RunId::new(), "Привет"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap()
+                .usage
+        }
+    };
+    let u = usage("or").await;
+    assert_eq!(u.cost_source, CostSource::Provider);
+    assert_eq!(u.cost_usd, Some(0.00042));
+
+    let u = usage("an").await;
+    assert_eq!((u.input, u.output), (1000, 2000));
+    assert_eq!(u.cost_source, CostSource::Computed);
+    assert!(
+        (u.cost_usd.unwrap() - 0.033).abs() < 1e-12,
+        "{:?}",
+        u.cost_usd
+    );
+
+    // Цены только в профиле (каталог OpenRouter): 20 × 3 + 5 × 15 за миллион.
+    let u = usage("or2").await;
+    assert_eq!(u.cost_source, CostSource::Computed);
+    assert!(
+        (u.cost_usd.unwrap() - 0.000135).abs() < 1e-12,
+        "{:?}",
+        u.cost_usd
+    );
+    // Расход учтён в группе облака.
+    let spent: f64 = g
+        .view()
+        .queue
+        .groups
+        .iter()
+        .map(|gr| gr.spent_today_usd)
+        .sum();
+    assert!(
+        (spent - (0.00042 + 0.033 + 0.000135)).abs() < 1e-9,
+        "{spent}"
+    );
+}
+
+#[tokio::test]
+async fn context_tokens_from_profile() {
+    let srv = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let g = start(
+        llama_cfg(&srv.base_url, json!({})),
+        "context_tokens",
+        opts(),
+    )
+    .await;
+    assert_eq!(g.context_tokens(&id("local")), Some(32768));
+    assert!(g.capabilities(&id("local")).is_some());
+    assert_eq!(g.context_tokens(&id("nope")), None);
+    let v = view_of(&g, "local");
+    assert_eq!((v.context_tokens, v.slots), (Some(32768), Some(4)));
+}
+
+#[tokio::test]
+async fn view_serializes() {
+    let srv = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let g = start(llama_cfg(&srv.base_url, json!({})), "view", opts()).await;
+    let v = serde_json::to_value(g.view()).unwrap();
+    for key in ["resources", "queue", "endpoints", "warnings"] {
+        assert!(v.get(key).is_some(), "нет ключа {key}: {v}");
+    }
+    assert!(v["queue"]["groups"].is_array());
+    assert_eq!(v["endpoints"][0]["state"], "ready");
+    assert_eq!(v["endpoints"][0]["backend"], "llama_cpp");
+}
+
+#[tokio::test]
+async fn slot_save_unsupported_is_recorded() {
+    // Маршрута /slots нет (404, как без `--slot-save-path` у старых сборок): restore
+    // новой сессии «не поддержан» → `slot_save = Some(false)` в фактах эндпоинта (D29).
+    let srv = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let st = store("slot_save");
+    let g = Gateway::start(
+        llama_cfg(&srv.base_url, json!({})),
+        secrets(&[]),
+        None,
+        st.clone(),
+        opts(),
+    )
+    .await
+    .unwrap();
+    let mut c = call_on("local", RunId::new(), "Привет");
+    c.meta.session = Some("sess-1".into());
+    let before = srv.total_requests();
+    g.stream(c.clone()).await.unwrap().collect().await.unwrap();
+    // restore (404) и сам запрос.
+    assert_eq!(srv.total_requests() - before, 2);
+    assert_eq!(srv.requests(CHAT).len(), 1);
+    assert!(
+        eventually(Duration::from_secs(2), || st
+            .load_endpoint(&id("local"))
+            .is_some_and(|f| f.slot_save == Some(false)))
+        .await,
+        "slot_save не записан"
+    );
+    // Второй запрос той же сессии идёт без save/restore и проходит.
+    let before = srv.total_requests();
+    g.stream(c).await.unwrap().collect().await.unwrap();
+    assert_eq!(srv.total_requests() - before, 1);
+}
+
+#[tokio::test]
+async fn forced_tool_choice_rejection_updates_profile() {
+    // D15: 400 с упоминанием tool_choice на `Required` → профиль без
+    // `tool_choice_required`; тот же выбор дальше отвергается до отправки.
+    let srv = llama_server(
+        vec![props("probe/llama_props.json")],
+        vec![Reply::Json(
+            400,
+            json!({"error": {"message": "tool_choice=required is not supported"}}),
+        )],
+    )
+    .await;
+    let g = start(llama_cfg(&srv.base_url, json!({})), "tool_choice", opts()).await;
+    assert!(g.capabilities(&id("local")).unwrap().tool_choice_required);
+    let mut c = call_on("local", RunId::new(), "Прочитай");
+    c.request.tools = vec![za_llm::ToolSchema {
+        name: "read_file".into(),
+        description: "Прочитать файл.".into(),
+        parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+    }];
+    c.request.tool_choice = za_llm::ToolChoice::Required;
+    let err = g
+        .stream(c.clone())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::BadRequest);
+    assert_eq!(srv.requests(CHAT).len(), 1);
+    assert!(!g.capabilities(&id("local")).unwrap().tool_choice_required);
+    c.request.messages[0].parts = vec![Part::Text("Прочитай ещё раз".into())];
+    let err = g.stream(c).await.unwrap().collect().await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::BadRequest);
+    assert_eq!(srv.requests(CHAT).len(), 1, "запрос не должен уйти");
+}

@@ -73,6 +73,10 @@ required-features = ["gateway"]
 name = "slots"
 required-features = ["gateway"]
 
+[[test]]
+name = "gateway"
+required-features = ["gateway"]
+
 [dev-dependencies]
 axum.workspace = true
 toml.workspace = true

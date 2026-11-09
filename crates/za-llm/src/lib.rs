@@ -14,6 +14,8 @@ pub mod caps;
 #[cfg(feature = "http")]
 pub mod config;
 pub mod error;
+#[cfg(feature = "gateway")]
+pub mod gateway;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod normalize;
@@ -47,6 +49,8 @@ pub use caps::{
     TextFormat, ThinkingSupport, TokenCountSource, ToolFormat, ToolIdFormat, Wire, default_caps,
 };
 pub use error::{ErrorClass, ModelError};
+#[cfg(feature = "gateway")]
+pub use gateway::*;
 #[cfg(feature = "http")]
 pub use http::{EnvSecrets, Secret, SecretSource};
 pub use port::{AbortOnDrop, BoxFuture, ModelCall, ModelPort, ModelStream, RequestMeta};
