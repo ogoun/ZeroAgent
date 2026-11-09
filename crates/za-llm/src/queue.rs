@@ -19,7 +19,9 @@
 //! 3. допуск по ресурсам при `resource_gated` (`Need { local_gpu: true, .. }`) — проверяется у
 //!    каждой ожидающей независимо от занятости мест, поэтому `WaitingResource { kind }`
 //!    отражает ресурс, а не слоты; не прошедшая не занимает места и не блокирует следующих
-//!    (RES-012);
+//!    (RES-012). У группы без `resource_gated` (облако, сервер в сети) фоновые заявки
+//!    (`Job`, `Arena`) проходят только порог тома журнала (RES-018,
+//!    [`Admission::journal_verdict`]): он касается всего узла, а RAM, VRAM и CPU — нет (D25);
 //! 4. лимит фоновых (`Job`, `Arena`) в локальной группе — не больше `max(1, n − 1)` из `n`
 //!    мест: последнее место — под интерактивную работу. При `n = 1` фон может занять
 //!    единственное место, пока нет ожидающего интерактива; уже выданное место не
@@ -394,12 +396,19 @@ impl State {
                 states.insert(id, WaitState::Queued);
                 continue;
             }
-            if g.limits.resource_gated
+            // Ресурсы узла — только у группы на этом хосте (D25); том журнала (RES-018) —
+            // у фоновых заявок любой группы, в том числе облачной.
+            let gated = g.limits.resource_gated;
+            if (gated || e.background())
                 && let Some(adm) = admission
             {
-                let v = *verdicts
-                    .entry(e.priority)
-                    .or_insert_with(|| adm.check(e.priority, &need));
+                let v = *verdicts.entry(e.priority).or_insert_with(|| {
+                    if gated {
+                        adm.check(e.priority, &need)
+                    } else {
+                        adm.journal_verdict(e.priority)
+                    }
+                });
                 if let Verdict::Wait { kind, .. } = v {
                     if self.monitor_stopped {
                         failed.push((id, QueueError::MonitorStopped));
@@ -461,12 +470,19 @@ impl State {
         }
     }
 
-    /// Пересчёт по новому снимку ресурсов: только группы с допуском и ожидающими.
+    /// Пересчёт по новому снимку ресурсов: группы с допуском и ожидающими, а также
+    /// группы с ожидающими фоновыми заявками (том журнала, RES-018).
     fn dispatch_gated(&mut self, admission: Option<&Admission>, now: Instant) {
+        let entries = &self.entries;
         let ids: Vec<GroupId> = self
             .groups
             .iter()
-            .filter(|(_, g)| g.limits.resource_gated && !g.waiting.is_empty())
+            .filter(|(_, g)| {
+                (g.limits.resource_gated && !g.waiting.is_empty())
+                    || g.waiting
+                        .iter()
+                        .any(|id| entries.get(id).is_some_and(Entry::background))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for gid in ids {
@@ -632,7 +648,8 @@ pub struct ModelQueue {
 
 impl ModelQueue {
     /// `rt` — runtime фоновой задачи очереди (таймеры, снимки ресурсов); `admission` —
-    /// допуск для групп с `resource_gated`, `None` — без проверки ресурсов.
+    /// допуск для групп с `resource_gated` и порог тома журнала для фоновых заявок всех
+    /// групп, `None` — без проверки ресурсов.
     ///
     /// Runtime `rt` должен опрашиваться (работать `block_on` или рабочие потоки): фоновая
     /// задача только порождается в нём. Если runtime жив, но не опрашивается (например,

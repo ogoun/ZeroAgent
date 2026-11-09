@@ -300,8 +300,10 @@ impl Admission {
         let _ = self.notices.send(n);
     }
 
-    /// Решение только по тому журнала (для резерва диска фоновыми, RES-018).
-    pub(crate) fn journal_verdict(&self, p: Priority) -> Verdict {
+    /// Решение только по тому журнала (RES-018): порог касается всего узла, поэтому
+    /// применяется и к фоновым заявкам облачных групп, и к резерву диска фоновыми.
+    /// Ресурсы узла (RAM, VRAM, CPU) здесь не проверяются (D25).
+    pub fn journal_verdict(&self, p: Priority) -> Verdict {
         let snap = self.rx.borrow();
         let mut st = self.lock();
         self.check_journal(&mut st, &snap, p)

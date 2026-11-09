@@ -16,7 +16,10 @@ use za_llm::queue::{
 };
 use za_llm::{PoolKind, WaitState};
 use za_protocol::{Priority, RunId};
-use za_res::{Admission, CpuSample, GpuStatus, MemSample, ResourceSnapshot, ResourcesConfig};
+use za_res::{
+    Admission, CpuSample, DiskKind, GpuStatus, MemSample, ResourceSnapshot, ResourcesConfig,
+    VolumeSample,
+};
 
 const GIB: u64 = 1 << 30;
 
@@ -408,6 +411,69 @@ async fn resource_wait_does_not_hold_the_only_slot() {
     assert_eq!(job.status().borrow().state, WaitState::Queued);
     drop(pi);
     assert_eq!(job.status().borrow().state, WaitState::Granted);
+}
+
+/// Снимок: RAM на пределе фоновых (`ram`), на томе `ZA_HOME` свободно `journal_free`.
+fn snapshot_with_journal(ram: u64, journal_free: u64) -> ResourceSnapshot {
+    let mut s = snapshot_with_ram(ram);
+    s.volumes = vec![VolumeSample {
+        mount: PathBuf::from(env!("CARGO_TARGET_TMPDIR")),
+        name: "target".into(),
+        kind: DiskKind::Ssd,
+        total: 1000 * GIB,
+        available: journal_free,
+        read_bps: None,
+        write_bps: None,
+        roles: vec![],
+    }];
+    s
+}
+
+#[tokio::test(start_paused = true)]
+async fn journal_volume_low_stops_cloud_background() {
+    // Финальное ревью I3 (RES-018): низкое место на томе журнала останавливает фоновые
+    // заявки и облачной группы; интерактивная и `Worker` идут.
+    let (tx, adm) = admission(snapshot_with_journal(32 * GIB, GIB));
+    let q = ModelQueue::new(Handle::current(), Some(adm));
+    let c = gid("cloud:anthropic:api.anthropic.com");
+    q.configure(c.clone(), cloud(4, None));
+    let arena = enq(&q, &c, Priority::Arena);
+    let disk = WaitState::WaitingResource {
+        kind: "disk".into(),
+    };
+    assert_eq!(arena.status().borrow().state, disk);
+    let job = enq(&q, &c, Priority::Job);
+    assert_eq!(job.status().borrow().state, disk);
+    let _pi = enq(&q, &c, Priority::Interactive).granted().await.unwrap();
+    let _pw = enq(&q, &c, Priority::Worker).granted().await.unwrap();
+    assert_eq!(active(&q, &c), 2);
+    let h = tokio::spawn(arena.granted());
+    settle().await;
+    assert!(!h.is_finished());
+    // Место освободилось — фоновые возобновляются по новому снимку.
+    tx.send(snapshot_with_journal(32 * GIB, 100 * GIB)).unwrap();
+    let _pa = h.await.unwrap().unwrap();
+    let _pj = job.granted().await.unwrap();
+    assert_eq!(active(&q, &c), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn node_resources_do_not_gate_cloud() {
+    // D25: RAM/VRAM/CPU узла — только для эндпоинтов на этом хосте; облачный фон при
+    // нехватке RAM получает место, если на томе журнала достаточно места.
+    let (_tx, adm) = admission(snapshot_with_journal(GIB, 100 * GIB));
+    let q = ModelQueue::new(Handle::current(), Some(adm));
+    let c = gid("cloud:openrouter:openrouter.ai");
+    q.configure(c.clone(), cloud(4, None));
+    let _pj = enq(&q, &c, Priority::Job).granted().await.unwrap();
+    // Та же нехватка RAM у локальной группы на хосте останавливает фон.
+    let l = gid("llama-local");
+    q.configure(l.clone(), gated(4));
+    let job = enq(&q, &l, Priority::Job);
+    assert_eq!(
+        job.status().borrow().state,
+        WaitState::WaitingResource { kind: "ram".into() }
+    );
 }
 
 #[tokio::test(start_paused = true)]
