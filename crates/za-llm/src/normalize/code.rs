@@ -17,7 +17,8 @@
 //! - символы `U+E000`/`U+E001` самого текста — чтобы заглушки нельзя было подделать.
 //!
 //! Заборы и обратные кавычки внутри тел вызовов (блок `<tool_call>…</tool_call>`,
-//! `<function=…>…</function>`, тело Harmony `<|message|>…<|call|>`) разметкой
+//! `<function=…>…</function>`, вызов Harmony `to=functions.…<|message|>…<|call|>`
+//! или `…<|end|>`; сообщения обычных каналов — не тела вызовов) разметкой
 //! Markdown не считаются: нечётный забор в значении `write_file` иначе спарился бы
 //! с забором примера после вызова и открыл бы пример для исполнения. Тела ищутся по
 //! маркерам по исходному тексту: закрытие должно стоять раньше следующего открытия
@@ -257,12 +258,7 @@ impl Bodies {
         let mut spans = Vec::new();
         paired(text, "<tool_call>", &["</tool_call>"], &mut spans);
         paired(text, "<function=", &["</function>"], &mut spans);
-        paired(
-            text,
-            "<|message|>",
-            &["<|call|>", "<|end|>", "<|return|>"],
-            &mut spans,
-        );
+        harmony_calls(text, &mut spans);
         // Тела разных видов могут вкладываться (`<tool_call><function=…>…`): нужна
         // только принадлежность, поэтому они сливаются в непересекающиеся отрезки.
         spans.sort_unstable();
@@ -303,6 +299,46 @@ fn paired(text: &str, open: &'static str, closes: &[&'static str], out: &mut Vec
                 cur = c + t.len();
             }
             _ => cur = body,
+        }
+    }
+}
+
+/// Тела вызовов Harmony: `to=functions.… <|message|> … <|call|>` (или `<|end|>`).
+/// Сообщения обычных каналов (`final`, `analysis` до `<|end|>`/`<|return|>`) телами
+/// вызовов не считаются: в сыром ответе gpt-oss весь ответ лежит в таком канале, и
+/// код Markdown в нём должен оставаться скрытым (раунд 3, I-H1).
+fn harmony_calls(text: &str, out: &mut Vec<(usize, usize)>) {
+    const TO: &str = "to=functions.";
+    const MESSAGE: &str = "<|message|>";
+    let mut to = Finder::new(text, TO);
+    let mut message = Finder::new(text, MESSAGE);
+    // Заголовок вызова кончается на `<|message|>` раньше конца сообщения и нового
+    // заголовка.
+    let mut header_stops = [
+        Finder::new(text, "<|start|>"),
+        Finder::new(text, "<|end|>"),
+        Finder::new(text, "<|call|>"),
+        Finder::new(text, "<|return|>"),
+        Finder::new(text, TO),
+    ];
+    let mut body_ends = [Finder::new(text, "<|call|>"), Finder::new(text, "<|end|>")];
+    let mut cur = 0;
+    while let Some(p) = to.find(cur) {
+        let after = p + TO.len();
+        cur = after;
+        let Some(m) = message.find(after) else {
+            break;
+        };
+        if earliest(&mut header_stops, after).is_some_and(|(s, _)| s < m) {
+            continue;
+        }
+        let body = m + MESSAGE.len();
+        let next_message = message.find(body);
+        if let Some((c, t)) = earliest(&mut body_ends, body)
+            && next_message.is_none_or(|n| c < n)
+        {
+            out.push((p, c + t.len()));
+            cur = c + t.len();
         }
     }
 }

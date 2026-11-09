@@ -913,3 +913,38 @@ fn code_regions_are_not_shifted_by_cut_calls() {
         "```rs\nlet a = `b`;\n```"
     );
 }
+
+// ---- Раунд исправлений 3 ----
+
+/// I-H1: сообщение обычного канала Harmony (`final`, `analysis`) — не тело вызова:
+/// код Markdown внутри него скрыт, примеры вызовов не исполняются.
+#[test]
+fn code_inside_harmony_channels_stays_hidden() {
+    let hermes_example = hermes("read_file", json!({"path": "EX"}));
+    let qwen_example =
+        "<function=read_file>\n<parameter=path>\nEX\n</parameter>\n</function>".to_owned();
+    for src in [
+        format!(
+            "<|channel|>final<|message|>Пример:\n```\n{hermes_example}\n```\nГотово.<|return|>"
+        ),
+        format!("<|channel|>analysis<|message|>Пример:\n```\n{qwen_example}\n```\n<|end|>"),
+        format!(
+            "<|channel|>final<|message|>Инлайн: `{}` — так.<|return|>",
+            hermes_example.replace('\n', "")
+        ),
+    ] {
+        let out = normalize(&text(&src), &tools(), all_formats());
+        assert!(
+            out.calls.is_empty() && out.rejected.is_empty(),
+            "{src}: {:?} {:?}",
+            out.calls,
+            out.rejected
+        );
+        assert_eq!(out.text, src);
+    }
+    // Настоящий вызов Harmony с кодом в аргументе по-прежнему тело вызова.
+    let call = "<|channel|>commentary to=functions.write_file <|constrain|>json<|message|>{\"path\":\"a\",\"content\":\"`x`\"}<|call|>";
+    let out = normalize(&text(call), &tools(), all_formats());
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].call.arguments["content"], "`x`");
+}
