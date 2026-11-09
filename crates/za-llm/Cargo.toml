@@ -23,13 +23,15 @@ reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 # Даты `Retry-After` (HTTP-дата RFC 9110) и сброса лимитов Anthropic (RFC 3339).
 jiff = { workspace = true, optional = true }
+# Допуск очереди по ресурсам узла (D1: `za-res` не зависит от `za-llm`).
+za-res = { path = "../za-res", optional = true }
 
 [features]
 # Без функций крейт даёт только чистые части: канонический формат, возможности,
 # ошибки, `ModelPort`, `ScriptedModel`, префикс. Так его подключает `za-core`.
 # `http` — транспорт, коннекторы и зонды; `gateway` — очередь, повторы и `Gateway`.
 default = ["gateway"]
-gateway = ["http"]
+gateway = ["http", "dep:za-res"]
 # `tokio/macros` — `select!` насоса SSE коннекторов на `tx.closed()` (D2).
 http = ["dep:reqwest", "dep:rustls", "dep:jiff", "tokio/macros"]
 # Псевдоним R0 для совместимости.
@@ -61,6 +63,10 @@ required-features = ["http"]
 
 [[test]]
 name = "resilience"
+required-features = ["gateway"]
+
+[[test]]
+name = "queue"
 required-features = ["gateway"]
 
 [dev-dependencies]

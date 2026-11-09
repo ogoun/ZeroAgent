@@ -1793,6 +1793,7 @@ dependencies = [
  "toml",
  "tracing",
  "za-protocol",
+ "za-res",
 ]
 
 [[package]]
