@@ -461,17 +461,32 @@ impl Probe<'_> {
     async fn openrouter(&self) -> Result<Found, Fail> {
         let models = self.get_bearer("/models").await?;
         let want = self.configured_model();
-        // Варианты `:nitro`, `:floor`, `:online` и т. п. — ярлыки маршрутизации, в
-        // каталоге их нет: ищется запись без суффикса. `:free` и другие варианты со своей
-        // записью находятся точным совпадением раньше.
-        let entry = find_model(&models, &want)
-            .or_else(|| {
-                want.rsplit_once(':')
-                    .and_then(|(base, _)| find_model(&models, base))
-            })
-            .ok_or_else(|| {
-                Fail::Inactive(format!("модель {want} не найдена в каталоге OpenRouter"))
-            })?;
+        // Варианты маршрутизации (`:nitro`, `:floor`, `:exacto`, `:online`) принимаются у
+        // любой модели и в каталоге не перечисляются — ищется запись без суффикса.
+        // Варианты каталога (`:free`, `:thinking`, `:extended` и любые неизвестные) —
+        // отдельные записи: без своей записи эндпоинт `Inactive`, а не платная базовая
+        // модель (страница «Model variants», проверено 2026-11-09).
+        let entry = match find_model(&models, &want) {
+            Some(e) => e,
+            None => match want.rsplit_once(':') {
+                Some((base, variant)) if ROUTING_VARIANTS.contains(&variant) => {
+                    find_model(&models, base).ok_or_else(|| {
+                        Fail::Inactive(format!("модель {base} не найдена в каталоге OpenRouter"))
+                    })?
+                }
+                Some((_, variant)) => {
+                    return Err(Fail::Inactive(format!(
+                        "варианта :{variant} модели {want} нет в каталоге OpenRouter \
+                         (базовая модель не подставляется)"
+                    )));
+                }
+                None => {
+                    return Err(Fail::Inactive(format!(
+                        "модель {want} не найдена в каталоге OpenRouter"
+                    )));
+                }
+            },
+        };
         let mut f = Found::new(self.ep, want);
         f.runtime_ctx = u32_field(entry, "context_length").map(|n| (n, "/models".to_owned()));
         let params: Vec<&str> = entry
@@ -670,6 +685,9 @@ fn path_segment(s: &str) -> String {
     }
     out
 }
+
+/// Варианты маршрутизации OpenRouter: применимы к любой модели, в каталоге их нет.
+const ROUTING_VARIANTS: &[&str] = &["nitro", "floor", "exacto", "online"];
 
 /// Текст пробы переполнения: однобуквенные слова через пробел — около токена на два
 /// символа у BPE (повтор одной буквы сжимается в длинные токены и до предела не доходит).

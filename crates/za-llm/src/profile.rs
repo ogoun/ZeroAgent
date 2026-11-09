@@ -209,10 +209,20 @@ impl ProfileStore {
         write_atomic(&self.endpoint_path(&f.endpoint), f)
     }
 
-    /// Профиль связки и факты эндпоинта одного зонда.
+    /// Профиль связки и факты эндпоинта одного зонда. Блокирующий вызов (файловый
+    /// ввод-вывод, `sync_all`, паузы повтора `rename`).
     pub fn save_probed(&self, p: &ProbedEndpoint) -> std::io::Result<()> {
         self.save(&p.profile)?;
         self.save_endpoint(&p.facts)
+    }
+
+    /// [`Self::save_probed`] для async-кода: на потоке `spawn_blocking`, поток рантайма
+    /// не блокируется.
+    pub async fn save_probed_async(&self, p: ProbedEndpoint) -> std::io::Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.save_probed(&p))
+            .await
+            .map_err(std::io::Error::other)?
     }
 
     fn profile_path(&self, key: &str) -> Option<PathBuf> {
@@ -220,21 +230,44 @@ impl ProfileStore {
         ok.then(|| self.profiles.join(format!("{key}.json")))
     }
 
-    /// Имя файла эндпоинта: id, если он из `[A-Za-z0-9_-]` (до 64 символов), иначе
-    /// `id-<blake3[..16]>` — без выхода за каталог и без зарезервированных имён.
     fn endpoint_path(&self, id: &EndpointId) -> PathBuf {
-        let s = &id.0;
-        let plain = !s.is_empty()
-            && s.len() <= 64
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-        let name = if plain {
-            s.clone()
-        } else {
-            format!("id-{}", &blake3::hash(s.as_bytes()).to_hex()[..16])
-        };
-        self.endpoints.join(format!("{name}.json"))
+        self.endpoints
+            .join(format!("{}.json", endpoint_file_stem(&id.0)))
     }
+}
+
+/// Имя файла эндпоинта (без `.json`), одинаково безопасное на Windows и Linux:
+/// - id из `[a-z0-9_-]` (до 64 символов) и не зарезервированное имя Windows — как есть;
+/// - id из `[A-Za-z0-9_-]` с заглавными буквами или зарезервированное (`CON`, `PRN`,
+///   `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9` в любом регистре) — нижний регистр и
+///   `-<blake3(id)[..8]>`: NTFS не различает регистр, и `A`/`a` иначе делили бы файл;
+/// - прочее — `id-<blake3(id)[..16]>`: без выхода за каталог.
+pub(crate) fn endpoint_file_stem(id: &str) -> String {
+    let plain = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    let hash = blake3::hash(id.as_bytes()).to_hex();
+    if !plain {
+        return format!("id-{}", &hash[..16]);
+    }
+    let lower = id.to_ascii_lowercase();
+    if lower != id || is_reserved_windows_name(&lower) {
+        format!("{lower}-{}", &hash[..8])
+    } else {
+        lower
+    }
+}
+
+/// Зарезервированные имена устройств Windows (без расширения, нижний регистр).
+fn is_reserved_windows_name(lower: &str) -> bool {
+    matches!(lower, "con" | "prn" | "aux" | "nul")
+        || ["com", "lpt"].iter().any(|p| {
+            lower
+                .strip_prefix(p)
+                .is_some_and(|d| d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9'))
+        })
 }
 
 /// JSON из файла: нет файла — `None`, ошибка чтения или разбора — `warn` и `None`.
@@ -258,8 +291,10 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 
 /// Атомарная запись (D13): уникальный временный файл рядом
 /// (`<имя>.<pid>.<n>.tmp`), `sync_all`, `rename`. Внутри процесса записи идут по
-/// одной ([`WRITE_LOCK`]); от другого процесса на Windows `rename` может получить
-/// `PermissionDenied` — повторы с паузой 2, 4 … 64 мс, всего около 0,5 с.
+/// одной ([`WRITE_LOCK`], только на время `rename`); от другого процесса на Windows
+/// `rename` может получить `PermissionDenied` — повторы с паузой 2, 4 … 64 мс (без
+/// замка), всего около 0,5 с. Вызов блокирующий: из async-кода —
+/// [`ProfileStore::save_probed_async`] (`spawn_blocking`).
 fn write_atomic<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
     use std::io::Write;
     let body = serde_json::to_vec_pretty(v).map_err(std::io::Error::other)?;
@@ -274,12 +309,16 @@ fn write_atomic<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
         f.write_all(&body)?;
         f.sync_all()?;
         drop(f);
-        let _guard = WRITE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut attempt: u32 = 0;
         loop {
-            match std::fs::rename(&tmp, path) {
+            // Замок — только на сам `rename`, пауза повтора идёт без него.
+            let r = {
+                let _guard = WRITE_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::fs::rename(&tmp, path)
+            };
+            match r {
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < 10 => {
                     attempt += 1;
                     let ms = 1u64 << attempt.min(6);

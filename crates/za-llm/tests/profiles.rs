@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 use support::{FakeServer, Reply, fixture};
 use za_llm::config::{
-    ConfigError, ConfigParseError, ConfigWarning, EndpointConfig, ModelsConfig, Price, compute_cost,
+    ConfigError, ConfigParseError, ConfigWarning, EndpointConfig, ModelsConfig, ParseErrorKind,
+    Price, compute_cost,
 };
 use za_llm::http::{HttpTransport, Secret, SecretSource, Timeouts};
 use za_llm::profile::{
@@ -1081,4 +1082,164 @@ async fn literal_key_ref_without_validate_is_not_echoed() {
     let shown = format!("{st:?}");
     assert!(matches!(st, EndpointState::Inactive { .. }), "{shown}");
     assert!(!shown.contains("sk-ant-api03-literal"), "{shown}");
+}
+
+// ---------------------------------------------------------------------------
+// Раунд исправлений 2.
+
+#[test]
+fn parse_error_is_whitelist_only() {
+    const SECRET: &str = "SECRET";
+    let base = "[[endpoints]]\nid = \"c\"\nbackend = \"anthropic\"\n";
+    // Три случая утечки санитайзера из ревью: кавычка внутри значения, обратная
+    // кавычка внутри варианта, ключ как имя поля.
+    let toml_cases = [
+        format!("{base}context_tokens = 'sk-ab\"{SECRET}'\n"),
+        format!("[[endpoints]]\nid = \"c\"\nbackend = 'sk-a`{SECRET}'\n"),
+        format!("{base}sk-{SECRET} = 1\n"),
+        format!("[sk-{SECRET}]\nx = 1\n"),
+        format!("{base}price.sk-{SECRET} = 1\n"),
+        format!("{base}pool = 'sk-a`{SECRET}`, expected'\n"),
+    ];
+    for src in &toml_cases {
+        let e = toml_models(src).unwrap_err();
+        let shown = format!("{e} {e:?}");
+        assert!(!shown.contains(SECRET), "{src} → {shown}");
+        assert!(e.line.is_some(), "{shown}");
+    }
+    let json_cases = [
+        format!(
+            r#"{{"endpoints": [{{"id": "c", "backend": "anthropic", "context_tokens": "sk-a\"{SECRET}"}}]}}"#
+        ),
+        format!(r#"{{"endpoints": [{{"id": "c", "backend": "sk-a`{SECRET}"}}]}}"#),
+        format!(r#"{{"endpoints": [{{"id": "c", "backend": "anthropic", "sk-{SECRET}": 1}}]}}"#),
+    ];
+    for src in &json_cases {
+        let e = ModelsConfig::from_json_str(src).unwrap_err();
+        let shown = format!("{e} {e:?}");
+        assert!(!shown.contains(SECRET), "{src} → {shown}");
+    }
+    // Категории и известные имена полей.
+    let e = toml_models(&format!("{base}api_key = 'sk-x'\n")).unwrap_err();
+    assert_eq!(
+        (e.kind, e.field),
+        (ParseErrorKind::UnknownField, Some("api_key"))
+    );
+    assert!(e.to_string().contains("key_ref"), "{e}");
+    let e = toml_models(&format!("{base}sk-{SECRET} = 1\n")).unwrap_err();
+    assert_eq!((e.kind, e.field), (ParseErrorKind::UnknownField, None));
+    let e = toml_models(&format!("{base}context_tokens = 'x'\n")).unwrap_err();
+    assert_eq!(e.kind, ParseErrorKind::InvalidType);
+    let e = toml_models("[[endpoints]]\nid = \"c\"\nbackend = 'zzz'\n").unwrap_err();
+    assert_eq!(e.kind, ParseErrorKind::UnknownVariant);
+    let e = toml_models("[[endpoints]]\nid = \"c\"\n").unwrap_err();
+    assert_eq!(
+        (e.kind, e.field),
+        (ParseErrorKind::MissingField, Some("backend"))
+    );
+    let e = toml_models("[[endpoints]]\nid = \"c\n").unwrap_err();
+    assert_eq!(e.kind, ParseErrorKind::Syntax);
+    let e = ModelsConfig::from_json_str(r#"{"endpoints": [{"id": "c""#).unwrap_err();
+    assert_eq!(e.kind, ParseErrorKind::Syntax);
+}
+
+#[test]
+fn validate_errors_show_only_id_format() {
+    const SECRET: &str = "sk-ant-SECRET";
+    let check = |c: ModelsConfig| {
+        let err = c.validate().unwrap_err();
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        err
+    };
+    let err = check(cfg(json!({"endpoints": [
+        {"id": "ok", "backend": "llama_cpp"}, {"id": SECRET, "backend": "llama_cpp"}]})));
+    assert_eq!(err, ConfigError::BadId(2));
+    assert!(err.to_string().contains("№2"));
+    check(cfg(
+        json!({"default": SECRET, "endpoints": [{"id": "l", "backend": "llama_cpp"}]}),
+    ));
+    check(cfg(
+        json!({"roles": {SECRET: "l"}, "endpoints": [{"id": "l", "backend": "llama_cpp"}]}),
+    ));
+    check(cfg(json!({"roles": {"worker": SECRET},
+                     "endpoints": [{"id": "l", "backend": "llama_cpp"}]})));
+    let err = check(cfg(
+        json!({"endpoints": [{"id": "a b", "backend": "llama_cpp"}]}),
+    ));
+    assert_eq!(err, ConfigError::BadId(1));
+}
+
+#[tokio::test]
+async fn async_save_runs_off_runtime_thread() {
+    let srv = llama_server("probe/llama_props.json", vec!["a", "b"]).await;
+    let p = ready(probe_endpoint(&llama_ep(&srv.base_url), &http(), &MapSecrets::default()).await);
+    let store = ProfileStore::open(&store_dir("async_save")).unwrap();
+    store.save_probed_async(p.clone()).await.unwrap();
+    assert_eq!(store.load(&p.facts.bundle_key), Some(p.profile.clone()));
+    assert_eq!(store.load_endpoint(&p.facts.endpoint), Some(p.facts));
+}
+
+#[tokio::test]
+async fn endpoint_file_names_are_windows_safe() {
+    let srv = llama_server("probe/llama_props.json", vec!["a", "b"]).await;
+    let p = ready(probe_endpoint(&llama_ep(&srv.base_url), &http(), &MapSecrets::default()).await);
+    let dir = store_dir("windows_names");
+    let store = ProfileStore::open(&dir).unwrap();
+    let ids = ["A", "a", "CON", "nul", "Com1", "lpt9", "com10", "worker-1"];
+    for id in ids {
+        let mut f = p.facts.clone();
+        f.endpoint = EndpointId(id.into());
+        f.context_tokens = id.len() as u32;
+        store.save_endpoint(&f).unwrap();
+    }
+    for id in ids {
+        let f = store.load_endpoint(&EndpointId(id.into())).unwrap();
+        assert_eq!(f.context_tokens, id.len() as u32, "{id}");
+    }
+    let mut names: Vec<String> = std::fs::read_dir(dir.join("endpoints"))
+        .unwrap()
+        .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), ids.len(), "{names:?}");
+    for n in &names {
+        let stem = n.strip_suffix(".json").unwrap();
+        assert_eq!(stem, stem.to_ascii_lowercase(), "{n}");
+        let reserved = ["con", "prn", "aux", "nul"].contains(&stem)
+            || (stem.len() == 4 && (stem.starts_with("com") || stem.starts_with("lpt")));
+        assert!(!reserved, "{n}");
+    }
+    assert!(names.contains(&"a.json".to_owned()));
+    assert!(names.contains(&"com10.json".to_owned()));
+    assert!(names.contains(&"worker-1.json".to_owned()));
+}
+
+#[tokio::test]
+async fn openrouter_catalog_variant_is_not_replaced_by_base() {
+    let srv = FakeServer::start(vec![(
+        "GET /api/v1/models",
+        vec![Reply::Json(
+            200,
+            fixture_json("probe/openrouter_models.json"),
+        )],
+    )])
+    .await;
+    let e = ep(
+        json!({"id": "or", "backend": "openrouter", "base_url": srv.url("/api/v1"),
+                      "model": "qwen/qwen3.8-235b:free", "key_ref": "openrouter"}),
+    );
+    let st = probe_endpoint(&e, &http(), &MapSecrets::with("openrouter", "k")).await;
+    match st {
+        EndpointState::Inactive { reason } => assert!(reason.contains(":free"), "{reason}"),
+        other => panic!("ожидался Inactive: {other:?}"),
+    }
+    for v in ["exacto", "floor"] {
+        let e = ep(
+            json!({"id": "or", "backend": "openrouter", "base_url": srv.url("/api/v1"),
+                          "model": format!("qwen/qwen3.8-235b:{v}"), "key_ref": "openrouter"}),
+        );
+        let p = ready(probe_endpoint(&e, &http(), &MapSecrets::with("openrouter", "k")).await);
+        assert_eq!(p.facts.context_tokens, 131072);
+    }
 }

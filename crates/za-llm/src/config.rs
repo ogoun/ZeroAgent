@@ -4,10 +4,13 @@
 //! [`crate::SecretSource`] (D4). Поле `api_key` и любое другое неизвестное поле
 //! отвергаются разбором (`deny_unknown_fields`).
 //!
-//! Текст ошибки разбора наружу — только через [`ConfigParseError`]: место (строка,
-//! столбец) и сообщение без фрагментов исходного текста. `Display` ошибки `toml`
-//! печатает строку источника с указателем (`api_key = "sk-…"` целиком), а сообщения
-//! serde вида `invalid type: string "…"` — значение поля; оба пути значения теряют.
+//! Текст ошибки разбора наружу — только через [`ConfigParseError`]: белый список из
+//! места (строка, столбец), категории из фиксированного набора и имени поля, если оно
+//! из списка известных. Текста парсера в ней нет: `Display` ошибки `toml` печатает
+//! строку источника (`api_key = "sk-…"` целиком), а сообщения serde — значения
+//! (`invalid type: string "…"`, ``unknown variant `…` ``, ``unknown field `…` ``).
+//! Ошибки [`ModelsConfig::validate`] выводят id и имена ролей, только если они в
+//! формате id; id эндпоинта вне формата — ошибка `BadId(№)` по номеру.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -68,9 +71,16 @@ pub struct ModelsConfig {
     pub roles: BTreeMap<String, EndpointId>,
 }
 
-/// Ошибка конфигурации. Текст называет поле; значения `key_ref` не печатаются.
+/// Ошибка конфигурации. Текст называет поле; значения `key_ref` не печатаются, id и
+/// имена ролей — только в формате id (иначе `<недопустимый id>` или номер эндпоинта).
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ConfigError {
+    /// Номер эндпоинта с 1: id вне формата `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` (или
+    /// похож на ключ) не печатается.
+    #[error(
+        "models.endpoints, эндпоинт №{0}: id должен быть из латиницы, цифр, `_`, `-`, `.` (до 64 символов)"
+    )]
+    BadId(usize),
     #[error("models.endpoints: эндпоинт {0} описан дважды")]
     DuplicateId(EndpointId),
     #[error("models.default: эндпоинт {0} не описан в models.endpoints")]
@@ -116,6 +126,11 @@ pub enum ConfigWarning {
 impl ModelsConfig {
     /// Проверка ссылок и обязательных полей. Ошибка — первая найденная.
     pub fn validate(&self) -> Result<Vec<ConfigWarning>, ConfigError> {
+        for (i, ep) in self.endpoints.iter().enumerate() {
+            if !valid_key_ref(&ep.id.0) {
+                return Err(ConfigError::BadId(i + 1));
+            }
+        }
         let mut ids = BTreeSet::new();
         for ep in &self.endpoints {
             if !ids.insert(&ep.id) {
@@ -126,19 +141,21 @@ impl ModelsConfig {
         if let Some(d) = &self.default {
             let ep = self
                 .endpoint(d)
-                .ok_or_else(|| ConfigError::UnknownRef(d.clone()))?;
+                .ok_or_else(|| ConfigError::UnknownRef(shown_id(d)))?;
             if ep.pool() != PoolKind::Local {
                 return Err(ConfigError::CloudDefault(d.clone()));
             }
         }
         for (role, id) in &self.roles {
-            if parse_role(role).is_none() {
-                return Err(ConfigError::UnknownRole(role.clone()));
-            }
+            let Some(_) = parse_role(role) else {
+                return Err(ConfigError::UnknownRole(
+                    shown_id(&EndpointId(role.clone())).0,
+                ));
+            };
             if self.endpoint(id).is_none() {
                 return Err(ConfigError::UnknownRoleTarget {
                     role: role.clone(),
-                    id: id.clone(),
+                    id: shown_id(id),
                 });
             }
         }
@@ -342,22 +359,89 @@ pub fn compute_cost(price: &Price, u: &Usage) -> f64 {
         / 1e6
 }
 
-/// Ошибка разбора конфигурации без фрагментов исходного текста (D4, SEC-044): место
-/// и сообщение, из которого вырезаны значения в кавычках.
+/// Категория ошибки разбора — фиксированный набор: текст парсера наружу не выходит.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    /// Синтаксис TOML/JSON (незакрытая строка, лишний символ и т. п.).
+    Syntax,
+    /// Неверный тип значения (строка вместо числа и т. п.).
+    InvalidType,
+    /// Значение нужного типа, но недопустимое (длина, диапазон).
+    InvalidValue,
+    UnknownField,
+    /// Неизвестное значение перечисления (`backend`, `pool`, `reasoning`).
+    UnknownVariant,
+    MissingField,
+    DuplicateField,
+    Other,
+}
+
+impl ParseErrorKind {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Syntax => "синтаксическая ошибка",
+            Self::InvalidType => "неверный тип значения",
+            Self::InvalidValue => "недопустимое значение",
+            Self::UnknownField => "неизвестное поле",
+            Self::UnknownVariant => "неизвестное значение перечисления",
+            Self::MissingField => "нет обязательного поля",
+            Self::DuplicateField => "поле задано дважды",
+            Self::Other => "ошибка разбора",
+        }
+    }
+}
+
+/// Имена полей, которые ошибка разбора может назвать: поля схемы `[models]` и частые
+/// ошибочные имена поля ключа. Любое другое имя (в том числе ключ, записанный именем
+/// поля TOML) не выводится.
+const SHOWN_FIELDS: &[&str] = &[
+    "default",
+    "endpoints",
+    "roles",
+    "id",
+    "backend",
+    "base_url",
+    "model",
+    "key_ref",
+    "pool",
+    "max_parallel",
+    "context_tokens",
+    "daily_budget_usd",
+    "price",
+    "reasoning",
+    "input_per_mtok",
+    "cached_per_mtok",
+    "cache_write_per_mtok",
+    "output_per_mtok",
+    "effort",
+    "budget",
+    "api_key",
+    "apikey",
+    "key",
+    "token",
+    "secret",
+    "password",
+];
+
+/// Ошибка разбора конфигурации (D4, SEC-044) по белому списку: место, категория из
+/// фиксированного набора и имя поля, только если оно из [`SHOWN_FIELDS`]. Текст
+/// парсера не хранится и не выводится.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{}", self.render())]
 pub struct ConfigParseError {
     /// Строка и столбец (с 1), если известны.
     pub line: Option<usize>,
     pub column: Option<usize>,
-    /// Тип ошибки и путь ключа (``unknown field `api_key` ``), без значений.
-    pub message: String,
+    pub kind: ParseErrorKind,
+    /// Имя поля из [`SHOWN_FIELDS`], если ошибка его называет.
+    pub field: Option<&'static str>,
 }
 
 impl ConfigParseError {
     /// Из сообщения парсера и смещения в исходнике. Для `toml`:
-    /// `ConfigParseError::from_message(e.message(), e.span().map(|s| s.start), src)` —
-    /// не `e.to_string()`: его `Display` печатает строку исходника.
+    /// `ConfigParseError::from_message(e.message(), e.span().map(|s| s.start), src)`.
+    /// Сообщение только классифицируется; `Display` самой ошибки `toml` печатает
+    /// строку исходника и наружу не выводится.
     pub fn from_message(message: &str, offset: Option<usize>, source: &str) -> Self {
         let (line, column) = match offset {
             Some(off) => {
@@ -372,37 +456,81 @@ impl ConfigParseError {
             }
             None => (None, None),
         };
+        let (kind, field) = classify(message, ParseErrorKind::Syntax);
         Self {
             line,
             column,
-            message: sanitize_parse_message(message),
+            kind,
+            field,
         }
     }
 
-    /// Из ошибки `serde_json`: её `Display` добавляет « at line L column C», место
-    /// берётся из `line()`/`column()`.
+    /// Из ошибки `serde_json`: место — `line()`/`column()`, категория — `classify()`
+    /// и начало сообщения.
     pub fn from_json(e: &serde_json::Error) -> Self {
-        let text = e.to_string();
-        let text = text
-            .rfind(" at line ")
-            .map_or(text.as_str(), |i| &text[..i]);
+        let (kind, field) = match e.classify() {
+            serde_json::error::Category::Data => classify(&e.to_string(), ParseErrorKind::Other),
+            _ => (ParseErrorKind::Syntax, None),
+        };
         Self {
             line: Some(e.line()).filter(|l| *l > 0),
             column: Some(e.column()).filter(|c| *c > 0),
-            message: sanitize_parse_message(text),
+            kind,
+            field,
         }
     }
 
     fn render(&self) -> String {
+        let mut out = String::from("конфигурация моделей");
         match (self.line, self.column) {
-            (Some(l), Some(c)) => format!(
-                "конфигурация моделей, строка {l}, столбец {c}: {}",
-                self.message
-            ),
-            (Some(l), None) => format!("конфигурация моделей, строка {l}: {}", self.message),
-            _ => format!("конфигурация моделей: {}", self.message),
+            (Some(l), Some(c)) => out.push_str(&format!(", строка {l}, столбец {c}")),
+            (Some(l), None) => out.push_str(&format!(", строка {l}")),
+            _ => {}
+        }
+        out.push_str(": ");
+        out.push_str(self.kind.text());
+        if let Some(f) = self.field {
+            out.push_str(&format!(" `{f}`"));
+            if matches!(
+                f,
+                "api_key" | "apikey" | "key" | "token" | "secret" | "password"
+            ) {
+                out.push_str(" (ключ в конфигурации не задаётся: key_ref и ZA_SECRET_<ИМЯ>)");
+            }
+        }
+        out
+    }
+}
+
+/// Категория и имя поля по началу сообщения serde/toml. Сообщения, не начинающиеся с
+/// известных форм serde, — `fallback` (у `toml` — синтаксис).
+fn classify(message: &str, fallback: ParseErrorKind) -> (ParseErrorKind, Option<&'static str>) {
+    let m = message.trim_start();
+    let forms = [
+        ("unknown field `", ParseErrorKind::UnknownField),
+        ("missing field `", ParseErrorKind::MissingField),
+        ("duplicate field `", ParseErrorKind::DuplicateField),
+        ("duplicate key `", ParseErrorKind::DuplicateField),
+    ];
+    for (prefix, kind) in forms {
+        if let Some(rest) = m.strip_prefix(prefix) {
+            let name = rest.split('`').next().unwrap_or("");
+            let field = SHOWN_FIELDS.iter().copied().find(|f| *f == name);
+            return (kind, field);
         }
     }
+    let kind = if m.starts_with("unknown variant") {
+        ParseErrorKind::UnknownVariant
+    } else if m.starts_with("invalid type") {
+        ParseErrorKind::InvalidType
+    } else if m.starts_with("invalid value") || m.starts_with("invalid length") {
+        ParseErrorKind::InvalidValue
+    } else if m.starts_with("duplicate") {
+        ParseErrorKind::DuplicateField
+    } else {
+        fallback
+    };
+    (kind, None)
 }
 
 impl ModelsConfig {
@@ -412,46 +540,14 @@ impl ModelsConfig {
     }
 }
 
-/// Сообщение парсера без значений: строки в двойных и одинарных кавычках заменены на
-/// `"…"`; имена полей в обратных кавычках остаются. Только первая непустая строка
-/// сообщения, не длиннее 300 символов.
-fn sanitize_parse_message(msg: &str) -> String {
-    let first = msg
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    let mut out = String::new();
-    let mut quote: Option<char> = None;
-    for c in first.chars() {
-        match quote {
-            Some(q) if c == q => {
-                out.push('…');
-                out.push(c);
-                quote = None;
-            }
-            Some(_) => {}
-            None if c == '"' || c == '\'' => {
-                out.push(c);
-                quote = Some(c);
-            }
-            None => out.push(c),
-        }
+/// Значение, которое можно показать в ошибке `validate` как id: формат id (как у
+/// `key_ref`: `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`, не `sk-…`). Иначе — заглушка.
+fn shown_id(id: &EndpointId) -> EndpointId {
+    if valid_key_ref(&id.0) {
+        id.clone()
+    } else {
+        EndpointId("<недопустимый id>".to_owned())
     }
-    if quote.is_some() {
-        out.push('…');
-    }
-    // serde пишет значение неизвестного варианта в обратных кавычках
-    // (``unknown variant `sk-…`, expected one of …``): оно вырезается тоже. Имя
-    // неизвестного поля (``unknown field `api_key` ``) остаётся — это путь ключа.
-    const VARIANT: &str = "unknown variant `";
-    if let Some(i) = out.find(VARIANT) {
-        let start = i + VARIANT.len();
-        if let Some(len) = out[start..].find('`') {
-            out.replace_range(start..start + len, "…");
-        }
-    }
-    out.chars().take(300).collect()
 }
 
 /// Облачные бэкенды — всегда облачные, по адресу не уточняются (D25).
