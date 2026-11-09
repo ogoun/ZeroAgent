@@ -7,7 +7,8 @@
 //! `http` добавляет транспорт, SSE и секреты (`http`), конфигурацию эндпоинтов
 //! (`config`), зонды (`probe`) и профили моделей (`profile`), коннекторы
 //! (`wire`, внутренние, D38), `gateway` — повторы и предохранитель (`resilience`),
-//! общая очередь к моделям (`queue`) и `Gateway` (включена по умолчанию).
+//! общая очередь к моделям (`queue`), слоты llama.cpp (`slots`) и `Gateway`
+//! (включена по умолчанию).
 
 pub mod caps;
 #[cfg(feature = "http")]
@@ -27,6 +28,8 @@ pub mod queue;
 #[cfg(feature = "gateway")]
 pub mod resilience;
 pub mod scripted;
+#[cfg(feature = "gateway")]
+pub mod slots;
 pub mod types;
 #[cfg(feature = "http")]
 pub(crate) mod wire;
