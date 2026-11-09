@@ -108,11 +108,23 @@ impl ChatWire {
             body.insert(key.into(), json!(n));
         }
         let s = &req.sampling;
-        if let Some(t) = s.temperature {
-            body.insert("temperature".into(), f32_json(t));
-        }
-        if let Some(p) = s.top_p {
-            body.insert("top_p".into(), f32_json(p));
+        // OpenAI: рассуждающие модели отвечают 400 на `temperature`/`top_p` и в Chat
+        // Completions — поля уходят, только если профиль допускает (`thinking.sampling`,
+        // задача 9); до зонда — как в запросе. Прочие диалекты — как есть.
+        let sampling_ok =
+            self.dialect != ChatDialect::OpenAi || ctx.thinking.is_none_or(|t| t.sampling);
+        if sampling_ok {
+            if let Some(t) = s.temperature {
+                body.insert("temperature".into(), f32_json(t));
+            }
+            if let Some(p) = s.top_p {
+                body.insert("top_p".into(), f32_json(p));
+            }
+        } else if s.temperature.is_some() || s.top_p.is_some() {
+            tracing::debug!(
+                model = self.model.as_str(),
+                "temperature/top_p модель не принимает, не отправляются"
+            );
         }
         if let Some(seed) = s.seed {
             body.insert("seed".into(), json!(seed));

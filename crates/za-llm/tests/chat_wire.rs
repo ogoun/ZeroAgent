@@ -75,6 +75,42 @@ fn body(d: ChatDialect, req: &ChatRequest) -> Value {
     wire(d, "http://x").build_body(req, &ctx(&caps)).unwrap()
 }
 
+#[test]
+fn openai_sampling_follows_profile() {
+    let mut req = request();
+    req.sampling.temperature = Some(0.5);
+    req.sampling.top_p = Some(0.9);
+    let with = |d: ChatDialect, model: &str| {
+        let caps = default_caps(kind(d));
+        let t = za_llm::probe::openai_thinking(model);
+        let mut c = ctx(&caps);
+        c.thinking = Some(&t);
+        wire(d, "http://x").build_body(&req, &c).unwrap()
+    };
+    // Рассуждающая модель OpenAI: поля не уходят.
+    let b = with(ChatDialect::OpenAi, "gpt-6-astra");
+    assert!(
+        b.get("temperature").is_none() && b.get("top_p").is_none(),
+        "{b}"
+    );
+    // Модель без рассуждений: уходят.
+    let b = with(ChatDialect::OpenAi, "gpt-4.1");
+    assert_eq!(b["temperature"], 0.5);
+    assert_eq!(b["top_p"], 0.9);
+    // До зонда — как в запросе.
+    assert_eq!(body(ChatDialect::OpenAi, &req)["temperature"], 0.5);
+    // llama.cpp, vLLM, совместимый — как есть, профиль не смотрится.
+    for d in [
+        ChatDialect::LlamaCpp,
+        ChatDialect::Vllm,
+        ChatDialect::Generic,
+    ] {
+        let b = with(d, "gpt-6-astra");
+        assert_eq!(b["temperature"], 0.5, "{d:?}");
+        assert_eq!(b["top_p"], 0.9, "{d:?}");
+    }
+}
+
 fn transport() -> HttpTransport {
     HttpTransport::local(Timeouts {
         connect: Duration::from_secs(2),

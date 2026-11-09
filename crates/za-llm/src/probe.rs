@@ -527,12 +527,11 @@ impl Probe<'_> {
                  (сейчас {CONSERVATIVE_CONTEXT})"
             ));
         }
-        if self.ep.backend == BackendKind::OpenAiResponses {
-            f.thinking = openai_thinking(&model);
-            f.notes.push(
-                "возможности рассуждения OpenAI — по имени модели (API их не сообщает)".to_owned(),
-            );
-        }
+        // Responses читает все поля, Chat Completions — только `sampling`.
+        f.thinking = openai_thinking(&model);
+        f.notes.push(
+            "возможности рассуждения OpenAI — по имени модели (API их не сообщает)".to_owned(),
+        );
         Ok(f)
     }
 

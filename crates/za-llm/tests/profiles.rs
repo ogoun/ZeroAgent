@@ -348,6 +348,24 @@ async fn cloud_model_not_found_is_inactive() {
 }
 
 #[tokio::test]
+async fn openai_chat_profile_has_sampling_flag() {
+    let srv = FakeServer::start(vec![(
+        "GET /v1/models/o4-mini",
+        vec![Reply::Json(
+            200,
+            json!({"id": "o4-mini", "object": "model"}),
+        )],
+    )])
+    .await;
+    let e = ep(
+        json!({"id": "oai", "backend": "openai_chat", "base_url": srv.url("/v1"),
+                      "model": "o4-mini", "key_ref": "openai"}),
+    );
+    let p = ready(probe_endpoint(&e, &http(), &MapSecrets::with("openai", "sk-oai")).await);
+    assert!(!p.thinking.sampling && p.thinking.effort);
+}
+
+#[tokio::test]
 async fn cloud_without_key_is_inactive_and_silent() {
     let srv = FakeServer::start(vec![(
         "GET /v1/models/claude-opus-5-5",

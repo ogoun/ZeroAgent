@@ -54,9 +54,9 @@ pub enum TextFormat {
 }
 
 /// Способ мышления модели (не поле MDL-002): заполняет зонд (задача 9), читают
-/// коннекторы Anthropic и Responses. У Anthropic — из Models API (`capabilities`), у
-/// OpenAI Responses — по имени модели (API возможностей не сообщает), у прочих —
-/// `Default` (коннектор Chat Completions поле не читает).
+/// коннекторы Anthropic, Responses и Chat Completions OpenAI (только `sampling`). У
+/// Anthropic — из Models API (`capabilities`), у OpenAI (Responses и Chat) — по имени
+/// модели (API возможностей не сообщает), у прочих — `Default` (не читается).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ThinkingSupport {
     /// Адаптивное мышление (`{"type":"adaptive"}`).
@@ -74,7 +74,7 @@ pub struct ThinkingSupport {
     /// Уровень усилия `max`.
     #[serde(default)]
     pub effort_max: bool,
-    /// Модель принимает `temperature` и `top_p` (Responses; у Anthropic на
+    /// Модель принимает `temperature` и `top_p` (OpenAI Responses и Chat; у Anthropic на
     /// `2026-10-21` — никогда, D15).
     #[serde(default)]
     pub sampling: bool,
