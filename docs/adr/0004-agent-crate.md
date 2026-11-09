@@ -21,7 +21,7 @@
 Направление зависимостей (проверяет `cargo xtask policy`, модульные тесты `xtask/src/policy.rs`):
 
 - `za-agent` зависит только от `za-protocol`, `za-store`, `za-core`, `za-llm`, `za-res` из крейтов workspace; `zero-agent`, `za-memory` и прочие — нарушение.
-- `za-agent` и `za-core` подключают `za-llm` с `default-features = false` и пустым набором функций (`features` из `cargo metadata`: `http`, `gateway`, `probe` — нарушение): без HTTP и `Gateway`, модель — только через `ModelPort` (RES-001). Прямая зависимость `za-agent` от `reqwest` — нарушение.
+- `za-agent` и `za-core` подключают `za-llm` с `default-features = false` и пустым набором функций (`features` из `cargo metadata`: `http`, `gateway`, `probe` — нарушение): без HTTP и `Gateway`, модель — только через `ModelPort` (RES-001). Кроме объявления, проверяется итоговый набор функций `za-llm` в сборке `-p za-agent` и `-p za-core` (`cargo tree -p … -e normal --target all`): включение через собственный `[features]` или транзитивно тоже нарушение. `resolve` из `cargo metadata` для этого не годится — он объединяет функции всего workspace. Прямая зависимость `za-agent` от `reqwest` — нарушение.
 - Нижние слои (`za-protocol`, `za-store`, `za-core`, `za-llm`, `za-res`) не зависят от `za-agent` ни в каком виде, включая dev; от `za-agent` зависит только бинарник `zero-agent`.
 - `za-core` не зависит от `za-res` и `reqwest` напрямую.
 

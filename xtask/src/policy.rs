@@ -184,6 +184,61 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
     out
 }
 
+/// Итоговые функции крейта `krate` из вывода `cargo tree --prefix none -f "{p}|{f}"`;
+/// `None` — крейта в дереве нет. Повторы (`(*)`) объединяются.
+pub fn parse_tree_features(tree: &str, krate: &str) -> Option<Vec<String>> {
+    let mut found: Option<Vec<String>> = None;
+    for line in tree.lines() {
+        let Some((pkg, feats)) = line.split_once('|') else {
+            continue;
+        };
+        if pkg.split(' ').next() != Some(krate) {
+            continue;
+        }
+        let list = found.get_or_insert_with(Vec::new);
+        let feats = feats.trim_end().trim_end_matches("(*)").trim();
+        for f in feats.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            if !list.iter().any(|x| x == f) {
+                list.push(f.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// Нарушение, если в итоговой сборке `pkg` у `za-llm` включена хоть одна функция.
+pub fn check_resolved_llm_features(pkg: &str, features: &[String]) -> Option<Violation> {
+    (!features.is_empty()).then(|| {
+        Violation(format!(
+            "{pkg}: в сборке `-p {pkg}` у za-llm включены функции {features:?} (допустим только пустой набор)"
+        ))
+    })
+}
+
+/// Итоговые функции `za-llm` в сборке `-p pkg` (обычные зависимости, все цели).
+///
+/// `resolve` из `cargo metadata` для этого не годится: он объединяет функции по всему
+/// workspace (бинарник `zero-agent` включает `gateway`), а `cargo tree -p` разрешает их
+/// так же, как `cargo build -p` — с собственным `[features]` и транзитивными включениями.
+fn resolved_llm_features(root: &Path, pkg: &str) -> Result<Vec<String>, String> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let res = Command::new(cargo)
+        .args([
+            "tree", "-p", pkg, "-e", "normal", "--target", "all", "--prefix", "none", "-f",
+            "{p}|{f}",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cargo tree -p {pkg}: {e}"))?;
+    if !res.status.success() {
+        return Err(format!(
+            "cargo tree -p {pkg}: {}",
+            String::from_utf8_lossy(&res.stderr)
+        ));
+    }
+    Ok(parse_tree_features(&String::from_utf8_lossy(&res.stdout), "za-llm").unwrap_or_default())
+}
+
 /// Крейт workspace: `za-*` или бинарник `zero-agent`.
 fn is_workspace_crate(name: &str) -> bool {
     name.starts_with("za-") || name == "zero-agent"
@@ -238,6 +293,10 @@ fn collect(root: &Path) -> Result<Vec<Violation>, String> {
     let metadata: Metadata =
         serde_json::from_slice(&res.stdout).map_err(|e| format!("metadata: {e}"))?;
     out.extend(check_direction(&metadata));
+    for pkg in PURE_LLM_USERS {
+        let features = resolved_llm_features(root, pkg)?;
+        out.extend(check_resolved_llm_features(pkg, &features));
+    }
 
     let limit_text = std::fs::read_to_string(root.join("xtask/core-size-limit.txt"))
         .map_err(|e| format!("core-size-limit.txt: {e}"))?;
@@ -438,6 +497,33 @@ version = \"0.0.1\"
         let m: Metadata = serde_json::from_str(json).unwrap();
         assert_eq!(m.packages[0].dependencies[0].features, vec!["gateway"]);
         assert_eq!(check_direction(&m).len(), 1);
+    }
+    #[test]
+    fn resolved_llm_features_are_parsed_from_tree() {
+        let clean = "za-agent v0.0.1 (H:\\p\\crates\\za-agent)|\n\
+            za-core v0.0.1 (H:\\p\\crates\\za-core)|\n\
+            za-llm v0.0.1 (H:\\p\\crates\\za-llm)|\n\
+            za-llm v0.0.1 (H:\\p\\crates\\za-llm)| (*)\n\
+            tokio v1.54.1|default,sync\n";
+        assert_eq!(
+            parse_tree_features(clean, "za-llm"),
+            Some(Vec::<String>::new())
+        );
+        assert_eq!(check_resolved_llm_features("za-agent", &[]), None);
+        // Включение через собственный `[features]` или транзитивно через другой крейт
+        // видно только в итоговом наборе сборки `-p za-agent`.
+        let dirty = "za-agent v0.0.1 (/p/za-agent)|x\n\
+            za-llm v0.0.1 (/p/za-llm)|gateway,http\n\
+            za-llm v0.0.1 (/p/za-llm)|gateway,http (*)\n";
+        let f = parse_tree_features(dirty, "za-llm").unwrap();
+        assert_eq!(f, vec!["gateway", "http"]);
+        assert!(check_resolved_llm_features("za-agent", &f).is_some());
+        assert_eq!(parse_tree_features("tokio v1|sync\n", "za-llm"), None);
+        // Префикс имени не путается: `za-llm-x` — другой крейт.
+        assert_eq!(
+            parse_tree_features("za-llm-x v1 (/p)|http\n", "za-llm"),
+            None
+        );
     }
     #[test]
     fn core_must_not_depend_on_res_or_http() {

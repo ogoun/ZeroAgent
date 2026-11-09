@@ -263,50 +263,82 @@ pub fn render_control(
     )
 }
 
-/// Имена тегов разметки промпта, которые недоверенный текст не может открыть или
-/// закрыть (D23; `memory` — обёртка MEM-006 и снимка первого сообщения, `state` — resume).
-pub const RESERVED_TAGS: &[&str] = &["control", "task", "grants", "env", "memory", "state"];
+/// Символы, похожие на `<`: ASCII, одиночная кавычка-уголок, угловые скобки
+/// (технические, математические, CJK, орнаментальные), малая и полноширинная формы,
+/// гомоглифы (канадское слоговое PA, модификатор-стрелка) и невидимый тег-символ
+/// U+E003C (ASCII smuggling).
+pub const LEFT_ANGLES: &[char] = &[
+    '<',
+    '\u{02C2}',
+    '\u{1438}',
+    '\u{2039}',
+    '\u{2329}',
+    '\u{276C}',
+    '\u{276E}',
+    '\u{2770}',
+    '\u{27E8}',
+    '\u{27EA}',
+    '\u{27EC}',
+    '\u{2991}',
+    '\u{2993}',
+    '\u{2995}',
+    '\u{29FC}',
+    '\u{3008}',
+    '\u{300A}',
+    '\u{FE3F}',
+    '\u{FE64}',
+    '\u{FF1C}',
+    '\u{E003C}',
+];
+/// Символы, похожие на `>` — пары к [`LEFT_ANGLES`].
+pub const RIGHT_ANGLES: &[char] = &[
+    '>',
+    '\u{02C3}',
+    '\u{1433}',
+    '\u{203A}',
+    '\u{232A}',
+    '\u{276D}',
+    '\u{276F}',
+    '\u{2771}',
+    '\u{27E9}',
+    '\u{27EB}',
+    '\u{27ED}',
+    '\u{2992}',
+    '\u{2994}',
+    '\u{2996}',
+    '\u{29FD}',
+    '\u{3009}',
+    '\u{300B}',
+    '\u{FE40}',
+    '\u{FE65}',
+    '\u{FF1E}',
+    '\u{E003E}',
+];
 
-/// Экранирование тегов разметки промпта в недоверенном тексте (D23, PRM-011).
+/// Экранирование разметки промпта в недоверенном тексте (D23, PRM-011, решение
+/// контроллера, раунд 2).
 ///
-/// Каждое `<`, за которым идут пробельные или невидимые символы и `/` в любом порядке
-/// и количестве, а затем имя из [`RESERVED_TAGS`] без учёта регистра ASCII, заменяется
-/// на `&lt;`; остальной текст не меняется. Совпадение по префиксу (`<controller`,
-/// `<environment` тоже экранируются): лишнее экранирование безопасно, пропущенное — нет.
-/// Пробельные — `char::is_whitespace`, невидимые — нулевой ширины, мягкий перенос,
-/// управление направлением письма и BOM. Функция идемпотентна.
+/// Каждый символ из [`LEFT_ANGLES`] заменяется на `&lt;`, из [`RIGHT_ANGLES`] — на `&gt;`,
+/// независимо от того, что за ним: обходы распознавания имени тега (невидимые символы
+/// внутри имени, гомоглифы, полноширинные буквы, `ſ`) теряют смысл, потому что без
+/// угловой скобки тега нет. Остальной текст не меняется, `&` не трогается, поэтому
+/// функция идемпотентна. Цена — `Vec<String>` в выводе инструмента читается как
+/// `Vec&lt;String&gt;`; кавычки «» не трогаются.
 pub fn escape_untrusted(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('<') {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + 1..];
-        if opens_reserved(after) {
+    for c in s.chars() {
+        // Быстрый путь: из ASCII в списках только `<` и `>`.
+        if c.is_ascii() && c != '<' && c != '>' {
+            out.push(c);
+        } else if LEFT_ANGLES.contains(&c) {
             out.push_str("&lt;");
+        } else if RIGHT_ANGLES.contains(&c) {
+            out.push_str("&gt;");
         } else {
-            out.push('<');
+            out.push(c);
         }
-        rest = after;
     }
-    out.push_str(rest);
     out
-}
-
-/// Символ без видимого начертания, который модель может пропустить при чтении тега.
-fn is_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
-}
-
-/// Текст после `<` — `[пробелы, невидимые, /]*` и имя зарезервированного тега.
-fn opens_reserved(after: &str) -> bool {
-    let t = after.trim_start_matches(|c: char| c == '/' || c.is_whitespace() || is_invisible(c));
-    RESERVED_TAGS.iter().any(|tag| {
-        t.as_bytes()
-            .get(..tag.len())
-            .is_some_and(|w| w.eq_ignore_ascii_case(tag.as_bytes()))
-    })
 }
 
 /// Длина имени ветки в `<env>`, символы: длинное имя иначе раздувало бы блок сверх
@@ -399,6 +431,10 @@ pub const AGENTS_MD_LIMIT: u32 = 700;
 /// больше [`AGENTS_MD_LIMIT`]. Резерв, а не фактический `<env>`, — чтобы обрезка
 /// `AGENTS.md` (блок 5, общий префикс) не зависела от ветки и пути. Orchestrator и
 /// worker `AGENTS.md` не получают (N-07) — 0.
+///
+/// `fixed_tokens` — счёт фиксированных текстов (CI-счётчик плана B2 или завышающая для
+/// английского [`approx_tokens`]); результат расходуется в верхней оценке
+/// [`upper_tokens`] ([`fit_agents_md`]), поэтому реальный счёт `AGENTS.md` его не превысит.
 pub fn agents_md_budget(role: RunRole, tier: Tier, fixed_tokens: u32) -> u32 {
     if role != RunRole::Top {
         return 0;
@@ -414,7 +450,9 @@ pub fn agents_md_budget(role: RunRole, tier: Tier, fixed_tokens: u32) -> u32 {
         .min(AGENTS_MD_LIMIT)
 }
 
-/// `AGENTS.md` в пределах `budget` токенов ([`approx_tokens`]) (D22, D23): текст
+/// `AGENTS.md` в пределах `budget` токенов по гарантированной верхней оценке
+/// [`upper_tokens`] (D22, D23, решение контроллера: недоверенный текст не считается
+/// байтами / 4 — на коде и hex это занижает в 1,6–3,8 раза): текст
 /// экранируется [`escape_untrusted`]; не помещается — обрезается по строкам с конца,
 /// последняя строка `[AGENTS.md truncated: N lines omitted]` входит в бюджет. Не
 /// помещается и она (или текст пуст) — `None`, блок опускается целиком.
@@ -423,13 +461,13 @@ pub fn fit_agents_md(text: &str, budget: u32) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    if approx_tokens(&text) <= budget {
+    if upper_tokens(&text) <= budget {
         return Some(text);
     }
     let lines: Vec<&str> = text.split('\n').collect();
     let total = lines.len();
     let marker = |omitted: usize| format!("[AGENTS.md truncated: {omitted} lines omitted]");
-    let fits = |len: usize| len.div_ceil(4) <= budget as usize;
+    let fits = |len: usize| len <= budget as usize;
     // Длина растёт с k не убывая: строка добавляет ≥ 1 байт, маркер теряет ≤ 1 цифру.
     let mut kept = None;
     let mut kept_len = 0usize;
@@ -457,7 +495,16 @@ pub fn fit_agents_md(text: &str, budget: u32) -> Option<String> {
     Some(out)
 }
 
-/// Оценка рантайма: `ceil(байты UTF-8 / 4)` (D22). Точный счёт — CI (PRM-007).
+/// Гарантированная верхняя оценка числа токенов недоверенного или переменного текста:
+/// число байт UTF-8. Токен byte-level BPE (cl100k, o200k, Qwen, Llama 3) не короче
+/// одного байта, поэтому ни один такой токенизатор не даст больше. Ею считаются
+/// `AGENTS.md`, `<env>` и прочие данные, которые CI не видит.
+pub fn upper_tokens(s: &str) -> u32 {
+    u32::try_from(s.len()).unwrap_or(u32::MAX)
+}
+
+/// Оценка рантайма: `ceil(байты UTF-8 / 4)` (D22) — только для планирования с запасом
+/// по фиксированным текстам (на английском завышает). Точный счёт — CI (PRM-007).
 pub fn approx_tokens(s: &str) -> u32 {
     u32::try_from(s.len().div_ceil(4)).unwrap_or(u32::MAX)
 }
