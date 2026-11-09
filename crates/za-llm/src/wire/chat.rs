@@ -356,7 +356,6 @@ const STRICT_KEYS: &[&str] = &[
     "$ref",
     "description",
     "title",
-    "default",
     "pattern",
     "format",
     "multipleOf",

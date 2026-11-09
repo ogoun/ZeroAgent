@@ -312,6 +312,11 @@ fn strict_only_for_compatible_schema() {
         None
     );
     assert_eq!(strict_of(with_prop(json!({}))), None);
+    // `default` в документации strict-режима не указан: консервативно несовместим.
+    assert_eq!(
+        strict_of(with_prop(json!({"type": "string", "default": "x"}))),
+        None
+    );
     // Корень `anyOf` и внешний `$ref`.
     let mut root_any = with_prop(json!({"type": "string"}));
     root_any["anyOf"] = json!([{"type": "object"}]);
