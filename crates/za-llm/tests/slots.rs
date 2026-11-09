@@ -282,3 +282,36 @@ async fn hanging_save_times_out() {
     assert!(!save_unsupported(&err));
     assert!(started.elapsed() < Duration::from_secs(3));
 }
+
+#[test]
+fn reset_keeps_busy_slots_and_old_lease_frees_only_its_own() {
+    // Раунд исправлений 1 задачи 15 (I1): сброс после перезапуска сервера забывает
+    // владельцев, но не отдаёт слот идущей аренды; поздний drop старой аренды не
+    // освобождает слот, выданный уже другой аренде.
+    let m = Arc::new(Mutex::new(SlotManager::new(2)));
+    let (l0, p0) = SlotManager::lease(&m, Some("a"));
+    let (l1, p1) = SlotManager::lease(&m, Some("b"));
+    assert_eq!((p0.slot, p1.slot), (0, 1));
+
+    m.lock().unwrap().reset(2);
+    {
+        let g = m.lock().unwrap();
+        assert_eq!(g.busy_slots(), vec![0, 1]);
+        assert_eq!(g.slot_of("a"), None, "владельцы забыты");
+    }
+    // Слот 1 исчезает и появляется снова (сервер с -np 1, затем -np 2).
+    m.lock().unwrap().reset(1);
+    m.lock().unwrap().reset(2);
+    assert_eq!(m.lock().unwrap().busy_slots(), vec![0]);
+    let (l2, p2) = SlotManager::lease(&m, Some("c"));
+    assert_eq!(p2.slot, 1);
+    drop(l1);
+    assert_eq!(
+        m.lock().unwrap().busy_slots(),
+        vec![0, 1],
+        "старая аренда освободила чужой слот"
+    );
+    drop(l2);
+    drop(l0);
+    assert!(m.lock().unwrap().busy_slots().is_empty());
+}

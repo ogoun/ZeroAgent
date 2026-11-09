@@ -36,6 +36,11 @@ pub enum ErrorClass {
     Cancelled,
     /// Ошибка очереди (ожидание дольше `max_wait` и т. п.).
     Queue,
+    /// Эндпоинт недоступен по зонду (D40): запрос не отправлялся. Не повторяется и не
+    /// считается предохранителю; run встаёт на паузу до следующего зонда.
+    Unreachable,
+    /// Внутренний сбой `Gateway` (паника задачи запроса), не ошибка эндпоинта.
+    Internal,
 }
 
 impl ErrorClass {
@@ -110,10 +115,13 @@ mod tests {
             Malformed,
             NotFound,
             Inactive,
+            Unreachable,
+            Internal,
         ] {
             assert!(!c.retryable(), "{c:?}");
         }
         assert!(!RateLimited.counts_for_breaker() && Server.counts_for_breaker());
+        assert!(!Unreachable.counts_for_breaker() && !Internal.counts_for_breaker());
     }
 
     #[test]

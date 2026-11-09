@@ -40,6 +40,8 @@ pub enum Reply {
     Raw(u16, Vec<(String, String)>, Vec<u8>),
     /// Заголовков нет вовсе: обработчик не отвечает никогда.
     Hang,
+    /// Тот же ответ после паузы (заголовки приходят не сразу).
+    Delayed(Duration, Box<Reply>),
 }
 
 impl Reply {
@@ -195,11 +197,17 @@ async fn handle(state: Arc<Mutex<State>>, req: Request) -> Response {
     let Some((reply, disconnects)) = picked else {
         return respond(404, &[], Body::from(r#"{"error":"нет маршрута"}"#));
     };
+    let mut reply = reply;
+    while let Reply::Delayed(d, inner) = reply {
+        tokio::time::sleep(d).await;
+        reply = *inner;
+    }
     match reply {
         Reply::Json(status, v) => json(status, &[], &v),
         Reply::JsonWithHeaders(status, h, v) => json(status, &h, &v),
         Reply::Raw(status, h, bytes) => respond(status, &h, Body::from(bytes)),
         Reply::Hang => std::future::pending::<Response>().await,
+        Reply::Delayed(..) => unreachable!("пауза снята выше"),
         Reply::Sse {
             chunks,
             delay,

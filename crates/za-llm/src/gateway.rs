@@ -2,46 +2,65 @@
 //! зонды и профили, коннекторы, повторы, предохранитель, очередь с допуском по ресурсам
 //! и слоты llama.cpp в одну реализацию [`ModelPort`].
 //!
+//! **Старт.** [`Gateway::start`] проверяет конфигурацию, берёт из [`ProfileStore`]
+//! последние факты эндпоинтов (для показа и мест D8), настраивает группы очереди и
+//! запускает зонды в фоне — не ждёт их. Пока идёт первый зонд, эндпоинт в состоянии
+//! `probing`; у каждого зонда общий предел [`GatewayOptions::probe_deadline`], по его
+//! истечении эндпоинт `Unreachable`. Дождаться зондов — [`Gateway::wait_probed`].
+//!
+//! **Зонды** одного эндпоинта идут по одному: запрошенный во время идущего зонда
+//! «свежий» зонд (ручной [`Gateway::probe`], повторный зонд D40) выполняется сразу
+//! после него, ожидающие заявки присоединяются к идущему. У каждого зонда поколение;
+//! результат применяется, только если его поколение новее применённого.
+//!
 //! **Путь запроса** ([`ModelPort::stream`]):
-//! 1. До стрима: эндпоинт `Inactive` — ошибка `Inactive` без сети; `Unreachable` — один
-//!    повторный зонд, не ответил — `Transport` (D40); идентичный запрос после ошибки
-//!    разбора — `RepeatedAfterParseError` (D21, D43); предохранитель не пускает —
-//!    `CircuitOpen` (D22, переход в `HalfOpen` запускает повторный зонд в фоне); заявка
-//!    встаёт в очередь своей группы.
+//! 1. До стрима: эндпоинт `Inactive` (по завершённому зонду) — ошибка `Inactive` без
+//!    сети; идентичный запрос после ошибки разбора — `RepeatedAfterParseError` (D21,
+//!    D43); у готового эндпоинта предохранитель не пускает — `CircuitOpen` (D22,
+//!    переход в `HalfOpen` запускает повторный зонд); заявка встаёт в очередь группы.
 //! 2. Стрим возвращается сразу; его guard — [`AbortOnDrop`] фоновой задачи (D2). Первое
-//!    событие — всегда `Queued`, затем каждое изменение статуса заявки, пока она ждёт
-//!    (D31). Отказ очереди: `cancelled` → `ErrorClass::Cancelled`, прочие — `Queue` с
-//!    кодом [`QueueError::code`] в тексте (D12).
-//! 3. Место выдано: у llama.cpp слот (`SlotManager`, ключ `"{bundle_key}:{session}"`),
-//!    порядок `save` вытесненной сессии → `restore` → запрос (D29); затем
-//!    `Started { attempt: 1 }` и [`drive_with_retry`] (D19, D20) с джиттером от
+//!    событие — всегда `Queued`. Эндпоинт ещё зондируется — заявка ждёт итога зонда,
+//!    стоя в очереди; эндпоинт `Unreachable` — один повторный зонд (D40); не ответил —
+//!    `ErrorClass::Unreachable`: запрос не отправлялся, предохранителю не считается.
+//!    Затем — каждое изменение статуса заявки, пока она ждёт места (D31). Отказ
+//!    очереди: `cancelled` → `Cancelled`, прочие — `Queue` с кодом [`QueueError::code`].
+//! 3. Место выдано: если эндпоинт за время ожидания стал недоступен — то же, что в п. 2.
+//!    У llama.cpp слот (`SlotManager`, ключ `"{bundle_key}:{session}"`), порядок `save`
+//!    вытесненной сессии → `restore` → запрос (D29); каждое действие со слотом — до
+//!    30 с, вместе до 60 с, место очереди при этом занято, событий потребителю нет.
+//!    Затем `Started { attempt: 1 }` и [`drive_with_retry`] (D19, D20) с джиттером от
 //!    [`request_fingerprint`] (D44). Каждый 429 ставит cooldown группы до
-//!    `now + Retry-After`; успешный ответ с исчерпанным лимитом — cooldown до сброса
-//!    (MDL-016, RES-004). В `Finished` дописывается стоимость (D16), она же учитывается
-//!    в бюджете группы (D14).
+//!    `now + Retry-After` (без заголовка — на базовую паузу повтора); успешный ответ с
+//!    исчерпанным лимитом — cooldown до сброса (MDL-016, RES-004). В `Finished`
+//!    дописывается стоимость (D16), она же учитывается в бюджете группы (D14).
 //! 4. Итог сообщается предохранителю через его разрешение — для каждой пропущенной
 //!    заявки, в том числе отменённой. `Malformed` запоминает отпечаток; итог `Transport`
 //!    или `StreamCut` запускает повторный зонд; отказ провайдера по `tool_choice`
-//!    снимает `tool_choice_required` в профиле (D15).
+//!    снимает `tool_choice_required` в профиле (D15). Паника задачи запроса — `error!`
+//!    в лог и `ErrorClass::Internal` потребителю; предохранителю не сообщается.
 //!
 //! Эндпоинт запроса не меняется ни при каком исходе: автоматического перехода на другую
 //! модель, тем более в облако, нет (MDL-016, ТЗ D-24).
 //!
 //! **Освобождение** (Review Focus 5). Drop стрима отменяет задачу: заявка снимается или
 //! освобождаются слот и место очереди (слот раньше места), канал попытки закрывается, и
-//! насос коннектора закрывает HTTP-соединение (D2, D35). [`Gateway::cancel_run`] снимает
-//! ожидающие заявки run и отменяет уже идущие его запросы.
+//! насос коннектора закрывает HTTP-соединение (D2, D35). Соединение закрывается
+//! асинхронно, чуть позже освобождения слота: следующий запрос на тот же слот
+//! llama-server отложит до конца прежней задачи — задержка, не ошибка.
+//! [`Gateway::cancel_run`] снимает ожидающие заявки run и отменяет уже идущие его запросы.
 //!
-//! **Профили** (D40). После каждого зонда профиль связки и факты эндпоинта пишутся в
-//! [`ProfileStore`], а `SlotManager` создаётся заново (новая связка, другое число слотов,
-//! перезапуск сервера). Контекст и слоты берутся из фактов эндпоинта, а не из профиля
-//! связки. Если зонд при старте не удался, для показа берутся последние сохранённые
-//! факты и профиль их связки (ключи сверяются).
+//! **Профили и слоты** (D40). После зонда профиль связки и факты эндпоинта пишутся в
+//! хранилище. `SlotManager` сбрасывается ([`SlotManager::reset`]) только при смене
+//! связки, числа слотов или контекста сервера (признак перезапуска с другими
+//! параметрами; времени старта `/props` не сообщает); иначе карта «сессия → слот» и
+//! `slot_save` сохраняются. Сброс сохраняет занятость идущих аренд. Контекст и слоты
+//! берутся из фактов эндпоинта; факты из хранилища сверяются с профилем по ключу связки.
 
 use std::collections::{BTreeMap, HashMap};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use serde::Serialize;
 use tokio::runtime::Handle;
@@ -58,14 +77,14 @@ use crate::error::{ErrorClass, ModelError};
 use crate::http::{HttpTransport, ProviderLimits, Secret, SecretSource, Timeouts};
 use crate::port::{AbortOnDrop, BoxFuture, ModelCall, ModelPort, ModelStream};
 use crate::probe::{probe_endpoint, probe_transport};
-use crate::profile::{EndpointState, ProbedEndpoint, ProfileStore};
+use crate::profile::{EndpointFacts, EndpointState, ProbedEndpoint, ProfileStore};
 use crate::queue::{
     DEFAULT_CLOUD_PARALLEL, GroupId, GroupLimits, ModelQueue, Permit as PlacePermit, QueueError,
     QueueSnapshot, Ticket,
 };
 use crate::resilience::{
-    BreakerOptions, BreakerState, CircuitBreaker, ParseGuard, Permit as BreakerPermit, RetryPolicy,
-    drive_with_retry, request_fingerprint,
+    BreakerOptions, BreakerState, CircuitBreaker, ParseGuard, Permit as BreakerPermit,
+    RetryDecision, RetryPolicy, drive_with_retry, request_fingerprint,
 };
 use crate::slots::{
     LlamaSlots, SlotLease, SlotManager, SlotPlan, restore_unsupported, save_unsupported,
@@ -77,6 +96,9 @@ use crate::wire::{AnthropicWire, ChatDialect, ChatWire, Connector, ResponsesWire
 
 /// Число мест локального эндпоинта, кроме llama.cpp, без `max_parallel` (D8).
 pub const DEFAULT_LOCAL_PARALLEL: u32 = 4;
+
+/// Общий предел одного зонда по умолчанию (несколько запросов зонда вместе).
+pub const DEFAULT_PROBE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Ёмкость канала стрима для потребителя.
 const STREAM_CHANNEL: usize = 64;
@@ -110,16 +132,19 @@ pub struct GatewayOptions {
     pub timeouts_local: Timeouts,
     pub timeouts_cloud: Timeouts,
     pub breaker: BreakerOptions,
+    /// Общий предел одного зонда эндпоинта; истёк — эндпоинт `Unreachable`.
+    pub probe_deadline: Duration,
 }
 
 impl Default for GatewayOptions {
-    /// D19 (повторы), D26 (таймауты), D22 (предохранитель).
+    /// D19 (повторы), D26 (таймауты), D22 (предохранитель), зонд — 30 с.
     fn default() -> Self {
         Self {
             retry: RetryPolicy::default(),
             timeouts_local: Timeouts::local(),
             timeouts_cloud: Timeouts::cloud(),
             breaker: BreakerOptions::default(),
+            probe_deadline: DEFAULT_PROBE_DEADLINE,
         }
     }
 }
@@ -130,8 +155,9 @@ pub struct EndpointView {
     pub id: EndpointId,
     pub backend: BackendKind,
     pub pool: PoolKind,
-    /// `ready`, `inactive`, `unreachable`, `open` (предохранитель открыт или идёт проба),
-    /// `disabled` (ключ отвергнут, до [`Gateway::reset`]).
+    /// `probing` (первый зонд ещё идёт), `ready`, `inactive`, `unreachable`, `open`
+    /// (предохранитель открыт или идёт проба), `disabled` (ключ отвергнут, до
+    /// [`Gateway::reset`]).
     pub state: String,
     pub reason: Option<String>,
     /// Контекст из фактов эндпоинта (последний известный, если эндпоинт не готов).
@@ -178,18 +204,35 @@ struct Endpoint {
     probe_http: HttpTransport,
     breaker: Mutex<CircuitBreaker>,
     live: Mutex<Live>,
-    /// Идёт фоновый повторный зонд: второй не запускается.
-    probing: AtomicBool,
+    probe: Mutex<ProbeCtl>,
+    /// Поколение последнего завершённого зонда (применённого или нет).
+    probe_done: watch::Sender<u64>,
     /// Предупреждение «сохранение слотов не поддержано» уже записано (D29).
     slot_save_warned: AtomicBool,
 }
 
+/// Управление зондами эндпоинта: один за раз.
+#[derive(Debug, Default)]
+struct ProbeCtl {
+    /// Идёт задача зондов.
+    running: bool,
+    /// После идущего зонда нужен ещё один (запрошен свежий).
+    rerun: bool,
+    /// Поколение последнего начатого (или назначенного) зонда.
+    started: u64,
+}
+
 /// Изменяемое состояние эндпоинта.
 struct Live {
+    /// Итог последнего применённого зонда; до первого — `Unreachable` с `probed == false`.
     state: EndpointState,
+    /// Первый зонд применён.
+    probed: bool,
+    /// Поколение применённого зонда.
+    applied: u64,
     /// Последние известные профиль и факты: из зонда или из `ProfileStore` при старте.
     last: Option<ProbedEndpoint>,
-    /// Слоты llama.cpp; новый менеджер после каждого зонда.
+    /// Слоты llama.cpp; сбрасывается при смене связки, числа слотов или контекста.
     slots: Option<Arc<Mutex<SlotManager>>>,
 }
 
@@ -233,10 +276,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Gateway {
-    /// Проверяет конфигурацию, настраивает группы очереди и зондирует все эндпоинты
-    /// параллельно. Облачный эндпоинт без ключа становится `Inactive` без сети
-    /// (MDL-021). Недоступный эндпоинт не мешает старту: он `Unreachable`, первый
-    /// запрос к нему зондирует его ещё раз (D40).
+    /// Проверяет конфигурацию, загружает сохранённые факты эндпоинтов, настраивает
+    /// группы очереди и запускает зонды всех эндпоинтов в фоне; зондов не ждёт.
+    /// Облачный эндпоинт без ключа становится `Inactive` без сети (MDL-021).
     pub async fn start(
         cfg: ModelsConfig,
         secrets: Arc<dyn SecretSource>,
@@ -269,27 +311,27 @@ impl Gateway {
             warnings,
             rt,
         });
+        inner.load_cached().await;
         for (group, limits) in inner.group_limits() {
             inner.queue.configure(group, limits);
         }
-        let probes: Vec<_> = inner
-            .endpoints
-            .keys()
-            .cloned()
-            .map(|id| {
-                let inner = inner.clone();
-                inner.rt.clone().spawn(async move {
-                    inner.probe_now(&id).await;
-                })
-            })
-            .collect();
-        for p in probes {
-            if let Err(e) = p.await {
-                tracing::warn!(error = %e, "зонд эндпоинта при старте не завершён");
-            }
+        for id in inner.endpoints.keys() {
+            inner.request_probe(id, true);
         }
-        inner.load_cached().await;
         Ok(Self { inner })
+    }
+
+    /// Ждёт завершения первого зонда всех эндпоинтов не дольше `limit`; `true` — все
+    /// зонды завершены (с любым итогом). Для CLI, `doctor` и тестов.
+    pub async fn wait_probed(&self, limit: Duration) -> bool {
+        let until = Instant::now() + limit;
+        let mut all = true;
+        for ep in self.inner.endpoints.values() {
+            let mut rx = ep.probe_done.subscribe();
+            let done = tokio::time::timeout_at(until, rx.wait_for(|g| *g >= 1)).await;
+            all &= matches!(done, Ok(Ok(_)));
+        }
+        all
     }
 
     /// Эндпоинт запроса по порядку D24: выбор run, выбор задания, роль, `models.default`.
@@ -316,10 +358,18 @@ impl Gateway {
         Ok(id)
     }
 
-    /// Зонд эндпоинта по требованию (MDL-003 «при обновлении»): новое состояние,
-    /// профиль и слоты. Неизвестный id — `Inactive`.
+    /// Зонд эндпоинта по требованию (MDL-003 «при обновлении»): начатый после вызова
+    /// (если идёт другой, этот — сразу после него); итог — состояние после зонда.
+    /// Неизвестный id — `Inactive`.
     pub async fn probe(&self, id: &EndpointId) -> EndpointState {
-        self.inner.probe_now(id).await
+        let Some(ep) = self.inner.endpoints.get(id) else {
+            return EndpointState::Inactive {
+                reason: format!("эндпоинт {id} не описан в models.endpoints"),
+            };
+        };
+        let target = self.inner.request_probe(id, true);
+        wait_probe(ep, target).await;
+        lock(&ep.live).state.clone()
     }
 
     /// Выбор пользователя «повторить» (D22): предохранитель закрыт, счёт с начала.
@@ -330,7 +380,7 @@ impl Gateway {
         };
         lock(&ep.breaker).reset();
         if lock(&ep.live).ready().is_none() {
-            self.inner.spawn_reprobe(id);
+            self.inner.request_probe(id, true);
         }
     }
 
@@ -339,7 +389,7 @@ impl Gateway {
     /// ошибкой `Cancelled`. Возвращает число снятых заявок и прерванных запросов.
     ///
     /// Запрос, который забирает место в этот же миг, прерывается, но может не попасть в
-    /// счёт.
+    /// счёт; запрос, уже завершившийся, но ещё отдающий итог, может в него попасть.
     pub fn cancel_run(&self, run: RunId) -> usize {
         let mut n = self.inner.queue.cancel_run(run);
         let calls = lock(&self.inner.calls);
@@ -355,7 +405,8 @@ impl Gateway {
     }
 
     /// Run завершён: отпечатки запросов после ошибок разбора забываются
-    /// (`ParseGuard::clear`). Вызывает цикл R1-B при переходе run в конечное состояние.
+    /// (`ParseGuard::clear`). Вызывает цикл R1-B при переходе run в любое конечное
+    /// состояние, иначе отпечатки копятся.
     pub fn finish_run(&self, run: RunId) {
         lock(&self.inner.parse_guard).clear(run);
     }
@@ -382,7 +433,8 @@ impl Gateway {
 
 impl ModelPort for Gateway {
     fn stream(&self, call: ModelCall) -> BoxFuture<'_, Result<ModelStream, ModelError>> {
-        Box::pin(self.inner.open_call(call))
+        let r = self.inner.open_call(call);
+        Box::pin(async move { r })
     }
 
     /// Возможности готового эндпоинта; у неготового — последние известные или
@@ -433,12 +485,15 @@ impl Endpoint {
             breaker: Mutex::new(CircuitBreaker::new(ep.id.clone(), opts.breaker.clone())),
             live: Mutex::new(Live {
                 state: EndpointState::Unreachable {
-                    reason: "зонд ещё не выполнен".to_owned(),
+                    reason: "зонд ещё не завершён".to_owned(),
                 },
+                probed: false,
+                applied: 0,
                 last: None,
                 slots: None,
             }),
-            probing: AtomicBool::new(false),
+            probe: Mutex::new(ProbeCtl::default()),
+            probe_done: watch::channel(0).0,
             slot_save_warned: AtomicBool::new(false),
         }
     }
@@ -472,6 +527,7 @@ impl Endpoint {
         let live = lock(&self.live);
         let (state, reason) = match (&breaker, &live.state) {
             (BreakerState::Disabled { reason }, _) => ("disabled", Some(reason.clone())),
+            _ if !live.probed => ("probing", None),
             (_, EndpointState::Inactive { reason }) => ("inactive", Some(reason.clone())),
             (_, EndpointState::Unreachable { reason }) => ("unreachable", Some(reason.clone())),
             (BreakerState::Open { .. } | BreakerState::HalfOpen, EndpointState::Ready(_)) => {
@@ -497,19 +553,36 @@ impl Endpoint {
     }
 }
 
+/// Ждёт завершения зонда поколения `target` (или новее).
+async fn wait_probe(ep: &Endpoint, target: u64) {
+    let mut rx = ep.probe_done.subscribe();
+    // Отправитель живёт в `Endpoint`: ошибки (закрытого канала) не бывает.
+    let _ = rx.wait_for(|g| *g >= target).await;
+}
+
 /// Неудача запроса; `sent` — ошибка уже ушла в канал потребителя.
+/// `handled` — исход уже сообщён (до отправки ошибки потребителю).
 struct Failure {
     err: ModelError,
     sent: bool,
+    handled: bool,
 }
 
 impl Failure {
     fn unsent(err: ModelError) -> Self {
-        Self { err, sent: false }
+        Self {
+            err,
+            sent: false,
+            handled: false,
+        }
     }
 
     fn sent(err: ModelError) -> Self {
-        Self { err, sent: true }
+        Self {
+            err,
+            sent: true,
+            handled: false,
+        }
     }
 }
 
@@ -540,16 +613,45 @@ impl Drop for Registration {
     }
 }
 
-/// Снимает признак фонового зонда, в том числе если задача не запустилась.
-struct ProbeFlag {
+/// Задача зондов кончилась (в том числе отменена с остановкой runtime): признак
+/// снимается, ожидающие будятся.
+struct ProbeLoopGuard {
     inner: Arc<Inner>,
     id: EndpointId,
 }
 
-impl Drop for ProbeFlag {
+impl Drop for ProbeLoopGuard {
     fn drop(&mut self) {
-        if let Some(ep) = self.inner.endpoints.get(&self.id) {
-            ep.probing.store(false, Ordering::Release);
+        let Some(ep) = self.inner.endpoints.get(&self.id) else {
+            return;
+        };
+        let started = {
+            let mut c = lock(&ep.probe);
+            if !c.running {
+                return;
+            }
+            c.running = false;
+            c.rerun = false;
+            c.started
+        };
+        ep.probe_done.send_replace(started);
+    }
+}
+
+/// Страж паники задачи запроса (M1): `error!` и `Internal` потребителю.
+struct PanicGuard {
+    tx: mpsc::Sender<Ev>,
+    endpoint: EndpointId,
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!(endpoint = %self.endpoint, "паника задачи запроса к модели");
+            let _ = self.tx.try_send(Err(ModelError::new(
+                ErrorClass::Internal,
+                "внутренний сбой Gateway: задача запроса завершилась паникой",
+            )));
         }
     }
 }
@@ -592,50 +694,128 @@ impl Inner {
             .unwrap_or(1)
     }
 
-    /// Зонд эндпоинта и применение результата.
-    async fn probe_now(&self, id: &EndpointId) -> EndpointState {
+    /// Просит зонд эндпоинта; возвращает поколение, которого надо дождаться.
+    /// Нет идущего — запускается новый. Идёт — `fresh` назначает ещё один сразу после
+    /// него (начатый после этой просьбы), иначе просьба присоединяется к идущему.
+    fn request_probe(self: &Arc<Self>, id: &EndpointId, fresh: bool) -> u64 {
         let Some(ep) = self.endpoints.get(id) else {
-            return EndpointState::Inactive {
-                reason: format!("эндпоинт {id} не описан в models.endpoints"),
-            };
+            return 0;
         };
-        let state = probe_endpoint(&ep.cfg, &ep.probe_http, &*self.secrets).await;
-        self.apply_probe(ep, state.clone()).await;
-        state
+        let mut c = lock(&ep.probe);
+        if !c.running {
+            c.running = true;
+            c.started += 1;
+            let target = c.started;
+            drop(c);
+            self.spawn_probe_loop(id);
+            return target;
+        }
+        if fresh {
+            c.rerun = true;
+            c.started + 1
+        } else {
+            c.started
+        }
     }
 
-    /// Новое состояние после зонда: профиль и факты в хранилище, новый `SlotManager`,
-    /// места группы по слотам сервера (D8, D40).
-    async fn apply_probe(&self, ep: &Endpoint, state: EndpointState) {
-        if let EndpointState::Ready(p) = &state
-            && let Err(e) = self.profiles.save_probed_async(p.clone()).await
-        {
-            tracing::warn!(endpoint = %ep.cfg.id, error = %e, "профиль эндпоинта не сохранён");
-        }
-        let (old_key, new_key) = {
-            let mut live = lock(&ep.live);
-            let old_key = live.known().map(|p| p.facts.bundle_key.clone());
-            let new_key = match &state {
-                EndpointState::Ready(p) => {
-                    live.last = Some(p.clone());
-                    live.slots = ep.is_llama().then(|| {
-                        Arc::new(Mutex::new(SlotManager::new(p.facts.slots.unwrap_or(1))))
-                    });
-                    Some(p.facts.bundle_key.clone())
-                }
-                _ => {
-                    live.slots = None;
-                    None
-                }
-            };
-            live.state = state;
-            (old_key, new_key)
+    /// Задача зондов эндпоинта: зонд, затем назначенный следующий, пока назначают.
+    fn spawn_probe_loop(self: &Arc<Self>, id: &EndpointId) {
+        let guard = ProbeLoopGuard {
+            inner: self.clone(),
+            id: id.clone(),
         };
-        if let (Some(old), Some(new)) = (&old_key, &new_key)
-            && old != new
-        {
+        self.rt.spawn(async move {
+            let inner = &guard.inner;
+            let Some(ep) = inner.endpoints.get(&guard.id) else {
+                return;
+            };
+            loop {
+                let generation = lock(&ep.probe).started;
+                let state = inner.run_probe(ep).await;
+                inner.apply_probe(ep, generation, state).await;
+                ep.probe_done.send_replace(generation);
+                let mut c = lock(&ep.probe);
+                if c.rerun {
+                    c.rerun = false;
+                    c.started += 1;
+                    continue;
+                }
+                c.running = false;
+                break;
+            }
+            drop(guard);
+        });
+    }
+
+    /// Один зонд с общим пределом.
+    async fn run_probe(&self, ep: &Endpoint) -> EndpointState {
+        let limit = self.opts.probe_deadline;
+        let probe = probe_endpoint(&ep.cfg, &ep.probe_http, &*self.secrets);
+        match tokio::time::timeout(limit, probe).await {
+            Ok(s) => s,
+            Err(_) => EndpointState::Unreachable {
+                reason: format!("зонд не завершён за {} мс", limit.as_millis()),
+            },
+        }
+    }
+
+    /// Применяет итог зонда поколения `generation`, если оно новее применённого:
+    /// профиль и факты в хранилище, слоты (D29), места группы (D8, D40).
+    async fn apply_probe(&self, ep: &Endpoint, generation: u64, mut state: EndpointState) {
+        let (changed_bundle, saved) = {
+            let mut live = lock(&ep.live);
+            if generation <= live.applied {
+                tracing::debug!(endpoint = %ep.cfg.id, generation, applied = live.applied,
+                                "итог устаревшего зонда не применяется");
+                return;
+            }
+            live.applied = generation;
+            live.probed = true;
+            let mut changed_bundle = None;
+            let mut saved = None;
+            if let EndpointState::Ready(p) = &mut state {
+                let old = live.known().map(|o| o.facts.clone());
+                let same = old.as_ref().is_some_and(|o| same_server(o, &p.facts));
+                if same
+                    && p.facts.slot_save.is_none()
+                    && let Some(o) = &old
+                {
+                    p.facts.slot_save = o.slot_save;
+                }
+                if let Some(o) = &old
+                    && o.bundle_key != p.facts.bundle_key
+                {
+                    changed_bundle = Some((o.bundle_key.clone(), p.facts.bundle_key.clone()));
+                }
+                if ep.is_llama() {
+                    let total = p.facts.slots.unwrap_or(1);
+                    match (&live.slots, same) {
+                        // Тот же сервер: карта «сессия → слот» сохраняется.
+                        (Some(_), true) => {}
+                        (Some(m), false) => {
+                            tracing::info!(endpoint = %ep.cfg.id,
+                                "связка, число слотов или контекст сервера изменились: слоты сброшены");
+                            lock(m).reset(total);
+                        }
+                        (None, _) => {
+                            live.slots = Some(Arc::new(Mutex::new(SlotManager::new(total))));
+                        }
+                    }
+                }
+                live.last = Some(p.clone());
+                saved = Some(p.clone());
+            }
+            live.state = state;
+            (changed_bundle, saved)
+        };
+        if let Some((old, new)) = changed_bundle {
             tracing::info!(endpoint = %ep.cfg.id, old = %old, new = %new,
                            "на эндпоинте другая связка модели: профиль заменён");
+        }
+        if let Some(p) = saved
+            && let Err(e) = self.profiles.save_probed_async(p).await
+        {
+            tracing::warn!(endpoint = %ep.cfg.id, error = %e, "профиль эндпоинта не сохранён");
         }
         if ep.is_llama() {
             self.queue
@@ -643,22 +823,13 @@ impl Inner {
         }
     }
 
-    /// Факты и профили из хранилища для эндпоинтов, чей зонд при старте не удался.
-    /// Профиль берётся по `bundle_key` фактов, ключ связки профиля сверяется с ним.
+    /// Факты и профили из хранилища (до первого зонда: показ и места D8). Профиль
+    /// берётся по `bundle_key` фактов, ключ связки профиля сверяется с ним.
     async fn load_cached(&self) {
-        let missing: Vec<EndpointId> = self
-            .endpoints
-            .values()
-            .filter(|e| lock(&e.live).known().is_none())
-            .map(|e| e.cfg.id.clone())
-            .collect();
-        if missing.is_empty() {
-            return;
-        }
+        let ids: Vec<EndpointId> = self.endpoints.keys().cloned().collect();
         let store = self.profiles.clone();
         let loaded = tokio::task::spawn_blocking(move || {
-            missing
-                .into_iter()
+            ids.into_iter()
                 .filter_map(|id| load_probed(&store, &id).map(|p| (id, p)))
                 .collect::<Vec<_>>()
         })
@@ -674,63 +845,35 @@ impl Inner {
         }
     }
 
-    /// Повторный зонд в фоне (D40); один на эндпоинт одновременно.
-    fn spawn_reprobe(self: &Arc<Self>, id: &EndpointId) {
-        let Some(ep) = self.endpoints.get(id) else {
-            return;
-        };
-        if ep.probing.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let flag = ProbeFlag {
-            inner: self.clone(),
-            id: id.clone(),
-        };
-        self.rt.spawn(async move {
-            let state = flag.inner.probe_now(&flag.id).await;
-            tracing::debug!(endpoint = %flag.id, ready = matches!(state, EndpointState::Ready(_)),
-                            "повторный зонд эндпоинта");
-            drop(flag);
-        });
-    }
-
     /// Проверки до стрима и постановка в очередь; затем фоновая задача запроса.
-    async fn open_call(self: &Arc<Self>, call: ModelCall) -> Result<ModelStream, ModelError> {
+    fn open_call(self: &Arc<Self>, call: ModelCall) -> Result<ModelStream, ModelError> {
         let Some(ep) = self.endpoints.get(&call.endpoint) else {
             return Err(ModelError::new(
                 ErrorClass::NotFound,
                 format!("эндпоинт {} не описан в models.endpoints", call.endpoint),
             ));
         };
-        let unreachable = match &lock(&ep.live).state {
-            EndpointState::Inactive { reason } => return Err(inactive(&ep.cfg.id, reason)),
-            EndpointState::Unreachable { .. } => true,
-            EndpointState::Ready(_) => false,
-        };
-        if unreachable {
-            match self.probe_now(&call.endpoint).await {
-                EndpointState::Ready(_) => {}
-                EndpointState::Inactive { reason } => return Err(inactive(&ep.cfg.id, &reason)),
-                EndpointState::Unreachable { reason } => {
-                    return Err(ModelError::new(
-                        ErrorClass::Transport,
-                        format!("эндпоинт {} не отвечает: {reason}", ep.cfg.id),
-                    ));
-                }
+        let ready = {
+            let live = lock(&ep.live);
+            if live.probed
+                && let EndpointState::Inactive { reason } = &live.state
+            {
+                return Err(inactive(&ep.cfg.id, reason));
             }
-        }
+            live.probed && live.ready().is_some()
+        };
         let run = call.meta.run_id;
         let fp = request_fingerprint(&call.endpoint, &call.request);
         lock(&self.parse_guard).check(run, &fp)?;
-        let permit = lock(&ep.breaker).allow(Instant::now())?;
-        if permit.is_probe() {
-            self.spawn_reprobe(&call.endpoint);
-        }
+        // У неготового эндпоинта разрешение берётся после зонда (в задаче).
+        let permit = if ready { Some(self.allow(ep)?) } else { None };
         let ticket = match self.queue.enqueue(&ep.group, run, call.meta.priority, None) {
             Ok(t) => t,
             Err(e) => {
                 let err = queue_error(&e);
-                lock(&ep.breaker).on_failure(permit, &err, Instant::now());
+                if let Some(p) = permit {
+                    lock(&ep.breaker).on_failure(p, &err, Instant::now());
+                }
                 return Err(err);
             }
         };
@@ -758,8 +901,47 @@ impl Inner {
             claimed,
             _reg: reg,
         };
-        let handle = tokio::spawn(task.run(ticket, permit, cancel_rx));
+        let handle = self.rt.spawn(task.run(ticket, permit, cancel_rx));
         Ok(ModelStream::from_channel(rx, Box::new(AbortOnDrop(handle))))
+    }
+
+    /// Разрешение предохранителя; проба `HalfOpen` запускает повторный зонд (D40).
+    fn allow(self: &Arc<Self>, ep: &Endpoint) -> Result<BreakerPermit, ModelError> {
+        let permit = lock(&ep.breaker).allow(Instant::now())?;
+        if permit.is_probe() {
+            self.request_probe(&ep.cfg.id, true);
+        }
+        Ok(permit)
+    }
+
+    /// Эндпоинт готов к запросу: идёт зонд — ждать его итога; `Unreachable` — один
+    /// повторный зонд (D40), если зонда ещё не ждали. Отказ — `Inactive` или
+    /// `Unreachable` (запрос не отправлялся).
+    async fn ensure_ready(self: &Arc<Self>, ep: &Endpoint) -> Result<(), ModelError> {
+        let mut waited = false;
+        loop {
+            let (probed, state) = {
+                let live = lock(&ep.live);
+                (live.probed, live.state.clone())
+            };
+            match state {
+                EndpointState::Ready(_) if probed => return Ok(()),
+                EndpointState::Inactive { reason } if probed => {
+                    return Err(inactive(&ep.cfg.id, &reason));
+                }
+                EndpointState::Unreachable { reason } if waited => {
+                    return Err(ModelError::new(
+                        ErrorClass::Unreachable,
+                        format!("эндпоинт {} недоступен: {reason}", ep.cfg.id),
+                    ));
+                }
+                _ => {
+                    let target = self.request_probe(&ep.cfg.id, false);
+                    wait_probe(ep, target).await;
+                    waited = true;
+                }
+            }
+        }
     }
 
     /// Ключ эндпоинта на момент запроса; `key_ref` без ключа — `Inactive`.
@@ -830,7 +1012,7 @@ impl Inner {
                 "llama-server не сохраняет слоты (нет --slot-save-path): работа без сохранения KV-кэша");
         }
         let store = self.profiles.clone();
-        tokio::task::spawn_blocking(move || {
+        self.rt.spawn_blocking(move || {
             if let Err(e) = store.save_endpoint(&facts) {
                 tracing::warn!(error = %e, "факты эндпоинта не сохранены");
             }
@@ -858,12 +1040,20 @@ impl Inner {
         tracing::warn!(endpoint = %ep.cfg.id,
             "провайдер отверг принудительный tool_choice: профиль получает tool_choice_required = false");
         let store = self.profiles.clone();
-        tokio::task::spawn_blocking(move || {
+        self.rt.spawn_blocking(move || {
             if let Err(e) = store.save(&profile) {
                 tracing::warn!(error = %e, "профиль модели не сохранён");
             }
         });
     }
+}
+
+/// Тот же сервер с теми же параметрами: связка, число слотов и контекст рантайма не
+/// изменились. Иначе — смена модели или перезапуск с другими параметрами.
+fn same_server(old: &EndpointFacts, new: &EndpointFacts) -> bool {
+    old.bundle_key == new.bundle_key
+        && old.slots == new.slots
+        && old.runtime_context == new.runtime_context
 }
 
 /// Фоновая задача одного запроса.
@@ -877,9 +1067,21 @@ struct CallTask {
 }
 
 impl CallTask {
-    async fn run(self, ticket: Ticket, permit: BreakerPermit, mut cancel: watch::Receiver<bool>) {
+    async fn run(
+        self,
+        ticket: Ticket,
+        permit: Option<BreakerPermit>,
+        mut cancel: watch::Receiver<bool>,
+    ) {
+        // Разрешение предохранителя общее с задачей попытки: успех сообщается, когда
+        // пришёл `Finished`, до передачи его потребителю.
+        let verdict: Verdict = Arc::new(Mutex::new(permit));
         let Some(ep) = self.inner.endpoints.get(&self.call.endpoint) else {
             return;
+        };
+        let _panic = PanicGuard {
+            tx: self.tx.clone(),
+            endpoint: ep.cfg.id.clone(),
         };
         // Отмена run бросает `serve` целиком: слот, место и попытка освобождаются до
         // отправки ошибки.
@@ -889,35 +1091,59 @@ impl CallTask {
                 ErrorClass::Cancelled,
                 "run отменён",
             ))),
-            r = self.serve(ep, ticket) => r,
+            r = self.serve(ep, ticket, &verdict) => r,
         };
         match outcome {
-            Ok(()) => lock(&ep.breaker).on_success(permit),
+            Ok(()) => {
+                let p = lock(&verdict).take();
+                if let Some(p) = p {
+                    lock(&ep.breaker).on_success(p);
+                }
+            }
             Err(f) => {
-                lock(&ep.breaker).on_failure(permit, &f.err, Instant::now());
+                if !f.handled {
+                    self.report_failure(ep, &verdict, &f.err);
+                }
                 if !f.sent {
                     let _ = self.tx.send(Err(f.err.clone())).await;
                 }
-                self.after_failure(ep, &f.err);
             }
         }
     }
 
-    /// Очередь, слот, повторы, стоимость.
-    async fn serve(&self, ep: &Endpoint, ticket: Ticket) -> Result<(), Failure> {
-        let place = wait_place(ticket, &self.tx).await?;
+    /// Исход-ошибка: предохранителю (если разрешение ещё не отчиталось) и реакции D21,
+    /// D40, D15.
+    fn report_failure(&self, ep: &Endpoint, verdict: &Verdict, err: &ModelError) {
+        let p = lock(verdict).take();
+        if let Some(p) = p {
+            lock(&ep.breaker).on_failure(p, err, Instant::now());
+        }
+        self.after_failure(ep, err);
+    }
+
+    /// Зонд (если нужен), очередь, слот, повторы, стоимость.
+    async fn serve(&self, ep: &Endpoint, ticket: Ticket, verdict: &Verdict) -> Result<(), Failure> {
+        let mut status = ticket.status();
+        let first = status.borrow_and_update().clone();
+        send(&self.tx, Ok(StreamEvent::Queued(first))).await?;
+        let deferred = lock(verdict).is_none();
+        if deferred {
+            self.inner.ensure_ready(ep).await.map_err(Failure::unsent)?;
+            let p = self.inner.allow(ep).map_err(Failure::unsent)?;
+            *lock(verdict) = Some(p);
+        }
+        let place = wait_place(ticket, status, &self.tx).await?;
         self.claimed.store(true, Ordering::SeqCst);
+        // За время ожидания эндпоинт мог стать недоступным (I4): зонд, а не отказ.
+        self.inner.ensure_ready(ep).await.map_err(Failure::unsent)?;
         let (probed, slots) = {
             let live = lock(&ep.live);
-            match &live.state {
-                EndpointState::Ready(p) => (p.clone(), live.slots.clone()),
-                EndpointState::Inactive { reason } => {
-                    return Err(Failure::unsent(inactive(&ep.cfg.id, reason)));
-                }
-                EndpointState::Unreachable { reason } => {
+            match live.ready() {
+                Some(p) => (p.clone(), live.slots.clone()),
+                None => {
                     return Err(Failure::unsent(ModelError::new(
-                        ErrorClass::Transport,
-                        format!("эндпоинт {} не отвечает: {reason}", ep.cfg.id),
+                        ErrorClass::Unreachable,
+                        format!("эндпоинт {} недоступен", ep.cfg.id),
                     )));
                 }
             }
@@ -967,9 +1193,13 @@ impl CallTask {
             req.reasoning = r.clone();
         }
         let price = ep.cfg.price.or(probed.profile.price);
-        let usage: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
-        let (queue, group, http) = (&self.inner.queue, &ep.group, &ep.http);
-        let (conn, req, sink) = (&connector, &req, &usage);
+        let hook = FinishHook {
+            inner: self.inner.clone(),
+            endpoint: ep.cfg.id.clone(),
+            verdict: verdict.clone(),
+        };
+        let (queue, group, http, rt) = (&self.inner.queue, &ep.group, &ep.http, &self.inner.rt);
+        let (conn, req, hook) = (&connector, &req, &hook);
         let open = move |_attempt: u32| async move {
             let opened = conn.open(http, req, &ctx).await?;
             if let Some(until) = exhausted_until(&opened.limits) {
@@ -977,29 +1207,37 @@ impl CallTask {
                 queue.cooldown(group, until);
             }
             let (mtx, mrx) = mpsc::channel(STREAM_CHANNEL);
-            tokio::spawn(price_events(opened.events, mtx, price, sink.clone()));
+            rt.spawn(price_events(opened.events, mtx, price, hook.clone()));
             Ok(mrx)
         };
+        let policy = &self.inner.opts.retry;
+        let handled = AtomicBool::new(false);
+        let mut attempts: u32 = 0;
         let on_attempt_error = |e: &ModelError| {
-            if e.class == ErrorClass::RateLimited
-                && let Some(until) = e.retry_after.and_then(|d| Instant::now().checked_add(d))
-            {
-                queue.cooldown(group, until);
+            attempts = attempts.saturating_add(1);
+            if e.class == ErrorClass::RateLimited {
+                // Без `Retry-After` — хотя бы базовая пауза повтора: следующая заявка
+                // группы не бьёт сразу в тот же лимит.
+                let pause = e.retry_after.unwrap_or(policy.base);
+                if let Some(until) = Instant::now().checked_add(pause) {
+                    queue.cooldown(group, until);
+                }
+            }
+            // Итоговая ошибка (то же решение, что примет `drive_with_retry`; джиттер на
+            // него не влияет): исход сообщается до того, как ошибка уйдёт потребителю —
+            // иначе его следующий запрос мог бы опередить предохранитель и `ParseGuard`.
+            if policy.decide(attempts - 1, e, 0.5) == RetryDecision::GiveUp {
+                self.report_failure(ep, verdict, e);
+                handled.store(true, Ordering::SeqCst);
             }
         };
-        drive_with_retry(
-            &self.inner.opts.retry,
-            &self.fp,
-            &self.tx,
-            open,
-            on_attempt_error,
-        )
-        .await
-        .map_err(Failure::sent)?;
-        let cost = lock(&usage).as_ref().and_then(|u| u.cost_usd);
-        if let Some(c) = cost {
-            queue.record_spend(group, c);
-        }
+        drive_with_retry(policy, &self.fp, &self.tx, open, on_attempt_error)
+            .await
+            .map_err(|err| Failure {
+                err,
+                sent: true,
+                handled: handled.load(Ordering::SeqCst),
+            })?;
         Ok(())
     }
 
@@ -1010,7 +1248,7 @@ impl CallTask {
                 lock(&self.inner.parse_guard).record(self.call.meta.run_id, self.fp.clone());
             }
             ErrorClass::Transport | ErrorClass::StreamCut => {
-                self.inner.spawn_reprobe(&ep.cfg.id);
+                self.inner.request_probe(&ep.cfg.id, true);
             }
             ErrorClass::BadRequest if tool_choice_rejected(err, &self.call.request.tool_choice) => {
                 self.inner.disable_forced_tool_choice(ep);
@@ -1020,12 +1258,13 @@ impl CallTask {
     }
 }
 
-/// Ждёт места, пересылая статус заявки: первым — текущий (`Queued` всегда, даже при
-/// свободном месте), затем каждое изменение, пока заявка ждёт.
-async fn wait_place(ticket: Ticket, tx: &mpsc::Sender<Ev>) -> Result<PlacePermit, Failure> {
-    let mut status = ticket.status();
-    let first = status.borrow_and_update().clone();
-    send(tx, Ok(StreamEvent::Queued(first))).await?;
+/// Ждёт места, пересылая каждое изменение статуса заявки, пока она ждёт (первый статус
+/// уже отправлен).
+async fn wait_place(
+    ticket: Ticket,
+    mut status: watch::Receiver<crate::types::QueueStatus>,
+    tx: &mpsc::Sender<Ev>,
+) -> Result<PlacePermit, Failure> {
     let mut granted = pin!(ticket.granted());
     let mut watching = true;
     loop {
@@ -1068,13 +1307,42 @@ async fn wait_cancel(rx: &mut watch::Receiver<bool>) {
     }
 }
 
-/// Пересылает события попытки, дописывая стоимость в `Finished` (D16); кончается по
-/// закрытию приёмника (D2): его попытка брошена, канал коннектора закрывается.
+/// Разрешение предохранителя запроса; `None` — ещё не взято или исход уже сообщён.
+type Verdict = Arc<Mutex<Option<BreakerPermit>>>;
+
+/// Действия при `Finished` попытки — до передачи потребителю: иначе на многопоточном
+/// runtime следующий запрос мог бы застать незакрытую пробу предохранителя.
+#[derive(Clone)]
+struct FinishHook {
+    inner: Arc<Inner>,
+    endpoint: EndpointId,
+    verdict: Verdict,
+}
+
+impl FinishHook {
+    /// Успех предохранителю и расход в бюджет группы (D14).
+    fn finished(&self, usage: &Usage) {
+        let Some(ep) = self.inner.endpoints.get(&self.endpoint) else {
+            return;
+        };
+        let p = lock(&self.verdict).take();
+        if let Some(p) = p {
+            lock(&ep.breaker).on_success(p);
+        }
+        if let Some(c) = usage.cost_usd {
+            self.inner.queue.record_spend(&ep.group, c);
+        }
+    }
+}
+
+/// Пересылает события попытки, дописывая стоимость в `Finished` (D16) и сообщая успех
+/// ([`FinishHook`]); кончается по закрытию приёмника (D2): его попытка брошена, канал
+/// коннектора закрывается.
 async fn price_events(
     mut events: mpsc::Receiver<Ev>,
     out: mpsc::Sender<Ev>,
     price: Option<Price>,
-    sink: Arc<Mutex<Option<Usage>>>,
+    hook: FinishHook,
 ) {
     loop {
         let ev = tokio::select! {
@@ -1085,7 +1353,7 @@ async fn price_events(
         let Some(mut ev) = ev else { return };
         if let Ok(StreamEvent::Finished { usage, .. }) = &mut ev {
             apply_cost(usage, price.as_ref());
-            *lock(&sink) = Some(usage.clone());
+            hook.finished(usage);
         }
         if out.send(ev).await.is_err() {
             return;

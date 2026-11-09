@@ -26,12 +26,14 @@
 //! - ключ сессии составной — `"{bundle_key}:{session}"`: файл одной связки не попадает
 //!   в слот другой модели после смены модели на эндпоинте; [`slot_file`] хэширует ключ
 //!   целиком, двоеточие и прочие символы в имя не попадают;
-//! - `SlotManager` создаётся заново после каждого зонда эндпоинта, при смене
-//!   `bundle_key` или `total_slots` и при перезапуске llama-server: менеджер не видит
-//!   сервер и иначе считал бы, что сессия ещё живёт в слоте (без restore), а при
-//!   вытеснении затёр бы хороший файл пустым или чужим содержимым слота. `total_slots`
-//!   берётся из свежего зонда: сервер берёт `id_slot` по модулю, и лишние слоты
-//!   менеджера легли бы на чужие слоты сервера;
+//! - при смене `bundle_key` или `total_slots` и при перезапуске llama-server (по зонду)
+//!   менеджер сбрасывается [`SlotManager::reset`]: менеджер не видит сервер и иначе
+//!   считал бы, что сессия ещё живёт в слоте (без restore), а при вытеснении затёр бы
+//!   хороший файл пустым или чужим содержимым слота. `total_slots` берётся из свежего
+//!   зонда: сервер берёт `id_slot` по модулю, и лишние слоты менеджера легли бы на
+//!   чужие слоты сервера. Сброс сохраняет занятость идущих аренд (без двойного
+//!   занятия слота), drop аренды освобождает только свой слот. Зонд без изменений
+//!   менеджер не трогает: карта «сессия → слот» сохраняется;
 //! - [`SlotLease`] объявляется полем раньше `Permit` очереди (поля дропаются в порядке
 //!   объявления): иначе очередь выдаст место до освобождения слота, и два запроса
 //!   получат один слот;
@@ -82,6 +84,9 @@ struct SlotState {
     /// Отметка последнего использования (выдача или освобождение).
     last_used: u64,
     busy: bool,
+    /// Номер аренды, занявшей слот (0 — не занят арендой): drop аренды освобождает
+    /// слот, только если он всё ещё её.
+    lease: u64,
 }
 
 /// Соответствие «сессия → слот» (D29). Сессия владеет не больше чем одним слотом.
@@ -90,6 +95,8 @@ pub struct SlotManager {
     slots: Vec<SlotState>,
     /// Логические часы LRU: растут при каждой выдаче и освобождении.
     clock: u64,
+    /// Счётчик номеров аренд.
+    next_lease: u64,
 }
 
 impl SlotManager {
@@ -99,7 +106,44 @@ impl SlotManager {
         Self {
             slots: vec![SlotState::default(); n],
             clock: 0,
+            next_lease: 0,
         }
+    }
+
+    /// Сервер сменил связку или число слотов либо перезапустился: владельцы забываются
+    /// (KV-кэша в слотах сервера больше нет), число слотов — `total_slots`. Занятость
+    /// идущих аренд сохраняется: новые заявки не получат их слоты, пока аренды живы, а
+    /// drop аренды освобождает только свой слот (по номеру аренды), даже если слоты
+    /// между тем исчезали и появлялись снова.
+    pub fn reset(&mut self, total_slots: u32) {
+        let n = total_slots.max(1) as usize;
+        self.slots.resize_with(n, SlotState::default);
+        for st in &mut self.slots {
+            st.owner = None;
+        }
+    }
+
+    /// Число слотов.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Слотов нет (не бывает: минимум один).
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Занятые слоты по возрастанию номера.
+    pub fn busy_slots(&self) -> Vec<u32> {
+        (0..self.slots.len())
+            .filter(|i| self.slots[*i].busy)
+            .map(|i| i as u32)
+            .collect()
+    }
+
+    /// Слот, где живёт сессия.
+    pub fn slot_of(&self, session: &str) -> Option<u32> {
+        self.home_of(session).map(|i| i as u32)
     }
 
     /// Вызывается при выдаче `Permit`; свободный слот гарантирован очередью.
@@ -134,6 +178,8 @@ impl SlotManager {
         st.owner = session.map(str::to_owned);
         st.busy = true;
         st.last_used = self.clock;
+        self.next_lease += 1;
+        st.lease = self.next_lease;
         // Сессия переехала из занятого домашнего слота: тот остаётся без владельца.
         if let Some(h) = home
             && h != slot
@@ -155,16 +201,32 @@ impl SlotManager {
         };
         self.clock += 1;
         st.busy = false;
+        st.lease = 0;
         st.last_used = self.clock;
+    }
+
+    /// Освобождает слот аренды `id`; слот, занятый уже другой арендой, не трогается.
+    fn release_lease(&mut self, slot: u32, id: u64) {
+        if self
+            .slots
+            .get(slot as usize)
+            .is_some_and(|st| st.busy && st.lease == id)
+        {
+            self.release(slot);
+        }
     }
 
     /// Выдача слота под замком с освобождением при drop [`SlotLease`]: отмена заявки
     /// (drop будущего во время save, restore или стрима) не оставляет слот занятым.
     pub fn lease(this: &Arc<Mutex<Self>>, session: Option<&str>) -> (SlotLease, SlotPlan) {
-        let plan = lock(this).assign(session);
+        let mut m = lock(this);
+        let plan = m.assign(session);
+        let id = m.slots[plan.slot as usize].lease;
+        drop(m);
         let lease = SlotLease {
             manager: this.clone(),
             slot: plan.slot,
+            id,
         };
         (lease, plan)
     }
@@ -206,6 +268,7 @@ impl SlotManager {
 pub struct SlotLease {
     manager: Arc<Mutex<SlotManager>>,
     slot: u32,
+    id: u64,
 }
 
 impl SlotLease {
@@ -216,7 +279,7 @@ impl SlotLease {
 
 impl Drop for SlotLease {
     fn drop(&mut self) {
-        lock(&self.manager).release(self.slot);
+        lock(&self.manager).release_lease(self.slot, self.id);
     }
 }
 
