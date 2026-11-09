@@ -587,8 +587,17 @@ fn every_truncation_point_is_safe() {
 
 // ---- Раунд исправлений 1 ----
 
-/// I1: разбор линейный — ~1,2 МБ повторов каждого формата меньше секунды даже в
-/// debug-сборке (порог с запасом; квадратичный разбор давал десятки секунд).
+/// Порог тестов скорости на ~1,2 МБ (раунд исправлений 1 задачи 8, решение: запас
+/// ×5 в debug). Норма — 1 с в release; в debug, где тесты гоняются обычно, порог 5 с,
+/// чтобы медленный раннер CI не давал ложных падений. Квадратичный разбор на таком
+/// входе занимает десятки секунд и в release, так что порог его ловит. Худший
+/// замер ревью в release — 0,076 с.
+fn time_limit() -> std::time::Duration {
+    std::time::Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 1 })
+}
+
+/// I1: разбор линейный — ~1,2 МБ повторов каждого формата укладываются в
+/// [`time_limit`].
 #[test]
 fn megabyte_of_repeated_markers_is_linear() {
     let call_h = hermes("read_file", json!({"path": "a"}));
@@ -613,7 +622,7 @@ fn megabyte_of_repeated_markers_is_linear() {
         let started = std::time::Instant::now();
         let out = normalize(&text(&src), &tools, all_formats());
         let took = started.elapsed();
-        assert!(took.as_secs_f64() < 1.0, "{unit:?}: {took:?}");
+        assert!(took < time_limit(), "{unit:?}: {took:?}");
         assert!(
             out.calls.len() + out.rejected.len() <= MAX_EXTRACTED_CALLS as usize + 1,
             "{unit:?}"
@@ -846,7 +855,7 @@ fn megabyte_with_many_tools_and_long_names() {
         let out = normalize(&text(&src), &tools, all_formats());
         let took = started.elapsed();
         assert!(
-            took.as_secs_f64() < 1.0,
+            took < time_limit(),
             "{}: {took:?}",
             &unit[..unit.len().min(40)]
         );
@@ -1312,7 +1321,7 @@ fn p1_call_bodies_and_code_examples() {
     }
 }
 
-/// Линейность форматов P1: ~1,2 МБ повторов меньше секунды в debug.
+/// Линейность форматов P1: ~1,2 МБ повторов укладываются в [`time_limit`].
 #[test]
 fn megabyte_of_repeated_p1_markers_is_linear() {
     let units: Vec<String> = vec![
@@ -1350,7 +1359,7 @@ fn megabyte_of_repeated_p1_markers_is_linear() {
         let started = std::time::Instant::now();
         let out = normalize(&text(&src), &tools, all_formats());
         let took = started.elapsed();
-        assert!(took.as_secs_f64() < 1.0, "{unit:?}: {took:?}");
+        assert!(took < time_limit(), "{unit:?}: {took:?}");
         assert!(
             out.calls.len() + out.rejected.len() <= MAX_EXTRACTED_CALLS as usize + 1,
             "{unit:?}"
@@ -1393,4 +1402,137 @@ fn every_truncation_point_is_safe_p1() {
         assert_eq!(full.calls.len(), 1, "{src}");
         assert!(full.rejected.is_empty(), "{src}");
     }
+}
+
+// ---- Задача 8, раунд исправлений 1 ----
+
+/// Important 1: описание инструмента (OpenAI или сериализованный `ToolSchema`) —
+/// не вызов llama3_json, даже если имя известно, а схема пропустила бы аргументы.
+#[test]
+fn llama3_json_tool_description_is_not_a_call() {
+    let schema = serde_json::to_string(&tools()[1]).unwrap();
+    for src in [
+        schema,
+        "{\"name\":\"write_file\",\"description\":\"Пишет файл\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}".to_owned(),
+        "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"parameters\":{}}}".to_owned(),
+        "{\"name\":\"count\",\"parameters\":{\"n\":1},\"description\":\"x\"}".to_owned(),
+        // Оборванное описание — тоже не вызов.
+        "{\"name\":\"read_file\",\"description\":\"Чита".to_owned(),
+    ] {
+        assert_plain(&src, TextFormat::Llama3Json);
+    }
+}
+
+/// Important 2: маркеры в инлайн-коде не делают тело вызова — пример в блоке кода
+/// между ними остаётся скрытым и не исполняется.
+#[test]
+fn marker_mentions_do_not_unmask_code_examples() {
+    let example = hermes("read_file", json!({"path": "EX"}));
+    for src in [
+        format!(
+            "Токен `<|tool_call>` открывает вызов:\n```\n{example}\n```\nа `<tool_call|>` закрывает."
+        ),
+        format!(
+            "Тег `<｜DSML｜invoke name=\"x\">` и пример:\n```\n{example}\n```\nзакрытие `</｜DSML｜invoke>`."
+        ),
+        format!("Тег `<function=x>`:\n```\n{example}\n```\nзакрытие `</function>`."),
+        "Обёртка `<tool_call>`:\n```\n<function=read_file>\n<parameter=path>\nEX\n</parameter>\n</function>\n```\nи `</tool_call>`."
+            .to_owned(),
+    ] {
+        let out = normalize(&text(&src), &tools(), all_formats());
+        assert!(
+            out.calls.is_empty() && out.rejected.is_empty(),
+            "{src}: {:?} {:?}",
+            out.calls,
+            out.rejected
+        );
+        assert_eq!(out.text, src);
+    }
+}
+
+/// Minor 1, 2: синтаксическая ошибка без обрыва концом текста — обычный текст
+/// (правило R2), `Unparseable` — только для обрыва.
+#[test]
+fn syntax_errors_without_truncation_are_text() {
+    for (src, format) in [
+        ("[read_file(path=p) for p in paths]", TextFormat::Pythonic),
+        ("[count(n=len(xs)), count(n=2)]", TextFormat::Pythonic),
+        ("[read_file(\"a.txt\")]", TextFormat::Pythonic),
+        (
+            "{\"name\": \"read_file\", \"parameters\": {path: \"a\"}}",
+            TextFormat::Llama3Json,
+        ),
+        (
+            "Формат Mistral: [TOOL_CALLS]read_file[ARGS]{...} — далее текст\nвторая строка",
+            TextFormat::MistralToolCalls,
+        ),
+        (
+            "Модель пишет [TOOL_CALLS] read_file",
+            TextFormat::MistralToolCalls,
+        ),
+    ] {
+        assert_plain(src, format);
+    }
+}
+
+/// Minor 3: обратные кавычки в двух аргументах pythonic не искажают аргументы.
+#[test]
+fn pythonic_backticks_in_two_arguments() {
+    let out = normalize(
+        &text("[write_file(path=\"`a\", content=\"b`\")]"),
+        &tools(),
+        all_formats(),
+    );
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(
+        out.calls[0].call.arguments,
+        json!({"path": "`a", "content": "b`"})
+    );
+    let out = normalize(
+        &text("{\"name\":\"write_file\",\"parameters\":{\"path\":\"`a\",\"content\":\"b`\"}}"),
+        &tools(),
+        all_formats(),
+    );
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(
+        out.calls[0].call.arguments,
+        json!({"path": "`a", "content": "b`"})
+    );
+}
+
+/// Minor 4: расхождения с vLLM — значение Gemma с `<`, варианты обёртки DSML V4,
+/// префиксы строк и восьмеричное экранирование pythonic.
+#[test]
+fn p1_vllm_compat_details() {
+    let out = only(
+        "<|tool_call>call:write_file{content:a<b,path:x}<tool_call|>",
+        TextFormat::Gemma4,
+    );
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(
+        out.calls[0].call.arguments,
+        json!({"content": "a<b", "path": "x"})
+    );
+
+    let src = "<｜DSML｜toolcalls>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">a</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    let out = only(src, TextFormat::Dsml);
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.text, "");
+
+    let out = only(
+        "[write_file(path=r\"C:\\new\\\"q\", content=b'\\101\\0x' u\"\\x41\")]",
+        TextFormat::Pythonic,
+    );
+    // Неявная склейка строк не поддерживается — ошибка синтаксиса, текст.
+    assert!(out.calls.is_empty() && out.rejected.is_empty());
+    let out = only(
+        "[write_file(path=r\"C:\\new\\\"q\", content=b'\\101\\0x')]",
+        TextFormat::Pythonic,
+    );
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(
+        out.calls[0].call.arguments,
+        json!({"path": "C:\\new\\\"q", "content": "A\u{0}x"})
+    );
 }

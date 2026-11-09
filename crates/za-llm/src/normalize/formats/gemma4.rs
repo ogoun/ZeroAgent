@@ -16,8 +16,8 @@
 //!   имя принято (`accept_name`), иначе текст.
 //! - Синтаксическая ошибка: если до следующего `<|tool_call>` есть закрывающий тег —
 //!   отклонение до него; иначе текст (как Hermes).
-//! - Значения без кавычек: `true`, `false`, `null` и числа — JSON, прочее — строка
-//!   (типы приводит схема).
+//! - Значения без кавычек — до `,`, `}` или `]` (как vLLM): `true`, `false`, `null` и
+//!   числа — JSON, прочее — строка (типы приводит схема).
 //! - Известное ограничение (как у vLLM): строка, содержащая `<|"|>`, режется.
 
 use serde_json::{Map, Value};
@@ -41,22 +41,10 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
     let mut cur = 0;
     while let Some(start) = open.find(cur) {
         let after = start + OPEN.len();
-        let lead = skip_ws(text, after);
-        let rest = &text[lead..];
-        let name_start = if rest.starts_with("call:") {
-            lead + "call:".len()
-        } else if rest.starts_with(':') {
-            lead + 1
-        } else {
+        let Some((name, brace)) = head(text, after) else {
             cur = after;
             continue;
         };
-        let brace = name_start + name_len(text, name_start);
-        let name = &text[name_start..brace];
-        if name.is_empty() {
-            cur = after;
-            continue;
-        }
         let end = if brace == text.len() {
             // Обрыв на имени.
             if !accept_name(name) {
@@ -113,6 +101,27 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
         remaining: splice(text, &spans),
         calls,
     }
+}
+
+/// Заголовок после `<|tool_call>` (в `after`): `call:` или `:` и непустое имя —
+/// (имя, позиция после имени).
+fn head(text: &str, after: usize) -> Option<(&str, usize)> {
+    let lead = skip_ws(text, after);
+    let rest = &text[lead..];
+    let name_start = if rest.starts_with("call:") {
+        lead + "call:".len()
+    } else if rest.starts_with(':') {
+        lead + 1
+    } else {
+        return None;
+    };
+    let end = name_start + name_len(text, name_start);
+    (end > name_start).then(|| (&text[name_start..end], end))
+}
+
+/// `<|tool_call>` в `start` открывает вызов: заголовок и `{` (для `code.rs`).
+pub(crate) fn opens_call(text: &str, start: usize) -> bool {
+    head(text, start + OPEN.len()).is_some_and(|(_, brace)| text[brace..].starts_with('{'))
 }
 
 /// Разбор аргументов Gemma 4 по байтам текста.
@@ -232,11 +241,11 @@ impl<'a> Args<'a> {
     /// Значение без кавычек до `,`, `}` или `]`.
     fn bare(&self, pos: usize) -> Parsed<Value> {
         let rest = &self.s[pos..];
-        let Some(i) = rest.find([',', '}', ']', '{', '[', '<']) else {
+        let Some(i) = rest.find([',', '}', ']']) else {
             return Err(ParseError::Eof);
         };
         let raw = rest[..i].trim();
-        if raw.is_empty() || !matches!(rest.as_bytes()[i], b',' | b'}' | b']') {
+        if raw.is_empty() {
             return Err(ParseError::Syntax(pos + i));
         }
         let value = match serde_json::from_str::<Value>(raw) {

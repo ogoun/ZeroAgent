@@ -17,15 +17,19 @@
 //!   Полный вызов принимается при любом имени.
 //! - Обрыв: старый вид — отклонение до конца; новый — отклонение до конца, только если
 //!   имя принято (`accept_name`), иначе текст.
-//! - Синтаксическая ошибка в JSON нового вида с принятым именем — отклонение до конца
-//!   строки или следующего `[TOOL_CALLS]` (аргументы — однострочный `json.dumps`);
-//!   иначе текст.
+//! - Обрыв на имени (`[TOOL_CALLS]ИМЯ` в конце текста) считается вызовом, только если
+//!   имя стоит вплотную к маркеру, как в выводе модели; `[TOOL_CALLS] read_file` в
+//!   прозе — текст.
+//! - Синтаксическая ошибка JSON — текст (правило R2 задачи 7: закрывающего маркера у
+//!   формата нет; раунд исправлений 1).
 
 use serde::de::IgnoredAny;
 use serde_json::Value;
 
-use super::hermes::call_from_value;
-use super::{Extraction, Finder, ParseError, RawArgs, RawCall, json_at, name_len, skip_ws, splice};
+use super::{
+    Extraction, Finder, ParseError, RawArgs, RawCall, call_from_value, json_at, name_len, skip_ws,
+    splice,
+};
 
 const MARK: &str = "[TOOL_CALLS]";
 const ARGS: &str = "[ARGS]";
@@ -43,7 +47,6 @@ enum Head<'a> {
 
 pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extraction {
     let mut mark = Finder::new(text, MARK);
-    let mut newline = Finder::new(text, "\n");
     let mut calls = Vec::new();
     let mut spans = Vec::new();
     let mut cur = 0;
@@ -82,14 +85,8 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
                     text.len()
                 }
                 Err(ParseError::Syntax(error_at)) => {
-                    if !accept_name(name) {
-                        cur = error_at.max(after);
-                        continue;
-                    }
-                    let line_end = newline.find(error_at).unwrap_or(text.len());
-                    let end = mark.find(error_at).map_or(line_end, |m| m.min(line_end));
-                    calls.push(RawCall::broken(&text[start..end]));
-                    end
+                    cur = error_at.max(after);
+                    continue;
                 }
             },
             Head::Legacy(js) => match json_at::<Value>(text, js) {
@@ -151,15 +148,21 @@ fn head(text: &str, after: usize) -> Option<Head<'_>> {
         q += name_len(text, q);
     }
     let rest = &text[q..];
+    // Обрыв на имени засчитывается, только если имя вплотную к маркеру.
+    let truncated = (p == after).then_some(Head::Truncated(name));
     if rest.starts_with(ARGS) {
         q = skip_ws(text, q + ARGS.len());
     } else if !rest.starts_with('{') {
         // Обрыв на `[ARGS]` или `[CALL_ID]`.
         let cut = !rest.is_empty() && (ARGS.starts_with(rest) || CALL_ID.starts_with(rest));
-        return (rest.is_empty() || cut).then_some(Head::Truncated(name));
+        return if rest.is_empty() || cut {
+            truncated
+        } else {
+            None
+        };
     }
     if q == text.len() {
-        return Some(Head::Truncated(name));
+        return truncated;
     }
     text[q..].starts_with('{').then_some(Head::Named(name, q))
 }

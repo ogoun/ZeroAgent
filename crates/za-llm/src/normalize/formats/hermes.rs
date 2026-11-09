@@ -14,9 +14,11 @@
 //!   прозе), ничего не вырезается (решение контроллера, раунд 2, R2).
 //! - `arguments` (или `parameters`): объект — `Json`, строка — `Text`, нет — `{}`.
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use super::{Extraction, Finder, ParseError, RawArgs, RawCall, json_at, splice};
+use super::{
+    Extraction, Finder, ParseError, RawCall, call_from_value, json_at, qwen_xml, skip_ws, splice,
+};
 
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
@@ -76,6 +78,14 @@ pub(super) fn extract(text: &str) -> Extraction {
     }
 }
 
+/// `<tool_call>` в `start` открывает вызов (для `code.rs`): после пробелов `{`
+/// (Hermes) или `<function=` с признаком вызова Qwen XML.
+pub(crate) fn opens_call(text: &str, start: usize) -> bool {
+    let p = skip_ws(text, start + OPEN.len());
+    text[p..].starts_with('{')
+        || (text[p..].starts_with("<function=") && qwen_xml::opens_call(text, p))
+}
+
 /// JSON-объекты подряд от `from`: (значения, конец последнего) или ошибка.
 fn parse_values(text: &str, from: usize) -> Result<(Vec<Value>, usize), ParseError> {
     let mut values = Vec::new();
@@ -92,23 +102,4 @@ fn parse_values(text: &str, from: usize) -> Result<(Vec<Value>, usize), ParseErr
         pos += rest.len() - trimmed.len();
     }
     Ok((values, pos))
-}
-
-/// Вызов из объекта `{"name": …, "arguments" | "parameters": …}` (Hermes, Mistral,
-/// llama3_json); без имени — нераспознанная разметка.
-pub(super) fn call_from_value(v: Value) -> RawCall {
-    let Value::Object(mut obj) = v else {
-        return RawCall::broken(&v.to_string());
-    };
-    let name = match obj.get("name") {
-        Some(Value::String(n)) if !n.trim().is_empty() => n.trim().to_owned(),
-        _ => return RawCall::broken(&Value::Object(obj).to_string()),
-    };
-    let args = obj.remove("arguments").or_else(|| obj.remove("parameters"));
-    let args = match args {
-        None | Some(Value::Null) => RawArgs::Json(Value::Object(Map::new())),
-        Some(Value::String(s)) => RawArgs::Text(s),
-        Some(v) => RawArgs::Json(v),
-    };
-    RawCall { name, args }
 }

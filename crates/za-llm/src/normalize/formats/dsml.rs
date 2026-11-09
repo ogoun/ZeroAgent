@@ -17,8 +17,9 @@
 //!   принимается при любом имени (неизвестное — `UnknownTool` с ближайшими).
 //! - Без закрытия вызов обрезан: отклонение до следующего `invoke` или конца текста,
 //!   только если имя принято (`accept_name`), иначе — текст.
-//! - Обёртка (`function_calls` V3.2 или `tool_calls` V4) вырезается вместе с первым
-//!   и последним вызовом, если стоит вплотную (через пробелы).
+//! - Обёртка (`function_calls` V3.2 или `tool_calls` V4, а также варианты открытия V4
+//!   `toolcalls`, `tool` из vLLM) вырезается вместе с первым и последним вызовом, если
+//!   стоит вплотную (через пробелы).
 //! - `string="true"` — строка как есть; иначе JSON, при ошибке — строка (vLLM).
 //! - Известное ограничение (как у vLLM): значение с `</｜DSML｜parameter>` или
 //!   `<｜DSML｜parameter` режется.
@@ -36,6 +37,14 @@ const WRAPPERS: [(&str, &str); 2] = [
     ("<｜DSML｜function_calls>", "</｜DSML｜function_calls>"),
     ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"),
 ];
+/// Открытия обёртки, которые вырезаются перед первым вызовом: V3.2, V4 и варианты
+/// написания V4, встречавшиеся в работе (`DSML_TOOL_START_VARIANTS` vLLM).
+const WRAPPER_OPENS: [&str; 4] = [
+    WRAPPERS[0].0,
+    WRAPPERS[1].0,
+    "<｜DSML｜toolcalls>",
+    "<｜DSML｜tool>",
+];
 /// Закрытия обёрток (для поиска тел в `code.rs`).
 pub(crate) const WRAPPER_CLOSES: [&str; 2] = [WRAPPERS[0].1, WRAPPERS[1].1];
 
@@ -48,19 +57,15 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
     let mut cur = 0;
     while let Some(istart) = invoke.find(cur) {
         let name_start = istart + INVOKE.len();
-        let Some((name, body_start)) = header(text, name_start) else {
+        let Some((name, body_start)) = call_head(text, istart) else {
             cur = name_start;
             continue;
         };
-        if name.is_empty() || !looks_like_body(&text[body_start..]) {
-            cur = name_start;
-            continue;
-        }
         let before = text[cur..istart].trim_end();
-        let start = WRAPPERS
+        let start = WRAPPER_OPENS
             .iter()
-            .find(|(open, _)| before.ends_with(open))
-            .map_or(istart, |(open, _)| cur + before.len() - open.len());
+            .find(|open| before.ends_with(*open))
+            .map_or(istart, |open| cur + before.len() - open.len());
         let limit = invoke.find(name_start).unwrap_or(text.len());
         let close = invoke_close.find(body_start).filter(|c| *c < limit);
         let wclose = earliest(&mut wrap_close, body_start).filter(|(c, _)| *c < limit);
@@ -106,6 +111,18 @@ fn close_end(text: &str, c: usize) -> (usize, usize) {
         end += tail.len() - trimmed.len() + wc.len();
     }
     (c, end)
+}
+
+/// Признак вызова у `invoke` в `istart`: непустое имя и тело с параметра или
+/// закрытия — (имя, начало тела).
+fn call_head(text: &str, istart: usize) -> Option<(&str, usize)> {
+    let (name, body_start) = header(text, istart + INVOKE.len())?;
+    (!name.is_empty() && looks_like_body(&text[body_start..])).then_some((name, body_start))
+}
+
+/// `invoke` в `istart` открывает вызов (для `code.rs`).
+pub(crate) fn opens_call(text: &str, istart: usize) -> bool {
+    call_head(text, istart).is_some()
 }
 
 /// Имя вызова и начало тела: `ИМЯ">`. `None`, если до `"` встретился `<`, `>` или

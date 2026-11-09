@@ -13,15 +13,17 @@
 //!   служебных токенов по краям), начинающийся с `[`. Текст после `]` — не вызов.
 //! - Вызовы извлекаются, только если хотя бы одно имя принято (`accept_name`, D28);
 //!   остальные имена дают `UnknownTool` в конвейере. Иначе текст не меняется.
-//! - Литералы: строки `'…'`, `"…"`, `'''…'''`, `"""…"""` с экранированием Python,
-//!   целые и дробные числа (с `_`), `True`/`False`/`None`, списки, кортежи (как
-//!   списки), словари. Позиционные аргументы и выражения — синтаксическая ошибка.
-//! - Ошибка или обрыв внутри списка при принятом имени — отклонение всего текста,
-//!   иначе текст.
+//! - Литералы: строки `'…'`, `"…"`, `'''…'''`, `"""…"""` с экранированием Python
+//!   (включая восьмеричное `\ooo`) и префиксами `r`, `b`, `u`, целые и дробные
+//!   числа (с `_`), `True`/`False`/`None`, списки, кортежи (как списки), словари.
+//!   Позиционные аргументы и выражения — синтаксическая ошибка.
+//! - Обрыв концом текста при принятом имени — отклонение всего текста. Синтаксическая
+//!   ошибка (`[f(x) for x in xs]`, позиционный аргумент) — текст (правило R2
+//!   задачи 7, как vLLM; раунд исправлений 1).
 
 use serde_json::{Map, Number, Value};
 
-use super::{Extraction, ParseError, RawArgs, RawCall};
+use super::{Extraction, ParseError, RawArgs, RawCall, strip_edge_tokens};
 
 /// Служебные токены, которые могут окружать список вызовов.
 const PREFIXES: [&str; 2] = ["<|python_tag|>", "<|python_start|>"];
@@ -30,7 +32,7 @@ const SUFFIXES: [&str; 3] = ["<|python_end|>", "<|eot_id|>", "<|eom_id|>"];
 const MAX_DEPTH: usize = 64;
 
 pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extraction {
-    let body = strip_tokens(text);
+    let body = strip_edge_tokens(text, &PREFIXES, &SUFFIXES);
     if !body.starts_with('[') {
         return Extraction::unchanged(text);
     }
@@ -55,24 +57,12 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
                 remaining: String::new(),
             }
         }
-        Err(_) if accepted(&p.names) => Extraction {
+        Err(ParseError::Eof) if accepted(&p.names) => Extraction {
             calls: vec![RawCall::broken(text.trim())],
             remaining: String::new(),
         },
         Err(_) => Extraction::unchanged(text),
     }
-}
-
-/// Текст без пробелов и служебных токенов по краям.
-fn strip_tokens(text: &str) -> &str {
-    let mut body = text.trim();
-    if let Some(b) = PREFIXES.iter().find_map(|p| body.strip_prefix(p)) {
-        body = b.trim_start();
-    }
-    while let Some(b) = SUFFIXES.iter().find_map(|s| body.strip_suffix(s)) {
-        body = b.trim_end();
-    }
-    body
 }
 
 type Parsed<T> = Result<(T, usize), ParseError>;
@@ -169,12 +159,15 @@ impl<'a> Py<'a> {
         }
         match self.byte(pos) {
             None => Err(ParseError::Eof),
-            Some(q @ (b'"' | b'\'')) => self.string(pos, q).map(|(s, e)| (Value::String(s), e)),
+            Some(q @ (b'"' | b'\'')) => self.string(pos + 1, q, false),
             Some(b'[') => self.sequence(pos, b']', depth),
             Some(b'(') => self.sequence(pos, b')', depth),
             Some(b'{') => self.dict(pos, depth),
             Some(b'0'..=b'9' | b'-' | b'+' | b'.') => self.number(pos),
             Some(_) => {
+                if let Some((quote, raw)) = self.string_prefix(pos) {
+                    return self.string(quote + 1, self.s.as_bytes()[quote], raw);
+                }
                 let (word, end) = self.ident(pos)?;
                 let v = match word {
                     "True" => Value::Bool(true),
@@ -268,11 +261,28 @@ impl<'a> Py<'a> {
         }
     }
 
-    /// Строка с кавычкой `q` в `pos` (тройная — многострочная).
-    fn string(&self, pos: usize, q: u8) -> Parsed<String> {
+    /// Префикс строки (`r`, `b`, `u`, `rb`, `br` в любом регистре) в `pos`:
+    /// (позиция кавычки, сырая ли строка).
+    fn string_prefix(&self, pos: usize) -> Option<(usize, bool)> {
         let bytes = self.s.as_bytes();
-        let triple = bytes.get(pos + 1) == Some(&q) && bytes.get(pos + 2) == Some(&q);
-        let mut i = if triple { pos + 3 } else { pos + 1 };
+        let len = bytes[pos..]
+            .iter()
+            .take(3)
+            .take_while(|b| matches!(b.to_ascii_lowercase(), b'r' | b'b' | b'u'))
+            .count();
+        let prefix = self.s[pos..pos + len].to_ascii_lowercase();
+        let quote = pos + len;
+        let valid = matches!(prefix.as_str(), "r" | "b" | "u" | "rb" | "br");
+        (valid && matches!(bytes.get(quote), Some(b'"' | b'\'')))
+            .then_some((quote, prefix.contains('r')))
+    }
+
+    /// Строка: `pos` — сразу после открывающей кавычки `q` (тройная — многострочная).
+    /// В сырой строке (`raw`) экранирование не раскрывается.
+    fn string(&self, pos: usize, q: u8, raw: bool) -> Parsed<Value> {
+        let bytes = self.s.as_bytes();
+        let triple = bytes.get(pos) == Some(&q) && bytes.get(pos + 1) == Some(&q);
+        let mut i = if triple { pos + 2 } else { pos };
         let mut out = String::new();
         let mut run = i;
         loop {
@@ -282,7 +292,7 @@ impl<'a> Py<'a> {
             if b == q && (!triple || (bytes.get(i + 1) == Some(&q) && bytes.get(i + 2) == Some(&q)))
             {
                 out.push_str(&self.s[run..i]);
-                return Ok((out, i + if triple { 3 } else { 1 }));
+                return Ok((Value::String(out), i + if triple { 3 } else { 1 }));
             }
             if b == b'\n' && !triple {
                 return Err(ParseError::Syntax(i));
@@ -291,10 +301,15 @@ impl<'a> Py<'a> {
                 i += 1;
                 continue;
             }
-            out.push_str(&self.s[run..i]);
             let Some(&e) = bytes.get(i + 1) else {
                 return Err(ParseError::Eof);
             };
+            if raw {
+                // Сырая строка: обратная косая черта остаётся, но экранирует кавычку.
+                i += if e == q || e == b'\\' { 2 } else { 1 };
+                continue;
+            }
+            out.push_str(&self.s[run..i]);
             i += 2;
             match e {
                 b'\n' => {}
@@ -302,7 +317,18 @@ impl<'a> Py<'a> {
                 b'n' => out.push('\n'),
                 b't' => out.push('\t'),
                 b'r' => out.push('\r'),
-                b'0' => out.push('\0'),
+                b'0'..=b'7' => {
+                    // Восьмеричное `\ooo`: до трёх цифр.
+                    let digits = bytes[i - 1..]
+                        .iter()
+                        .take(3)
+                        .take_while(|d| (b'0'..=b'7').contains(d))
+                        .count();
+                    let code = u32::from_str_radix(&self.s[i - 1..i - 1 + digits], 8)
+                        .map_err(|_| ParseError::Syntax(i))?;
+                    out.push(char::from_u32(code).ok_or(ParseError::Syntax(i))?);
+                    i += digits - 1;
+                }
                 b'a' => out.push('\u{7}'),
                 b'b' => out.push('\u{8}'),
                 b'f' => out.push('\u{c}'),
@@ -313,9 +339,10 @@ impl<'a> Py<'a> {
                         b'u' => 4,
                         _ => 8,
                     };
-                    let Some(hex) = self.s.get(i..i + n) else {
+                    if i + n > self.s.len() {
                         return Err(ParseError::Eof);
-                    };
+                    }
+                    let hex = self.s.get(i..i + n).ok_or(ParseError::Syntax(i))?;
                     let c = u32::from_str_radix(hex, 16)
                         .ok()
                         .and_then(char::from_u32)

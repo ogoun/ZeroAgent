@@ -326,18 +326,42 @@ fn scan(
 ) -> (String, Vec<(TextFormat, RawCall)>) {
     let masked = code::Masked::new(text);
     let mut remaining = masked.text.clone();
+    // (формат, вызов, нужно ли вернуть в него код).
     let mut found = Vec::new();
     for &format in formats {
         if remaining.is_empty() {
             break;
         }
+        if matches!(format, TextFormat::Pythonic | TextFormat::Llama3Json) {
+            // Форматы «весь текст — вызов» разбирают текст без заглушек: обратные
+            // кавычки в двух строковых аргументах иначе спарились бы в инлайн-код и
+            // исказили аргументы (раунд исправлений 1 задачи 8, Minor 3). Код Markdown
+            // в начале текста такой разбор и так отвергает.
+            let plain = masked.restore(&remaining);
+            let e = formats::extract(format, &plain, accept_name);
+            if !e.calls.is_empty() {
+                debug_assert!(e.remaining.is_empty());
+                found.extend(e.calls.into_iter().map(|c| (format, c, false)));
+                remaining = String::new();
+            }
+            continue;
+        }
         let e = formats::extract(format, &remaining, accept_name);
-        found.extend(e.calls.into_iter().map(|c| (format, c)));
+        found.extend(e.calls.into_iter().map(|c| (format, c, true)));
         remaining = e.remaining;
     }
     let found = found
         .into_iter()
-        .map(|(f, c)| (f, masked.restore_call(c)))
+        .map(|(f, c, masked_call)| {
+            (
+                f,
+                if masked_call {
+                    masked.restore_call(c)
+                } else {
+                    c
+                },
+            )
+        })
         .collect();
     (masked.restore(&remaining), found)
 }

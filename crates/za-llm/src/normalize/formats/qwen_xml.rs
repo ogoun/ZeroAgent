@@ -102,6 +102,22 @@ pub(super) fn extract(text: &str, accept_name: &dyn Fn(&str) -> bool) -> Extract
     }
 }
 
+/// `<function=` в `fstart` открывает вызов: непустое имя, `>` и тело с
+/// `<parameter=`/`</function>` (или оборванное на их префиксе) — как в `extract`
+/// (для `code.rs`).
+pub(crate) fn opens_call(text: &str, fstart: usize) -> bool {
+    let name_start = fstart + FN_OPEN.len();
+    let Some(name_end) = tag_end(text, name_start) else {
+        return false;
+    };
+    let lead = text[name_end + 1..].trim_start();
+    !text[name_start..name_end].trim().is_empty()
+        && (lead.starts_with(P_OPEN)
+            || lead.starts_with(FN_CLOSE)
+            || P_OPEN.starts_with(lead)
+            || FN_CLOSE.starts_with(lead))
+}
+
 /// Позиция `>`, закрывающего `<function=…` или `<parameter=…`; `None`, если раньше
 /// встретился `<`, перевод строки или конец текста. Поиск останавливается на
 /// первом из этих символов.

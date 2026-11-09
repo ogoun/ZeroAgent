@@ -32,7 +32,9 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::formats::{Finder, RawArgs, RawCall, dsml, earliest, gemma4, mistral_bodies};
+use super::formats::{
+    Finder, RawArgs, RawCall, dsml, earliest, gemma4, hermes, mistral_bodies, qwen_xml,
+};
 
 const OPEN: char = '\u{E000}';
 const CLOSE: char = '\u{E001}';
@@ -258,19 +260,39 @@ struct Bodies {
 impl Bodies {
     fn new(text: &str) -> Self {
         let mut spans = Vec::new();
-        paired(text, "<tool_call>", &["</tool_call>"], &mut spans);
-        paired(text, "<function=", &["</function>"], &mut spans);
+        paired(
+            text,
+            "<tool_call>",
+            &["</tool_call>"],
+            hermes::opens_call,
+            &mut spans,
+        );
+        paired(
+            text,
+            "<function=",
+            &["</function>"],
+            qwen_xml::opens_call,
+            &mut spans,
+        );
         harmony_calls(text, &mut spans);
         let dsml_closes = [
             dsml::INVOKE_CLOSE,
             dsml::WRAPPER_CLOSES[0],
             dsml::WRAPPER_CLOSES[1],
         ];
-        paired(text, dsml::INVOKE, &dsml_closes, &mut spans);
+        paired(
+            text,
+            dsml::INVOKE,
+            &dsml_closes,
+            dsml::opens_call,
+            &mut spans,
+        );
+        let gemma_closes = [gemma4::CLOSE, gemma4::TURN];
         paired(
             text,
             gemma4::OPEN,
-            &[gemma4::CLOSE, gemma4::TURN],
+            &gemma_closes,
+            gemma4::opens_call,
             &mut spans,
         );
         spans.extend(mistral_bodies(text));
@@ -300,14 +322,35 @@ impl Bodies {
     }
 }
 
-/// Тела `open … close`, где закрытие стоит раньше следующего `open`.
-fn paired(text: &str, open: &'static str, closes: &[&'static str], out: &mut Vec<(usize, usize)>) {
-    let mut opens = Finder::new(text, open);
+/// Тела `open … close`: открытие проходит признак вызова своего формата `opens`
+/// (упоминание маркера в прозе или инлайн-коде телом не считается — раунд
+/// исправлений 1 задачи 8, Important 2), закрытие стоит раньше следующего такого же
+/// открытия.
+fn paired(
+    text: &str,
+    open: &'static str,
+    closes: &[&'static str],
+    opens: fn(&str, usize) -> bool,
+    out: &mut Vec<(usize, usize)>,
+) {
+    let mut finder = Finder::new(text, open);
     let mut ends: Vec<Finder<'_>> = closes.iter().map(|c| Finder::new(text, c)).collect();
+    // Ближайшее открытие с признаком вызова не раньше `from`; признак проверяется
+    // на каждом вхождении не больше двух раз.
+    let mut next_call = |from: usize| {
+        let mut p = from;
+        while let Some(o) = finder.find(p) {
+            if opens(text, o) {
+                return Some(o);
+            }
+            p = o + open.len();
+        }
+        None
+    };
     let mut cur = 0;
-    while let Some(o) = opens.find(cur) {
+    while let Some(o) = next_call(cur) {
         let body = o + open.len();
-        let next_open = opens.find(body);
+        let next_open = next_call(body);
         match earliest(&mut ends, body) {
             Some((c, t)) if next_open.is_none_or(|n| c < n) => {
                 out.push((o, c + t.len()));
@@ -379,7 +422,7 @@ mod tests {
         assert_eq!(masked_parts("a\u{E000}0\u{E001}"), ["\u{E000}", "\u{E001}"]);
         // Забор и кавычки внутри тела вызова — не Markdown.
         assert_eq!(
-            masked_parts("<function=w>\n```\n`a` </function>\n```\nx\n```"),
+            masked_parts("<function=w>\n<parameter=c>\n```\n`a` </function>\n```\nx\n```"),
             ["```\nx\n```"]
         );
     }

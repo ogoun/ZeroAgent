@@ -25,17 +25,17 @@
 pub(crate) mod dsml;
 pub(crate) mod gemma4;
 mod harmony;
-mod hermes;
+pub(crate) mod hermes;
 mod llama3_json;
 mod mistral;
 mod pythonic;
-mod qwen_xml;
+pub(crate) mod qwen_xml;
 
 pub(crate) use mistral::bodies as mistral_bodies;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::caps::TextFormat;
 
@@ -276,6 +276,42 @@ pub(crate) fn earliest(finders: &mut [Finder<'_>], from: usize) -> Option<(usize
         .iter_mut()
         .filter_map(|f| f.find(from).map(|p| (p, f.needle())))
         .min_by_key(|(p, _)| *p)
+}
+
+/// Вызов из объекта `{"name": …, "arguments" | "parameters": …}` (Hermes, Mistral,
+/// llama3_json); без имени — нераспознанная разметка.
+pub(crate) fn call_from_value(v: Value) -> RawCall {
+    let Value::Object(mut obj) = v else {
+        return RawCall::broken(&v.to_string());
+    };
+    let name = match obj.get("name") {
+        Some(Value::String(n)) if !n.trim().is_empty() => n.trim().to_owned(),
+        _ => return RawCall::broken(&Value::Object(obj).to_string()),
+    };
+    let args = obj.remove("arguments").or_else(|| obj.remove("parameters"));
+    let args = match args {
+        None | Some(Value::Null) => RawArgs::Json(Value::Object(Map::new())),
+        Some(Value::String(s)) => RawArgs::Text(s),
+        Some(v) => RawArgs::Json(v),
+    };
+    RawCall { name, args }
+}
+
+/// Текст без пробелов и служебных токенов по краям: не больше одного префикса
+/// из `prefixes`, любые суффиксы из `suffixes` подряд.
+pub(crate) fn strip_edge_tokens<'a>(
+    text: &'a str,
+    prefixes: &[&str],
+    suffixes: &[&str],
+) -> &'a str {
+    let mut body = text.trim();
+    if let Some(b) = prefixes.iter().find_map(|p| body.strip_prefix(p)) {
+        body = b.trim_start();
+    }
+    while let Some(b) = suffixes.iter().find_map(|s| body.strip_suffix(s)) {
+        body = b.trim_end();
+    }
+    body
 }
 
 #[cfg(test)]
