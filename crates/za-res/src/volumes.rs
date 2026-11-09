@@ -2,6 +2,7 @@
 //! размеры каталогов, пути категорий данных (RES-016, D42).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::snapshot::{CategoryUsage, DataCategory};
 
@@ -61,50 +62,94 @@ pub fn volume_for<'a>(path: &Path, mounts: &'a [PathBuf]) -> Option<&'a PathBuf>
         .map(|(m, _)| m)
 }
 
-/// Размер каталога в байтах: файлы без перехода по символическим ссылкам и junction.
+/// Размер каталога в байтах.
 ///
-/// Каталоги из `exclude` не обходятся. Обход останавливается, когда просмотрено больше
-/// `max_entries` записей: тогда второй элемент `true`, а размер — нижняя оценка.
-/// Нет `path` — `(None, false)`. Нечитаемые вложенные каталоги пропускаются.
+/// Корень берётся с переходом по ссылке или junction (`models_dir` на другом диске),
+/// внутри обхода ссылки и junction не обходятся. Каталоги из `exclude` не обходятся.
+/// Второй элемент `true` — обход неполный, размер — нижняя оценка: просмотрено больше
+/// `max_entries` записей или вложенный каталог не читается. Корня нет или он не читается —
+/// `(None, false)`.
 pub fn dir_size(path: &Path, max_entries: usize, exclude: &[PathBuf]) -> (Option<u64>, bool) {
-    let meta = match std::fs::symlink_metadata(path) {
+    walk(path, max_entries, exclude, &AtomicBool::new(false)).unwrap_or((None, false))
+}
+
+/// [`dir_size`] с отменой: `cancel` проверяется на каждой записи, отменённый обход — `None`.
+pub(crate) fn walk(
+    path: &Path,
+    max_entries: usize,
+    exclude: &[PathBuf],
+    cancel: &AtomicBool,
+) -> Option<(Option<u64>, bool)> {
+    let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(_) => return (None, false),
+        Err(_) => return Some((None, false)),
     };
     if !meta.is_dir() {
-        return (Some(if meta.is_file() { meta.len() } else { 0 }), false);
+        return Some((Some(if meta.is_file() { meta.len() } else { 0 }), false));
     }
     let exclude: Vec<String> = exclude.iter().map(|p| norm(p)).collect();
     let mut total = 0u64;
     let mut seen = 0usize;
+    let mut incomplete = false;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
+            Err(e) if dir == path => {
+                tracing::debug!(dir = %dir.display(), error = %e, "корень категории не читается");
+                return Some((None, false));
+            }
             Err(e) => {
                 tracing::debug!(dir = %dir.display(), error = %e, "каталог не читается");
+                incomplete = true;
                 continue;
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let Ok(entry) = entry else {
+                incomplete = true;
+                continue;
+            };
             seen += 1;
             if seen > max_entries {
-                return (Some(total), true);
+                return Some((Some(total), true));
             }
-            let Ok(ft) = entry.file_type() else { continue };
+            let Ok(ft) = entry.file_type() else {
+                incomplete = true;
+                continue;
+            };
             let p = entry.path();
             if ft.is_dir() {
                 if !exclude.contains(&norm(&p)) {
                     stack.push(p);
                 }
-            } else if ft.is_file()
-                && let Ok(m) = entry.metadata()
-            {
-                total = total.saturating_add(m.len());
+            } else if ft.is_file() {
+                match entry.metadata() {
+                    Ok(m) => total = total.saturating_add(m.len()),
+                    Err(_) => incomplete = true,
+                }
             }
         }
     }
-    (Some(total), false)
+    Some((Some(total), incomplete))
+}
+
+/// Убирает категории с путём, уже встречавшимся раньше (один проект дважды,
+/// `CARGO_HOME` = `UV_CACHE_DIR`): иначе байты посчитались бы дважды.
+pub(crate) fn dedup_paths(paths: &mut Vec<(DataCategory, PathBuf)>) {
+    let mut seen = Vec::new();
+    paths.retain(|(_, p)| {
+        let n = norm(p);
+        if seen.contains(&n) {
+            false
+        } else {
+            seen.push(n);
+            true
+        }
+    });
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -145,7 +190,7 @@ fn cargo_cache() -> Option<PathBuf> {
 ///
 /// `ZaHome`, `UvCache`, `CargoCache`, затем для каждого проекта `ProjectWork`
 /// (`.zero-agent/work`), `Spill`, `Worktrees`, `BrowserProfiles` внутри него.
-/// Кэш без известного пути (нет переменных окружения) пропускается.
+/// Кэш без известного пути (нет переменных окружения) пропускается, повторный путь — тоже.
 pub fn default_category_paths(
     za_home: &Path,
     projects: &[PathBuf],
@@ -160,6 +205,7 @@ pub fn default_category_paths(
         out.push((DataCategory::BrowserProfiles, work.join("browser")));
         out.push((DataCategory::ProjectWork, work));
     }
+    dedup_paths(&mut out);
     out
 }
 
@@ -170,6 +216,15 @@ pub fn measure_categories(
     paths: &[(DataCategory, PathBuf)],
     max_entries: usize,
 ) -> Vec<CategoryUsage> {
+    measure_categories_cancellable(paths, max_entries, &AtomicBool::new(false)).unwrap_or_default()
+}
+
+/// [`measure_categories`] с отменой (drop монитора): отменённый обход — `None`.
+pub(crate) fn measure_categories_cancellable(
+    paths: &[(DataCategory, PathBuf)],
+    max_entries: usize,
+    cancel: &AtomicBool,
+) -> Option<Vec<CategoryUsage>> {
     let normed: Vec<String> = paths.iter().map(|(_, p)| norm(p)).collect();
     paths
         .iter()
@@ -183,13 +238,13 @@ pub fn measure_categories(
                 })
                 .map(|(_, (_, p))| p.clone())
                 .collect();
-            let (bytes, truncated) = dir_size(path, max_entries, &exclude);
-            CategoryUsage {
+            let (bytes, truncated) = walk(path, max_entries, &exclude, cancel)?;
+            Some(CategoryUsage {
                 category: *category,
                 path: path.clone(),
                 bytes,
                 truncated,
-            }
+            })
         })
         .collect()
 }
@@ -210,6 +265,35 @@ mod tests {
     fn trailing_separator_is_ignored() {
         assert_eq!(norm(Path::new("/home/u/")), norm(Path::new("/home/u")));
         assert_eq!(norm(Path::new("/")).len(), 1);
+    }
+
+    #[test]
+    fn cancelled_walk_returns_none() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert_eq!(walk(&dir, 100, &[], &AtomicBool::new(true)), None);
+        assert!(walk(&dir, 100, &[], &AtomicBool::new(false)).is_some());
+        let paths = vec![(DataCategory::ZaHome, dir)];
+        assert_eq!(
+            measure_categories_cancellable(&paths, 100, &AtomicBool::new(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_paths_are_dropped() {
+        let mut v = vec![
+            (DataCategory::UvCache, PathBuf::from("/c/x")),
+            (DataCategory::CargoCache, PathBuf::from("/c/x/")),
+            (DataCategory::ZaHome, PathBuf::from("/c")),
+        ];
+        dedup_paths(&mut v);
+        assert_eq!(
+            v,
+            vec![
+                (DataCategory::UvCache, PathBuf::from("/c/x")),
+                (DataCategory::ZaHome, PathBuf::from("/c")),
+            ]
+        );
     }
 
     #[cfg(windows)]

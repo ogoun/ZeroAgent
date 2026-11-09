@@ -222,6 +222,104 @@ fn dir_size_counts_and_truncates() {
     assert_eq!(dir_size(&root.join("нет"), 100, &[]), (None, false));
 }
 
+/// Ссылка на каталог: junction на Windows (без прав администратора), symlink на Unix.
+fn link_dir(target: &Path, link: &Path) {
+    #[cfg(windows)]
+    {
+        let ok = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "mklink /J");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[test]
+fn dir_size_follows_root_link_but_not_nested() {
+    let base = scratch("root-link");
+    let real = base.join("real");
+    write_bytes(&real.join("model.gguf"), 700);
+    let link = base.join("models");
+    link_dir(&real, &link);
+    // Корень-ссылка — размер цели.
+    assert_eq!(dir_size(&link, 100, &[]), (Some(700), false));
+    // Вложенная ссылка не обходится: внутри `outer` только свой файл.
+    let outer = base.join("outer");
+    write_bytes(&outer.join("f"), 50);
+    link_dir(&real, &outer.join("inner-link"));
+    assert_eq!(dir_size(&outer, 100, &[]), (Some(50), false));
+}
+
+/// Запрещает чтение содержимого каталога; возвращает функцию снятия запрета.
+fn deny_read(dir: &Path) -> impl FnOnce() {
+    #[cfg(windows)]
+    {
+        // *S-1-1-0 — «Все»; запрет «List folder / read data».
+        let run = |args: &[&str]| {
+            std::process::Command::new("icacls")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        assert!(run(&["/deny", "*S-1-1-0:(RD)"]), "icacls /deny");
+        let dir = dir.to_path_buf();
+        move || {
+            let _ = std::process::Command::new("icacls")
+                .arg(&dir)
+                .args(["/remove:d", "*S-1-1-0"])
+                .output();
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let dir = dir.to_path_buf();
+        move || {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
+#[test]
+fn unreadable_root_is_none_and_unreadable_nested_is_incomplete() {
+    let base = scratch("unreadable");
+    let root = base.join("root");
+    write_bytes(&root.join("f"), 10);
+    let restore = deny_read(&root);
+    let readable = std::fs::read_dir(&root).is_ok();
+    let got = dir_size(&root, 100, &[]);
+    restore();
+    if readable {
+        // Запрет не действует (например, Unix под root) — проверять нечего.
+        eprintln!("запрет чтения не подействовал, тест пропущен");
+        return;
+    }
+    assert_eq!(got, (None, false));
+
+    let outer = base.join("outer");
+    write_bytes(&outer.join("f"), 20);
+    let inner = outer.join("inner");
+    write_bytes(&inner.join("g"), 30);
+    let restore = deny_read(&inner);
+    let got = dir_size(&outer, 100, &[]);
+    restore();
+    assert_eq!(
+        got,
+        (Some(20), true),
+        "нечитаемый подкаталог — нижняя оценка"
+    );
+}
+
 #[test]
 fn project_work_excludes_nested_categories() {
     let base = scratch("categories");
@@ -339,8 +437,20 @@ fn snapshot_json_shape() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["categories", "cpu", "gpu", "ram", "sampled_at", "volumes"]
+        [
+            "categories",
+            "categories_sampled_at",
+            "cpu",
+            "gpu",
+            "gpu_sampled_at",
+            "ram",
+            "sampled_at",
+            "volumes",
+            "volumes_sampled_at"
+        ]
     );
+    assert!(obj["gpu_sampled_at"].is_null());
+    assert!(obj["volumes_sampled_at"].is_string());
     assert!(obj["gpu"].get("unavailable").is_some(), "{}", obj["gpu"]);
     // Круговая сериализация.
     let back: za_res::ResourceSnapshot = serde_json::from_value(v).unwrap();

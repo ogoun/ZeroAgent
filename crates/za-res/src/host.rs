@@ -38,13 +38,14 @@ struct IoMark {
     written: u64,
 }
 
-/// Состояние `sysinfo` между замерами.
+/// Состояние `sysinfo` для CPU и RAM между замерами.
+///
+/// Тома — отдельный [`VolumeSampler`] в отдельной задаче: медленный `statvfs` или
+/// запрос к съёмному носителю не задерживает CPU и RAM.
 pub(crate) struct HostSampler {
     /// `None` — платформа не поддерживается или `sysinfo` не инициализировался.
     system: Option<System>,
-    disks: Option<Disks>,
     busy: BusyTracker,
-    io: HashMap<PathBuf, IoMark>,
 }
 
 impl HostSampler {
@@ -52,14 +53,9 @@ impl HostSampler {
         let system = System::new()
             .inspect_err(|e| tracing::warn!(error = %e, "sysinfo: CPU и RAM недоступны"))
             .ok();
-        let disks = Disks::new()
-            .inspect_err(|e| tracing::warn!(error = %e, "sysinfo: тома недоступны"))
-            .ok();
         Self {
             system,
-            disks,
             busy: BusyTracker::default(),
-            io: HashMap::new(),
         }
     }
 
@@ -113,7 +109,43 @@ impl HostSampler {
             },
         }
     }
+}
 
+/// Источник замеров томов; в рабочем коде — [`VolumeSampler`], в тестах — подмена.
+pub(crate) trait VolumeProbe: Send + 'static {
+    fn sample(&mut self, categories: &[(DataCategory, PathBuf)], now: Instant)
+    -> Vec<VolumeSample>;
+}
+
+/// Состояние `sysinfo` для томов: список дисков и накопленные счётчики ввода-вывода.
+pub(crate) struct VolumeSampler {
+    disks: Option<Disks>,
+    io: HashMap<PathBuf, IoMark>,
+}
+
+impl VolumeSampler {
+    pub(crate) fn new() -> Self {
+        let disks = Disks::new()
+            .inspect_err(|e| tracing::warn!(error = %e, "sysinfo: тома недоступны"))
+            .ok();
+        Self {
+            disks,
+            io: HashMap::new(),
+        }
+    }
+}
+
+impl VolumeProbe for VolumeSampler {
+    fn sample(
+        &mut self,
+        categories: &[(DataCategory, PathBuf)],
+        now: Instant,
+    ) -> Vec<VolumeSample> {
+        self.volumes(categories, now)
+    }
+}
+
+impl VolumeSampler {
     /// Тома со скоростью ввода-вывода — разность накопленных счётчиков за прошедшее время.
     /// `roles` — категории данных, лежащие на томе (по самой длинной точке монтирования).
     pub(crate) fn volumes(
@@ -132,7 +164,10 @@ impl HostSampler {
             .collect();
         let mut roles: HashMap<&Path, Vec<DataCategory>> = HashMap::new();
         for (cat, path) in categories {
-            let abs = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+            // Ссылка или junction (модели на другом диске) — том цели, а не ссылки.
+            let abs = std::fs::canonicalize(path)
+                .or_else(|_| std::path::absolute(path))
+                .unwrap_or_else(|_| path.clone());
             if let Some(m) = volume_for(&abs, &mounts) {
                 let r = roles.entry(m.as_path()).or_default();
                 if !r.contains(cat) {

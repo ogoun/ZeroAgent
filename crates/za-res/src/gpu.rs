@@ -1,5 +1,6 @@
 //! GPU через `nvidia-smi` (D6): отдельный процесс на замер, таймаут, `kill_on_drop`.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -124,10 +125,11 @@ async fn run_query(
     tmp_dir: &Path,
 ) -> Result<Vec<GpuSample>, QueryError> {
     let mut cmd = Command::new(exe);
-    cmd.args(QUERY_ARGS)
-        .env("TMP", tmp_dir)
-        .env("TEMP", tmp_dir)
-        .env("TMPDIR", tmp_dir)
+    // Окружение — только белый список: ключи `ZA_SECRET_*` и прочее окружение daemon
+    // дочернему процессу не достаются (путь к нему настраивается в `[resources]`).
+    cmd.env_clear()
+        .envs(child_env(std::env::vars_os(), tmp_dir))
+        .args(QUERY_ARGS)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -167,6 +169,44 @@ async fn run_query(
     Ok(gpus)
 }
 
+/// Переменные родителя, нужные для запуска `nvidia-smi`: поиск по `PATH`, на Windows —
+/// системные каталоги (без `SystemRoot` процесс не стартует), на Unix — `LD_LIBRARY_PATH`
+/// для NVML вне стандартных путей. Плюс `TMP`, `TEMP`, `TMPDIR` = `tmp_dir` (D33).
+fn child_env(
+    parent: impl Iterator<Item = (OsString, OsString)>,
+    tmp_dir: &Path,
+) -> Vec<(OsString, OsString)> {
+    const KEEP: &[&str] = if cfg!(windows) {
+        &[
+            "PATH",
+            "SYSTEMROOT",
+            "WINDIR",
+            "SYSTEMDRIVE",
+            "PROGRAMFILES",
+            "PROGRAMDATA",
+        ]
+    } else {
+        &["PATH", "LD_LIBRARY_PATH"]
+    };
+    let mut env: Vec<(OsString, OsString)> = parent
+        .filter(|(k, _)| {
+            let k = k.to_string_lossy();
+            // Имена переменных Windows не различают регистр (`Path`, `SystemRoot`).
+            KEEP.iter().any(|w| {
+                if cfg!(windows) {
+                    k.eq_ignore_ascii_case(w)
+                } else {
+                    k == *w
+                }
+            })
+        })
+        .collect();
+    for k in ["TMP", "TEMP", "TMPDIR"] {
+        env.push((k.into(), tmp_dir.as_os_str().to_owned()));
+    }
+    env
+}
+
 fn first_line(s: &str) -> Option<String> {
     s.lines()
         .map(str::trim)
@@ -202,6 +242,34 @@ mod tests {
         assert_eq!(t.chars().count(), REASON_MAX_CHARS);
         assert!(t.ends_with('…'));
         assert_eq!(truncate("коротко"), "коротко");
+    }
+
+    #[test]
+    fn child_env_is_whitelisted() {
+        let parent = [
+            ("ZA_SECRET_OPENAI", "sk-test"),
+            ("OPENAI_API_KEY", "sk-test"),
+            (if cfg!(windows) { "Path" } else { "PATH" }, "/bin"),
+            ("TMP", "C:/system-temp"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let env = child_env(parent, Path::new("home/work/tmp/monitor"));
+        let names: Vec<String> = env
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|k| k.contains("SECRET") || k.contains("API_KEY"))
+        );
+        assert!(names.iter().any(|k| k.eq_ignore_ascii_case("PATH")));
+        let tmp: Vec<_> = env.iter().filter(|(k, _)| k == "TMP").collect();
+        assert_eq!(tmp.len(), 1, "системный TMP родителя не наследуется");
+        assert_eq!(tmp[0].1, OsString::from("home/work/tmp/monitor"));
+        assert!(env.iter().any(|(k, _)| k == "TEMP"));
+        assert!(env.iter().any(|(k, _)| k == "TMPDIR"));
     }
 
     #[test]

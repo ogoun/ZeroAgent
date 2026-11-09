@@ -95,17 +95,28 @@ pub struct CategoryUsage {
     pub path: PathBuf,
     /// Байты; `None` — каталога нет или он не читается.
     pub bytes: Option<u64>,
-    /// Обход остановлен на пределе записей (D11): `bytes` — нижняя оценка.
+    /// Обход неполный — предел записей (D11) или нечитаемый вложенный каталог:
+    /// `bytes` — нижняя оценка.
     pub truncated: bool,
 }
 
 /// Снимок ресурсов узла.
+///
+/// Части снимка опрашиваются независимо (CPU и RAM, GPU, тома, категории), у каждой своя
+/// отметка времени: потребитель видит устаревшую часть (например, зависший замер томов).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResourceSnapshot {
+    /// Время замера CPU и RAM.
     pub sampled_at: jiff::Timestamp,
     pub cpu: CpuSample,
     pub ram: MemSample,
+    /// Время замера GPU; `None` — ещё не опрашивался.
+    pub gpu_sampled_at: Option<jiff::Timestamp>,
     pub gpu: GpuStatus,
+    /// Время замера томов; `None` — ещё не было.
+    pub volumes_sampled_at: Option<jiff::Timestamp>,
     pub volumes: Vec<VolumeSample>,
+    /// Время обхода категорий; `None` — ещё не было.
+    pub categories_sampled_at: Option<jiff::Timestamp>,
     pub categories: Vec<CategoryUsage>,
 }
