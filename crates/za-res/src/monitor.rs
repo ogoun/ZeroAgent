@@ -80,6 +80,7 @@ impl ResourceMonitor {
         sampler.refresh_cpu();
         let initial = ResourceSnapshot {
             sampled_at: jiff::Timestamp::now(),
+            sampled_mono: Some(Instant::now()),
             cpu: CpuSample {
                 usage_percent: 0.0,
                 cores: sampler.cores(),
@@ -87,12 +88,15 @@ impl ResourceMonitor {
             },
             ram: sampler.memory(),
             gpu_sampled_at: None,
+            gpu_sampled_mono: None,
             gpu: GpuStatus::Unavailable {
                 reason: GPU_NOT_POLLED.into(),
             },
             volumes_sampled_at: None,
+            volumes_sampled_mono: None,
             volumes: Vec::new(),
             categories_sampled_at: None,
+            categories_sampled_mono: None,
             categories: Vec::new(),
         };
         let (tx, rx) = watch::channel(initial);
@@ -157,6 +161,7 @@ async fn cpu_ram_loop(
                 sampler = s;
                 tx.send_modify(|snap| {
                     snap.sampled_at = jiff::Timestamp::now();
+                    snap.sampled_mono = Some(Instant::now());
                     snap.cpu = cpu;
                     snap.ram = ram;
                 });
@@ -194,6 +199,7 @@ async fn volumes_loop(
                 probe = p;
                 tx.send_modify(|snap| {
                     snap.volumes_sampled_at = Some(jiff::Timestamp::now());
+                    snap.volumes_sampled_mono = Some(Instant::now());
                     snap.volumes = volumes;
                 });
             }
@@ -226,6 +232,7 @@ async fn gpu_loop(tx: watch::Sender<ResourceSnapshot>, cfg: MonitorConfig, tmp: 
         let next = next_gpu_poll(started, &status, cfg.gpu_every);
         tx.send_modify(|snap| {
             snap.gpu_sampled_at = Some(jiff::Timestamp::now());
+            snap.gpu_sampled_mono = Some(Instant::now());
             snap.gpu = status;
         });
         tokio::time::sleep_until(next).await;
@@ -252,6 +259,7 @@ async fn categories_loop(
         match res {
             Ok(Some(usage)) => tx.send_modify(|snap| {
                 snap.categories_sampled_at = Some(jiff::Timestamp::now());
+                snap.categories_sampled_mono = Some(Instant::now());
                 snap.categories = usage;
             }),
             Ok(None) => return,
@@ -274,20 +282,26 @@ pub fn host_sample_once(cfg: &MonitorConfig) -> ResourceSnapshot {
     let cpu = sampler.cpu(cfg.cpu_busy_percent, now);
     let ram = sampler.memory();
     let sampled_at = jiff::Timestamp::now();
+    let sampled_mono = Some(Instant::now());
     let volumes = VolumeSampler::new().sample(&categories, now);
     let volumes_sampled_at = Some(jiff::Timestamp::now());
+    let volumes_sampled_mono = Some(Instant::now());
     let categories = measure_categories(&categories, CATEGORY_MAX_ENTRIES);
     ResourceSnapshot {
         sampled_at,
+        sampled_mono,
         cpu,
         ram,
         gpu_sampled_at: None,
+        gpu_sampled_mono: None,
         gpu: GpuStatus::Unavailable {
             reason: GPU_NOT_POLLED.into(),
         },
         volumes_sampled_at,
+        volumes_sampled_mono,
         volumes,
         categories_sampled_at: Some(jiff::Timestamp::now()),
+        categories_sampled_mono: Some(Instant::now()),
         categories,
     }
 }

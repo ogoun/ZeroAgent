@@ -452,9 +452,15 @@ fn snapshot_json_shape() {
     assert!(obj["gpu_sampled_at"].is_null());
     assert!(obj["volumes_sampled_at"].is_string());
     assert!(obj["gpu"].get("unavailable").is_some(), "{}", obj["gpu"]);
-    // Круговая сериализация.
+    // Круговая сериализация; монотонные отметки не сериализуются.
+    assert!(s.sampled_mono.is_some() && s.volumes_sampled_mono.is_some());
     let back: za_res::ResourceSnapshot = serde_json::from_value(v).unwrap();
-    assert_eq!(back, s);
+    let mut expected = s;
+    expected.sampled_mono = None;
+    expected.gpu_sampled_mono = None;
+    expected.volumes_sampled_mono = None;
+    expected.categories_sampled_mono = None;
+    assert_eq!(back, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

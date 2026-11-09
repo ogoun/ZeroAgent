@@ -1,7 +1,8 @@
 //! Ресурсы узла zero-agent: снимки CPU, RAM, GPU/VRAM, томов и занятого агентом места.
 //!
 //! Из крейтов `za-*` зависит только от `za-protocol` (D1). CPU, RAM и тома — `sysinfo` (D7),
-//! GPU — процесс `nvidia-smi` (D6). Время — `tokio::time::Instant`.
+//! GPU — процесс `nvidia-smi` (D6). Время — `tokio::time::Instant`: у частей снимка есть
+//! монотонные отметки, по ним считается устаревание; настенные — для отображения.
 //! Допуск заявок по порогам (D10, D30) — [`Admission`], резерв места — [`DiskReservations`].
 
 mod admission;
@@ -17,7 +18,7 @@ pub use admission::{
     Admission, CPU_RAM_STALE_AFTER, GPU_STALE_AFTER, MonitorStopped, Need, ResourceKind,
     ResourceNotice, VOLUMES_STALE_AFTER, Verdict,
 };
-pub use config::{MonitorConfig, ResourcesConfig};
+pub use config::{MonitorConfig, ResourcesConfig, ResourcesConfigError};
 pub use gpu::{
     GPU_NOT_POLLED, GPU_RETRY_UNAVAILABLE, next_gpu_poll, parse_nvidia_smi_csv, query_nvidia_smi,
 };

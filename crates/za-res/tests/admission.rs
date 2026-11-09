@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
+use tokio::time::Instant;
 use za_protocol::Priority;
 use za_res::{
     Admission, CpuSample, DiskKind, DiskReservations, GpuSample, GpuStatus, MemSample,
-    MonitorStopped, Need, ResourceKind, ResourceNotice, ResourceSnapshot, ResourcesConfig, Verdict,
-    VolumeSample,
+    MonitorStopped, Need, ResourceKind, ResourceNotice, ResourceSnapshot, ResourcesConfig,
+    ResourcesConfigError, Verdict, VolumeSample,
 };
 
 const MIB: u64 = 1 << 20;
@@ -53,6 +54,7 @@ fn snap() -> ResourceSnapshot {
     let now = jiff::Timestamp::now();
     ResourceSnapshot {
         sampled_at: now,
+        sampled_mono: Some(Instant::now()),
         cpu: CpuSample {
             usage_percent: 5.0,
             cores: 16,
@@ -63,10 +65,13 @@ fn snap() -> ResourceSnapshot {
             available: 32 * GIB,
         },
         gpu_sampled_at: Some(now),
+        gpu_sampled_mono: Some(Instant::now()),
         gpu: gpu(24576, Some(1000), Some(23576)),
         volumes_sampled_at: Some(now),
+        volumes_sampled_mono: Some(Instant::now()),
         volumes: vec![volume(500 * GIB)],
         categories_sampled_at: None,
+        categories_sampled_mono: None,
         categories: vec![],
     }
 }
@@ -85,8 +90,15 @@ fn cfg() -> ResourcesConfig {
 }
 
 fn setup(s: ResourceSnapshot) -> (watch::Sender<ResourceSnapshot>, Admission) {
+    setup_with(s, cfg())
+}
+
+fn setup_with(
+    s: ResourceSnapshot,
+    c: ResourcesConfig,
+) -> (watch::Sender<ResourceSnapshot>, Admission) {
     let (tx, rx) = watch::channel(s);
-    (tx, Admission::new(rx, cfg(), za_home()))
+    (tx, Admission::new(rx, c, za_home()))
 }
 
 fn none() -> Need {
@@ -286,8 +298,9 @@ fn vram_floor_applies_to_worker_only() {
         a.check(Priority::Job, &gpu_need()),
         Verdict::Wait {
             kind: ResourceKind::Vram,
-            free: 700,
-            required: 1024,
+            free: 700 * MIB,
+            // Уровень 700 < 1024 закрыл порог: нужен уровень возобновления max(1126,4, 1280).
+            required: 1280 * MIB,
         }
     );
     assert_eq!(a.check(Priority::Worker, &gpu_need()), Verdict::Admit);
@@ -354,6 +367,7 @@ fn ago(secs: i64) -> jiff::Timestamp {
 fn stale_cpu_ram_pauses_reserve_classes_only() {
     let mut s = snap();
     s.sampled_at = ago(60);
+    s.sampled_mono = None;
     let (_tx, a) = setup(s);
     assert_eq!(
         kind(a.check(Priority::Job, &none())),
@@ -370,6 +384,7 @@ fn stale_cpu_ram_pauses_reserve_classes_only() {
 fn stale_volumes_pause_background_only() {
     let mut s = snap();
     s.volumes_sampled_at = Some(ago(60));
+    s.volumes_sampled_mono = None;
     let (tx, a) = setup(s);
     assert_eq!(
         kind(a.check(Priority::Job, &none())),
@@ -380,6 +395,7 @@ fn stale_volumes_pause_background_only() {
     // Томов ещё не замеряли — то же самое.
     let mut s = snap();
     s.volumes_sampled_at = None;
+    s.volumes_sampled_mono = None;
     s.volumes = vec![];
     tx.send(s).unwrap();
     assert_eq!(
@@ -393,6 +409,7 @@ fn stale_volumes_pause_background_only() {
 fn stale_gpu_pauses_reserve_classes_only() {
     let mut s = snap();
     s.gpu_sampled_at = Some(ago(60));
+    s.gpu_sampled_mono = None;
     let (_tx, a) = setup(s);
     assert_eq!(
         kind(a.check(Priority::Job, &gpu_need())),
@@ -570,4 +587,460 @@ async fn background_reservation_respects_journal_volume() {
     assert!(bg.is_err(), "фоновая заявка должна ждать");
     assert_eq!(res.reserved_on(Path::new("/big")), GIB);
     drop(fg);
+}
+
+// --- Раунд исправлений 1 ---
+
+/// Решения двух заявок с разной потребностью при заданной последовательности уровней RAM.
+fn run_sequence(order_ab: bool) -> Vec<(Verdict, Verdict)> {
+    let big = Need {
+        ram_mib: 4096,
+        ..none()
+    };
+    let (tx, a) = setup_with(
+        with_ram(10 * GIB),
+        ResourcesConfig {
+            ram_reserve_mib: None, // 64 ГиБ × 10 % = 6,4 ГиБ, возобновление 7,04 ГиБ
+            ..ResourcesConfig::default()
+        },
+    );
+    let mut out = vec![];
+    for avail in [10 * GIB, 6 * GIB, 7 * GIB, 10 * GIB + GIB / 2, 8 * GIB] {
+        tx.send(with_ram(avail)).unwrap();
+        let (va, vb) = if order_ab {
+            let va = a.check(Priority::Job, &big);
+            (va, a.check(Priority::Job, &none()))
+        } else {
+            let vb = a.check(Priority::Job, &none());
+            (a.check(Priority::Job, &big), vb)
+        };
+        out.push((va, vb));
+    }
+    out
+}
+
+#[test]
+fn check_order_does_not_change_verdicts() {
+    // I1: состояние порога зависит только от уровня ресурса, а не от потребности заявки.
+    assert_eq!(run_sequence(true), run_sequence(false));
+}
+
+#[test]
+fn hysteresis_is_not_bypassed_by_request_order() {
+    let big = Need {
+        ram_mib: 4096,
+        ..none()
+    };
+    let (tx, a) = setup_with(
+        with_ram(10 * GIB),
+        ResourcesConfig {
+            ram_reserve_mib: None,
+            ..ResourcesConfig::default()
+        },
+    );
+    // Уровень 10 ГиБ ≥ 6,4: порог открыт; большой заявке не хватает (6 < 6,4), порог не закрыт.
+    assert_eq!(kind(a.check(Priority::Job, &big)), Some(ResourceKind::Ram));
+    assert_eq!(a.check(Priority::Job, &none()), Verdict::Admit);
+    // Уровень упал ниже запаса — порог закрыт.
+    tx.send(with_ram(6 * GIB)).unwrap();
+    assert_eq!(
+        kind(a.check(Priority::Job, &none())),
+        Some(ResourceKind::Ram)
+    );
+    // 7 ГиБ < 7,04: и маленькая заявка ждёт, в каком бы порядке ни шли проверки.
+    tx.send(with_ram(7 * GIB)).unwrap();
+    assert_eq!(kind(a.check(Priority::Job, &big)), Some(ResourceKind::Ram));
+    assert_eq!(
+        kind(a.check(Priority::Job, &none())),
+        Some(ResourceKind::Ram)
+    );
+    // 10,5 ГиБ ≥ 7,04: порог открыт; большая — 6,5 ≥ 6,4 — допуск.
+    tx.send(with_ram(10 * GIB + GIB / 2)).unwrap();
+    assert_eq!(a.check(Priority::Job, &big), Verdict::Admit);
+    assert_eq!(a.check(Priority::Job, &none()), Verdict::Admit);
+}
+
+#[test]
+fn closed_gate_uses_resume_level_with_need() {
+    let (tx, a) = setup(with_ram(19 * GIB / 10));
+    assert_eq!(
+        kind(a.check(Priority::Job, &none())),
+        Some(ResourceKind::Ram)
+    );
+    // 2,2 ГиБ < 2,25: порог закрыт; заявка 256 МиБ сравнивается с уровнем возобновления.
+    tx.send(with_ram(22 * GIB / 10)).unwrap();
+    let need = Need {
+        ram_mib: 256,
+        ..none()
+    };
+    assert_eq!(
+        a.check(Priority::Job, &need),
+        Verdict::Wait {
+            kind: ResourceKind::Ram,
+            free: 22 * GIB / 10 - 256 * MIB,
+            required: 2 * GIB + 256 * MIB,
+        }
+    );
+    // 2,5 ГиБ ≥ 2,25 — порог открывается; заявке 768 МиБ: 1,75 < 2 — ждёт по порогу.
+    tx.send(with_ram(5 * GIB / 2)).unwrap();
+    let need = Need {
+        ram_mib: 768,
+        ..none()
+    };
+    assert_eq!(
+        a.check(Priority::Job, &need),
+        Verdict::Wait {
+            kind: ResourceKind::Ram,
+            free: 5 * GIB / 2 - 768 * MIB,
+            required: 2 * GIB,
+        }
+    );
+}
+
+// Монотонные отметки (I2).
+
+#[test]
+fn monotonic_stamp_ignores_wall_clock_jumps() {
+    // Часы ушли вперёд: настенная отметка «час назад», монотонная — свежая.
+    let mut s = snap();
+    s.sampled_at = ago(3600);
+    s.volumes_sampled_at = Some(ago(3600));
+    s.gpu_sampled_at = Some(ago(3600));
+    let (tx, a) = setup(s);
+    assert_eq!(a.check(Priority::Job, &gpu_need()), Verdict::Admit);
+    // Часы ушли назад: настенная отметка «через час», монотонная — свежая.
+    let mut s = snap();
+    s.sampled_at = ago(-3600);
+    s.volumes_sampled_at = Some(ago(-3600));
+    s.gpu_sampled_at = Some(ago(-3600));
+    tx.send(s).unwrap();
+    assert_eq!(a.check(Priority::Job, &gpu_need()), Verdict::Admit);
+}
+
+#[test]
+fn future_wall_stamp_without_monotonic_is_stale() {
+    // Снимок из сериализации (монотонных нет), отметки из будущего — устаревшие.
+    let mut s = snap();
+    s.sampled_at = ago(-3600);
+    s.sampled_mono = None;
+    s.volumes_sampled_at = Some(ago(-3600));
+    s.volumes_sampled_mono = None;
+    let (_tx, a) = setup(s);
+    assert_eq!(
+        kind(a.check(Priority::Job, &none())),
+        Some(ResourceKind::Ram)
+    );
+    assert_eq!(
+        kind(a.check(Priority::Worker, &none())),
+        Some(ResourceKind::Ram)
+    );
+    assert_eq!(a.check(Priority::Interactive, &none()), Verdict::Admit);
+}
+
+#[test]
+fn fresh_wall_stamp_without_monotonic_is_fresh() {
+    let mut s = snap();
+    s.sampled_mono = None;
+    s.volumes_sampled_mono = None;
+    s.gpu_sampled_mono = None;
+    let (_tx, a) = setup(s);
+    assert_eq!(a.check(Priority::Job, &gpu_need()), Verdict::Admit);
+}
+
+#[test]
+fn deserialized_snapshot_has_no_monotonic_stamps() {
+    let json = serde_json::to_string(&snap()).unwrap();
+    let back: ResourceSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.sampled_mono, None);
+    assert_eq!(back.gpu_sampled_mono, None);
+    assert_eq!(back.volumes_sampled_mono, None);
+    assert_eq!(back.categories_sampled_mono, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn monotonic_age_makes_part_stale() {
+    let (_tx, a) = setup(snap());
+    assert_eq!(a.check(Priority::Job, &none()), Verdict::Admit);
+    // Настенные отметки свежие, но по монотонным CPU и RAM старше 3 с.
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert_eq!(
+        kind(a.check(Priority::Job, &none())),
+        Some(ResourceKind::Ram)
+    );
+    assert_eq!(a.check(Priority::Interactive, &none()), Verdict::Admit);
+}
+
+// Уведомления и гистерезис остальных порогов.
+
+#[test]
+fn ram_critical_once_per_episode() {
+    let (tx, a) = setup(with_ram(400 * MIB));
+    let mut notices = a.notices();
+    a.check(Priority::Interactive, &none());
+    a.check(Priority::Job, &none());
+    assert_eq!(
+        drain(&mut notices),
+        vec![ResourceNotice::RamCritical { free: 400 * MIB }]
+    );
+    // 600 МиБ < max(512 × 1,1, 768) — эпизод продолжается.
+    tx.send(with_ram(600 * MIB)).unwrap();
+    assert_eq!(
+        kind(a.check(Priority::Interactive, &none())),
+        Some(ResourceKind::Ram)
+    );
+    assert!(drain(&mut notices).is_empty());
+    tx.send(with_ram(GIB)).unwrap();
+    assert_eq!(a.check(Priority::Interactive, &none()), Verdict::Admit);
+    tx.send(with_ram(300 * MIB)).unwrap();
+    a.check(Priority::Interactive, &none());
+    assert_eq!(drain(&mut notices).len(), 1);
+}
+
+fn with_vram_free(free: u64) -> ResourceSnapshot {
+    let mut s = snap();
+    s.gpu = gpu(24576, Some(24576 - free), Some(free));
+    s
+}
+
+#[test]
+fn vram_reserve_hysteresis() {
+    // Запас 1024: закрыт при 900; 1200 < max(1126,4, 1280) — ждёт; 1300 — допуск.
+    let (tx, a) = setup(with_vram_free(900));
+    assert_eq!(
+        kind(a.check(Priority::Job, &gpu_need())),
+        Some(ResourceKind::Vram)
+    );
+    tx.send(with_vram_free(1200)).unwrap();
+    assert_eq!(
+        a.check(Priority::Job, &gpu_need()),
+        Verdict::Wait {
+            kind: ResourceKind::Vram,
+            free: 1200 * MIB,
+            required: 1280 * MIB,
+        }
+    );
+    tx.send(with_vram_free(1300)).unwrap();
+    assert_eq!(a.check(Priority::Job, &gpu_need()), Verdict::Admit);
+}
+
+#[test]
+fn vram_shared_hysteresis() {
+    // D30: пауза при запасе ≤ 256; 400 < 512 — пауза продолжается; 600 — снята.
+    let (tx, a) = setup(with_vram_free(176));
+    assert_eq!(
+        kind(a.check(Priority::Worker, &gpu_need())),
+        Some(ResourceKind::Vram)
+    );
+    tx.send(with_vram_free(400)).unwrap();
+    assert_eq!(
+        a.check(Priority::Worker, &gpu_need()),
+        Verdict::Wait {
+            kind: ResourceKind::Vram,
+            free: 400 * MIB,
+            required: 512 * MIB,
+        }
+    );
+    tx.send(with_vram_free(600)).unwrap();
+    assert_eq!(a.check(Priority::Worker, &gpu_need()), Verdict::Admit);
+}
+
+#[test]
+fn journal_volume_hysteresis() {
+    let mut s = snap();
+    s.volumes = vec![volume(GIB)];
+    let (tx, a) = setup(s);
+    assert_eq!(
+        kind(a.check(Priority::Job, &none())),
+        Some(ResourceKind::Disk)
+    );
+    // 2,1 ГиБ ≥ 2 ГиБ, но < max(2,2, 2,25) ГиБ — ждёт.
+    let mut s = snap();
+    s.volumes = vec![volume(21 * GIB / 10)];
+    tx.send(s).unwrap();
+    assert_eq!(
+        a.check(Priority::Job, &none()),
+        Verdict::Wait {
+            kind: ResourceKind::Disk,
+            free: 21 * GIB / 10,
+            required: 2 * GIB + 256 * MIB,
+        }
+    );
+    let mut s = snap();
+    s.volumes = vec![volume(23 * GIB / 10)];
+    tx.send(s).unwrap();
+    assert_eq!(a.check(Priority::Job, &none()), Verdict::Admit);
+}
+
+fn card(index: u32, total: u64, used: Option<u64>, free: Option<u64>) -> GpuSample {
+    GpuSample {
+        index,
+        name: format!("GPU {index}"),
+        uuid: format!("GPU-{index}"),
+        util_percent: None,
+        mem_total_mib: total,
+        mem_used_mib: used,
+        mem_free_mib: free,
+        temp_c: None,
+    }
+}
+
+#[test]
+fn multi_gpu_uses_tightest_card() {
+    let mut s = snap();
+    s.gpu = GpuStatus::Available(vec![
+        card(0, 24576, Some(1000), Some(23576)),
+        card(1, 16384, Some(15684), Some(700)),
+    ]);
+    let (_tx, a) = setup(s);
+    assert_eq!(
+        a.check(Priority::Job, &gpu_need()),
+        Verdict::Wait {
+            kind: ResourceKind::Vram,
+            free: 700 * MIB,
+            // Уровень 700 < 1024 закрыл порог: нужен уровень возобновления max(1126,4, 1280).
+            required: 1280 * MIB,
+        }
+    );
+    assert_eq!(a.check(Priority::Worker, &gpu_need()), Verdict::Admit);
+}
+
+#[test]
+fn vram_used_known_free_unknown() {
+    // mem_free = None, used известен: свободное = total − used.
+    let mut s = snap();
+    s.gpu = gpu(24576, Some(23876), None);
+    let (tx, a) = setup(s);
+    assert_eq!(
+        a.check(Priority::Job, &gpu_need()),
+        Verdict::Wait {
+            kind: ResourceKind::Vram,
+            free: 700 * MIB,
+            // Уровень 700 < 1024 закрыл порог: нужен уровень возобновления max(1126,4, 1280).
+            required: 1280 * MIB,
+        }
+    );
+    // D30 по used.
+    let mut notices = a.notices();
+    let mut s = snap();
+    s.gpu = gpu(24576, Some(24400), None);
+    tx.send(s).unwrap();
+    assert_eq!(
+        kind(a.check(Priority::Worker, &gpu_need())),
+        Some(ResourceKind::Vram)
+    );
+    assert_eq!(drain(&mut notices).len(), 1);
+}
+
+#[test]
+fn vram_need_is_subtracted() {
+    let (_tx, a) = setup(with_vram_free(4096));
+    let need = Need {
+        vram_mib: 3500,
+        local_gpu: true,
+        ..none()
+    };
+    assert_eq!(
+        a.check(Priority::Job, &need),
+        Verdict::Wait {
+            kind: ResourceKind::Vram,
+            free: 596 * MIB,
+            required: 1024 * MIB,
+        }
+    );
+    assert_eq!(a.check(Priority::Worker, &need), Verdict::Admit);
+}
+
+// Конфигурация.
+
+#[test]
+fn config_validation() {
+    assert_eq!(ResourcesConfig::default().validate(), Ok(()));
+    let bad = |c: ResourcesConfig| c.validate().unwrap_err();
+    assert_eq!(
+        bad(ResourcesConfig {
+            hysteresis: f32::INFINITY,
+            ..ResourcesConfig::default()
+        }),
+        ResourcesConfigError::Hysteresis(f32::INFINITY)
+    );
+    assert!(matches!(
+        bad(ResourcesConfig {
+            hysteresis: f32::NAN,
+            ..ResourcesConfig::default()
+        }),
+        ResourcesConfigError::Hysteresis(_)
+    ));
+    assert_eq!(
+        bad(ResourcesConfig {
+            hysteresis: -0.1,
+            ..ResourcesConfig::default()
+        }),
+        ResourcesConfigError::Hysteresis(-0.1)
+    );
+    assert_eq!(
+        bad(ResourcesConfig {
+            cpu_busy_for_s: 0,
+            ..ResourcesConfig::default()
+        }),
+        ResourcesConfigError::CpuBusyFor
+    );
+    assert_eq!(
+        bad(ResourcesConfig {
+            cpu_busy_percent: 0.0,
+            ..ResourcesConfig::default()
+        }),
+        ResourcesConfigError::CpuBusyPercent(0.0)
+    );
+}
+
+#[test]
+fn invalid_config_falls_back_to_defaults() {
+    // inf дал бы вечную паузу по RAM, cpu_busy_for_s = 0 — вечную паузу по CPU.
+    let c = ResourcesConfig {
+        ram_reserve_mib: Some(2048),
+        hysteresis: f32::INFINITY,
+        cpu_busy_for_s: 0,
+        ..ResourcesConfig::default()
+    };
+    let (tx, a) = setup_with(with_ram(19 * GIB / 10), c);
+    assert_eq!(
+        kind(a.check(Priority::Job, &none())),
+        Some(ResourceKind::Ram)
+    );
+    tx.send(with_ram(23 * GIB / 10)).unwrap();
+    assert_eq!(a.check(Priority::Job, &none()), Verdict::Admit);
+}
+
+// Резерв: учёт записанного.
+
+#[tokio::test]
+async fn consumed_bytes_release_reservation() {
+    let mut s = snap();
+    s.volumes = vec![volume(10 * GIB)];
+    let (_tx, a) = setup(s);
+    let res = DiskReservations::new(a);
+    let path = mount().join("x");
+    let mut first = res.reserve(&path, 4 * GIB, Priority::Worker).await.unwrap();
+    let second = {
+        let res = res.clone();
+        let path = path.clone();
+        tokio::spawn(async move { res.reserve(&path, 2 * GIB, Priority::Worker).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!second.is_finished());
+    // Записано 3 ГиБ: резерв первой — 1 ГиБ, свободно 10 − 1 = 9 ≥ 2 + 5.
+    first.consume(3 * GIB);
+    assert_eq!(first.bytes(), GIB);
+    let second = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(res.reserved_on(&mount()), 3 * GIB);
+    first.consume(10 * GIB);
+    assert_eq!(first.bytes(), 0);
+    drop(first);
+    assert_eq!(res.reserved_on(&mount()), 2 * GIB);
+    drop(second);
+    assert_eq!(res.reserved_on(&mount()), 0);
 }

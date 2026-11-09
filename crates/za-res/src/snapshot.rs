@@ -104,19 +104,36 @@ pub struct CategoryUsage {
 ///
 /// Части снимка опрашиваются независимо (CPU и RAM, GPU, тома, категории), у каждой своя
 /// отметка времени: потребитель видит устаревшую часть (например, зависший замер томов).
+///
+/// У каждой части две отметки: настенная (`*_sampled_at`, для отображения и сериализации)
+/// и монотонная (`*_sampled_mono`, `tokio::time::Instant`, не сериализуется) — по ней
+/// допуск считает устаревание, не завися от перевода часов. После десериализации
+/// монотонных отметок нет (`None`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResourceSnapshot {
     /// Время замера CPU и RAM.
     pub sampled_at: jiff::Timestamp,
+    /// Монотонное время замера CPU и RAM; `None` — снимок из сериализации.
+    #[serde(skip)]
+    pub sampled_mono: Option<tokio::time::Instant>,
     pub cpu: CpuSample,
     pub ram: MemSample,
     /// Время замера GPU; `None` — ещё не опрашивался.
     pub gpu_sampled_at: Option<jiff::Timestamp>,
+    /// Монотонное время замера GPU; `None` — замера не было или снимок из сериализации.
+    #[serde(skip)]
+    pub gpu_sampled_mono: Option<tokio::time::Instant>,
     pub gpu: GpuStatus,
     /// Время замера томов; `None` — ещё не было.
     pub volumes_sampled_at: Option<jiff::Timestamp>,
+    /// Монотонное время замера томов; `None` — замера не было или снимок из сериализации.
+    #[serde(skip)]
+    pub volumes_sampled_mono: Option<tokio::time::Instant>,
     pub volumes: Vec<VolumeSample>,
     /// Время обхода категорий; `None` — ещё не было.
     pub categories_sampled_at: Option<jiff::Timestamp>,
+    /// Монотонное время замера категорий; `None` — замера не было или снимок из сериализации.
+    #[serde(skip)]
+    pub categories_sampled_mono: Option<tokio::time::Instant>,
     pub categories: Vec<CategoryUsage>,
 }

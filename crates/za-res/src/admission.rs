@@ -1,17 +1,31 @@
 //! Допуск заявок по порогам ресурсов (D10, D30, RES-012, RES-013, RES-018).
 //!
 //! Решение берётся из последнего снимка монитора. Пороги — из [`ResourcesConfig`].
-//! Гистерезис и отправленные уведомления хранятся в общем состоянии клонов [`Admission`].
 //!
-//! **Устаревшие части снимка.** У каждой части снимка своя отметка времени. Часть считается
-//! устаревшей, если её замер старше трёх периодов опроса D11 ([`CPU_RAM_STALE_AFTER`],
-//! [`GPU_STALE_AFTER`], [`VOLUMES_STALE_AFTER`]) или замера ещё не было. По устаревшей
-//! части классы, к которым применяется её запас (RAM и VRAM — `Job`, `Arena`, `Worker`;
-//! CPU и том журнала — `Job`, `Arena`), ждут (`Wait`, `free` = 0 для RAM, VRAM и диска);
-//! `Interactive`, `Top`, `Orchestrator` эту часть не проверяют (RES-013). Гистерезис
-//! и уведомления по устаревшим данным не меняются. Возраст считается по часам
-//! (`jiff::Timestamp::now()` против отметки снимка): отметки снимка — настенное время;
-//! отметка из будущего (часы перевели назад) — возраст 0.
+//! **Гистерезис.** У каждого порога (запас RAM, пол RAM, запас VRAM, пол VRAM, признак
+//! общей памяти D30, том журнала) своё состояние «открыт/закрыт», общее у клонов
+//! [`Admission`]. Состояние меняется только по уровню ресурса (свободно на узле), без учёта
+//! потребности заявки: закрывается при уровне ниже порога, открывается при уровне не ниже
+//! уровня возобновления `max(порог × (1 + hysteresis), порог + 256 МиБ)`. Заявка проверяется
+//! без изменения состояния: `свободно − потребность ≥ порог` при открытом пороге и
+//! `≥ уровень возобновления` при закрытом. Поэтому порядок проверок разных заявок на
+//! результат не влияет. Пороги разных классов раздельны: пауза фоновых по запасу RAM не
+//! поднимает пол интерактива (RES-013).
+//!
+//! **Устаревшие части снимка.** Возраст части считается по её монотонной отметке
+//! (`*_sampled_mono`, `tokio::time::Instant`) — перевод часов на него не влияет. Если
+//! монотонной отметки нет (снимок пришёл из сериализации), — по настенной; настенная
+//! отметка из будущего считается устаревшей. Часть устарела, если замер старше трёх
+//! периодов опроса D11 ([`CPU_RAM_STALE_AFTER`], [`GPU_STALE_AFTER`],
+//! [`VOLUMES_STALE_AFTER`]) или замера не было. По устаревшей части классы, к которым
+//! применяется её запас (RAM и VRAM — `Job`, `Arena`, `Worker`; CPU и том журнала — `Job`,
+//! `Arena`), ждут (`Wait`, `free` = 0 для RAM, VRAM и диска); `Interactive`, `Top`,
+//! `Orchestrator` эту часть не проверяют (RES-013). Состояние порогов и уведомления по
+//! устаревшим данным не меняются.
+//!
+//! **Уведомления** (`RamCritical`, `VramExhausted`, `JournalVolumeLow`) — одно на вход
+//! порога в паузу. Шлёт их допуск при проверке заявок, а не монитор: без заявок (а для
+//! `VramExhausted` — без заявок к локальному GPU) уведомлений нет.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -20,11 +34,12 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
+use tokio::time::Instant;
 use za_protocol::Priority;
 
 use crate::config::ResourcesConfig;
 use crate::monitor::GPU_QUERY_TIMEOUT;
-use crate::snapshot::{CategoryUsage, GpuStatus, ResourceSnapshot};
+use crate::snapshot::{CategoryUsage, GpuSample, GpuStatus, ResourceSnapshot, VolumeSample};
 use crate::volumes::volume_for;
 
 const MIB: u64 = 1 << 20;
@@ -79,10 +94,11 @@ pub struct Need {
 
 /// Решение допуска.
 ///
-/// Единицы `free` и `required`: RAM и диск — байты, VRAM — МиБ, CPU — миллисекунды
-/// непрерывной занятости (`free` — текущая `busy_ms`, `required` — предел; ждут при
-/// `free ≥ required`). `required` для RAM, VRAM и диска учитывает гистерезис: после
-/// паузы это уровень возобновления, а не исходный порог.
+/// Единицы `free` и `required`: RAM, VRAM и диск — **байты**; CPU — миллисекунды
+/// непрерывной занятости (`free` — текущая `busy_ms`, `required` — предел; для CPU ждут
+/// при `free ≥ required`, т. е. сравнение обратное). Для RAM, VRAM и диска `free` —
+/// свободно за вычетом потребности заявки, `required` — действующий уровень: порог или,
+/// пока порог закрыт, уровень возобновления.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Admit,
@@ -119,13 +135,12 @@ pub enum ResourceNotice {
 #[error("монитор ресурсов остановлен")]
 pub struct MonitorStopped;
 
-/// Порог со своим гистерезисом. У разных порогов одного ресурса состояние раздельное:
-/// пауза фоновых по запасу RAM не поднимает пол для интерактива (RES-013).
+/// Порог со своим гистерезисом.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Gate {
     RamReserve,
+    /// Пол RAM; вход в паузу — уведомление `RamCritical`.
     RamFloor,
-    RamCritical,
     VramReserve,
     VramFloor,
     VramShared,
@@ -134,20 +149,37 @@ enum Gate {
 
 #[derive(Debug, Default)]
 struct HysteresisState {
-    /// Пороги в паузе: возобновление только при свободном ≥ уровня возобновления.
+    /// Закрытые пороги.
     closed: HashSet<Gate>,
-    /// Предупреждение «том `ZA_HOME` не найден» уже записано.
+    /// Предупреждение «том `ZA_HOME` не найден» уже записано; сбрасывается, когда том найден.
     warned_no_journal_volume: bool,
 }
 
-/// Итог проверки порога.
-enum GateOutcome {
-    Open,
-    /// `required` — нужный сейчас уровень; `entered` — пауза началась этой проверкой.
-    Closed {
-        required: u64,
-        entered: bool,
-    },
+/// Порог с уровнем возобновления.
+#[derive(Clone, Copy)]
+struct Level {
+    open_at: u64,
+    resume_at: u64,
+}
+
+impl Level {
+    /// Обычный порог D10: возобновление при `max(порог × (1 + h), порог + шаг)`.
+    fn new(threshold: u64, hysteresis: f32, step: u64) -> Self {
+        Self {
+            open_at: threshold,
+            resume_at: resume_level(threshold, hysteresis, step),
+        }
+    }
+}
+
+/// Состояние порога после обновления.
+#[derive(Clone, Copy)]
+struct GateState {
+    closed: bool,
+    /// Порог закрылся этим обновлением.
+    entered: bool,
+    /// Действующий уровень.
+    required: u64,
 }
 
 /// Допуск заявок. Clone дешёвый: всё изменяемое состояние (гистерезис по порогам,
@@ -162,25 +194,43 @@ pub struct Admission {
     notices: broadcast::Sender<ResourceNotice>,
 }
 
-/// Уровень возобновления (D10): `max(порог × (1 + h), порог + шаг)`.
+/// Уровень возобновления (D10): `max(⌈порог × (1 + h)⌉, порог + шаг)`.
 fn resume_level(threshold: u64, hysteresis: f32, step: u64) -> u64 {
-    let h = f64::from(hysteresis.max(0.0));
-    // u64 → f64 точен до 2^53 байт (8 ПиБ) — с запасом для RAM и дисков.
+    let h = f64::from(hysteresis.clamp(0.0, 1.0));
+    // u64 → f64 точен до 2^53 байт (8 ПиБ) — с запасом для RAM и дисков; приведение насыщается.
     let scaled = (threshold as f64 * (1.0 + h)).ceil() as u64;
     scaled.max(threshold.saturating_add(step))
 }
 
-/// Возраст отметки по настенным часам; `None` (замера не было) — бесконечно стар.
-pub(crate) fn is_fresh(ts: Option<jiff::Timestamp>, now: jiff::Timestamp, limit: Duration) -> bool {
-    let Some(ts) = ts else { return false };
-    let age_ms = now
-        .as_millisecond()
-        .saturating_sub(ts.as_millisecond())
-        .max(0);
-    u128::from(age_ms.unsigned_abs()) <= limit.as_millis()
+/// Свежесть части снимка: по монотонной отметке, иначе по настенной (из будущего — устарела).
+pub(crate) fn is_fresh(
+    mono: Option<Instant>,
+    wall: Option<jiff::Timestamp>,
+    limit: Duration,
+) -> bool {
+    if let Some(m) = mono {
+        return Instant::now().saturating_duration_since(m) <= limit;
+    }
+    let Some(ts) = wall else { return false };
+    let age_ms = jiff::Timestamp::now().as_millisecond() - ts.as_millisecond();
+    age_ms >= 0 && u128::from(age_ms.unsigned_abs()) <= limit.as_millis()
+}
+
+/// Свободная и занятая память карты, МиБ: неизвестную половину выводим из `total`.
+fn gpu_mem(g: &GpuSample) -> (Option<u64>, Option<u64>) {
+    let total = g.mem_total_mib;
+    let free = g
+        .mem_free_mib
+        .or_else(|| g.mem_used_mib.map(|u| total.saturating_sub(u)));
+    let used = g
+        .mem_used_mib
+        .or_else(|| g.mem_free_mib.map(|f| total.saturating_sub(f)));
+    (free, used)
 }
 
 impl Admission {
+    /// Недопустимые значения `cfg` ([`ResourcesConfig::validate`]) заменяются умолчаниями
+    /// с предупреждением: допуск не должен вставать навсегда из-за опечатки.
     pub fn new(
         rx: watch::Receiver<ResourceSnapshot>,
         cfg: ResourcesConfig,
@@ -189,7 +239,7 @@ impl Admission {
         let (notices, _) = broadcast::channel(NOTICE_CAPACITY);
         Self {
             rx,
-            cfg: Arc::new(cfg),
+            cfg: Arc::new(cfg.sanitized()),
             za_home: Arc::new(za_home),
             state: Arc::new(Mutex::new(HysteresisState::default())),
             notices,
@@ -197,17 +247,15 @@ impl Admission {
     }
 
     /// Решение по последнему снимку. Порядок видов при нескольких нехватках:
-    /// RAM, VRAM, CPU, диск; пороги всех видов оцениваются всегда (гистерезис и
-    /// уведомления не зависят от порядка).
+    /// RAM, VRAM, CPU, диск; пороги всех видов обновляются всегда.
     pub fn check(&self, p: Priority, need: &Need) -> Verdict {
-        let snap = self.snapshot();
-        let now = jiff::Timestamp::now();
+        let snap = self.rx.borrow();
         let mut st = self.lock();
         let verdicts = [
-            self.check_ram(&mut st, &snap, now, p, need),
-            self.check_vram(&mut st, &snap, now, p, need),
-            self.check_cpu(&snap, now, p),
-            self.check_journal(&mut st, &snap, now, p),
+            self.check_ram(&mut st, &snap, p, need),
+            self.check_vram(&mut st, &snap, p, need),
+            self.check_cpu(&snap, p),
+            self.check_journal(&mut st, &snap, p),
         ];
         verdicts
             .into_iter()
@@ -237,8 +285,8 @@ impl Admission {
         self.notices.subscribe()
     }
 
-    pub(crate) fn snapshot(&self) -> ResourceSnapshot {
-        self.rx.borrow().clone()
+    pub(crate) fn snapshot(&self) -> watch::Ref<'_, ResourceSnapshot> {
+        self.rx.borrow()
     }
 
     pub(crate) fn config(&self) -> &ResourcesConfig {
@@ -252,10 +300,9 @@ impl Admission {
 
     /// Решение только по тому журнала (для резерва диска фоновыми, RES-018).
     pub(crate) fn journal_verdict(&self, p: Priority) -> Verdict {
-        let snap = self.snapshot();
-        let now = jiff::Timestamp::now();
+        let snap = self.rx.borrow();
         let mut st = self.lock();
-        self.check_journal(&mut st, &snap, now, p)
+        self.check_journal(&mut st, &snap, p)
     }
 
     fn lock(&self) -> MutexGuard<'_, HysteresisState> {
@@ -263,38 +310,32 @@ impl Admission {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Порог `g`: открыт при `free ≥ open_at`; закрывшись, открывается при `free ≥ resume_at`.
-    fn gate(
-        st: &mut HysteresisState,
-        g: Gate,
-        free: u64,
-        open_at: u64,
-        resume_at: u64,
-    ) -> GateOutcome {
-        if st.closed.contains(&g) {
-            let resume = resume_at.max(open_at);
-            if free >= resume {
-                st.closed.remove(&g);
-                GateOutcome::Open
-            } else {
-                GateOutcome::Closed {
-                    required: resume,
-                    entered: false,
-                }
-            }
-        } else if free >= open_at {
-            GateOutcome::Open
+    /// Обновляет порог `g` по уровню ресурса (без потребности заявки).
+    fn update(st: &mut HysteresisState, g: Gate, level: u64, l: Level) -> GateState {
+        let was = st.closed.contains(&g);
+        let closed = if was {
+            level < l.resume_at.max(l.open_at)
         } else {
+            level < l.open_at
+        };
+        if closed {
             st.closed.insert(g);
-            GateOutcome::Closed {
-                required: open_at,
-                entered: true,
-            }
+        } else {
+            st.closed.remove(&g);
+        }
+        GateState {
+            closed,
+            entered: closed && !was,
+            required: if closed {
+                l.resume_at.max(l.open_at)
+            } else {
+                l.open_at
+            },
         }
     }
 
-    fn resume(&self, threshold: u64, step: u64) -> u64 {
-        resume_level(threshold, self.cfg.hysteresis, step)
+    fn level(&self, threshold: u64, step: u64) -> Level {
+        Level::new(threshold, self.cfg.hysteresis, step)
     }
 
     fn ram_reserve(&self, total: u64) -> u64 {
@@ -308,48 +349,44 @@ impl Admission {
         &self,
         st: &mut HysteresisState,
         snap: &ResourceSnapshot,
-        now: jiff::Timestamp,
         p: Priority,
         need: &Need,
     ) -> Verdict {
         let reserve_class = matches!(p, Priority::Job | Priority::Arena | Priority::Worker);
-        let reserve = self.ram_reserve(snap.ram.total);
-        let floor = self.cfg.ram_floor_mib.saturating_mul(MIB);
         let step = HYSTERESIS_MIN_MIB * MIB;
-        if !is_fresh(Some(snap.sampled_at), now, CPU_RAM_STALE_AFTER) {
+        let reserve = self.level(self.ram_reserve(snap.ram.total), step);
+        let floor = self.level(self.cfg.ram_floor_mib.saturating_mul(MIB), step);
+        if !is_fresh(
+            snap.sampled_mono,
+            Some(snap.sampled_at),
+            CPU_RAM_STALE_AFTER,
+        ) {
             return if reserve_class {
                 Verdict::Wait {
                     kind: ResourceKind::Ram,
                     free: 0,
-                    required: reserve,
+                    required: reserve.open_at,
                 }
             } else {
                 Verdict::Admit
             };
         }
         let available = snap.ram.available;
-        if let GateOutcome::Closed { entered: true, .. } = Self::gate(
-            st,
-            Gate::RamCritical,
-            available,
-            floor,
-            self.resume(floor, step),
-        ) {
+        let r = Self::update(st, Gate::RamReserve, available, reserve);
+        let f = Self::update(st, Gate::RamFloor, available, floor);
+        if f.entered {
             self.notify(ResourceNotice::RamCritical { free: available });
         }
+        let gate = if reserve_class { r } else { f };
         let free = available.saturating_sub(need.ram_mib.saturating_mul(MIB));
-        let (g, threshold) = if reserve_class {
-            (Gate::RamReserve, reserve)
+        if free >= gate.required {
+            Verdict::Admit
         } else {
-            (Gate::RamFloor, floor)
-        };
-        match Self::gate(st, g, free, threshold, self.resume(threshold, step)) {
-            GateOutcome::Open => Verdict::Admit,
-            GateOutcome::Closed { required, .. } => Verdict::Wait {
+            Verdict::Wait {
                 kind: ResourceKind::Ram,
                 free,
-                required,
-            },
+                required: gate.required,
+            }
         }
     }
 
@@ -357,7 +394,6 @@ impl Admission {
         &self,
         st: &mut HysteresisState,
         snap: &ResourceSnapshot,
-        now: jiff::Timestamp,
         p: Priority,
         need: &Need,
     ) -> Verdict {
@@ -368,103 +404,97 @@ impl Admission {
         let GpuStatus::Available(gpus) = &snap.gpu else {
             return Verdict::Admit;
         };
-        let threshold = match p {
-            Priority::Job | Priority::Arena => Some(self.cfg.vram_reserve_mib),
-            Priority::Worker => Some(self.cfg.vram_floor_mib),
-            // D10: Interactive, Top, Orchestrator по VRAM не проверяются.
+        let wait = |free_mib: u64, required_mib: u64| Verdict::Wait {
+            kind: ResourceKind::Vram,
+            free: free_mib.saturating_mul(MIB),
+            required: required_mib.saturating_mul(MIB),
+        };
+        // D10: Interactive, Top, Orchestrator по VRAM не проверяются.
+        let class_gate = match p {
+            Priority::Job | Priority::Arena => Some((Gate::VramReserve, self.cfg.vram_reserve_mib)),
+            Priority::Worker => Some((Gate::VramFloor, self.cfg.vram_floor_mib)),
             Priority::Interactive | Priority::Top | Priority::Orchestrator => None,
         };
-        if !is_fresh(snap.gpu_sampled_at, now, GPU_STALE_AFTER) {
-            return match threshold {
-                Some(required) => Verdict::Wait {
-                    kind: ResourceKind::Vram,
-                    free: 0,
-                    required,
-                },
+        if !is_fresh(snap.gpu_sampled_mono, snap.gpu_sampled_at, GPU_STALE_AFTER) {
+            return match class_gate {
+                Some((_, threshold)) => wait(0, threshold),
                 None => Verdict::Admit,
             };
         }
+        let mems: Vec<(Option<u64>, Option<u64>, u64)> = gpus
+            .iter()
+            .map(|g| {
+                let (free, used) = gpu_mem(g);
+                (free, used, g.mem_total_mib)
+            })
+            .collect();
 
         // D30: карта с наименьшим запасом до предела (несколько GPU — консервативно).
-        let shared = gpus
-            .iter()
-            .filter_map(|g| {
-                g.mem_used_mib
-                    .map(|u| (g.mem_total_mib.saturating_sub(u), u, g.mem_total_mib))
-            })
-            .min_by_key(|(headroom, _, _)| *headroom);
+        // Занятая память неизвестна и не выводится — признак не срабатывает.
         let mut verdict = Verdict::Admit;
+        let shared = mems
+            .iter()
+            .filter_map(|&(_, used, total)| used.map(|u| (total.saturating_sub(u), u, total)))
+            .min_by_key(|(headroom, _, _)| *headroom);
         if let Some((headroom, used_mib, total_mib)) = shared {
-            // Пауза при занято ≥ всего − 256, т. е. открыт при запасе ≥ 257.
-            // Возобновление — как у порога 256 МиБ: max(256 × 1,1, 512) МиБ.
-            match Self::gate(
-                st,
-                Gate::VramShared,
-                headroom,
-                SHARED_VRAM_MARGIN_MIB + 1,
-                self.resume(SHARED_VRAM_MARGIN_MIB, HYSTERESIS_MIN_MIB),
-            ) {
-                GateOutcome::Open => {}
-                GateOutcome::Closed { required, entered } => {
-                    if entered {
-                        self.notify(ResourceNotice::VramExhausted {
-                            used_mib,
-                            total_mib,
-                        });
-                    }
-                    if threshold.is_some() {
-                        verdict = Verdict::Wait {
-                            kind: ResourceKind::Vram,
-                            free: headroom,
-                            required,
-                        };
-                    }
-                }
+            // Пауза при занято ≥ всего − 256 (открыт при запасе ≥ 257); возобновление — как
+            // у порога 256 МиБ: max(256 × (1 + h), 512) МиБ.
+            let l = Level {
+                open_at: SHARED_VRAM_MARGIN_MIB + 1,
+                resume_at: resume_level(
+                    SHARED_VRAM_MARGIN_MIB,
+                    self.cfg.hysteresis,
+                    HYSTERESIS_MIN_MIB,
+                ),
+            };
+            let s = Self::update(st, Gate::VramShared, headroom, l);
+            if s.entered {
+                self.notify(ResourceNotice::VramExhausted {
+                    used_mib,
+                    total_mib,
+                });
+            }
+            if s.closed && class_gate.is_some() {
+                verdict = wait(headroom, s.required);
             }
         }
 
-        let Some(threshold) = threshold else {
-            return Verdict::Admit;
-        };
-        // `mem_free` = None ([N/A] под WDDM) — проверки запаса нет.
-        let Some(min_free) = gpus.iter().filter_map(|g| g.mem_free_mib).min() else {
+        // Запас и пол: карта с наименьшим свободным; свободное неизвестно — проверки нет.
+        let Some(min_free) = mems.iter().filter_map(|&(free, _, _)| free).min() else {
             return verdict;
         };
-        let free = min_free.saturating_sub(need.vram_mib);
-        let g = if p == Priority::Worker {
-            Gate::VramFloor
-        } else {
-            Gate::VramReserve
+        let reserve = self.level(self.cfg.vram_reserve_mib, HYSTERESIS_MIN_MIB);
+        let floor = self.level(self.cfg.vram_floor_mib, HYSTERESIS_MIN_MIB);
+        let r = Self::update(st, Gate::VramReserve, min_free, reserve);
+        let f = Self::update(st, Gate::VramFloor, min_free, floor);
+        let Some((g, _)) = class_gate else {
+            return Verdict::Admit;
         };
-        match Self::gate(
-            st,
-            g,
-            free,
-            threshold,
-            self.resume(threshold, HYSTERESIS_MIN_MIB),
-        ) {
-            GateOutcome::Open => verdict,
-            GateOutcome::Closed { required, .. } => {
-                if verdict == Verdict::Admit {
-                    verdict = Verdict::Wait {
-                        kind: ResourceKind::Vram,
-                        free,
-                        required,
-                    };
-                }
-                verdict
-            }
+        if verdict != Verdict::Admit {
+            return verdict;
+        }
+        let gate = if g == Gate::VramFloor { f } else { r };
+        let free = min_free.saturating_sub(need.vram_mib);
+        if free >= gate.required {
+            Verdict::Admit
+        } else {
+            wait(free, gate.required)
         }
     }
 
-    fn check_cpu(&self, snap: &ResourceSnapshot, now: jiff::Timestamp, p: Priority) -> Verdict {
+    fn check_cpu(&self, snap: &ResourceSnapshot, p: Priority) -> Verdict {
         if !p.is_background() {
             return Verdict::Admit;
         }
         let limit = self.cfg.cpu_busy_for_s.saturating_mul(1000);
         let busy = snap.cpu.busy_ms;
+        let fresh = is_fresh(
+            snap.sampled_mono,
+            Some(snap.sampled_at),
+            CPU_RAM_STALE_AFTER,
+        );
         // Гистерезис по времени уже в `busy_ms`: сбрасывается в 0 при первом же спаде.
-        if busy >= limit || !is_fresh(Some(snap.sampled_at), now, CPU_RAM_STALE_AFTER) {
+        if busy >= limit || !fresh {
             Verdict::Wait {
                 kind: ResourceKind::Cpu,
                 free: busy,
@@ -479,23 +509,28 @@ impl Admission {
         &self,
         st: &mut HysteresisState,
         snap: &ResourceSnapshot,
-        now: jiff::Timestamp,
         p: Priority,
     ) -> Verdict {
-        let low = self.cfg.journal_low_mib.saturating_mul(MIB);
-        if !is_fresh(snap.volumes_sampled_at, now, VOLUMES_STALE_AFTER) {
+        let low = self.level(
+            self.cfg.journal_low_mib.saturating_mul(MIB),
+            HYSTERESIS_MIN_MIB * MIB,
+        );
+        if !is_fresh(
+            snap.volumes_sampled_mono,
+            snap.volumes_sampled_at,
+            VOLUMES_STALE_AFTER,
+        ) {
             return if p.is_background() {
                 Verdict::Wait {
                     kind: ResourceKind::Disk,
                     free: 0,
-                    required: low,
+                    required: low.open_at,
                 }
             } else {
                 Verdict::Admit
             };
         }
-        let mounts: Vec<PathBuf> = snap.volumes.iter().map(|v| v.mount.clone()).collect();
-        let Some(vol) = journal_volume(&self.za_home, &snap.volumes, &mounts) else {
+        let Some(vol) = journal_volume(&self.za_home, &snap.volumes) else {
             // Тома нет среди замеренных: мерить нечем, вечная пауза хуже (как GPU Unavailable).
             if !st.warned_no_journal_volume {
                 st.warned_no_journal_volume = true;
@@ -503,39 +538,29 @@ impl Admission {
             }
             return Verdict::Admit;
         };
-        let resume = self.resume(low, HYSTERESIS_MIN_MIB * MIB);
-        match Self::gate(st, Gate::JournalLow, vol.1, low, resume) {
-            GateOutcome::Open => Verdict::Admit,
-            GateOutcome::Closed { required, entered } => {
-                if entered {
-                    self.notify(ResourceNotice::JournalVolumeLow {
-                        volume: vol.0.clone(),
-                        free: vol.1,
-                    });
-                }
-                if p.is_background() {
-                    Verdict::Wait {
-                        kind: ResourceKind::Disk,
-                        free: vol.1,
-                        required,
-                    }
-                } else {
-                    Verdict::Admit
-                }
+        st.warned_no_journal_volume = false;
+        let s = Self::update(st, Gate::JournalLow, vol.available, low);
+        if s.entered {
+            self.notify(ResourceNotice::JournalVolumeLow {
+                volume: vol.mount.clone(),
+                free: vol.available,
+            });
+        }
+        if s.closed && p.is_background() {
+            Verdict::Wait {
+                kind: ResourceKind::Disk,
+                free: vol.available,
+                required: s.required,
             }
+        } else {
+            Verdict::Admit
         }
     }
 }
 
-/// Том `ZA_HOME`: точка монтирования и свободное место.
-fn journal_volume<'a>(
-    za_home: &Path,
-    volumes: &'a [crate::snapshot::VolumeSample],
-    mounts: &[PathBuf],
-) -> Option<(&'a PathBuf, u64)> {
-    let m = volume_for(za_home, mounts)?;
-    volumes
-        .iter()
-        .find(|v| &v.mount == m)
-        .map(|v| (&v.mount, v.available))
+/// Том `ZA_HOME` среди замеренных.
+fn journal_volume<'a>(za_home: &Path, volumes: &'a [VolumeSample]) -> Option<&'a VolumeSample> {
+    let mounts: Vec<PathBuf> = volumes.iter().map(|v| v.mount.clone()).collect();
+    let m = volume_for(za_home, &mounts)?;
+    volumes.iter().find(|v| &v.mount == m)
 }

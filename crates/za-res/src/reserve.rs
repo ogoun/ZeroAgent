@@ -8,6 +8,15 @@
 //! Тома нет среди замеренных — заявка проходит без учёта (мерить нечем). Замер томов
 //! устарел или его не было ([`crate::VOLUMES_STALE_AFTER`]) — фоновые ждут, остальные
 //! проходят без проверки места; заявка учитывается в резерве, если том известен.
+//!
+//! **Правило учёта.** Резерв — обещание места под запись, которой ещё нет. Записанное уже
+//! видно в замере тома, поэтому, пока резерв держится, записанные байты учитываются
+//! дважды (консервативно: другие заявки ждут дольше, но перерасхода нет). Владелец
+//! отпускает резерв (Drop) сразу после завершения записи (fsync или rename), а при долгой
+//! записи сообщает о записанном через [`Reservation::consume`].
+//!
+//! Освобождение будит всех ждущих; порядка между ними нет — маленькие заявки могут
+//! обгонять большую (справедливость очереди — задача очереди, не резерва).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,22 +75,39 @@ impl Reservation {
         self.volume.as_deref()
     }
 
-    /// Объём, байты.
+    /// Ещё не записанный объём резерва, байты.
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Записано `written` байт: они уже видны в замере тома, резерв уменьшается на них
+    /// (не ниже нуля), ждущие пробуждаются.
+    pub fn consume(&mut self, written: u64) {
+        let n = written.min(self.bytes);
+        if n == 0 {
+            return;
+        }
+        self.bytes -= n;
+        if let Some(v) = &self.volume {
+            sub_reserved(&mut self.inner.lock(), v, n);
+        }
+        self.inner.released.send_modify(|c| *c = c.wrapping_add(1));
+    }
+}
+
+fn sub_reserved(map: &mut HashMap<PathBuf, u64>, v: &Path, n: u64) {
+    if let Some(sum) = map.get_mut(v) {
+        *sum = sum.saturating_sub(n);
+        if *sum == 0 {
+            map.remove(v);
+        }
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         if let Some(v) = &self.volume {
-            let mut map = self.inner.lock();
-            if let Some(sum) = map.get_mut(v) {
-                *sum = sum.saturating_sub(self.bytes);
-                if *sum == 0 {
-                    map.remove(v);
-                }
-            }
+            sub_reserved(&mut self.inner.lock(), v, self.bytes);
         }
         self.inner.released.send_modify(|n| *n = n.wrapping_add(1));
     }
@@ -147,8 +173,8 @@ impl DiskReservations {
         }
         let snap = adm.snapshot();
         let fresh = is_fresh(
+            snap.volumes_sampled_mono,
             snap.volumes_sampled_at,
-            jiff::Timestamp::now(),
             VOLUMES_STALE_AFTER,
         );
         if !fresh && p.is_background() {
@@ -177,6 +203,7 @@ impl DiskReservations {
                     .cloned()
                     .collect();
                 caches.sort_by_key(|c| std::cmp::Reverse(c.bytes));
+                drop(map);
                 return Err(Some(ResourceNotice::DiskWait {
                     volume: vol,
                     need,

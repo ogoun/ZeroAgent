@@ -50,6 +50,51 @@ impl Default for ResourcesConfig {
     }
 }
 
+/// Недопустимое значение в разделе `[resources]`.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ResourcesConfigError {
+    /// Гистерезис вне `0..=1` или не число: `inf` дал бы вечную паузу фоновых.
+    #[error("resources.hysteresis = {0}: нужно число от 0 до 1")]
+    Hysteresis(f32),
+    /// `0` — фоновые ждали бы всегда (`busy_ms ≥ 0`).
+    #[error("resources.cpu_busy_for_s = 0: нужно не меньше 1")]
+    CpuBusyFor,
+    #[error("resources.cpu_busy_percent = {0}: нужно число больше 0 и не больше 100")]
+    CpuBusyPercent(f32),
+}
+
+impl ResourcesConfig {
+    /// Проверка значений; вызывается при чтении конфигурации.
+    pub fn validate(&self) -> Result<(), ResourcesConfigError> {
+        if !(0.0..=1.0).contains(&self.hysteresis) {
+            return Err(ResourcesConfigError::Hysteresis(self.hysteresis));
+        }
+        if self.cpu_busy_for_s == 0 {
+            return Err(ResourcesConfigError::CpuBusyFor);
+        }
+        if !(self.cpu_busy_percent > 0.0 && self.cpu_busy_percent <= 100.0) {
+            return Err(ResourcesConfigError::CpuBusyPercent(self.cpu_busy_percent));
+        }
+        Ok(())
+    }
+
+    /// Копия, в которой недопустимые значения заменены умолчаниями (с `warn`).
+    pub(crate) fn sanitized(mut self) -> Self {
+        let def = Self::default();
+        while let Err(e) = self.validate() {
+            tracing::warn!(error = %e, "недопустимый порог ресурсов, взято значение по умолчанию");
+            match e {
+                ResourcesConfigError::Hysteresis(_) => self.hysteresis = def.hysteresis,
+                ResourcesConfigError::CpuBusyFor => self.cpu_busy_for_s = def.cpu_busy_for_s,
+                ResourcesConfigError::CpuBusyPercent(_) => {
+                    self.cpu_busy_percent = def.cpu_busy_percent;
+                }
+            }
+        }
+        self
+    }
+}
+
 /// Параметры монитора. Своих порогов нет — копии из [`ResourcesConfig`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorConfig {
