@@ -407,18 +407,157 @@ async fn consumer_drop_stops_retries() {
     )
     .await;
     assert_eq!(res.unwrap_err().class, ErrorClass::Cancelled);
-    assert!(opens.get() <= 1, "после ухода потребителя повторов нет");
+    assert_eq!(
+        opens.get(),
+        0,
+        "потребитель ушёл до старта — open не вызывается"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn consumer_drop_during_backoff_cancels() {
+    // Попытка 1 — Server, пауза ≥ 0,8 с; потребитель уходит через 100 мс паузы.
+    let (tx, rx) = mpsc::channel::<Ev>(8);
+    let opens = Cell::new(0u32);
+    let t0 = Instant::now();
+    let policy = RetryPolicy::default();
+    let drive = drive_with_retry(
+        &policy,
+        "fp",
+        &tx,
+        |_| {
+            opens.set(opens.get() + 1);
+            async { Err(err(ErrorClass::Server)) }
+        },
+        |_| {},
+    );
+    let consumer = async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(rx);
+    };
+    let (res, ()) = tokio::join!(drive, consumer);
+    assert_eq!(res.unwrap_err().class, ErrorClass::Cancelled);
+    assert_eq!(opens.get(), 1, "повтора после ухода потребителя нет");
+    assert_eq!(
+        t0.elapsed(),
+        Duration::from_millis(100),
+        "пауза прервана сразу"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_model_stream_mid_attempt_ends_network_task() {
+    // «Сетевая задача» попытки отдаёт дельту и ждёт закрытия своего канала, как насос
+    // коннектора (D2). Потребитель читает дельту и бросает `ModelStream`.
+    let (tx, rx) = mpsc::channel::<Ev>(8);
+    let opens = Cell::new(0u32);
+    let net = Cell::new(None);
+    let policy = RetryPolicy::default();
+    let drive = drive_with_retry(
+        &policy,
+        "fp",
+        &tx,
+        |_| {
+            opens.set(opens.get() + 1);
+            let (atx, arx) = mpsc::channel::<Ev>(8);
+            net.set(Some(tokio::spawn(async move {
+                atx.send(Ok(StreamEvent::TextDelta("част".into())))
+                    .await
+                    .unwrap();
+                atx.closed().await;
+            })));
+            async move { Ok(arx) }
+        },
+        |_| panic!("отмена — не неудачная попытка"),
+    );
+    let consumer = async move {
+        let mut stream = ModelStream::from_channel(rx, Box::new(()));
+        assert_eq!(
+            stream.next().await,
+            Some(Ok(StreamEvent::TextDelta("част".into())))
+        );
+        drop(stream);
+    };
+    let (res, ()) = tokio::join!(drive, consumer);
+    assert_eq!(res.unwrap_err().class, ErrorClass::Cancelled);
+    assert_eq!(opens.get(), 1);
+    let handle = net.take().expect("попытка открыта");
+    tokio::time::timeout(secs(5), handle)
+        .await
+        .expect("сетевая задача не завершилась: канал попытки жив")
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_reason_is_truncated() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let res = drive_with_retry(
+        &RetryPolicy::default(),
+        "fp",
+        &tx,
+        |attempt| async move {
+            Ok(if attempt == 1 {
+                attempt_rx(vec![
+                    Ok(StreamEvent::TextDelta("об".into())),
+                    Err(ModelError::new(ErrorClass::Server, "ж".repeat(5000))),
+                ])
+            } else {
+                attempt_rx(vec![Ok(tool_finished(json!({})))])
+            })
+        },
+        |_| {},
+    )
+    .await;
+    assert_eq!(res, Ok(()));
+    drop(tx);
+    let reason = drain(&mut rx)
+        .into_iter()
+        .find_map(|e| match e {
+            Ok(StreamEvent::Restart { reason, .. }) => Some(reason),
+            _ => None,
+        })
+        .expect("Restart");
+    assert_eq!(reason.chars().count(), 256);
+    assert!(
+        reason.starts_with("Server: жжж") && reason.ends_with('…'),
+        "{reason}"
+    );
+}
+
+fn breaker() -> CircuitBreaker {
+    CircuitBreaker::new(EndpointId("local".into()), BreakerOptions::default())
+}
+
+/// Заявка с исходом `class` в момент `t`.
+fn fail(b: &mut CircuitBreaker, class: ErrorClass, t: Instant) {
+    let p = b.allow(t).unwrap();
+    b.on_failure(p, &err(class), t);
+}
+
+/// `Open` сразу после пяти отказов в `t`.
+fn opened(t: Instant) -> CircuitBreaker {
+    let mut b = breaker();
+    for _ in 0..5 {
+        fail(&mut b, ErrorClass::Server, t);
+    }
+    assert_eq!(
+        b.state(),
+        BreakerState::Open {
+            until: t + secs(30)
+        }
+    );
+    b
 }
 
 #[test]
 fn breaker_opens_after_five_and_half_opens() {
-    let mut b = CircuitBreaker::new(BreakerOptions::default());
+    let mut b = breaker();
     let t0 = Instant::now();
     for i in 0..4 {
-        b.on_failure(&err(ErrorClass::Server), t0);
+        fail(&mut b, ErrorClass::Server, t0);
         assert_eq!(b.state(), BreakerState::Closed, "после {} отказов", i + 1);
     }
-    b.on_failure(&err(ErrorClass::Server), t0);
+    fail(&mut b, ErrorClass::Server, t0);
     assert_eq!(
         b.state(),
         BreakerState::Open {
@@ -429,7 +568,8 @@ fn breaker_opens_after_five_and_half_opens() {
     assert_eq!(e.class, ErrorClass::CircuitOpen);
     assert_eq!(e.retry_after, Some(secs(1)));
 
-    assert_eq!(b.allow(t0 + secs(30)), Ok(()));
+    let probe = b.allow(t0 + secs(30)).unwrap();
+    assert!(probe.is_probe());
     assert_eq!(b.state(), BreakerState::HalfOpen);
     // Пробная заявка одна: вторая отвергается, пока проба не закончилась.
     assert_eq!(
@@ -438,7 +578,7 @@ fn breaker_opens_after_five_and_half_opens() {
     );
 
     let t1 = t0 + secs(31);
-    b.on_failure(&err(ErrorClass::Timeout), t1);
+    b.on_failure(probe, &err(ErrorClass::Timeout), t1);
     assert_eq!(
         b.state(),
         BreakerState::Open {
@@ -449,15 +589,17 @@ fn breaker_opens_after_five_and_half_opens() {
         b.allow(t1 + secs(59)).unwrap_err().class,
         ErrorClass::CircuitOpen
     );
-    assert_eq!(b.allow(t1 + secs(60)), Ok(()));
-    b.on_success();
+    let probe = b.allow(t1 + secs(60)).unwrap();
+    b.on_success(probe);
     assert_eq!(b.state(), BreakerState::Closed);
-    assert_eq!(b.allow(t1 + secs(60)), Ok(()));
+    let p = b.allow(t1 + secs(60)).unwrap();
+    assert!(!p.is_probe());
+    b.on_success(p);
 
     // После успеха пауза снова базовая.
     let t2 = t1 + secs(100);
     for _ in 0..5 {
-        b.on_failure(&err(ErrorClass::Overloaded), t2);
+        fail(&mut b, ErrorClass::Overloaded, t2);
     }
     assert_eq!(
         b.state(),
@@ -469,19 +611,15 @@ fn breaker_opens_after_five_and_half_opens() {
 
 #[test]
 fn breaker_cooldown_doubles_up_to_cap() {
-    let mut b = CircuitBreaker::new(BreakerOptions::default());
     let mut t = Instant::now();
-    for _ in 0..5 {
-        b.on_failure(&err(ErrorClass::Transport), t);
-    }
+    let mut b = opened(t);
     let mut expected = [60, 120, 240, 300, 300].into_iter();
     loop {
         let BreakerState::Open { until } = b.state() else {
             panic!("{:?}", b.state())
         };
         t = until;
-        assert_eq!(b.allow(t), Ok(()));
-        b.on_failure(&err(ErrorClass::StreamCut), t);
+        fail(&mut b, ErrorClass::StreamCut, t);
         let Some(want) = expected.next() else { break };
         assert_eq!(
             b.state(),
@@ -494,60 +632,154 @@ fn breaker_cooldown_doubles_up_to_cap() {
 
 #[test]
 fn success_resets_failure_streak() {
-    let mut b = CircuitBreaker::new(BreakerOptions::default());
+    let mut b = breaker();
     let t = Instant::now();
     for _ in 0..4 {
-        b.on_failure(&err(ErrorClass::Server), t);
+        fail(&mut b, ErrorClass::Server, t);
     }
-    b.on_success();
+    let p = b.allow(t).unwrap();
+    b.on_success(p);
     for _ in 0..4 {
-        b.on_failure(&err(ErrorClass::Server), t);
+        fail(&mut b, ErrorClass::Server, t);
     }
     assert_eq!(b.state(), BreakerState::Closed);
 }
 
 #[test]
-fn half_open_probe_released_by_neutral_outcome() {
-    // Проба, закончившаяся классом вне предохранителя (отмена, 429), не держит
-    // эндпоинт закрытым: следующая заявка снова получает пробу.
-    let mut b = CircuitBreaker::new(BreakerOptions::default());
+fn half_open_probe_released_by_neutral_outcome_or_drop() {
+    // Проба, закончившаяся классом вне предохранителя (отмена, 429) или брошенная без
+    // исхода, не держит эндпоинт закрытым: следующая заявка снова получает пробу.
     let t = Instant::now();
-    for _ in 0..5 {
-        b.on_failure(&err(ErrorClass::Server), t);
-    }
-    assert_eq!(b.allow(t + secs(30)), Ok(()));
-    b.on_failure(&err(ErrorClass::Cancelled), t + secs(31));
+    let mut b = opened(t);
+    let probe = b.allow(t + secs(30)).unwrap();
+    b.on_failure(probe, &err(ErrorClass::Cancelled), t + secs(31));
     assert_eq!(b.state(), BreakerState::HalfOpen);
-    assert_eq!(b.allow(t + secs(31)), Ok(()));
+    let probe = b.allow(t + secs(31)).unwrap();
+    assert!(probe.is_probe());
+    drop(probe);
+    let probe = b.allow(t + secs(32)).unwrap();
+    assert!(probe.is_probe());
+    b.on_success(probe);
+    assert_eq!(b.state(), BreakerState::Closed);
+}
+
+#[test]
+fn concurrent_allow_in_half_open_admits_exactly_one() {
+    let t = Instant::now();
+    let mut b = opened(t);
+    let results: Vec<_> = (0..10).map(|_| b.allow(t + secs(30))).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert!(results.iter().all(|r| match r {
+        Ok(p) => p.is_probe(),
+        Err(e) => e.class == ErrorClass::CircuitOpen,
+    }));
+}
+
+#[test]
+fn stale_requests_do_not_touch_half_open() {
+    // Заявки, начатые в `Closed` до открытия, завершаются уже в `HalfOpen`.
+    let t = Instant::now();
+    let mut b = breaker();
+    let stale: Vec<_> = (0..4).map(|_| b.allow(t).unwrap()).collect();
+    for _ in 0..5 {
+        fail(&mut b, ErrorClass::Server, t);
+    }
+    let probe = b.allow(t + secs(30)).unwrap();
+    let mut stale = stale.into_iter();
+
+    // Нейтральный исход старой заявки не освобождает пробу.
+    b.on_failure(
+        stale.next().unwrap(),
+        &err(ErrorClass::Cancelled),
+        t + secs(31),
+    );
+    assert_eq!(
+        b.allow(t + secs(31)).unwrap_err().class,
+        ErrorClass::CircuitOpen
+    );
+    // Отказ старой заявки не засчитывается как отказ пробы: пауза не удваивается.
+    b.on_failure(
+        stale.next().unwrap(),
+        &err(ErrorClass::Server),
+        t + secs(31),
+    );
+    assert_eq!(b.state(), BreakerState::HalfOpen);
+    // Успех старой заявки не закрывает предохранитель.
+    b.on_success(stale.next().unwrap());
+    assert_eq!(b.state(), BreakerState::HalfOpen);
+
+    // Решает только проба: её отказ — пауза 60 с.
+    b.on_failure(probe, &err(ErrorClass::Server), t + secs(32));
+    assert_eq!(
+        b.state(),
+        BreakerState::Open {
+            until: t + secs(92)
+        }
+    );
+    // Старая заявка и в `Open` ничего не меняет.
+    b.on_success(stale.next().unwrap());
+    assert!(matches!(b.state(), BreakerState::Open { .. }));
+}
+
+#[test]
+fn stale_failures_after_close_do_not_count() {
+    // Отказы заявок прошлого поколения после закрытия пробой не копят новую серию.
+    let t = Instant::now();
+    let mut b = breaker();
+    let stale: Vec<_> = (0..5).map(|_| b.allow(t).unwrap()).collect();
+    for _ in 0..5 {
+        fail(&mut b, ErrorClass::Server, t);
+    }
+    let probe = b.allow(t + secs(30)).unwrap();
+    b.on_success(probe);
+    for p in stale {
+        b.on_failure(p, &err(ErrorClass::Server), t + secs(31));
+    }
+    assert_eq!(b.state(), BreakerState::Closed);
 }
 
 #[test]
 fn rate_limited_does_not_trip_breaker() {
-    let mut b = CircuitBreaker::new(BreakerOptions::default());
+    let mut b = breaker();
     let t = Instant::now();
     for _ in 0..10 {
-        b.on_failure(&rate_limited(secs(1)), t);
+        let p = b.allow(t).unwrap();
+        b.on_failure(p, &rate_limited(secs(1)), t);
     }
     assert_eq!(b.state(), BreakerState::Closed);
-    assert_eq!(b.allow(t), Ok(()));
+    assert!(b.allow(t).is_ok());
 }
 
 #[test]
 fn auth_disables_until_reset() {
-    let mut b = CircuitBreaker::new(BreakerOptions::default());
+    let mut b = breaker();
     let t = Instant::now();
-    b.on_failure(&ModelError::new(ErrorClass::Auth, "ключ отвергнут"), t);
+    let p = b.allow(t).unwrap();
+    let late = b.allow(t).unwrap();
+    b.on_failure(p, &ModelError::new(ErrorClass::Auth, "ключ отвергнут"), t);
     assert!(
         matches!(b.state(), BreakerState::Disabled { ref reason } if reason.contains("ключ отвергнут")),
         "{:?}",
         b.state()
     );
     assert_eq!(b.allow(t + secs(3600)).unwrap_err().class, ErrorClass::Auth);
-    b.on_success();
+    b.on_success(late);
     assert!(matches!(b.state(), BreakerState::Disabled { .. }));
     b.reset();
     assert_eq!(b.state(), BreakerState::Closed);
-    assert_eq!(b.allow(t + secs(3600)), Ok(()));
+    assert!(b.allow(t + secs(3600)).is_ok());
+}
+
+#[test]
+fn auth_from_stale_request_still_disables() {
+    let t = Instant::now();
+    let mut b = breaker();
+    let stale = b.allow(t).unwrap();
+    for _ in 0..5 {
+        fail(&mut b, ErrorClass::Server, t);
+    }
+    b.on_failure(stale, &err(ErrorClass::Auth), t + secs(1));
+    assert!(matches!(b.state(), BreakerState::Disabled { .. }));
 }
 
 #[test]

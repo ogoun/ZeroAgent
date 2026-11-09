@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -151,57 +152,84 @@ pub enum BreakerState {
     Disabled { reason: String },
 }
 
+/// Разрешение предохранителя на одну заявку: исход заявки сообщается через него
+/// (`on_success`, `on_failure`). Помнит поколение предохранителя, в котором выдано:
+/// исходы заявок прошлых поколений (начатых до открытия или до закрытия) состояние не
+/// меняют. Разрешение пробы (`HalfOpen`) держит пробу занятой, пока живо: drop без
+/// исхода (отмена) её освобождает, следующая заявка получит новую пробу.
+#[derive(Debug)]
+#[must_use = "исход заявки сообщается через разрешение"]
+pub struct Permit {
+    generation: u64,
+    /// `Some` — разрешение пробы; проба занята, пока жив этот `Arc`.
+    probe: Option<Arc<()>>,
+}
+
+impl Permit {
+    /// Разрешение пробной заявки полуоткрытого предохранителя.
+    pub fn is_probe(&self) -> bool {
+        self.probe.is_some()
+    }
+}
+
 /// Предохранитель эндпоинта (MDL-016, D22).
 ///
-/// Считает запросы, а не попытки: Gateway вызывает `on_failure` после исчерпания
-/// повторов. На каждую заявку, пропущенную `allow`, Gateway обязан сообщить исход —
-/// `on_success` или `on_failure` (в том числе с классом вне предохранителя, например
-/// `Cancelled`), иначе пробная заявка полуоткрытого состояния не освобождается.
+/// Считает запросы, а не попытки: Gateway сообщает исход после исчерпания повторов.
+/// Поколение растёт при каждом открытии, закрытии пробой, выключении и сбросе.
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
+    endpoint: EndpointId,
     opts: BreakerOptions,
     state: BreakerState,
-    /// Отказы подряд в `Closed`.
+    generation: u64,
+    /// Отказы подряд в `Closed` текущего поколения.
     failures: u32,
     /// Пауза следующего открытия из `HalfOpen`; после успеха — `opts.cooldown`.
     cooldown: Duration,
-    /// Пробная заявка `HalfOpen` уже выдана.
-    probe_out: bool,
+    /// Выданная проба `HalfOpen`; занята, пока жив её `Permit`.
+    probe: Weak<()>,
 }
 
 impl CircuitBreaker {
-    pub fn new(opts: BreakerOptions) -> Self {
+    /// Предохранитель эндпоинта `endpoint` (id — для логов).
+    pub fn new(endpoint: EndpointId, opts: BreakerOptions) -> Self {
         Self {
+            endpoint,
             cooldown: opts.cooldown,
             opts,
             state: BreakerState::Closed,
+            generation: 0,
             failures: 0,
-            probe_out: false,
+            probe: Weak::new(),
         }
     }
 
     /// Можно ли отправить заявку в момент `now`. Открытый предохранитель — `CircuitOpen`
     /// с `retry_after = until − now`; по истечении паузы — переход в `HalfOpen` и одна
-    /// пробная заявка, остальные — `CircuitOpen` до её исхода. `Disabled` — `Auth`.
-    pub fn allow(&mut self, now: Instant) -> Result<(), ModelError> {
+    /// пробная заявка, остальные — `CircuitOpen` (`retry_after: None`), пока жив её
+    /// `Permit`. `Disabled` — `Auth`.
+    pub fn allow(&mut self, now: Instant) -> Result<Permit, ModelError> {
         match &self.state {
-            BreakerState::Closed => Ok(()),
+            BreakerState::Closed => Ok(Permit {
+                generation: self.generation,
+                probe: None,
+            }),
             BreakerState::Open { until } if now < *until => Err(ModelError {
                 retry_after: Some(*until - now),
                 ..ModelError::new(ErrorClass::CircuitOpen, "предохранитель эндпоинта открыт")
             }),
-            BreakerState::Open { .. } => {
-                self.state = BreakerState::HalfOpen;
-                self.probe_out = true;
-                Ok(())
-            }
-            BreakerState::HalfOpen if self.probe_out => Err(ModelError::new(
+            BreakerState::HalfOpen if self.probe.strong_count() > 0 => Err(ModelError::new(
                 ErrorClass::CircuitOpen,
                 "предохранитель эндпоинта: идёт пробная заявка",
             )),
-            BreakerState::HalfOpen => {
-                self.probe_out = true;
-                Ok(())
+            BreakerState::Open { .. } | BreakerState::HalfOpen => {
+                self.state = BreakerState::HalfOpen;
+                let token = Arc::new(());
+                self.probe = Arc::downgrade(&token);
+                Ok(Permit {
+                    generation: self.generation,
+                    probe: Some(token),
+                })
             }
             BreakerState::Disabled { reason } => Err(ModelError::new(
                 ErrorClass::Auth,
@@ -210,38 +238,47 @@ impl CircuitBreaker {
         }
     }
 
-    /// Запрос завершился успешно: предохранитель закрывается, пауза — базовая.
-    /// `Disabled` не снимается: это делает только `reset`.
-    pub fn on_success(&mut self) {
-        if matches!(self.state, BreakerState::Disabled { .. }) {
+    /// Заявка завершилась успешно. В `Closed` — серия отказов сбрасывается; успех
+    /// пробы закрывает предохранитель с базовой паузой. Успех заявки прошлого
+    /// поколения (например, поздний ответ заявки, начатой до открытия) состояние не
+    /// меняет; `Disabled` снимает только `reset`.
+    pub fn on_success(&mut self, permit: Permit) {
+        if permit.generation != self.generation {
             return;
         }
-        self.state = BreakerState::Closed;
-        self.failures = 0;
-        self.cooldown = self.opts.cooldown;
-        self.probe_out = false;
+        match self.state {
+            BreakerState::Closed => self.failures = 0,
+            BreakerState::HalfOpen if permit.is_probe() => {
+                self.close();
+                tracing::info!(endpoint = %self.endpoint, "предохранитель эндпоинта закрыт");
+            }
+            _ => {}
+        }
     }
 
-    /// Запрос завершился ошибкой `err`. `Auth` выключает эндпоинт (`Disabled`);
-    /// считаются только классы `counts_for_breaker()`, прочие (429, отмена, 400)
-    /// счёт не меняют, а в `HalfOpen` лишь освобождают пробу. Отказ пробы открывает
-    /// предохранитель с удвоенной паузой (до `max_cooldown`); отказы заявок, начатых до
-    /// открытия, паузу не продлевают.
-    pub fn on_failure(&mut self, err: &ModelError, now: Instant) {
+    /// Заявка завершилась ошибкой `err`. `Auth` выключает эндпоинт (`Disabled`) при
+    /// любом поколении: ключ (или TLS) отвергнут независимо от времени начала заявки.
+    /// Прочее учитывается только у заявки текущего поколения и только для классов
+    /// `counts_for_breaker()`; остальные (429, отмена, 400) счёт не меняют, у пробы —
+    /// лишь освобождают её (с drop разрешения). Отказ пробы открывает предохранитель
+    /// с удвоенной паузой (до `max_cooldown`).
+    pub fn on_failure(&mut self, permit: Permit, err: &ModelError, now: Instant) {
         if matches!(self.state, BreakerState::Disabled { .. }) {
             return;
         }
         if err.class == ErrorClass::Auth {
+            tracing::warn!(
+                endpoint = %self.endpoint,
+                reason = %err.message,
+                "эндпоинт выключен до сброса"
+            );
             self.state = BreakerState::Disabled {
                 reason: err.message.clone(),
             };
-            self.probe_out = false;
+            self.bump();
             return;
         }
-        if !err.class.counts_for_breaker() {
-            if self.state == BreakerState::HalfOpen {
-                self.probe_out = false;
-            }
+        if permit.generation != self.generation || !err.class.counts_for_breaker() {
             return;
         }
         match self.state {
@@ -251,7 +288,7 @@ impl CircuitBreaker {
                     self.open(now, self.opts.cooldown);
                 }
             }
-            BreakerState::HalfOpen => {
+            BreakerState::HalfOpen if permit.is_probe() => {
                 let next = self
                     .cooldown
                     .saturating_mul(2)
@@ -259,29 +296,39 @@ impl CircuitBreaker {
                     .max(self.opts.cooldown);
                 self.open(now, next);
             }
-            BreakerState::Open { .. } | BreakerState::Disabled { .. } => {}
+            _ => {}
         }
     }
 
     fn open(&mut self, now: Instant, cooldown: Duration) {
         self.cooldown = cooldown;
-        self.failures = 0;
-        self.probe_out = false;
         self.state = BreakerState::Open {
             until: now + cooldown,
         };
+        self.bump();
         tracing::warn!(
+            endpoint = %self.endpoint,
             cooldown_ms = cooldown.as_millis() as u64,
             "предохранитель эндпоинта открыт"
         );
     }
 
+    fn close(&mut self) {
+        self.state = BreakerState::Closed;
+        self.cooldown = self.opts.cooldown;
+        self.bump();
+    }
+
+    /// Новое поколение: разрешения прошлых больше не влияют на состояние.
+    fn bump(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.failures = 0;
+        self.probe = Weak::new();
+    }
+
     /// Сброс пользователем («повторить», D22): `Closed`, счёт и пауза — с начала.
     pub fn reset(&mut self) {
-        self.state = BreakerState::Closed;
-        self.failures = 0;
-        self.cooldown = self.opts.cooldown;
-        self.probe_out = false;
+        self.close();
     }
 
     pub fn state(&self) -> BreakerState {
@@ -290,12 +337,24 @@ impl CircuitBreaker {
 }
 
 /// Отпечаток запроса для [`ParseGuard`] и джиттера (D21, D44): BLAKE3 от id эндпоинта
-/// и канонического JSON запроса. Инструменты сортируются по имени — порядок
+/// и канонического JSON запроса. Инструменты сортируются по имени (затем по схеме) — порядок
 /// объявления не делает запрос другим; всё прочее (сообщения, сэмплирование,
 /// рассуждение, `tool_choice`) входит в отпечаток. Результат — hex.
 pub fn request_fingerprint(endpoint: &EndpointId, req: &ChatRequest) -> String {
-    let mut tools: Vec<&crate::prefix::ToolSchema> = req.tools.iter().collect();
-    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    // При одинаковых именах порядок задаёт канонический JSON схемы — полностью
+    // детерминированно.
+    let mut tools: Vec<(&crate::prefix::ToolSchema, String)> = req
+        .tools
+        .iter()
+        .map(|t| {
+            let key = serde_json::to_value(t)
+                .map(|v| canonical_json(&v))
+                .unwrap_or_default();
+            (t, key)
+        })
+        .collect();
+    tools.sort_by(|a, b| a.0.name.cmp(&b.0.name).then_with(|| a.1.cmp(&b.1)));
+    let tools: Vec<&crate::prefix::ToolSchema> = tools.into_iter().map(|(t, _)| t).collect();
     let mut h = blake3::Hasher::new();
     h.update(endpoint.0.as_bytes());
     h.update(&[0]);
@@ -374,6 +433,10 @@ where
     let mut retries_done: u32 = 0;
     loop {
         let attempt = retries_done.saturating_add(1);
+        // Потребитель ушёл — попытка не открывается (`open` не вызывается).
+        if tx.is_closed() {
+            return Err(cancelled());
+        }
         let mut forwarded = false;
         let outcome = tokio::select! {
             biased;
@@ -403,7 +466,7 @@ where
                 if forwarded {
                     let restart = StreamEvent::Restart {
                         attempt: attempt.saturating_add(1),
-                        reason: err.to_string(),
+                        reason: short_reason(&err),
                     };
                     if tx.send(Ok(restart)).await.is_err() {
                         return Err(cancelled());
@@ -418,6 +481,21 @@ where
             }
         }
     }
+}
+
+/// Предел текста причины `Restart`: тело ответа 5xx в сообщении ошибки бывает до 2 КиБ,
+/// потребителю достаточно класса и начала текста.
+const RESTART_REASON_CHARS: usize = 256;
+
+/// Причина повтора для `Restart`: `"{класс:?}: {сообщение}"`, не длиннее 256 символов.
+fn short_reason(err: &ModelError) -> String {
+    let full = err.to_string();
+    if full.chars().count() <= RESTART_REASON_CHARS {
+        return full;
+    }
+    let mut s: String = full.chars().take(RESTART_REASON_CHARS - 1).collect();
+    s.push('…');
+    s
 }
 
 /// Неудача одной попытки.

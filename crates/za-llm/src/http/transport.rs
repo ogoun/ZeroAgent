@@ -398,32 +398,52 @@ fn mark_sensitive(headers: &mut HeaderMap, secrets: &[&Secret]) {
 
 /// Ошибка reqwest → класс. `in_body` — ошибка при чтении тела: обрыв стрима.
 fn from_reqwest(e: &reqwest::Error, in_body: bool, secrets: &[&Secret]) -> ModelError {
-    // Ошибка TLS при установке соединения (сертификат, рукопожатие, `https://` на
-    // порт без TLS) ожиданием не лечится: это ошибка конфигурации или безопасности.
-    // Класс `Auth` (проверка подлинности сервера не пройдена): без повторов, зонд
-    // даёт `Inactive`, предохранитель выключает эндпоинт до сброса пользователем
-    // вместо циклов «открыт — проба» (D22). Ошибка TLS посреди тела после успешного
-    // рукопожатия — обрыв (`StreamCut`), как прочие сбои чтения.
-    if !in_body && is_tls_error(e) {
-        return ModelError::new(
-            ErrorClass::Auth,
-            format!("TLS: {}", redact(&error_chain(e), secrets)),
-        );
+    let class = reqwest_class(
+        e.is_connect(),
+        e.is_timeout(),
+        e.is_builder(),
+        in_body,
+        is_tls_error(e),
+    );
+    let text = redact(&error_chain(e), secrets);
+    if class == ErrorClass::Auth {
+        return ModelError::new(class, format!("TLS: {text}"));
     }
-    // Сбой соединения, в том числе таймаут connect (на Windows закрытый порт
-    // отвечает только по таймауту), — `Transport`: сервер недоступен.
-    let class = if e.is_connect() {
+    ModelError::new(class, text)
+}
+
+/// Класс ошибки reqwest по её признакам.
+///
+/// Ошибка TLS при установке соединения (`is_connect`: сертификат, рукопожатие,
+/// `https://` на порт без TLS — рукопожатие идёт в коннекторе) ожиданием не лечится:
+/// это ошибка конфигурации или безопасности. Класс `Auth` (подлинность сервера не
+/// подтверждена): без повторов, зонд даёт `Inactive`, предохранитель выключает
+/// эндпоинт до сброса пользователем вместо циклов «открыт — проба» (D22). Ошибка TLS
+/// на уже установленном соединении (alert балансировщика, сбой расшифровки, в том
+/// числе на соединении из пула) — разовый сбой: `Transport` при отправке, `StreamCut`
+/// при чтении тела, оба повторяются.
+/// Прочий сбой соединения, в том числе таймаут connect (на Windows закрытый порт
+/// отвечает только по таймауту), — `Transport`: сервер недоступен.
+fn reqwest_class(
+    connect: bool,
+    timeout: bool,
+    builder: bool,
+    in_body: bool,
+    tls: bool,
+) -> ErrorClass {
+    if connect && tls {
+        ErrorClass::Auth
+    } else if connect {
         ErrorClass::Transport
-    } else if e.is_timeout() {
+    } else if timeout {
         ErrorClass::Timeout
-    } else if e.is_builder() {
+    } else if builder {
         ErrorClass::BadRequest
     } else if in_body {
         ErrorClass::StreamCut
     } else {
         ErrorClass::Transport
-    };
-    ModelError::new(class, redact(&error_chain(e), secrets))
+    }
 }
 
 /// В цепочке причин есть `rustls::Error`. tokio-rustls отдаёт его внутри `io::Error`,
@@ -474,6 +494,38 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&*self.0)
         }
+    }
+
+    #[test]
+    fn tls_is_auth_only_while_connecting() {
+        // (connect, timeout, builder, in_body, tls)
+        assert_eq!(
+            reqwest_class(true, false, false, false, true),
+            ErrorClass::Auth
+        );
+        // TLS на установленном соединении: при отправке и при чтении тела — повторяемо.
+        let send = reqwest_class(false, false, false, false, true);
+        let body = reqwest_class(false, false, false, true, true);
+        assert_eq!(send, ErrorClass::Transport);
+        assert_eq!(body, ErrorClass::StreamCut);
+        assert!(send.retryable() && body.retryable());
+        // Без TLS — прежние классы.
+        assert_eq!(
+            reqwest_class(true, false, false, false, false),
+            ErrorClass::Transport
+        );
+        assert_eq!(
+            reqwest_class(false, true, false, true, false),
+            ErrorClass::Timeout
+        );
+        assert_eq!(
+            reqwest_class(false, false, true, false, false),
+            ErrorClass::BadRequest
+        );
+        assert_eq!(
+            reqwest_class(false, false, false, true, false),
+            ErrorClass::StreamCut
+        );
     }
 
     #[test]
