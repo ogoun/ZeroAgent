@@ -106,13 +106,42 @@ fn opts_long_idle() -> GatewayOptions {
     o
 }
 
-/// Хранилище профилей теста. В пути — id процесса: одновременные прогоны одного
+/// Каталоги прогонов старше этого удаляются первым `store()` следующего прогона.
+/// Прогон бинарника длится минуты, поэтому каталог идущего соседнего прогона не
+/// трогается.
+const STALE_RUN: Duration = Duration::from_secs(30 * 60);
+
+/// Каталог хранилищ этого прогона: `gateway/<pid>`. Одновременные прогоны одного
 /// тестового бинарника (два `cargo test` в одном `target`) не стирают друг другу
-/// каталоги.
+/// каталоги; каталоги прошлых прогонов (старше [`STALE_RUN`]) удаляются один раз за
+/// прогон.
+fn run_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway");
+        let pid = std::process::id().to_string();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for e in entries.flatten() {
+                let stale = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > STALE_RUN);
+                if stale && e.file_name() != pid.as_str() {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+        let dir = root.join(pid);
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    })
+}
+
+/// Хранилище профилей теста в каталоге прогона.
 fn store(name: &str) -> ProfileStore {
-    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("gateway")
-        .join(format!("{name}-{}", std::process::id()));
+    let d = run_dir().join(name);
     let _ = std::fs::remove_dir_all(&d);
     ProfileStore::open(&d).unwrap()
 }
@@ -1919,4 +1948,56 @@ async fn finish_run_through_trait() {
     port.finish_run(run);
     g.stream(call).await.unwrap().collect().await.unwrap();
     assert_eq!(srv.requests(CHAT).len(), 1);
+}
+
+#[tokio::test]
+async fn max_wait_fires_during_probe() {
+    // Ревью задачи 6, Minor 1: очередь снимает приостановленную заявку по `max_wait`, пока
+    // идёт зонд, — отказ `wait_timeout` приходит сразу, а не после зонда.
+    let srv = llama_server(
+        vec![Reply::Delayed(
+            ms(700),
+            Box::new(props("probe/llama_props.json")),
+        )],
+        vec![llama_text()],
+    )
+    .await;
+    let g = Gateway::start(
+        llama_cfg(&srv.base_url, json!({})),
+        secrets(&[]),
+        None,
+        store("max_wait_probe"),
+        opts(),
+    )
+    .await
+    .unwrap();
+    let mut c = call_on("local", RunId::new(), "ждёт");
+    c.meta.max_wait = Some(ms(100));
+    let err = call_error(&g, c).await;
+    assert_eq!(err.class, ErrorClass::Queue, "{err:?}");
+    assert_eq!(err.message, "wait_timeout");
+    assert_eq!(
+        view_of(&g, "local").state,
+        "probing",
+        "отказ пришёл только после зонда"
+    );
+    assert_eq!(srv.requests(CHAT).len(), 0);
+}
+
+#[tokio::test]
+async fn zero_max_wait_gives_only_error() {
+    // Ревью задачи 6, Minor 4: заявка, снятая очередью уже при постановке, не получает
+    // `Queued` со статусом `Failed` — в стриме только итоговая ошибка.
+    let srv = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let g = start(llama_cfg(&srv.base_url, json!({})), "zero_max_wait", opts()).await;
+    let mut c = call_on("local", RunId::new(), "сразу");
+    c.meta.max_wait = Some(Duration::ZERO);
+    let evs = drain(g.stream(c).await.unwrap()).await;
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    let err = evs[0].as_ref().unwrap_err();
+    assert_eq!(
+        (err.class, err.message.as_str()),
+        (ErrorClass::Queue, "wait_timeout")
+    );
+    assert_eq!(srv.requests(CHAT).len(), 0);
 }

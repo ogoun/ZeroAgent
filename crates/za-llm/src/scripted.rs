@@ -136,7 +136,11 @@ impl ScriptedModel {
 
 /// Стрим сценария. Ёмкость канала вмещает весь сценарий: отправка не ждёт получателя,
 /// а получатель жив (он в стриме), поэтому `try_send` не падает.
-fn open_script(script: Script, open: &Arc<AtomicUsize>) -> ModelStream {
+fn open_script(
+    script: Script,
+    open: &Arc<AtomicUsize>,
+    start: tokio::time::Instant,
+) -> ModelStream {
     let Script { events, mode } = script;
     let (tx, rx) = mpsc::channel(events.len().max(1));
     let keep: Box<dyn Send + Sync> = match mode {
@@ -150,9 +154,10 @@ fn open_script(script: Script, open: &Arc<AtomicUsize>) -> ModelStream {
             }
         }
         Mode::Paced(gap) => {
-            // Моменты отсчитываются от вызова `stream`, а не от первого опроса задачи:
-            // на паузе времени они не зависят от планировщика.
-            let mut at = tokio::time::Instant::now();
+            // Моменты отсчитываются от синхронного вызова `stream` (`start`), а не от
+            // первого опроса возвращённого им будущего или задачи: на паузе времени они не
+            // зависят от планировщика.
+            let mut at = start;
             let mut rest = events.into_iter();
             if let Some(first) = rest.next() {
                 let _ = tx.try_send(first);
@@ -176,10 +181,11 @@ impl ModelPort for ScriptedModel {
     fn stream(&self, call: ModelCall) -> BoxFuture<'_, Result<ModelStream, ModelError>> {
         lock(&self.calls).push(call);
         let script = lock(&self.scripts).pop_front();
+        let start = tokio::time::Instant::now();
         Box::pin(async move {
             let script =
                 script.ok_or_else(|| ModelError::new(ErrorClass::Inactive, "сценарий исчерпан"))?;
-            Ok(open_script(script, &self.open))
+            Ok(open_script(script, &self.open, start))
         })
     }
 

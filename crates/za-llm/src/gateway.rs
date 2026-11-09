@@ -21,8 +21,8 @@
 //!    не берётся); заявка встаёт в очередь группы с пределом `RequestMeta::max_wait`
 //!    (D12, M1; `None` — без предела).
 //! 2. Стрим возвращается сразу; его guard — [`AbortOnDrop`] фоновой задачи (D2). Первое
-//!    событие — всегда `Queued`. Пока эндпоинт не готов, его заявки стоят в очереди
-//!    приостановленными ([`ModelQueue::hold`] по id эндпоинта): с позицией и старением
+//!    событие — `Queued` (заявке, снятой очередью уже при постановке, — только ошибка).
+//!    Пока эндпоинт не готов, его заявки стоят в очереди приостановленными ([`ModelQueue::hold`] по id эндпоинта): с позицией и старением
 //!    D9, но без места (место общей группы не простаивает). Успешный зонд снимает
 //!    приостановку синхронно, в шаге установки `Ready`: места раздаются одним
 //!    пересчётом в порядке D9. Эндпоинт `Unreachable` — повторный зонд (D40): один на
@@ -1298,20 +1298,35 @@ impl CallTask {
                     ticket.insert(t)
                 }
             };
-            // Первое событие — всегда `Queued` с настоящей позицией заявки.
+            // Первое событие — `Queued` с настоящей позицией заявки. Заявка, снятая
+            // очередью уже при постановке (`max_wait` ноль или исчерпан, бюджет), его не
+            // получает: потребителю — только итоговая ошибка.
             let mut status = t.status();
             let st = status.borrow_and_update().clone();
             if announce {
-                send(&self.tx, Ok(StreamEvent::Queued(st))).await?;
+                if !matches!(st.state, WaitState::Failed { .. }) {
+                    send(&self.tx, Ok(StreamEvent::Queued(st))).await?;
+                }
                 announce = false;
             }
             if !ep.ready_now() {
                 // Заявка приостановлена в очереди (I6): ждёт зонда, сохраняя позицию и
-                // старение, место не занимает (I5).
-                self.inner
-                    .ensure_ready(ep, self.seen)
-                    .await
-                    .map_err(Failure::unsent)?;
+                // старение, место не занимает (I5). Очередь может снять её и во время
+                // зонда (`max_wait`, бюджет) — тогда её отказ уходит сразу, не после зонда.
+                tokio::select! {
+                    biased;
+                    () = queue_failed(t.status()) => {
+                        return Err(Failure::unsent(match t.wait_granted().await {
+                            Err(e) => queue_error(&e),
+                            // Не бывает: снятая заявка места не получает.
+                            Ok(_) => ModelError::new(
+                                ErrorClass::Internal,
+                                "очередь выдала место снятой заявке",
+                            ),
+                        }));
+                    }
+                    r = self.inner.ensure_ready(ep, self.seen) => r.map_err(Failure::unsent)?,
+                }
             }
             match wait_place(t, status, &self.tx, ep).await? {
                 Waited::NotReady => continue,
@@ -1500,6 +1515,21 @@ async fn wait_place(
                     send(tx, Ok(StreamEvent::Queued(st))).await?;
                 }
             }
+        }
+    }
+}
+
+/// Очередь сняла заявку (`WaitState::Failed`: `max_wait`, бюджет, отмена). Закрытый
+/// канал статуса — никогда. `Ref` статуса не держится через `await` (см.
+/// [`Ticket::status`]).
+async fn queue_failed(mut rx: watch::Receiver<QueueStatus>) {
+    loop {
+        let failed = matches!(rx.borrow_and_update().state, WaitState::Failed { .. });
+        if failed {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }
