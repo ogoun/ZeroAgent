@@ -2,6 +2,13 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-B1, задача 3: граф и прерывания
+
+- **Граф (`za_core::graph`, D2).** `Graph<S, E>` из узлов `Node<S, E>` (`run(&mut S) -> BoxFuture<Result<Transition, E>>`, `BoxFuture` — реэкспорт `za_llm::BoxFuture`), рёбер и входа. Переходы только `Goto`, `Suspend(Interrupt)`, `Done`; `run_from(at, st)` идёт до `Done` (`Exit::Done`) или `Suspend` (`Exit::Suspended`). `Goto` без объявленного ребра — `GraphError::UndeclaredEdge`, неизвестный узел (в том числе цель объявленного ребра) — `UnknownNode`, ошибка узла — `Node(e)`. Доменных выходов в `Exit` нет (D31): потребитель кладёт их в своё состояние и возвращает `Done`. Узел с повторным id заменяет прежний. Параллельные ветви `Fan` отложены до R2 (субагенты): слияние состояний ветвей ни одному потребителю R1 не нужно, параллельные чтения внутри узла делаются слотами эффектов (D3).
+- **`graph_hash`** — BLAKE3 hex от `za-graph-v1\0`, входа, отсортированных id узлов и рёбер; каждая строка с длиной (u64 LE), границы однозначны. Не зависит от порядка `node()`/`edge()`; нужен для CORE-008 в R2.
+- **Прерывания (`za_core::interrupt`, CORE-007, D16).** `InterruptKind::{Approval, Input, External, Timer, UnknownOutcome}` (`kind` в журнале: `approval`, `input`, `external`, `timer`, `unknown_outcome`); `Interrupt::for_effect` даёт id `appr-`, `input-`, `ext-`, `timer-`, `unk-` + ключ эффекта. `interrupt::open` — идемпотентное открытие через `ProjectStore::open_interrupt`; `interrupt::state` — `None`, `Open` или `Resolved(response)`; решённое без ответа или с неизвестным статусом — `StoreError::Corrupt`. `pause_reason_for`: `Approval` → `needs_approval`, `Input` → `needs_input`, `UnknownOutcome` → `needs_decision`, `External`/`Timer` → `waiting`.
+- **`recover`** открывает `unk-…` через `Interrupt::for_effect` и `interrupt::open`; id и payload прежние, `UNKNOWN_OUTCOME` = `InterruptKind::UnknownOutcome.as_str()`.
+
 ## 2026-11-09. R1-B1, задача 2: слоты эффектов, продолжение с шага, решение неизвестного исхода
 
 - **Слоты эффектов (D3).** `RunCtx::reserve` выдаёт `EffectSlot` с ключом `{run}:{step}:{effect_seq}` в порядке вызовов; слот владеет клоном `ProjectStore`, его future — `Send + 'static` при `Send + 'static` замыкании, поэтому слоты одного шага идут в `JoinSet` и при реплее получают те же ключи, в каком бы порядке ни завершились. Тело протокола R0 перенесено из `RunCtx` в `EffectSlot::run_traced`; `run` — его результат без источника; `RunCtx::effect` = `reserve` + `run` + `observe`. Слот сам контекст не отравляет: `observe` отравляет по правилам R0 (`Store`, `Unknown`, `ReplayMismatch`), уже выданные слоты отравление не останавливает. Поведение `effect` для R0 не изменилось (демо и приёмка R0 зелёные).

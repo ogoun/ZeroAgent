@@ -8,14 +8,22 @@
 //! резервировать заранее ([`RunCtx::reserve`], [`EffectSlot`]) и выполнять слоты
 //! одновременно; [`RunCtx::resume_at`] продолжает нумерацию с шага снимка.
 //!
+//! [`Graph`] выполняет узлы run с переходами `Goto`, `Suspend`, `Done` (D2);
+//! [`Interrupt`] с id из ключа эффекта (CORE-007, D16) останавливает граф до
+//! решения, модуль [`interrupt`] открывает прерывания и читает их состояние.
+//!
 //! [`run_demo`] — детерминированный демонстрационный run для сквозной проверки
 //! журнала и протокола эффектов, [`replay_hash`] — хэш его значимых событий.
 
 mod demo;
+pub mod graph;
+pub mod interrupt;
 mod recovery;
 mod runtime;
 
 pub use demo::{CrashPoint, DemoConfig, DemoOutcome, replay_hash, run_demo};
+pub use graph::{BoxFuture, Exit, Graph, GraphError, Node, NodeId, Transition};
+pub use interrupt::{Interrupt, InterruptKind, InterruptState, pause_reason_for};
 pub use recovery::{
     NOT_DONE_MESSAGE, Recovery, UNKNOWN_OUTCOME, UnknownDecision, recover, resolve_unknown,
 };

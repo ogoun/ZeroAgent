@@ -11,10 +11,11 @@ use serde_json::{Value, json};
 use za_protocol::{EffectClass, EffectKey, RunId};
 use za_store::{EffectRow, ProjectStore, StoreError};
 
+use crate::interrupt::{self, Interrupt, InterruptKind};
 use crate::runtime::{error_envelope, ok_envelope};
 
 /// Вид прерывания для намерения без квитанции у `NonIdempotent`-эффекта.
-pub const UNKNOWN_OUTCOME: &str = "unknown_outcome";
+pub const UNKNOWN_OUTCOME: &str = InterruptKind::UnknownOutcome.as_str();
 
 /// Итог восстановления run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,12 +54,10 @@ pub(crate) async fn open_unknown(
     run: RunId,
     row: &EffectRow,
 ) -> Result<String, StoreError> {
-    let id = format!("unk-{}", row.key.0);
     let payload = json!({ "effect_key": row.key.0, "intent_seq": row.intent_seq.0 });
-    store
-        .open_interrupt(&id, run, UNKNOWN_OUTCOME, payload)
-        .await?;
-    Ok(id)
+    let i = Interrupt::for_effect(InterruptKind::UnknownOutcome, &row.key, payload);
+    interrupt::open(store, run, &i).await?;
+    Ok(i.id)
 }
 
 /// Решение человека по прерыванию неизвестного исхода (D16).
