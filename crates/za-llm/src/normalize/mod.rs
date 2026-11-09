@@ -5,9 +5,12 @@
 //! 1. Нативные `Part::ToolCall`.
 //! 2. Всегда (D39) — скан `Text`, затем `Reasoning` по текстовым форматам; найденная
 //!    разметка вырезается из `text` и `reasoning`. Извлечённый вызов с тем же именем и
-//!    теми же каноническими аргументами, что у нативного, отбрасывается как дубль.
+//!    теми же каноническими аргументами, что у нативного, отбрасывается как дубль;
+//!    вызов из рассуждения, совпавший с принятым из текста, — тоже. Блоки кода
+//!    Markdown не сканируются; извлекается не больше [`MAX_EXTRACTED_CALLS`] вызовов.
 //! 3. Аргументы к канону: строка разбирается как JSON, пары — объект строк.
-//! 4. Имя (D28): единственный кандидат с расстоянием ≤ 2 исправляет имя.
+//! 4. Имя (D28 с порогом по длине): единственный кандидат с расстоянием
+//!    ≤ min(2, длина / 4) при длине имени ≥ 5 исправляет имя.
 //! 5. Схема и приведение типов (D5, [`validate_and_coerce`]).
 //! 6. Проверки политики — R1-C.
 
@@ -80,7 +83,15 @@ pub enum CallRejection {
     },
     /// Разметка или аргументы не разбираются; `raw` — исходный текст.
     Unparseable { raw: String },
+    /// Извлечено больше [`MAX_EXTRACTED_CALLS`] вызовов из текста и рассуждения:
+    /// разобраны первые `limit`, `skipped` отброшено (зацикленная модель). Добавлено
+    /// в раунде исправлений 1 (решение контроллера).
+    TooManyCalls { limit: u32, skipped: u32 },
 }
+
+/// Предел извлечённых из текста и рассуждения вызовов на сообщение; сверх него —
+/// одно отклонение [`CallRejection::TooManyCalls`].
+pub const MAX_EXTRACTED_CALLS: u32 = 64;
 
 /// Принятый вызов.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,7 +111,8 @@ pub struct NormalizeOutcome {
     /// Принятые вызовы: нативные, затем из текста, затем из рассуждения.
     pub calls: Vec<NormalizedCall>,
     pub rejected: Vec<CallRejection>,
-    /// Извлечённые из текста дубли нативных вызовов (D39).
+    /// Извлечённые из текста дубли нативных вызовов (D39), а также вызовы из
+    /// рассуждения, совпавшие с принятыми из текста.
     pub dropped_duplicates: u32,
 }
 
@@ -126,7 +138,7 @@ pub fn extracted_mutation_blocked(source: CallSource, class: EffectClass) -> boo
 }
 
 /// Нормализует сообщение модели. `formats` — текстовые форматы для скана; пустой
-/// срез — [`all_formats`].
+/// срез — [`all_formats`] (решение контроллера: скан по D39 выключить нельзя).
 pub fn normalize(msg: &Message, tools: &[ToolSchema], formats: &[TextFormat]) -> NormalizeOutcome {
     let formats = if formats.is_empty() {
         all_formats()
@@ -140,8 +152,8 @@ pub fn normalize(msg: &Message, tools: &[ToolSchema], formats: &[TextFormat]) ->
     let mut natives = Vec::new();
     for part in &msg.parts {
         match part {
-            Part::Text(t) => text.push_str(t),
-            Part::Reasoning { text: r, .. } => reasoning.push_str(r),
+            Part::Text(t) => join_part(&mut text, t),
+            Part::Reasoning { text: r, .. } => join_part(&mut reasoning, r),
             Part::ToolCall(c) => natives.push(c),
             Part::ToolResult { .. } => {}
         }
@@ -197,14 +209,29 @@ pub fn normalize(msg: &Message, tools: &[ToolSchema], formats: &[TextFormat]) ->
     out.text = text;
     out.reasoning = reasoning;
 
+    // Ключи вызовов, принятых из текста: тот же вызов в рассуждении — дубль (I3).
+    let mut content_keys: HashSet<String> = HashSet::new();
+    let mut processed = 0u32;
+    let mut skipped = 0u32;
     for (source, found) in [
         (CallSource::Content, from_text),
         (CallSource::Reasoning, from_reasoning),
     ] {
         for (format, raw) in found {
-            if let RawArgs::Json(v) = &raw.args
-                && native_keys.contains(&call_key(&raw.name, v))
-            {
+            if processed >= MAX_EXTRACTED_CALLS {
+                skipped += 1;
+                continue;
+            }
+            processed += 1;
+            let is_duplicate = |key: &str| {
+                native_keys.contains(key)
+                    || (source == CallSource::Reasoning && content_keys.contains(key))
+            };
+            let raw_key = match &raw.args {
+                RawArgs::Json(v) => Some(call_key(&raw.name, v)),
+                _ => None,
+            };
+            if raw_key.as_deref().is_some_and(is_duplicate) {
                 out.dropped_duplicates += 1;
                 continue;
             }
@@ -222,9 +249,14 @@ pub fn normalize(msg: &Message, tools: &[ToolSchema], formats: &[TextFormat]) ->
             };
             match finish(&raw.name, args, repairs, tools, &known) {
                 Ok((name, args, repairs)) => {
-                    if native_keys.contains(&call_key(&name, &args)) {
+                    let key = call_key(&name, &args);
+                    if is_duplicate(&key) {
                         out.dropped_duplicates += 1;
                         continue;
+                    }
+                    if source == CallSource::Content {
+                        content_keys.insert(key);
+                        content_keys.extend(raw_key);
                     }
                     let id = ids.derive(&name, &args);
                     out.calls.push(NormalizedCall {
@@ -242,7 +274,29 @@ pub fn normalize(msg: &Message, tools: &[ToolSchema], formats: &[TextFormat]) ->
             }
         }
     }
+    if skipped > 0 {
+        reject(
+            &mut out,
+            CallRejection::TooManyCalls {
+                limit: MAX_EXTRACTED_CALLS,
+                skipped,
+            },
+        );
+    }
     out
+}
+
+/// Склейка частей одного вида: между непустыми частями без пробела на стыке —
+/// перевод строки, чтобы слова соседних блоков не слиплись.
+fn join_part(acc: &mut String, part: &str) {
+    if !acc.is_empty()
+        && !part.is_empty()
+        && !acc.ends_with(char::is_whitespace)
+        && !part.starts_with(char::is_whitespace)
+    {
+        acc.push('\n');
+    }
+    acc.push_str(part);
 }
 
 fn reject(out: &mut NormalizeOutcome, rejection: CallRejection) {

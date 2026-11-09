@@ -1,10 +1,19 @@
 //! Текстовые форматы вызовов инструментов (MDL-005, шаг 2).
 //!
 //! Каждый формат — функция `text → Extraction`: найденные вызовы и текст без их
-//! разметки. Разбор без regex: поиск подстрок и ручной сканер. Битая или обрезанная
-//! разметка не роняет разбор: она вырезается из текста и возвращается вызовом с
-//! пустым `name` и `RawArgs::Text` с исходной разметкой — конвейер превращает его
-//! в `CallRejection::Unparseable`.
+//! разметки. Разбор без regex: поиск подстрок и ручной сканер.
+//!
+//! Общие правила форматов (ревью задачи 7, решения контроллера):
+//! - **Линейность.** Каждый маркер ищется от текущей позиции не больше одного раза
+//!   на вхождение ([`Finder`]): повтор маркера на мегабайты (зацикленная модель)
+//!   разбирается за O(n).
+//! - **Блоки кода Markdown** (```` ``` ```` в начале строки, незакрытый — до конца
+//!   текста) не сканируются ([`CodeFences`]): пример вызова в ответе не исполняется.
+//! - **Признак вызова.** Маркер без валидного продолжения — обычный текст: не
+//!   вырезается и не даёт отклонения. Битая или обрезанная разметка, начало которой
+//!   похоже на настоящий вызов, вырезается и возвращается вызовом с пустым `name` и
+//!   `RawArgs::Text` с исходной разметкой — конвейер превращает его в
+//!   `CallRejection::Unparseable`.
 //!
 //! P0 (задача 7): Hermes, Qwen XML, Harmony. P1 (`Dsml`, `Gemma4`,
 //! `MistralToolCalls`, `Pythonic`, `Llama3Json`) — задача 8; до неё `extract`
@@ -68,6 +77,10 @@ impl Extraction {
 
 /// accept_name учитывается только форматами без маркеров (Pythonic, Llama3Json): при false
 /// вызов не извлекается, а remaining == text без изменений (D28, D39). Прочие форматы его игнорируют.
+///
+/// Уточнение раунда исправлений 1 (I2): Qwen XML тоже требует принятого имени —
+/// `<function=ИМЯ>` с неизвестным и неисправимым именем считается текстом; Harmony —
+/// для обрезанного заголовка без `<|message|>`.
 pub(crate) fn extract(
     format: TextFormat,
     text: &str,
@@ -75,8 +88,8 @@ pub(crate) fn extract(
 ) -> Extraction {
     match format {
         TextFormat::Hermes => hermes::extract(text),
-        TextFormat::QwenXml => qwen_xml::extract(text),
-        TextFormat::Harmony => harmony::extract(text),
+        TextFormat::QwenXml => qwen_xml::extract(text, accept_name),
+        TextFormat::Harmony => harmony::extract(text, accept_name),
         // P1 — задача 8.
         TextFormat::Dsml
         | TextFormat::Gemma4
@@ -149,6 +162,129 @@ fn separator(gap: &[&str]) -> &'static str {
 /// Позиция `needle` в `text` начиная с `from`.
 pub(crate) fn find_from(text: &str, from: usize, needle: &str) -> Option<usize> {
     text.get(from..)?.find(needle).map(|i| from + i)
+}
+
+/// Поиск маркера с запоминанием: пока запрос не ушёл дальше найденного вхождения,
+/// поиск не повторяется; «не найдено» запоминается до конца текста. При
+/// неубывающих `from` суммарная работа — один проход по тексту.
+pub(crate) struct Finder<'a> {
+    text: &'a str,
+    needle: &'static str,
+    /// (откуда искали, что нашли).
+    cached: Option<(usize, Option<usize>)>,
+}
+
+impl<'a> Finder<'a> {
+    pub(crate) fn new(text: &'a str, needle: &'static str) -> Self {
+        Self {
+            text,
+            needle,
+            cached: None,
+        }
+    }
+
+    pub(crate) fn needle(&self) -> &'static str {
+        self.needle
+    }
+
+    /// Первое вхождение не раньше `from`.
+    pub(crate) fn find(&mut self, from: usize) -> Option<usize> {
+        if let Some((searched, found)) = self.cached
+            && searched <= from
+        {
+            match found {
+                None => return None,
+                Some(p) if p >= from => return Some(p),
+                Some(_) => {}
+            }
+        }
+        let found = find_from(self.text, from, self.needle);
+        self.cached = Some((from, found));
+        found
+    }
+}
+
+/// Ближайший из маркеров не раньше `from`: (позиция, маркер).
+pub(crate) fn earliest(finders: &mut [Finder<'_>], from: usize) -> Option<(usize, &'static str)> {
+    finders
+        .iter_mut()
+        .filter_map(|f| f.find(from).map(|p| (p, f.needle())))
+        .min_by_key(|(p, _)| *p)
+}
+
+/// Блоки кода Markdown: ```` ``` ```` в начале строки (до трёх пробелов отступа)
+/// открывает блок, следующий такой же закрывает; незакрытый блок тянется до конца
+/// текста. Запросы — с неубывающими позициями, работа линейна.
+pub(crate) struct CodeFences<'a> {
+    text: &'a str,
+    fence: Finder<'a>,
+    /// Дальше этой позиции блоки ещё не разбирались.
+    pos: usize,
+    /// Последний найденный блок [начало, конец).
+    block: Option<(usize, usize)>,
+}
+
+impl<'a> CodeFences<'a> {
+    pub(crate) fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            fence: Finder::new(text, "```"),
+            pos: 0,
+            block: None,
+        }
+    }
+
+    /// Конец блока кода, внутри которого стоит `at`; `None` — `at` вне кода.
+    /// `cur` — текущая позиция разбора: забор, попавший внутрь уже вырезанного
+    /// вызова, блоком не считается.
+    pub(crate) fn code_end(&mut self, cur: usize, at: usize) -> Option<usize> {
+        loop {
+            if let Some((start, end)) = self.block
+                && start >= cur
+            {
+                if at < start {
+                    return None;
+                }
+                if at < end {
+                    return Some(end);
+                }
+            }
+            let Some(open) = self.line_fence(self.pos.max(cur)) else {
+                self.block = None;
+                self.pos = self.text.len();
+                return None;
+            };
+            let end = self.block_end(open);
+            self.block = Some((open, end));
+            self.pos = end;
+        }
+    }
+
+    /// Конец блока, открытого забором `open`: после закрывающего забора или конец текста.
+    fn block_end(&mut self, open: usize) -> usize {
+        match self.line_fence(open + 3) {
+            Some(close) => close + 3,
+            None => self.text.len(),
+        }
+    }
+
+    /// Ближайший забор в начале строки не раньше `from`.
+    fn line_fence(&mut self, from: usize) -> Option<usize> {
+        let mut from = from;
+        loop {
+            let p = self.fence.find(from)?;
+            // Отступ — не больше трёх пробелов от начала строки (CommonMark).
+            let bytes = self.text.as_bytes();
+            let mut i = p;
+            while i > 0 && bytes[i - 1] == b' ' && p - i < 4 {
+                i -= 1;
+            }
+            if p - i <= 3 && (i == 0 || bytes[i - 1] == b'\n') {
+                return Some(p);
+            }
+            from = p + 3;
+        }
+    }
 }
 
 #[cfg(test)]

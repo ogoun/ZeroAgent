@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 /// Наибольшее расстояние, при котором имя исправляется (D28).
 const MAX_FIX: usize = 2;
+/// Короче этого имя не исправляется (решение контроллера, I4: `get` → `set`).
+const MIN_FIX_LEN: usize = 5;
 /// Сколько ближайших имён возвращается при отказе (D28).
 const NEAREST: usize = 3;
 /// Имя модели длиннее этого обрезается для расчёта расстояния (защита от O(n·m)
@@ -65,19 +67,26 @@ pub fn damerau_levenshtein(a: &str, b: &str) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NameMatch {
     Exact,
-    /// Единственный кандидат с расстоянием ≤ 2.
+    /// Единственный кандидат с расстоянием ≤ min(2, длина / 4) при длине ≥ 5.
     Corrected(String),
     /// Нет единственного кандидата: до трёх ближайших по возрастанию расстояния,
     /// при равенстве — по имени.
     Unknown(Vec<String>),
 }
 
-/// Проверка имени по списку известных (D28).
+/// Проверка имени по списку известных (D28 с порогом по длине — решение контроллера I4).
 pub(crate) fn resolve_name(name: &str, known: &[&str]) -> NameMatch {
     if known.contains(&name) {
         return NameMatch::Exact;
     }
+    let len = name.chars().count();
     let probe: String = name.chars().take(MAX_NAME_CHARS).collect();
+    // Порог относительно длины: d ≤ min(2, len / 4), имя не короче 5 символов.
+    let max_fix = if (MIN_FIX_LEN..=MAX_NAME_CHARS).contains(&len) {
+        MAX_FIX.min(len / 4)
+    } else {
+        0
+    };
     let mut ranked: Vec<(usize, &str)> = known
         .iter()
         .map(|k| (damerau_levenshtein(&probe, k), *k))
@@ -86,11 +95,11 @@ pub(crate) fn resolve_name(name: &str, known: &[&str]) -> NameMatch {
     ranked.dedup();
     let fixable: Vec<&str> = ranked
         .iter()
-        .filter(|(d, _)| *d <= MAX_FIX)
+        .filter(|(d, _)| *d <= max_fix)
         .map(|(_, k)| *k)
         .collect();
     if let [only] = fixable[..]
-        && probe.chars().count() == name.chars().count()
+        && max_fix > 0
     {
         return NameMatch::Corrected(only.to_owned());
     }

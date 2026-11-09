@@ -215,6 +215,10 @@ impl<'a> Cx<'a> {
             }
         }
 
+        if !s.contains_key("type") {
+            self.coerce_to_constants(s, value, path);
+        }
+
         if let Some(Value::Array(options)) = s.get("enum")
             && !options.iter().any(|o| json_eq(o, value))
         {
@@ -242,6 +246,42 @@ impl<'a> Cx<'a> {
         }
         if let Some(Value::Array(branches)) = s.get("oneOf") {
             self.check_branches(branches, value, path, depth, true);
+        }
+    }
+
+    /// `enum`/`const` без `type`: строка приводится к типу значения-кандидата, если
+    /// после приведения совпадает с ним (Qwen XML даёт `"1"` при `{"enum": [1, 2]}`).
+    fn coerce_to_constants(&mut self, s: &Map<String, Value>, value: &mut Value, path: &str) {
+        if !value.is_string() {
+            return;
+        }
+        let mut candidates: Vec<&Value> = Vec::new();
+        if let Some(Value::Array(options)) = s.get("enum") {
+            candidates.extend(options);
+        }
+        candidates.extend(s.get("const"));
+        if candidates.iter().any(|c| json_eq(c, value)) {
+            return;
+        }
+        for c in candidates {
+            let t = match c {
+                Value::Bool(_) => JsonType::Boolean,
+                Value::Number(_) if is_integer(c) => JsonType::Integer,
+                Value::Number(_) => JsonType::Number,
+                Value::Object(_) => JsonType::Object,
+                Value::Array(_) => JsonType::Array,
+                Value::Null | Value::String(_) => continue,
+            };
+            if let Some(v) = coerce_string(value, t)
+                && json_eq(&v, c)
+            {
+                *value = v;
+                self.repairs.push(Repair::TypeCoerced {
+                    path: path.to_owned(),
+                    to: t,
+                });
+                return;
+            }
         }
     }
 
@@ -441,7 +481,11 @@ fn coerce(value: &Value, types: &[JsonType], path: &str) -> Option<(Value, Repai
             return Some((v, repair));
         }
     }
-    if types.contains(&JsonType::Array) && !value.is_array() {
+    // Строка, похожая на массив, но не разобранная как JSON, — ошибка, а не `[строка]`.
+    let broken_array = value
+        .as_str()
+        .is_some_and(|s| s.trim_start().starts_with('['));
+    if types.contains(&JsonType::Array) && !value.is_array() && !broken_array {
         let repair = Repair::WrappedInArray {
             path: path.to_owned(),
         };

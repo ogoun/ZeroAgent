@@ -3,8 +3,8 @@
 
 use serde_json::{Value, json};
 use za_llm::normalize::{
-    CallRejection, CallSource, JsonType, Repair, all_formats, damerau_levenshtein,
-    extracted_mutation_blocked, normalize, validate_and_coerce,
+    CallRejection, CallSource, JsonType, MAX_EXTRACTED_CALLS, Repair, all_formats,
+    damerau_levenshtein, extracted_mutation_blocked, normalize, validate_and_coerce,
 };
 use za_llm::{Message, Part, Role, TextFormat, ToolCall, ToolSchema};
 use za_protocol::EffectClass;
@@ -582,4 +582,183 @@ fn every_truncation_point_is_safe() {
     let full = normalize(&text(&src), &tools, all_formats());
     assert_eq!(full.calls.len(), 3);
     assert_eq!(full.text, "Текст ✓.");
+}
+
+// ---- Раунд исправлений 1 ----
+
+/// I1: разбор линейный — ~1,2 МБ повторов каждого формата меньше секунды даже в
+/// debug-сборке (порог с запасом; квадратичный разбор давал десятки секунд).
+#[test]
+fn megabyte_of_repeated_markers_is_linear() {
+    let call_h = hermes("read_file", json!({"path": "a"}));
+    let call_q = "<function=count><parameter=n>1</parameter></function>\n".to_owned();
+    let call_x = "<|channel|>commentary to=functions.read_file <|constrain|>json<|message|>{\"path\":\"a\"}<|call|>".to_owned();
+    let units: Vec<String> = vec![
+        "to=functions.x ".into(),
+        "<tool_call> ".into(),
+        "<tool_call>{".into(),
+        "<function=a> ".into(),
+        "<function=read_file> ".into(),
+        "<function=count><parameter=n>".into(),
+        "<|channel|>commentary to=functions.read_file ".into(),
+        "```\n<tool_call>\n".into(),
+        call_h,
+        call_q,
+        call_x,
+    ];
+    let tools = tools();
+    for unit in units {
+        let src = unit.repeat(1_200_000 / unit.len());
+        let started = std::time::Instant::now();
+        let out = normalize(&text(&src), &tools, all_formats());
+        let took = started.elapsed();
+        assert!(took.as_secs_f64() < 1.0, "{unit:?}: {took:?}");
+        assert!(
+            out.calls.len() + out.rejected.len() <= MAX_EXTRACTED_CALLS as usize + 1,
+            "{unit:?}"
+        );
+    }
+}
+
+#[test]
+fn too_many_extracted_calls_are_capped() {
+    let src = hermes("read_file", json!({"path": "a"})).repeat(70);
+    let out = normalize(&text(&src), &tools(), all_formats());
+    assert_eq!(out.calls.len(), 64);
+    assert_eq!(
+        out.rejected,
+        [CallRejection::TooManyCalls {
+            limit: 64,
+            skipped: 6
+        }]
+    );
+}
+
+#[test]
+fn tag_mention_in_prose_is_plain_text() {
+    for src in [
+        "Добавил разбор `<tool_call>` в парсер. Дальше важный текст.",
+        "Шаблон Qwen: `<function=NAME>` и параметры. Дальше важный текст.",
+        "Используй `<function=read_file>` для чтения. Дальше важный текст.",
+        "Заголовок `<|channel|>commentary to=functions.read_file` и\nдальше важный текст.",
+    ] {
+        let out = normalize(&text(src), &tools(), all_formats());
+        assert!(out.calls.is_empty() && out.rejected.is_empty(), "{src}");
+        assert_eq!(out.text, src);
+    }
+}
+
+#[test]
+fn examples_in_code_blocks_are_not_calls() {
+    let call = hermes("read_file", json!({"path": "x"}));
+    let closed = format!("Пример:\n```xml\n{call}\n```\nКонец.");
+    let out = normalize(&text(&closed), &tools(), all_formats());
+    assert!(out.calls.is_empty() && out.rejected.is_empty());
+    assert_eq!(out.text, closed);
+
+    let unclosed = format!("Пример:\n```\n{call}");
+    let out = normalize(&text(&unclosed), &tools(), all_formats());
+    assert!(out.calls.is_empty() && out.rejected.is_empty());
+    assert_eq!(out.text, unclosed);
+
+    // Вызов после закрытого блока извлекается.
+    let after = format!("```\n{call}\n```\n{call}");
+    let out = normalize(&text(&after), &tools(), all_formats());
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.text, format!("```\n{call}\n```"));
+}
+
+#[test]
+fn unclosed_real_call_at_end_is_rejected() {
+    for src in [
+        "Текст.\n<tool_call>\n{\"name\": \"read_file\", \"argu",
+        "Текст.\n<function=read_file>\n<parameter=path>\na.t",
+        "Текст.\n<function=read_file>\n<param",
+        "Текст.\n<|channel|>commentary to=functions.read_file <|constrain|>js",
+    ] {
+        let out = normalize(&text(src), &tools(), all_formats());
+        assert!(out.calls.is_empty(), "{src}");
+        assert!(
+            matches!(&out.rejected[..], [CallRejection::Unparseable { .. }]),
+            "{src}: {:?}",
+            out.rejected
+        );
+        assert_eq!(out.text, "Текст.");
+    }
+}
+
+#[test]
+fn same_call_in_reasoning_and_content_runs_once() {
+    let call = hermes("read_file", json!({"path": "a"}));
+    let msg = assistant(vec![
+        Part::Reasoning {
+            text: call.clone(),
+            replay: None,
+        },
+        Part::Text(call),
+    ]);
+    let out = normalize(&msg, &tools(), all_formats());
+    assert_eq!(out.calls.len(), 1);
+    assert_eq!(out.calls[0].source, CallSource::Content);
+    assert_eq!(out.dropped_duplicates, 1);
+}
+
+#[test]
+fn short_names_are_not_corrected() {
+    let tools = names(&["read_file", "set"]);
+    let out = normalize(
+        &assistant(vec![native("c1", "get", json!({}))]),
+        &tools,
+        all_formats(),
+    );
+    assert!(out.calls.is_empty());
+    assert!(
+        matches!(&out.rejected[..], [CallRejection::UnknownTool { name, nearest }] if name == "get" && nearest[0] == "set")
+    );
+    // len 6 → порог 1: «read_x» с двумя ошибками от «read_ab» не исправляется.
+    let tools = names(&["read_ab"]);
+    let out = normalize(
+        &assistant(vec![native("c1", "rexd_b", json!({}))]),
+        &tools,
+        all_formats(),
+    );
+    assert!(out.calls.is_empty());
+}
+
+#[test]
+fn close_tag_inside_hermes_string_argument() {
+    let src = hermes(
+        "write_file",
+        json!({"path": "a", "content": "x</tool_call>y"}),
+    );
+    let out = normalize(&text(&src), &tools(), all_formats());
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(out.calls[0].call.arguments["content"], "x</tool_call>y");
+    assert_eq!(out.text, "");
+}
+
+#[test]
+fn enum_without_type_is_coerced() {
+    let schema = json!({"properties": {"k": {"enum": [1, 2]}, "c": {"const": true}}});
+    let mut args = json!({"k": "1", "c": "true"});
+    let repairs = validate_and_coerce(&schema, &mut args).unwrap();
+    assert_eq!(args, json!({"k": 1, "c": true}));
+    assert_eq!(repairs.len(), 2);
+}
+
+#[test]
+fn broken_json_array_string_is_not_wrapped() {
+    let schema = json!({"type": "array", "items": {"type": "string"}});
+    let mut args = json!("[1, 2");
+    assert!(validate_and_coerce(&schema, &mut args).is_err());
+}
+
+#[test]
+fn text_parts_do_not_stick_together() {
+    let msg = assistant(vec![
+        Part::Text("A".into()),
+        native("c1", "read_file", json!({"path": "a"})),
+        Part::Text("B".into()),
+    ]);
+    assert_eq!(normalize(&msg, &tools(), all_formats()).text, "A\nB");
 }
