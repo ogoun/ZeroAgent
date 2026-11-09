@@ -47,6 +47,8 @@ pub enum EventKind {
     ControlApplied,
     /// Превышен бюджет run.
     BudgetExceeded,
+    /// Память недоступна (уровень L0): один раз за run, на шаге 0 (N-16).
+    MemoryUnavailable,
     Unknown(String),
 }
 
@@ -72,6 +74,7 @@ impl EventKind {
             Self::ControlRequested => "control.requested",
             Self::ControlApplied => "control.applied",
             Self::BudgetExceeded => "budget.exceeded",
+            Self::MemoryUnavailable => "memory.unavailable",
             Self::Unknown(s) => s,
         }
     }
@@ -97,6 +100,7 @@ impl EventKind {
             "control.requested" => Self::ControlRequested,
             "control.applied" => Self::ControlApplied,
             "budget.exceeded" => Self::BudgetExceeded,
+            "memory.unavailable" => Self::MemoryUnavailable,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -186,10 +190,20 @@ mod tests {
             ControlRequested,
             ControlApplied,
             BudgetExceeded,
+            MemoryUnavailable,
         ] {
             assert_eq!(EventKind::parse(k.as_str()), k);
         }
         assert_eq!(EventKind::AgentHeartbeat.as_str(), "agent.heartbeat");
+    }
+
+    #[test]
+    fn memory_unavailable_kind() {
+        assert_eq!(EventKind::MemoryUnavailable.as_str(), "memory.unavailable");
+        assert_eq!(
+            EventKind::parse("memory.unavailable"),
+            EventKind::MemoryUnavailable
+        );
     }
 
     #[test]

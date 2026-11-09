@@ -2,6 +2,14 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-B1, задача 2: слоты эффектов, продолжение с шага, решение неизвестного исхода
+
+- **Слоты эффектов (D3).** `RunCtx::reserve` выдаёт `EffectSlot` с ключом `{run}:{step}:{effect_seq}` в порядке вызовов; слот владеет клоном `ProjectStore`, его future — `Send + 'static` при `Send + 'static` замыкании, поэтому слоты одного шага идут в `JoinSet` и при реплее получают те же ключи, в каком бы порядке ни завершились. Тело протокола R0 перенесено из `RunCtx` в `EffectSlot::run_traced`; `run` — его результат без источника; `RunCtx::effect` = `reserve` + `run` + `observe`. Слот сам контекст не отравляет: `observe` отравляет по правилам R0 (`Store`, `Unknown`, `ReplayMismatch`), уже выданные слоты отравление не останавливает. Поведение `effect` для R0 не изменилось (демо и приёмка R0 зелёные).
+- **Источник результата (D7, вариант А реплея паузы).** `EffectSource::Journal` — квитанция была (успех или отказ) и замыкание не вызывалось; `Live` — выполнено сейчас или ошибка без разобранной квитанции. Повреждённый конверт квитанции (`StoreError::Corrupt`) считается ошибкой журнала и получает `Live`.
+- **`RunCtx::resume_at(store, run, step, effect_seq)`** — контекст с позиции снимка (D4); `new` = `resume_at(…, 0, 0)`.
+- **Решение неизвестного исхода (D16, записка R0 progress:85 закрыта).** `resolve_unknown` берёт ключ из `payload.effect_key` прерывания `unk-…`, пишет квитанцию с конвертом R0 (`done` — успех `{"resolved":"done"}`, `not_done` — отказ `not executed: the user decided the action did not happen`, константа `NOT_DONE_MESSAGE`), затем `resolve_interrupt` с `{"decision": …}` (actor `user`). Порядок квитанция → решение: сбой между ними оставляет закрытый эффект и открытое прерывание, повтор только записывает решение (`EffectConflict` терпится). Решённое прерывание не меняется даже другим решением. Не `unk-`, другой вид, нет прерывания или намерения — `StoreError::UnknownInterrupt`; нет `payload.effect_key` — `StoreError::Corrupt`.
+- **Дополнения к задаче 1.** `EventKind::MemoryUnavailable` (`memory.unavailable`, D8, D24); `Budget` с `#[serde(deny_unknown_fields)]`.
+
 ## 2026-11-09. R1-B1, задача 1: протокол и журнал цикла
 
 - **Миграция 0002** (`crates/za-store/migrations/0002_usage.sql`, `user_version` 2): таблица `usage` части 01, 5.2 — строка на каждый вызов модели (`model`, `input` с кэшем, `cached`, `output`, `reasoning`, `gpu_ms`, `cost_eq` в долларах, `ts`) и `seq` события `model.usage`. `ProjectStore::record_usage(run, row, payload)` пишет событие (actor `model`, payload как передан) и строку в одной транзакции писателя; `usage_totals(run)` — суммы для бюджетов (CORE-113, D19), неизвестные `gpu_ms`/`cost_eq` считаются нулём, run без вызовов — нули. Журнал версии 1 (R0) открывается и доводится до версии 2, старые события читаются (тест). Новой зависимости нет: `rusqlite` стал ещё и dev-зависимостью `za-store` (тест готовит журнал версии 1 напрямую).

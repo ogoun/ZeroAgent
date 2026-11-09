@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
-use za_core::{EffectError, EffectSpec, Recovery, RunCtx, recover};
+use za_core::{
+    EffectError, EffectSource, EffectSpec, Recovery, RunCtx, UnknownDecision, recover,
+    resolve_unknown,
+};
 use za_protocol::{EffectClass, EffectKey, EventKind, RunId, RunRole, Seq};
 use za_store::{BLOB_THRESHOLD, NewRun, ProjectStore};
 
@@ -626,4 +629,348 @@ async fn float_args_replay_without_mismatch() {
         .await;
     assert_eq!(r, Ok(json!(1)));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+// --- R1-B1, задача 2: слоты эффектов, продолжение с шага, решение неизвестного исхода ---
+
+/// Спецификация чтения с номером `i`: у каждого слота своё намерение.
+fn read_spec(i: u64) -> EffectSpec {
+    EffectSpec {
+        class: EffectClass::ReadOnly,
+        name: "read".into(),
+        args: json!({ "i": i }),
+    }
+}
+
+/// Резервирует три слота текущего шага и выполняет их в `JoinSet`; задержки
+/// обратны порядку резервирования, поэтому слоты завершаются в обратном порядке.
+/// Возвращает ключи слотов, значения по номеру слота и порядок завершения.
+async fn run_three_reserved(
+    ctx: &mut RunCtx,
+    calls: &Arc<AtomicUsize>,
+) -> (Vec<String>, Vec<Value>, Vec<u64>) {
+    let slots: Vec<_> = (0..3).map(|_| ctx.reserve().unwrap()).collect();
+    let keys: Vec<String> = slots.iter().map(|s| s.key().0.clone()).collect();
+    let mut set = tokio::task::JoinSet::new();
+    for (i, slot) in slots.into_iter().enumerate() {
+        let i = i as u64;
+        let c = Arc::clone(calls);
+        set.spawn(async move {
+            let r = slot
+                .run(read_spec(i), move || async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(30 - 10 * i)).await;
+                    Ok(json!(i))
+                })
+                .await;
+            (i, r)
+        });
+    }
+    let mut values = vec![Value::Null; 3];
+    let mut finished = Vec::new();
+    while let Some(done) = set.join_next().await {
+        let (i, r) = done.unwrap();
+        ctx.observe(&r);
+        finished.push(i);
+        values[i as usize] = r.unwrap();
+    }
+    (keys, values, finished)
+}
+
+#[tokio::test]
+async fn reserved_slots_keep_order_when_run_concurrently() {
+    let (s, run) = setup("slots-order").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    ctx.next_step();
+    let (keys, values, finished) = run_three_reserved(&mut ctx, &calls).await;
+    assert_eq!(
+        keys,
+        vec![
+            format!("{run}:1:0"),
+            format!("{run}:1:1"),
+            format!("{run}:1:2")
+        ]
+    );
+    assert_eq!(values, vec![json!(0), json!(1), json!(2)]);
+    assert_eq!(
+        finished,
+        vec![2, 1, 0],
+        "слоты завершились в обратном порядке"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    for i in 0..3u64 {
+        let row = s
+            .effect(run, &EffectKey::derive(run, 1, i))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.args, json!({ "i": i }), "ключ 1:{i}");
+        assert_eq!(row.result, Some(ok(json!(i))));
+    }
+
+    // Повтор из снимка шага 1: те же ключи и значения, замыкания не вызываются.
+    let mut again = RunCtx::resume_at(s.clone(), run, 1, 0);
+    let (keys2, values2, _) = run_three_reserved(&mut again, &calls).await;
+    assert_eq!(keys2, keys);
+    assert_eq!(values2, vec![json!(0), json!(1), json!(2)]);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "замыкания при повторе не вызваны"
+    );
+    assert!(!again.is_poisoned());
+}
+
+#[tokio::test]
+async fn observe_poisons_on_unknown() {
+    let (s, run) = setup("observe-unknown").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let slot = ctx.reserve().unwrap();
+    assert_eq!(slot.key(), &key);
+    let r = slot
+        .run(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+        .await;
+    assert_eq!(
+        r,
+        Err(EffectError::Unknown {
+            interrupt_id: format!("unk-{}", key.0)
+        })
+    );
+    assert!(!ctx.is_poisoned(), "слот сам контекст не отравляет");
+    ctx.observe(&r);
+    assert!(ctx.is_poisoned());
+    assert_eq!(ctx.reserve().unwrap_err(), EffectError::Poisoned);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn observe_ignores_success_and_failure() {
+    let (s, run) = setup("observe-ok").await;
+    let mut ctx = RunCtx::new(s.clone(), run);
+    ctx.observe(&Ok::<_, EffectError>(json!(1)));
+    ctx.observe(&Err::<Value, _>(EffectError::Failed("нет".into())));
+    assert!(!ctx.is_poisoned());
+    ctx.observe(&Err::<Value, _>(EffectError::ReplayMismatch {
+        key: "k".into(),
+        field: "args",
+    }));
+    assert!(ctx.is_poisoned());
+}
+
+#[tokio::test]
+async fn run_traced_reports_source() {
+    let (s, run) = setup("traced").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = |n: u64| EffectSpec {
+        class: EffectClass::Idempotent,
+        name: "model".into(),
+        args: json!({ "n": n }),
+    };
+
+    let mut ctx = RunCtx::resume_at(s.clone(), run, 1, 0);
+    let slot = ctx.reserve().unwrap();
+    assert_eq!(slot.key().0, format!("{run}:1:0"));
+    let c = Arc::clone(&calls);
+    let live = slot
+        .run_traced(model(0), move || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            Err::<Value, _>("interrupted:pause".to_owned())
+        })
+        .await;
+    assert_eq!(
+        live,
+        (
+            Err(EffectError::Failed("interrupted:pause".into())),
+            EffectSource::Live
+        )
+    );
+    let ok_live = ctx
+        .reserve()
+        .unwrap()
+        .run_traced(model(1), counted(&calls, json!({"v": 1})))
+        .await;
+    assert_eq!(ok_live, (Ok(json!({"v": 1})), EffectSource::Live));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let mut again = RunCtx::resume_at(s.clone(), run, 1, 0);
+    let replay = again
+        .reserve()
+        .unwrap()
+        .run_traced(model(0), counted(&calls, json!(0)))
+        .await;
+    assert_eq!(
+        replay,
+        (
+            Err(EffectError::Failed("interrupted:pause".into())),
+            EffectSource::Journal
+        )
+    );
+    let ok_replay = again
+        .reserve()
+        .unwrap()
+        .run_traced(model(1), counted(&calls, json!(0)))
+        .await;
+    assert_eq!(ok_replay, (Ok(json!({"v": 1})), EffectSource::Journal));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "при повторе f не вызван");
+}
+
+#[tokio::test]
+async fn run_traced_errors_without_receipt_are_live() {
+    let (s, run) = setup("traced-live-errors").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let (r, src) = ctx
+        .reserve()
+        .unwrap()
+        .run_traced(spec(EffectClass::NonIdempotent), || async { Ok(json!(1)) })
+        .await;
+    assert!(matches!(r, Err(EffectError::Unknown { .. })), "{r:?}");
+    assert_eq!(src, EffectSource::Live);
+}
+
+#[tokio::test]
+async fn resume_at_continues_numbering() {
+    let (s, run) = setup("resume-at").await;
+    let mut c = RunCtx::resume_at(s.clone(), run, 4, 2);
+    assert_eq!((c.step(), c.effect_seq(), c.run_id()), (4, 2, run));
+    assert_eq!(c.reserve().unwrap().key().0, format!("{run}:4:2"));
+    assert_eq!(c.effect_seq(), 3);
+    c.next_step();
+    assert_eq!(c.reserve().unwrap().key().0, format!("{run}:5:0"));
+    assert!(!c.is_poisoned());
+    assert!(c.store().get_run(run).await.unwrap().is_some());
+}
+
+/// `NonIdempotent`-намерение шага 1 без квитанции и id его прерывания после `recover`.
+async fn unknown_at_step_1(s: &ProjectStore, run: RunId) -> String {
+    let key = EffectKey::derive(run, 1, 0);
+    record_spec_intent(s, run, &key, EffectClass::NonIdempotent).await;
+    let id = format!("unk-{}", key.0);
+    assert_eq!(
+        recover(s, run).await.unwrap(),
+        Recovery::NeedsDecision {
+            interrupt_ids: vec![id.clone()]
+        }
+    );
+    id
+}
+
+#[tokio::test]
+async fn resolved_unknown_closes_effect() {
+    let (s, run) = setup("resolve-done").await;
+    let id = unknown_at_step_1(&s, run).await;
+    resolve_unknown(&s, &id, UnknownDecision::Done)
+        .await
+        .unwrap();
+    assert_eq!(recover(&s, run).await.unwrap(), Recovery::Clean);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let r = RunCtx::resume_at(s.clone(), run, 1, 0)
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+        .await;
+    assert_eq!(r, Ok(json!({"resolved": "done"})));
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "действие не выполнено");
+    let int = s.interrupt(&id).await.unwrap().unwrap();
+    assert_eq!(int.status, "resolved");
+    assert_eq!(int.response, Some(json!({"decision": "done"})));
+
+    // Повтор — без изменений: другое решение не перезаписывает первое.
+    let before = s.read_run(run, Seq(0), 1000).await.unwrap().len();
+    resolve_unknown(&s, &id, UnknownDecision::NotDone)
+        .await
+        .unwrap();
+    assert_eq!(s.read_run(run, Seq(0), 1000).await.unwrap().len(), before);
+    assert_eq!(
+        s.interrupt(&id).await.unwrap().unwrap().response,
+        Some(json!({"decision": "done"}))
+    );
+}
+
+#[tokio::test]
+async fn resolved_unknown_not_done_fails_effect() {
+    let (s, run) = setup("resolve-not-done").await;
+    let id = unknown_at_step_1(&s, run).await;
+    resolve_unknown(&s, &id, UnknownDecision::NotDone)
+        .await
+        .unwrap();
+    assert_eq!(recover(&s, run).await.unwrap(), Recovery::Clean);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let r = RunCtx::resume_at(s.clone(), run, 1, 0)
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+        .await;
+    assert_eq!(
+        r,
+        Err(EffectError::Failed(
+            "not executed: the user decided the action did not happen".into()
+        ))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        s.interrupt(&id).await.unwrap().unwrap().response,
+        Some(json!({"decision": "not_done"}))
+    );
+}
+
+/// Сбой между квитанцией и решением: повтор только записывает решение.
+#[tokio::test]
+async fn resolve_unknown_after_receipt_only_resolves() {
+    let (s, run) = setup("resolve-after-receipt").await;
+    let id = unknown_at_step_1(&s, run).await;
+    let key = EffectKey::derive(run, 1, 0);
+    s.record_receipt(run, &key, ok(json!({"resolved": "done"})))
+        .await
+        .unwrap();
+    resolve_unknown(&s, &id, UnknownDecision::Done)
+        .await
+        .unwrap();
+    let int = s.interrupt(&id).await.unwrap().unwrap();
+    assert_eq!(int.status, "resolved");
+    assert_eq!(int.response, Some(json!({"decision": "done"})));
+    let receipts = s
+        .read_run(run, Seq(0), 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::EffectReceipt)
+        .count();
+    assert_eq!(receipts, 1);
+}
+
+#[tokio::test]
+async fn resolve_unknown_rejects_foreign_ids() {
+    let (s, run) = setup("resolve-foreign").await;
+    s.open_interrupt("appr-x", run, "approval", json!({}))
+        .await
+        .unwrap();
+    for id in ["appr-x", "unk-nothing"] {
+        assert_eq!(
+            resolve_unknown(&s, id, UnknownDecision::Done)
+                .await
+                .unwrap_err(),
+            za_store::StoreError::UnknownInterrupt(id.into())
+        );
+    }
+    // Прерывание `unk-` без намерения под ключом из payload.
+    let ghost = EffectKey::derive(run, 9, 0);
+    let id = format!("unk-{}", ghost.0);
+    s.open_interrupt(
+        &id,
+        run,
+        za_core::UNKNOWN_OUTCOME,
+        json!({"effect_key": ghost.0}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resolve_unknown(&s, &id, UnknownDecision::Done)
+            .await
+            .unwrap_err(),
+        za_store::StoreError::UnknownInterrupt(id.clone())
+    );
+    assert_eq!(s.interrupt(&id).await.unwrap().unwrap().status, "open");
 }
