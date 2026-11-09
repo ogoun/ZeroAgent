@@ -894,3 +894,71 @@ async fn on_attempt_error_receives_the_decision_taken() {
     drop(tx);
     assert!(matches!(drain(&mut rx).last(), Some(Err(_))));
 }
+
+/// Служебное сообщение коннектора (D10) — не ответ провайдера: сбой попытки до первого
+/// события провайдера повторяется без `Restart`, а служебное сообщение отбрасывается
+/// вместе с попыткой; в успешной попытке оно идёт первым, перед ответом.
+#[tokio::test(start_paused = true)]
+async fn service_message_alone_does_not_count_as_partial_output() {
+    let service = StreamEvent::ServiceMessage(Message {
+        role: Role::System,
+        parts: vec![Part::Text("x".into())],
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let s = service.clone();
+    let res = drive_with_retry(
+        &RetryPolicy::default(),
+        "fp",
+        &tx,
+        |attempt| {
+            let s = s.clone();
+            async move {
+                Ok(match attempt {
+                    1 => attempt_rx(vec![Ok(s), Err(err(ErrorClass::Overloaded))]),
+                    _ => attempt_rx(vec![Ok(s), Ok(tool_start()), Ok(tool_finished(json!({})))]),
+                })
+            }
+        },
+        |_, _| {},
+    )
+    .await;
+    assert_eq!(res, Ok(()));
+    drop(tx);
+    let events = drain(&mut rx);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Ok(StreamEvent::Restart { .. }))),
+        "{events:?}"
+    );
+    assert_eq!(events[0], Ok(service.clone()));
+    assert_eq!(events[1], Ok(tool_start()));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Ok(StreamEvent::ServiceMessage(_))))
+            .count(),
+        1
+    );
+
+    // Ответ из одного `Finished`: служебное сообщение всё равно идёт перед ним.
+    let (tx, mut rx) = mpsc::channel(64);
+    let s = service.clone();
+    drive_with_retry(
+        &RetryPolicy::default(),
+        "fp",
+        &tx,
+        |_| {
+            let s = s.clone();
+            async move { Ok(attempt_rx(vec![Ok(s), Ok(tool_finished(json!({})))])) }
+        },
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    drop(tx);
+    let events = drain(&mut rx);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0], Ok(service));
+    assert!(matches!(events[1], Ok(StreamEvent::Finished { .. })));
+}

@@ -519,6 +519,10 @@ enum AttemptError {
 
 /// Одна попытка: открыть и пересылать события до `Finished` или ошибки.
 /// `forwarded` — хотя бы одно событие попытки ушло в `tx`.
+///
+/// `ServiceMessage` коннектора (D10) — не ответ провайдера: оно ждёт в буфере первого
+/// события провайдера и уходит перед ним. Попытка, сорвавшаяся раньше, ничего не
+/// отдаёт: буфер отбрасывается, `Restart` не нужен.
 async fn run_attempt<Fut>(
     opening: Fut,
     tx: &mpsc::Sender<Ev>,
@@ -528,6 +532,7 @@ where
     Fut: Future<Output = Result<mpsc::Receiver<Ev>, ModelError>>,
 {
     let mut rx = opening.await.map_err(AttemptError::Model)?;
+    let mut service: Vec<StreamEvent> = Vec::new();
     loop {
         match rx.recv().await {
             None => {
@@ -537,8 +542,14 @@ where
                 )));
             }
             Some(Err(e)) => return Err(AttemptError::Model(e)),
+            Some(Ok(ev @ StreamEvent::ServiceMessage(_))) if !*forwarded => service.push(ev),
             Some(Ok(ev)) => {
                 let done = matches!(ev, StreamEvent::Finished { .. });
+                for s in service.drain(..) {
+                    if tx.send(Ok(s)).await.is_err() {
+                        return Err(AttemptError::Cancelled);
+                    }
+                }
                 if tx.send(Ok(ev)).await.is_err() {
                     return Err(AttemptError::Cancelled);
                 }

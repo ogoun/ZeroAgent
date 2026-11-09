@@ -1151,22 +1151,46 @@ fn history_system_rendered_with_clear_at() {
         user("c"),
     ]);
     let resent = w.body_text(&next, &c).unwrap();
+    let parsed_next: Value = serde_json::from_str(resent.get()).unwrap();
+    assert_eq!(parsed_next["messages"][1].to_string(), service);
     assert!(resent.get().contains(&service), "{}", resent.get());
 }
 
 #[test]
 fn history_system_does_not_merge_with_neighbours() {
+    // Допустимая для API форма: system сразу после user и перед assistant. Подряд
+    // идущие user сливаются, system остаётся отдельным элементом.
     let caps = caps();
     let req = ChatRequest {
-        messages: vec![user("a"), system_msg("x"), system_msg("y"), user("c")],
+        messages: vec![user("a"), user("a2"), system_msg("x"), assistant("b")],
         ..ChatRequest::default()
     };
     let b = wire("http://x").build_body(&req, &ctx(&caps)).unwrap();
-    let msgs = b["messages"].as_array().unwrap();
-    assert_eq!(msgs.len(), 4);
-    assert_eq!(msgs[1]["content"], "x");
-    assert_eq!(msgs[2]["content"], "y");
-    assert_eq!(msgs[3]["role"], "user");
+    assert_eq!(
+        b["messages"],
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "a"},
+                                         {"type": "text", "text": "a2"}]},
+            {"role": "system", "clear_at": "next_user_message", "content": "x"},
+            {"role": "assistant", "content": [{"type": "text", "text": "b"}]},
+        ])
+    );
+}
+
+#[test]
+fn history_system_with_empty_text_is_sent_as_is() {
+    // Опустить сообщение, которое модель уже видела, — правка истории (prefix check
+    // preserved thinking): пустое служебное сообщение пересылается как есть.
+    let caps = caps();
+    let req = ChatRequest {
+        messages: vec![user("a"), system_msg(""), assistant("b")],
+        ..ChatRequest::default()
+    };
+    let b = wire("http://x").build_body(&req, &ctx(&caps)).unwrap();
+    assert_eq!(
+        b["messages"][1],
+        json!({"role": "system", "clear_at": "next_user_message", "content": ""})
+    );
 }
 
 #[test]

@@ -371,7 +371,9 @@ impl AnthropicWire {
     /// `Role::System` из истории (D10) — отдельный элемент, ни с чем не сливается и
     /// рендерится тем же [`clear_at_message`], что и при эмуляции: погашенное
     /// сообщение пересылается без изменений (preserved thinking). Модели без
-    /// mid-conversation system получают историю без него: инструкция уже погашена.
+    /// mid-conversation system получают историю без него: инструкция уже погашена, а
+    /// эта модель его не видела. Модели с mid-system получают его всегда, даже с пустым
+    /// текстом: опустить уже виденное сообщение — правка истории (prefix check).
     fn messages(&self, req: &ChatRequest) -> Vec<Value> {
         enum Item {
             Turn(&'static str, Vec<Value>),
@@ -384,16 +386,13 @@ impl AnthropicWire {
                 Role::Assistant => ("assistant", self.assistant_blocks(m)),
                 Role::User | Role::Tool => ("user", user_blocks(m)),
                 Role::System => {
-                    let text = system_text(m);
-                    if !mid_system {
+                    if mid_system {
+                        out.push(Item::System(system_text(m)));
+                    } else {
                         tracing::debug!(
                             model = self.model.as_str(),
                             "модель не принимает system-сообщений в истории, служебное опущено"
                         );
-                    } else if text.is_empty() {
-                        tracing::debug!("пустое служебное system-сообщение опущено");
-                    } else {
-                        out.push(Item::System(text));
                     }
                     continue;
                 }
