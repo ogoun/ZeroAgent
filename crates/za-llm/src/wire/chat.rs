@@ -13,12 +13,13 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
-use super::{MessageAssembler, OpenedStream, STREAM_CHANNEL, WireCtx};
+use super::{
+    MessageAssembler, OpenedStream, STREAM_CHANNEL, StreamDecoder, WireCtx, bad_request, pump,
+    u64_at,
+};
 use crate::caps::{ReasoningField, Wire};
 use crate::error::{ErrorClass, ModelError};
-use crate::http::{
-    HttpTransport, Secret, SseEvent, SseResponse, classify_status, parse_rate_limits, redact,
-};
+use crate::http::{HttpTransport, Secret, SseEvent, classify_status, parse_rate_limits};
 use crate::prefix::{PromptBlocks, render_tools};
 use crate::types::{
     ChatRequest, CostSource, Effort, FinishReason, Part, ReasoningMode, ReplayBlob, Role,
@@ -497,57 +498,6 @@ fn f32_json(v: f32) -> Value {
         .map_or(Value::Null, Value::Number)
 }
 
-fn bad_request(m: impl Into<String>) -> ModelError {
-    ModelError::new(ErrorClass::BadRequest, m)
-}
-
-/// Насос SSE: читает стрим, пишет события в канал и кончается по `tx.closed()` (D2).
-async fn pump(
-    mut sse: SseResponse,
-    mut dec: ChatDecoder,
-    tx: mpsc::Sender<Result<StreamEvent, ModelError>>,
-    secret: Option<Secret>,
-) {
-    loop {
-        let step = tokio::select! {
-            biased;
-            () = tx.closed() => {
-                tracing::debug!("приёмник стрима закрыт, соединение закрывается");
-                return;
-            }
-            r = sse.next_event() => r,
-        };
-        let result = match step {
-            Ok(Some(ev)) => dec.on_event(&ev),
-            Ok(None) => dec.finish_at_eof(),
-            Err(cut) if cut.class == ErrorClass::StreamCut => match sse.take_unterminated() {
-                Some(ev) => dec.on_unterminated(&ev, cut),
-                None => Err(cut),
-            },
-            Err(e) => Err(e),
-        };
-        match result {
-            Ok(evs) => {
-                for ev in evs {
-                    if tx.send(Ok(ev)).await.is_err() {
-                        return;
-                    }
-                }
-                if dec.is_done() {
-                    return;
-                }
-            }
-            Err(mut e) => {
-                if let Some(s) = &secret {
-                    e.message = redact(&e.message, &[s]);
-                }
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-        }
-    }
-}
-
 /// Начатый вызов инструмента в декодере.
 #[derive(Debug)]
 struct StartedCall {
@@ -861,6 +811,25 @@ impl ChatDecoder {
     }
 }
 
+impl StreamDecoder for ChatDecoder {
+    fn on_event(&mut self, ev: &SseEvent) -> Result<Vec<StreamEvent>, ModelError> {
+        ChatDecoder::on_event(self, ev)
+    }
+    fn finish_at_eof(&mut self) -> Result<Vec<StreamEvent>, ModelError> {
+        ChatDecoder::finish_at_eof(self)
+    }
+    fn on_unterminated(
+        &mut self,
+        ev: &SseEvent,
+        cut: ModelError,
+    ) -> Result<Vec<StreamEvent>, ModelError> {
+        ChatDecoder::on_unterminated(self, ev, cut)
+    }
+    fn is_done(&self) -> bool {
+        ChatDecoder::is_done(self)
+    }
+}
+
 /// Фрагмент `reasoning_details`: продолжение последнего элемента с тем же `index` и
 /// `type` дописывает строки `text`, `summary`, `data`, прочие поля заменяет;
 /// иначе — новый элемент.
@@ -952,15 +921,6 @@ fn stream_error(err: &Value) -> ModelError {
     // Статус ответа был 2xx: код ошибки — из тела.
     e.http_status = None;
     e
-}
-
-fn u64_at(v: &Value, path: &[&str]) -> Option<u64> {
-    let mut cur = v;
-    for k in path {
-        cur = cur.get(k)?;
-    }
-    cur.as_u64()
-        .or_else(|| cur.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
 }
 
 fn u32_field(v: &Value, k: &str) -> u32 {

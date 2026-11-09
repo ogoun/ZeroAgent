@@ -10,12 +10,15 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::caps::{ProviderCapabilities, ThinkingSupport};
+use crate::error::ErrorClass;
 use crate::error::ModelError;
-use crate::http::{HttpTransport, ProviderLimits, Secret};
+use crate::http::{HttpTransport, ProviderLimits, Secret, SseEvent, SseResponse, redact};
 use crate::types::{ChatRequest, Message, Part, ReplayBlob, Role, StreamEvent, ToolCall};
 
+mod anthropic;
 mod chat;
 
+pub use anthropic::{AnthropicDecoder, AnthropicWire};
 pub use chat::{ChatDecoder, ChatDialect, ChatWire};
 
 /// Ёмкость канала событий стрима одной попытки.
@@ -44,10 +47,11 @@ pub struct OpenedStream {
     pub events: mpsc::Receiver<Result<StreamEvent, ModelError>>,
 }
 
-/// Коннектор эндпоинта. Задачи 5 и 6 добавляют варианты Anthropic Messages и Responses.
+/// Коннектор эндпоинта. Задача 6 добавляет вариант Responses.
 #[derive(Debug, Clone)]
 pub enum Connector {
     Chat(ChatWire),
+    Anthropic(AnthropicWire),
 }
 
 impl Connector {
@@ -56,6 +60,7 @@ impl Connector {
     pub fn build_body(&self, req: &ChatRequest, ctx: &WireCtx<'_>) -> Result<Value, ModelError> {
         match self {
             Self::Chat(w) => w.build_body(req, ctx),
+            Self::Anthropic(w) => w.build_body(req, ctx),
         }
     }
 
@@ -69,8 +74,89 @@ impl Connector {
     ) -> Result<OpenedStream, ModelError> {
         match self {
             Self::Chat(w) => w.open(http, req, ctx).await,
+            Self::Anthropic(w) => w.open(http, req, ctx).await,
         }
     }
+}
+
+/// Декодер стрима провайдера для общего насоса [`pump`].
+pub(crate) trait StreamDecoder: Send + 'static {
+    /// Событие SSE → события стрима.
+    fn on_event(&mut self, ev: &SseEvent) -> Result<Vec<StreamEvent>, ModelError>;
+    /// Тело кончилось штатно.
+    fn finish_at_eof(&mut self) -> Result<Vec<StreamEvent>, ModelError>;
+    /// Тело кончилось на строке без перевода строки (`cut` — `StreamCut` транспорта):
+    /// законченное финальное событие провайдера — штатный конец, иначе `cut`.
+    fn on_unterminated(
+        &mut self,
+        ev: &SseEvent,
+        cut: ModelError,
+    ) -> Result<Vec<StreamEvent>, ModelError>;
+    /// `Finished` уже отправлен: дальше события не нужны.
+    fn is_done(&self) -> bool;
+}
+
+/// Насос SSE: читает стрим, пишет события в канал и кончается по `tx.closed()` (D2).
+/// Ошибка — последнее событие канала, ключ из её текста вычищается.
+pub(crate) async fn pump<D: StreamDecoder>(
+    mut sse: SseResponse,
+    mut dec: D,
+    tx: mpsc::Sender<Result<StreamEvent, ModelError>>,
+    secret: Option<Secret>,
+) {
+    loop {
+        let step = tokio::select! {
+            biased;
+            () = tx.closed() => {
+                tracing::debug!("приёмник стрима закрыт, соединение закрывается");
+                return;
+            }
+            r = sse.next_event() => r,
+        };
+        let result = match step {
+            Ok(Some(ev)) => dec.on_event(&ev),
+            Ok(None) => dec.finish_at_eof(),
+            Err(cut) if cut.class == ErrorClass::StreamCut => match sse.take_unterminated() {
+                Some(ev) => dec.on_unterminated(&ev, cut),
+                None => Err(cut),
+            },
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(evs) => {
+                for ev in evs {
+                    if tx.send(Ok(ev)).await.is_err() {
+                        return;
+                    }
+                }
+                if dec.is_done() {
+                    return;
+                }
+            }
+            Err(mut e) => {
+                if let Some(s) = &secret {
+                    e.message = redact(&e.message, &[s]);
+                }
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Запрос, который провайдер заведомо отвергнет: ошибка до отправки.
+pub(crate) fn bad_request(m: impl Into<String>) -> ModelError {
+    ModelError::new(ErrorClass::BadRequest, m)
+}
+
+/// Целое число по пути ключей; дробное неотрицательное округляется вниз.
+pub(crate) fn u64_at(v: &Value, path: &[&str]) -> Option<u64> {
+    let mut cur = v;
+    for k in path {
+        cur = cur.get(k)?;
+    }
+    cur.as_u64()
+        .or_else(|| cur.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
 }
 
 /// Вызов инструмента, собираемый из фрагментов.
