@@ -112,11 +112,13 @@ impl HttpTransport {
     /// `POST` с телом JSON и ответом `text/event-stream`. Статус ≠ 2xx — `Err` по
     /// [`classify_status`] с телом, очищенным от ключей `redact`. Ответ 200 с
     /// `application/json` вместо стрима — `Malformed`.
-    pub async fn post_sse(
+    /// Тело — любое `Serialize`: обычно `Value`, у Anthropic — готовый текст
+    /// (`RawValue`), чтобы части тела ушли без пересериализации.
+    pub async fn post_sse<B: serde::Serialize + ?Sized>(
         &self,
         url: &str,
         mut headers: HeaderMap,
-        body: &Value,
+        body: &B,
         redact: &[&Secret],
     ) -> Result<SseResponse, ModelError> {
         if !headers.contains_key(ACCEPT) {

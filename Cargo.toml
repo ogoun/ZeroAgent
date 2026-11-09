@@ -17,7 +17,9 @@ unsafe_code = "forbid"
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip: дробные числа читаются из журнала без потери точности, иначе
 # сверка аргументов эффекта при повторе давала бы ложное расхождение.
-serde_json = { version = "1", features = ["float_roundtrip"] }
+# raw_value: тело запроса Anthropic уходит готовым текстом, чтобы входы `tool_use`
+# возвращались провайдеру байт-в-байт (preserved thinking); новых крейтов нет.
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 uuid = { version = "1", default-features = false, features = ["std", "v7", "serde"] }
 jiff = { version = "0.2", default-features = false, features = ["serde", "std"] }
 # SQLite со встроенной сборкой: версия библиотеки фиксирована крейтом (ARC-031, ≥ 3.51.3).

@@ -192,9 +192,11 @@ fn adaptive_thinking_when_profile_says_so() {
 
 #[test]
 fn budget_thinking_for_old_models() {
+    // Отступление от брифа (решение контроллера): `budget_tokens` — только при профиле
+    // без adaptive; до зонда (`thinking: None`) модель считается актуальной.
     let mut req = request();
     req.reasoning = ReasoningMode::Effort(Effort::High);
-    let b = body_with(&req, None);
+    let b = body_with(&req, Some(&OLD));
     assert_eq!(b["thinking"]["type"], "enabled");
     assert_eq!(b["thinking"]["budget_tokens"], 16384);
     assert!(b.get("output_config").is_none());
@@ -205,6 +207,19 @@ fn budget_thinking_for_old_models() {
     let b = body_with(&req, Some(&OLD));
     assert_eq!(b["thinking"]["budget_tokens"], 1024);
     assert_eq!(b["max_tokens"], 8192);
+}
+
+#[test]
+fn no_profile_means_adaptive() {
+    let mut req = request();
+    req.reasoning = ReasoningMode::Effort(Effort::High);
+    let b = body_with(&req, None);
+    assert_eq!(b["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(b["output_config"]["effort"], "high");
+    assert!(!b.to_string().contains("budget_tokens"));
+    assert_eq!(b["max_tokens"], 8192);
+    req.reasoning = ReasoningMode::Budget(30000);
+    assert_eq!(body_with(&req, None)["output_config"]["effort"], "max");
 }
 
 #[test]
@@ -226,15 +241,16 @@ fn default_and_off_send_no_thinking() {
     }
     let mut off = request();
     off.reasoning = ReasoningMode::Off;
-    for t in [None, Some(&OLD)] {
+    let b = body_with(&off, Some(&OLD));
+    assert!(b.get("thinking").is_none());
+    assert!(b.get("output_config").is_none());
+    // У адаптивных моделей (и до зонда) `disabled` даёт 400: поле не отправляется,
+    // усилие — low.
+    for t in [None, Some(&ADAPTIVE)] {
         let b = body_with(&off, t);
         assert!(b.get("thinking").is_none());
-        assert!(b.get("output_config").is_none());
+        assert_eq!(b["output_config"]["effort"], "low");
     }
-    // У адаптивных моделей `disabled` даёт 400: поле не отправляется, усилие — low.
-    let b = body_with(&off, Some(&ADAPTIVE));
-    assert!(b.get("thinking").is_none());
-    assert_eq!(b["output_config"]["effort"], "low");
     // Без поддержки effort output_config не отправляется.
     let no_effort = ThinkingSupport {
         adaptive: true,
@@ -403,21 +419,26 @@ fn tool_choice_auto_none_and_emulated_required() {
     );
 
     // Актуальные модели (adaptive) и профиль до зонда: принудительный выбор даёт 400,
-    // поэтому `auto` и инструкция в конце последнего сообщения пользователя.
+    // поэтому `auto` и инструкция отдельным system-сообщением в конце `messages`;
+    // существующие сообщения не меняются (preserved thinking).
     req.tool_choice = ToolChoice::Named("read_file".into());
     for t in [None, Some(&ADAPTIVE)] {
         let b = body_with(&req, t);
         assert_eq!(b["tool_choice"], json!({"type": "auto"}));
-        let last = b["messages"].as_array().unwrap().last().unwrap().clone();
-        assert_eq!(last["role"], "user");
-        let tail = last["content"].as_array().unwrap().last().unwrap().clone();
-        assert_eq!(tail["type"], "text");
-        assert!(tail["text"].as_str().unwrap().contains("read_file"));
+        let msgs = b["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0],
+            json!({"role": "user", "content": [{"type": "text", "text": "Привет"}]})
+        );
+        assert_eq!(msgs[1]["role"], "system");
+        assert!(msgs[1]["content"].as_str().unwrap().contains("read_file"));
     }
     req.tool_choice = ToolChoice::Required;
     let b = body_with(&req, Some(&ADAPTIVE));
     assert_eq!(b["tool_choice"], json!({"type": "auto"}));
-    assert_eq!(b["messages"][0]["content"].as_array().unwrap().len(), 2);
+    assert_eq!(b["messages"][0]["content"].as_array().unwrap().len(), 1);
+    assert_eq!(b["messages"][1]["role"], "system");
 
     // Старая модель без мышления в запросе: принудительный выбор отправляется.
     let b = body_with(&req, Some(&OLD));
@@ -434,6 +455,94 @@ fn tool_choice_auto_none_and_emulated_required() {
         body_with(&req, Some(&OLD))["tool_choice"],
         json!({"type": "auto"})
     );
+}
+
+#[test]
+fn instruction_without_mid_system_support_is_user_text() {
+    let caps = caps();
+    let c = ctx(&caps);
+    let mut req = request();
+    req.tools = vec![tool("read_file")];
+    req.tool_choice = ToolChoice::Named("read_file".into());
+    // Sonnet 5 и Haiku 4.5 не принимают system-сообщений в `messages`.
+    for model in ["claude-sonnet-5", "claude-haiku-4-5"] {
+        let w = AnthropicWire {
+            base_url: "http://x".into(),
+            model: model.into(),
+        };
+        let b = w.build_body(&req, &c).unwrap();
+        let msgs = b["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "{model}");
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(content[1]["text"].as_str().unwrap().contains("read_file"));
+    }
+    // Снимок по дате и префикс Bedrock — та же модель.
+    for model in ["claude-opus-5-5-20260401", "anthropic.claude-sonnet-5-5"] {
+        let w = AnthropicWire {
+            base_url: "http://x".into(),
+            model: model.into(),
+        };
+        let b = w.build_body(&req, &c).unwrap();
+        assert_eq!(b["messages"][1]["role"], "system", "{model}");
+    }
+    // Последним идёт ассистент: system-сообщение туда нельзя — новое сообщение user.
+    req.messages.push(Message {
+        role: Role::Assistant,
+        parts: vec![Part::Text("Сейчас.".into())],
+    });
+    let b = wire("http://x").build_body(&req, &c).unwrap();
+    let last = b["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["role"], "user");
+}
+
+#[tokio::test]
+async fn tool_use_input_is_returned_byte_for_byte() {
+    let raw = r#"{"z": 1,  "a" :"x",
+ "m":[2, 1]}"#;
+    let mut req = request();
+    req.messages.push(Message {
+        role: Role::Assistant,
+        parts: vec![Part::ToolCall(ToolCall {
+            id: "toolu_raw".into(),
+            name: "read_file".into(),
+            arguments: serde_json::from_str(raw).unwrap(),
+            raw_arguments: Some(raw.into()),
+        })],
+    });
+    // Аргументы изменены после разбора (ремонт нормализации): исходный текст не годится.
+    let changed = ToolCall {
+        id: "toolu_new".into(),
+        name: "read_file".into(),
+        arguments: json!({"b": 2, "a": 1}),
+        raw_arguments: Some(r#"{"b": 2}"#.into()),
+    };
+    req.messages.push(Message {
+        role: Role::Tool,
+        parts: vec![Part::ToolResult {
+            call_id: "toolu_raw".into(),
+            content: "ok".into(),
+            is_error: false,
+        }],
+    });
+    req.messages.push(Message {
+        role: Role::Assistant,
+        parts: vec![Part::ToolCall(changed)],
+    });
+    let srv = FakeServer::start(vec![(
+        ROUTE,
+        vec![Reply::sse(vec![fixture("anthropic/text.sse")])],
+    )])
+    .await;
+    let caps = caps();
+    let w = wire(&srv.url("/v1"));
+    drain(w.open(&transport(), &req, &ctx(&caps)).await.unwrap()).await;
+    let sent = String::from_utf8(srv.requests(ROUTE)[0].body.clone()).unwrap();
+    assert!(sent.contains(&format!(r#""input":{raw}"#)), "{sent}");
+    assert!(sent.contains(r#""input":{"a":1,"b":2}"#), "{sent}");
+    // Тело — тот же JSON, что `build_body`.
+    let parsed: Value = serde_json::from_str(&sent).unwrap();
+    assert_eq!(parsed, w.build_body(&req, &ctx(&caps)).unwrap());
 }
 
 #[test]
@@ -577,6 +686,15 @@ async fn thinking_signature_and_tool_use_roundtrip() {
     assert_eq!(asst[1], json!({"type": "text", "text": "Читаю файл."}));
     assert_eq!(asst[2]["id"], "toolu_01T1x1fJ34qAmk2tNTrN7Up6");
     assert_eq!(asst[2]["input"], json!({"path": "README.md"}));
+    let caps2 = caps();
+    let mut c2 = ctx(&caps2);
+    c2.thinking = Some(&ADAPTIVE);
+    let sent = wire("http://x")
+        .body_text(&req, &c2)
+        .unwrap()
+        .get()
+        .to_owned();
+    assert!(sent.contains(r#""input":{"path": "README.md"}"#), "{sent}");
 }
 
 #[tokio::test]

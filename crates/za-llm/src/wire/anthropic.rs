@@ -15,11 +15,20 @@
 //!   `ReasoningMode::Off` — без поля `thinking` и с наименьшим усилием `low`;
 //! - принудительный `tool_choice` (`any`, `tool`) у Opus 5.5, Sonnet 5.5, Fable 5.1 и
 //!   при включённом мышлении даёт 400: он отправляется только старым моделям без
-//!   мышления в запросе, иначе — `auto` и инструкция модели.
+//!   мышления в запросе, иначе — `auto` и инструкция модели отдельным
+//!   mid-conversation system-сообщением (добавление, а не правка истории — preserved
+//!   thinking); модели без таких сообщений получают инструкцию текстом в последнем
+//!   сообщении пользователя;
+//! - до зонда (профиля нет) модель считается актуальной: adaptive и
+//!   `output_config.effort`; `budget_tokens` — только если профиль говорит, что
+//!   adaptive не поддерживается (решение контроллера, отступление от брифа);
+//! - входы `tool_use` возвращаются байт-в-байт, как пришли (исходный текст из
+//!   `raw_arguments`), — тело уходит готовым текстом ([`AnthropicWire::body_text`]).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
@@ -47,6 +56,21 @@ const MIN_BUDGET: u32 = 1024;
 
 /// Запас `max_tokens` сверх бюджета мышления на сам ответ.
 const ANSWER_RESERVE: u32 = 1024;
+
+/// Модели, принимающие mid-conversation system-сообщения (`{"role":"system"}` в
+/// `messages`) без beta: справочник Claude API, 2026-10 (не Sonnet 5, Opus 4.7/4.6,
+/// Haiku 4.5). Сравнение — точное имя или имя с суффиксом `-…` (снимки по дате).
+const MID_SYSTEM_MODELS: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-fable-5-1",
+    "claude-fable-5",
+    "claude-mythos-5-1",
+    "claude-mythos-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+];
 
 /// Коннектор Anthropic Messages.
 #[derive(Debug, Clone)]
@@ -120,7 +144,7 @@ impl AnthropicWire {
             }
             body.insert("tool_choice".into(), choice);
             if let Some(text) = instruction {
-                append_user_text(&mut messages, text);
+                self.append_instruction(&mut messages, text);
             }
         }
         body.insert("messages".into(), Value::Array(messages));
@@ -158,10 +182,12 @@ impl AnthropicWire {
         req: &ChatRequest,
         ctx: &WireCtx<'_>,
     ) -> Result<OpenedStream, ModelError> {
-        let body = self.build_body(req, ctx)?;
+        let body = self.body_text(req, ctx)?;
         let headers = self.headers(ctx)?;
         let secrets: Vec<&Secret> = ctx.secret.into_iter().collect();
-        let sse = http.post_sse(&self.url(), headers, &body, &secrets).await?;
+        let sse = http
+            .post_sse(&self.url(), headers, &*body, &secrets)
+            .await?;
         let limits = parse_rate_limits(&sse.headers);
         let (tx, events) = mpsc::channel(STREAM_CHANNEL);
         let decoder = AnthropicDecoder::new(self.model.clone());
@@ -169,16 +195,55 @@ impl AnthropicWire {
         Ok(OpenedStream { limits, events })
     }
 
-    /// Поля мышления (D15, D36). Способ — по профилю: `adaptive` из Models API;
-    /// без профиля — `enabled` с бюджетом, как у старых моделей.
+    /// Тело запроса готовым текстом: [`Self::build_body`], где вход каждого
+    /// `tool_use`, пришедший от провайдера текстом (`raw_arguments`) и не изменённый
+    /// после разбора, подставлен этим текстом без пересериализации (порядок ключей и
+    /// пробелы сохраняются: preserved thinking сверяет историю).
+    pub fn body_text(
+        &self,
+        req: &ChatRequest,
+        ctx: &WireCtx<'_>,
+    ) -> Result<Box<RawValue>, ModelError> {
+        let body = self.build_body(req, ctx)?;
+        let raws = raw_inputs(req);
+        let mut out = String::new();
+        write_json(&body, &raws, &mut out)?;
+        RawValue::from_string(out)
+            .map_err(|e| bad_request(format!("тело запроса Anthropic не JSON: {e}")))
+    }
+
+    /// Модель принимает mid-conversation system-сообщения.
+    fn mid_system(&self) -> bool {
+        let m = self.model.strip_prefix("anthropic.").unwrap_or(&self.model);
+        MID_SYSTEM_MODELS
+            .iter()
+            .any(|id| m == *id || m.strip_prefix(id).is_some_and(|rest| rest.starts_with('-')))
+    }
+
+    /// Инструкция эмуляции принудительного выбора. Отдельное system-сообщение в конце
+    /// `messages` — добавление к истории, а не её правка; оно допустимо только сразу
+    /// после сообщения пользователя. Иначе (модель без таких сообщений или последним
+    /// идёт ассистент) — текст в конце последнего сообщения пользователя.
+    fn append_instruction(&self, messages: &mut Vec<Value>, text: String) {
+        let after_user = messages.last().is_some_and(|m| m["role"] == "user");
+        if self.mid_system() && after_user {
+            messages.push(json!({"role": "system", "content": text}));
+        } else {
+            append_user_text(messages, text);
+        }
+    }
+
+    /// Поля мышления (D15, D36). Способ — по профилю: `adaptive` из Models API. Без
+    /// профиля модель считается актуальной (adaptive и effort, решение контроллера);
+    /// `enabled` с бюджетом — только если профиль явно без adaptive.
     fn thinking(
         &self,
         body: &mut Map<String, Value>,
         mode: &ReasoningMode,
         support: Option<&ThinkingSupport>,
     ) -> Thinking {
-        let adaptive = support.is_some_and(|t| t.adaptive);
-        let effort_ok = support.is_some_and(|t| t.effort);
+        let adaptive = support.is_none_or(|t| t.adaptive);
+        let effort_ok = support.is_none_or(|t| t.effort);
         let mut put_effort = |e: Effort| {
             if effort_ok {
                 body.insert("output_config".into(), json!({"effort": e.as_str()}));
@@ -373,6 +438,71 @@ fn tool_use_block(c: &ToolCall) -> Value {
             }),
     };
     json!({"type": "tool_use", "id": c.id, "name": c.name, "input": input})
+}
+
+/// Входы вызовов, которые можно вернуть исходным текстом: `id` → (текст, разбор).
+/// Текст — объект JSON, а разобранные аргументы с ним совпадают (или не разобраны).
+fn raw_inputs(req: &ChatRequest) -> HashMap<&str, (&str, Value)> {
+    let mut out = HashMap::new();
+    for m in req.messages.iter().filter(|m| m.role == Role::Assistant) {
+        for p in &m.parts {
+            if let Part::ToolCall(c) = p
+                && let Some(raw) = c.raw_arguments.as_deref().map(str::trim)
+                && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+                && parsed.is_object()
+                && (c.arguments.is_null() || c.arguments == parsed)
+            {
+                out.insert(c.id.as_str(), (raw, parsed));
+            }
+        }
+    }
+    out
+}
+
+/// Пишет `v` как JSON; `input` блока `tool_use` с `id` из `raws` — исходным текстом,
+/// если он по-прежнему совпадает с разобранным.
+fn write_json(
+    v: &Value,
+    raws: &HashMap<&str, (&str, Value)>,
+    out: &mut String,
+) -> Result<(), ModelError> {
+    let enc = |e: serde_json::Error| bad_request(format!("тело запроса не сериализуется: {e}"));
+    match v {
+        Value::Object(m) => {
+            let raw = m
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|_| m.get("type") == Some(&json!("tool_use")))
+                .and_then(|id| raws.get(id))
+                .filter(|(_, parsed)| m.get("input") == Some(parsed))
+                .map(|(raw, _)| *raw);
+            out.push('{');
+            for (i, (k, x)) in m.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(k).map_err(enc)?);
+                out.push(':');
+                match raw {
+                    Some(r) if k == "input" => out.push_str(r),
+                    _ => write_json(x, raws, out)?,
+                }
+            }
+            out.push('}');
+        }
+        Value::Array(xs) => {
+            out.push('[');
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json(x, raws, out)?;
+            }
+            out.push(']');
+        }
+        scalar => out.push_str(&serde_json::to_string(scalar).map_err(enc)?),
+    }
+    Ok(())
 }
 
 /// Дописывает текст в конец последнего сообщения пользователя (или новым
