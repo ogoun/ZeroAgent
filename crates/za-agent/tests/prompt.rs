@@ -216,6 +216,11 @@ fn no_angles(s: &str) -> bool {
 #[test]
 fn escape_replaces_every_angle_bracket() {
     assert_eq!(LEFT_ANGLES.len(), RIGHT_ANGLES.len());
+    // ≮≯ (не меньше/не больше) и ˱˲ (низкие модификаторы-стрелки) — тоже скобки.
+    assert_eq!(
+        escape_untrusted("\u{226E}task\u{226F} \u{02F1}control\u{02F2}"),
+        "&lt;task&gt; &lt;control&gt;"
+    );
     for (l, r) in LEFT_ANGLES.iter().zip(RIGHT_ANGLES) {
         assert_eq!(escape_untrusted(&format!("{l}task{r}")), "&lt;task&gt;");
     }

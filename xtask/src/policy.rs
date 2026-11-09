@@ -224,8 +224,8 @@ fn resolved_llm_features(root: &Path, pkg: &str) -> Result<Vec<String>, String> 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let res = Command::new(cargo)
         .args([
-            "tree", "-p", pkg, "-e", "normal", "--target", "all", "--prefix", "none", "-f",
-            "{p}|{f}",
+            "tree", "--locked", "-p", pkg, "-e", "normal", "--target", "all", "--prefix", "none",
+            "-f", "{p}|{f}",
         ])
         .current_dir(root)
         .output()
