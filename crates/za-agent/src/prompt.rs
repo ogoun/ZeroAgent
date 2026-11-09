@@ -123,25 +123,78 @@ pub struct EnvInfo {
 /// Строковые поля экранируются [`escape_untrusted`]: ветка и путь приходят из
 /// недоверенного репозитория (ARC-041), git допускает `<` в именах ссылок. Ветка
 /// обрезается до [`BRANCH_MAX_CHARS`] символов.
+///
+/// Весь блок гарантированно укладывается в [`ENV_LIMIT`] по верхней оценке
+/// [`upper_tokens`] (байты): если поля не помещаются, самые длинные из них
+/// обрезаются до общего потолка с середины (`начало…конец`, маркер `…`), короткие не
+/// трогаются.
 pub fn render_env(e: &EnvInfo) -> String {
     let n_ctx = e.n_ctx.to_string();
     let branch: String = e.branch.chars().take(BRANCH_MAX_CHARS).collect();
-    let esc =
+    let mut esc =
         [&e.os, &e.shell, &e.project_dir, &e.date, &e.budget, &branch].map(|v| escape_untrusted(v));
-    let [os, shell, project_dir, date, budget, branch] = &esc;
-    fill(
-        ENV,
-        &[
-            ("os", os),
-            ("shell", shell),
-            ("project_dir", project_dir),
-            ("date", date),
-            ("tier", e.tier.as_str()),
-            ("n_ctx", &n_ctx),
-            ("budget", budget),
-            ("branch", branch),
-        ],
-    )
+    let render = |v: &[String; 6]| {
+        let [os, shell, project_dir, date, budget, branch] = v;
+        fill(
+            ENV,
+            &[
+                ("os", os),
+                ("shell", shell),
+                ("project_dir", project_dir),
+                ("date", date),
+                ("tier", e.tier.as_str()),
+                ("n_ctx", &n_ctx),
+                ("budget", budget),
+                ("branch", branch),
+            ],
+        )
+    };
+    let full = render(&esc);
+    let limit = ENV_LIMIT as usize;
+    if full.len() <= limit {
+        return full;
+    }
+    // Место под поля: лимит минус разметка шаблона с пустыми полями.
+    let overhead = render(&Default::default()).len();
+    let avail = limit.saturating_sub(overhead);
+    // Наибольший общий потолок `cap`, при котором сумма min(len, cap) помещается.
+    let lens = esc.each_ref().map(String::len);
+    let fits = |cap: usize| lens.iter().map(|l| (*l).min(cap)).sum::<usize>() <= avail;
+    let (mut lo, mut hi) = (0usize, lens.iter().copied().max().unwrap_or(0));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) { lo = mid } else { hi = mid - 1 }
+    }
+    for v in &mut esc {
+        if v.len() > lo {
+            *v = elide_middle(v, lo);
+        }
+    }
+    let out = render(&esc);
+    tracing::debug!(bytes = full.len(), "поля <env> обрезаны до лимита");
+    out
+}
+
+/// Маркер обрезки середины значения.
+const ELLIPSIS: &str = "…";
+
+/// `s` не длиннее `max` байт: начало, [`ELLIPSIS`], конец (по границам символов).
+/// Если места меньше маркера — только начало.
+fn elide_middle(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let floor = |n: usize| (0..=n).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0);
+    if max < ELLIPSIS.len() + 2 {
+        return s[..floor(max)].to_string();
+    }
+    let room = max - ELLIPSIS.len();
+    let head = floor(room / 2);
+    let tail_len = room - head;
+    let tail = (s.len() - tail_len..=s.len())
+        .find(|i| s.is_char_boundary(*i))
+        .unwrap_or(s.len());
+    format!("{}{ELLIPSIS}{}", &s[..head], &s[tail..])
 }
 
 /// Значения блока задания субагенту (A.5).
