@@ -1,0 +1,10 @@
+[package]
+name = "za-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-memory"
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+rust-version = "1.92"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# Общие версии зависимостей; крейты подключают через `dep.workspace = true`.
+# Только crates.io (проверяется `cargo xtask policy` и `cargo deny`).
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: дробные числа читаются из журнала без потери точности, иначе
+# сверка аргументов эффекта при повторе давала бы ложное расхождение.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+uuid = { version = "1", default-features = false, features = ["std", "v7", "serde"] }
+jiff = { version = "0.2", default-features = false, features = ["serde", "std"] }
+# SQLite со встроенной сборкой: версия библиотеки фиксирована крейтом (ARC-031, ≥ 3.51.3).
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
+# API хранилища асинхронный; писатель и читатели — обычные потоки, нужен только `sync`.
+tokio = { version = "1.54.1", default-features = false }
+thiserror = "2.0.21"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# Подписчик логов только в бинарнике: текст в stderr, фильтр из ZA_LOG/RUST_LOG
+# через `filter::Targets` (без regex и env-filter), без ANSI-цветов.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "registry"] }
+# Адресация blobs по содержимому (ARC-032).
+blake3 = "1.8.7"
+# HTTP-клиент к llama-server: без native TLS и OpenSSL, только rustls (ring).
+# Встроенные корни (webpki-roots), не хранилище ОС: одинаковое поведение на Windows и Linux.
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+# Только для поддельного HTTP-сервера в тестах.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+# Разбор командной строки бинарника zero-agent.
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }

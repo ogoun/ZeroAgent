@@ -1,0 +1,629 @@
+//! Протокол эффектов намерение → выполнение → квитанция и восстановление
+//! (CORE-002, CORE-003, CORE-004, CORE-007).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde_json::{Value, json};
+use za_core::{EffectError, EffectSpec, Recovery, RunCtx, recover};
+use za_protocol::{EffectClass, EffectKey, EventKind, RunId, RunRole, Seq};
+use za_store::{BLOB_THRESHOLD, NewRun, ProjectStore};
+
+/// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
+fn dir(name: &str) -> PathBuf {
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("za-core")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Хранилище и созданный в нём run.
+async fn setup(name: &str) -> (ProjectStore, RunId) {
+    let s = ProjectStore::open(&dir(name)).unwrap();
+    let run = RunId::new();
+    s.create_run(NewRun {
+        id: run,
+        project_id: "p".into(),
+        parent_id: None,
+        role: RunRole::Top,
+        model_profile: None,
+    })
+    .await
+    .unwrap();
+    (s, run)
+}
+
+fn spec(class: EffectClass) -> EffectSpec {
+    EffectSpec {
+        class,
+        name: "write_file".into(),
+        args: json!({"path": "a.txt"}),
+    }
+}
+
+/// Намерение с именем и аргументами [`spec`], как его записал бы `RunCtx`.
+async fn record_spec_intent(s: &ProjectStore, run: RunId, key: &EffectKey, class: EffectClass) {
+    let sp = spec(class);
+    s.record_intent(run, key, class, &sp.name, sp.args)
+        .await
+        .unwrap();
+}
+
+/// Замыкание эффекта, считающее вызовы и возвращающее `v`.
+fn counted(
+    calls: &Arc<AtomicUsize>,
+    v: Value,
+) -> impl FnOnce() -> std::future::Ready<Result<Value, String>> {
+    let calls = Arc::clone(calls);
+    move || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Ok(v))
+    }
+}
+
+/// Конверт квитанции успешного эффекта.
+fn ok(v: Value) -> Value {
+    json!({"outcome": "ok", "value": v})
+}
+
+/// Ключ первого эффекта шага 0.
+fn first_key(run: RunId) -> EffectKey {
+    EffectKey::derive(run, 0, 0)
+}
+
+#[tokio::test]
+async fn completed_effect_is_not_executed_twice() {
+    let (s, run) = setup("completed").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let mut a = RunCtx::new(s.clone(), run);
+    let r1 = a
+        .effect(
+            spec(EffectClass::NonIdempotent),
+            counted(&calls, json!({"ok": 1})),
+        )
+        .await
+        .unwrap();
+
+    // Повтор после перезапуска: новый контекст с теми же run и шагом.
+    let mut b = RunCtx::new(s.clone(), run);
+    let r2 = b
+        .effect(
+            spec(EffectClass::NonIdempotent),
+            counted(&calls, json!({"ok": 2})),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(r1, json!({"ok": 1}));
+    assert_eq!(r2, json!({"ok": 1}), "результат берётся из журнала");
+}
+
+#[tokio::test]
+async fn effect_keys_follow_step_and_effect_seq() {
+    let (s, run) = setup("keys").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    ctx.effect(spec(EffectClass::Pure), counted(&calls, json!(1)))
+        .await
+        .unwrap();
+    ctx.effect(spec(EffectClass::Pure), counted(&calls, json!(2)))
+        .await
+        .unwrap();
+    ctx.next_step();
+    ctx.effect(spec(EffectClass::Pure), counted(&calls, json!(3)))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    for (step, n, v) in [(0, 0, 1), (0, 1, 2), (1, 0, 3)] {
+        let row = s
+            .effect(run, &EffectKey::derive(run, step, n))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.result, Some(ok(json!(v))), "ключ {step}:{n}");
+        assert!(row.receipt_seq.unwrap() > row.intent_seq);
+    }
+}
+
+#[tokio::test]
+async fn idempotent_intent_without_receipt_is_retried() {
+    let (s, run) = setup("idem-retry").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::Idempotent).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let r = ctx
+        .effect(
+            spec(EffectClass::Idempotent),
+            counted(&calls, json!("done")),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(r, json!("done"));
+    let row = s.effect(run, &key).await.unwrap().unwrap();
+    assert_eq!(row.result, Some(ok(json!("done"))));
+    assert!(s.pending_effects(run).await.unwrap().is_empty());
+    assert!(s.interrupts(run).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn non_idempotent_intent_without_receipt_interrupts() {
+    let (s, run) = setup("nonidem-interrupt").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let err = ctx
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+
+    let expected = format!("unk-{}", key.0);
+    assert_eq!(
+        err,
+        EffectError::Unknown {
+            interrupt_id: expected.clone()
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "замыкание не вызвано");
+    let ints = s.interrupts(run).await.unwrap();
+    assert_eq!(ints.len(), 1);
+    assert_eq!(ints[0].id, expected);
+    assert_eq!(ints[0].kind, "unknown_outcome");
+    assert_eq!(ints[0].status, "open");
+    assert_eq!(
+        ints[0].payload.as_ref().unwrap()["effect_key"],
+        json!(key.0)
+    );
+    // Эффект остаётся незавершённым: решение за человеком.
+    assert_eq!(s.pending_effects(run).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn interrupt_id_is_deterministic() {
+    let (s, run) = setup("interrupt-id").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
+
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let mut ctx = RunCtx::new(s.clone(), run);
+        match ctx
+            .effect(spec(EffectClass::NonIdempotent), || async { Ok(json!(1)) })
+            .await
+        {
+            Err(EffectError::Unknown { interrupt_id }) => ids.push(interrupt_id),
+            other => panic!("ожидалось Unknown, получено {other:?}"),
+        }
+    }
+    let Recovery::NeedsDecision { interrupt_ids } = recover(&s, run).await.unwrap() else {
+        panic!("ожидалось NeedsDecision");
+    };
+    ids.extend(interrupt_ids);
+
+    assert_eq!(ids, vec![format!("unk-{}", key.0); 3]);
+    // Повторное открытие идемпотентно: одна строка и одно событие.
+    assert_eq!(s.interrupts(run).await.unwrap().len(), 1);
+    let opened = s
+        .read_run(run, Seq(0), 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::InterruptOpened)
+        .count();
+    assert_eq!(opened, 1);
+}
+
+#[tokio::test]
+async fn intent_is_written_before_execution() {
+    let (s, run) = setup("intent-first").await;
+    let key = first_key(run);
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let probe = s.clone();
+    let k = key.clone();
+    let seen = ctx
+        .effect(spec(EffectClass::NonIdempotent), move || async move {
+            let pending = probe
+                .pending_effects(run)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(pending.iter().any(|r| r.key == k)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(seen, json!(true), "намерение видно внутри замыкания");
+    assert!(s.pending_effects(run).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_effect_is_recorded_and_not_retried() {
+    let (s, run) = setup("failed").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&calls);
+    let mut a = RunCtx::new(s.clone(), run);
+    let err = a
+        .effect(spec(EffectClass::Idempotent), move || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            Err::<Value, _>("нет доступа".to_owned())
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Failed("нет доступа".into()));
+
+    let row = s.effect(run, &first_key(run)).await.unwrap().unwrap();
+    assert_eq!(
+        row.result,
+        Some(json!({"outcome": "error", "message": "нет доступа"}))
+    );
+
+    // Завершённый с ошибкой эффект не выполняется заново.
+    let mut b = RunCtx::new(s.clone(), run);
+    let err = b
+        .effect(spec(EffectClass::Idempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Failed("нет доступа".into()));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn success_that_looks_like_error_replays_as_success() {
+    let (s, run) = setup("ok-like-error").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let v = json!({"error": "это данные, а не отказ"});
+    let mut a = RunCtx::new(s.clone(), run);
+    let r1 = a
+        .effect(spec(EffectClass::Idempotent), counted(&calls, v.clone()))
+        .await
+        .unwrap();
+    let mut b = RunCtx::new(s.clone(), run);
+    let r2 = b
+        .effect(spec(EffectClass::Idempotent), counted(&calls, json!(0)))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(r1, v);
+    assert_eq!(r2, v, "успех при повторе остаётся успехом");
+}
+
+#[tokio::test]
+async fn receipt_without_envelope_is_corruption() {
+    let (s, run) = setup("no-envelope").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::Idempotent).await;
+    s.record_receipt(run, &key, json!({"error": "голое значение"}))
+        .await
+        .unwrap();
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let err = ctx
+        .effect(spec(EffectClass::Idempotent), || async { Ok(json!(1)) })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EffectError::Store(za_store::StoreError::Corrupt(_))),
+        "получено {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn large_result_round_trips() {
+    let (s, run) = setup("large-result").await;
+    let big = json!({"text": "x".repeat(BLOB_THRESHOLD + 10)});
+    let mut a = RunCtx::new(s.clone(), run);
+    let r = a
+        .effect(spec(EffectClass::ReadOnly), {
+            let big = big.clone();
+            move || async move { Ok(big) }
+        })
+        .await
+        .unwrap();
+    assert_eq!(r, big);
+    let row = s.effect(run, &first_key(run)).await.unwrap().unwrap();
+    assert_eq!(row.result, Some(ok(big)));
+}
+
+#[tokio::test]
+async fn recover_reports_unknown_outcomes() {
+    let (s, run) = setup("recover").await;
+    assert_eq!(recover(&s, run).await.unwrap(), Recovery::Clean);
+
+    // Завершённый эффект и незавершённый Idempotent не требуют решения.
+    let mut ctx = RunCtx::new(s.clone(), run);
+    ctx.effect(spec(EffectClass::NonIdempotent), || async { Ok(json!(1)) })
+        .await
+        .unwrap();
+    let idem = EffectKey::derive(run, 0, 1);
+    s.record_intent(run, &idem, EffectClass::Idempotent, "fetch", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(recover(&s, run).await.unwrap(), Recovery::Clean);
+
+    let a = EffectKey::derive(run, 1, 0);
+    let b = EffectKey::derive(run, 1, 1);
+    for k in [&a, &b] {
+        s.record_intent(run, k, EffectClass::NonIdempotent, "pay", json!({}))
+            .await
+            .unwrap();
+    }
+    let expected = vec![format!("unk-{}", a.0), format!("unk-{}", b.0)];
+    assert_eq!(
+        recover(&s, run).await.unwrap(),
+        Recovery::NeedsDecision {
+            interrupt_ids: expected.clone()
+        }
+    );
+    let ids: Vec<String> = s
+        .interrupts(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(ids, expected);
+}
+
+#[tokio::test]
+async fn recover_unknown_run_is_an_error() {
+    let s = ProjectStore::open(&dir("recover-unknown")).unwrap();
+    let run = RunId::new();
+    assert_eq!(
+        recover(&s, run).await.unwrap_err(),
+        za_store::StoreError::UnknownRun(run)
+    );
+}
+
+#[tokio::test]
+async fn store_error_poisons_the_context() {
+    let s = ProjectStore::open(&dir("poison")).unwrap();
+    // Run ещё не создан: намерение не запишется, это ошибка журнала.
+    let run = RunId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let err = ctx
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EffectError::Store(za_store::StoreError::UnknownRun(run))
+    );
+
+    s.create_run(NewRun {
+        id: run,
+        project_id: "p".into(),
+        parent_id: None,
+        role: RunRole::Top,
+        model_profile: None,
+    })
+    .await
+    .unwrap();
+    // Даже когда журнал снова исправен, отравленный контекст ничего не делает,
+    // в том числе после смены шага.
+    for _ in 0..2 {
+        let err = ctx
+            .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(err, EffectError::Poisoned);
+        ctx.next_step();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(s.pending_effects(run).await.unwrap().is_empty());
+
+    // Новый контекст начинает с того же ключа (шаг 0, эффект 0).
+    let mut fresh = RunCtx::new(s.clone(), run);
+    fresh
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(7)))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let row = s.effect(run, &first_key(run)).await.unwrap().unwrap();
+    assert_eq!(row.result, Some(ok(json!(7))));
+}
+
+#[tokio::test]
+async fn recreated_context_resumes_at_same_key_without_rerunning() {
+    let (s, run) = setup("poison-resume").await;
+    let key = first_key(run);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+
+    // Действие выполнено, но квитанция контекста не записывается: внутри
+    // замыкания квитанцию занимает другой писатель, запись даёт ошибку журнала.
+    let probe = s.clone();
+    let k = key.clone();
+    let c = Arc::clone(&calls);
+    let err = ctx
+        .effect(spec(EffectClass::NonIdempotent), move || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            probe
+                .record_receipt(run, &k, ok(json!("sent")))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!("sent"))
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EffectError::Store(_)), "получено {err:?}");
+
+    // Повтор на том же контексте не занимает ключ (0, 1) и ничего не выполняет.
+    let err = ctx
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(0)))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Poisoned);
+    assert!(
+        s.effect(run, &EffectKey::derive(run, 0, 1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Новый контекст после восстановления видит тот же ключ (0, 0) завершённым.
+    assert_eq!(recover(&s, run).await.unwrap(), Recovery::Clean);
+    let mut fresh = RunCtx::new(s.clone(), run);
+    let r = fresh
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(0)))
+        .await
+        .unwrap();
+    assert_eq!(r, json!("sent"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "необратимое действие не повторено"
+    );
+}
+
+#[tokio::test]
+async fn effect_row_carries_name_and_args() {
+    let (s, run) = setup("name-args").await;
+    let mut ctx = RunCtx::new(s.clone(), run);
+    ctx.effect(spec(EffectClass::Pure), || async { Ok(json!(1)) })
+        .await
+        .unwrap();
+    let row = s.effect(run, &first_key(run)).await.unwrap().unwrap();
+    assert_eq!(row.name, "write_file");
+    assert_eq!(row.args, json!({"path": "a.txt"}));
+}
+
+/// Подменённые при продолжении аргументы — ошибка, а не результат из журнала:
+/// эффект не выполняется, контекст отравлен.
+#[tokio::test]
+async fn changed_args_on_replay_is_an_error() {
+    let (s, run) = setup("mismatch-args").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut a = RunCtx::new(s.clone(), run);
+    a.effect(spec(EffectClass::Idempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap();
+
+    let mut b = RunCtx::new(s.clone(), run);
+    let mut changed = spec(EffectClass::Idempotent);
+    changed.args = json!({"path": "b.txt"});
+    let err = b
+        .effect(changed, counted(&calls, json!(2)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EffectError::ReplayMismatch {
+            key: first_key(run).0,
+            field: "args"
+        }
+    );
+    assert!(err.to_string().contains("расходится с журналом"), "{err}");
+    let err = b
+        .effect(spec(EffectClass::Idempotent), counted(&calls, json!(3)))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Poisoned);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Другое имя действия под тем же ключом — тоже расхождение, даже если
+/// намерение ещё без квитанции: эффект не повторяется и прерывание не открывается.
+#[tokio::test]
+async fn changed_name_on_pending_intent_is_an_error() {
+    let (s, run) = setup("mismatch-name").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let mut changed = spec(EffectClass::NonIdempotent);
+    changed.name = "delete_file".into();
+    let err = ctx
+        .effect(changed, counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EffectError::ReplayMismatch {
+            key: key.0.clone(),
+            field: "name"
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(s.interrupts(run).await.unwrap().is_empty());
+}
+
+/// После `Unknown` контекст отравлен: следующий эффект не займёт ключ `seq+1`.
+#[tokio::test]
+async fn unknown_outcome_poisons_the_context() {
+    let (s, run) = setup("unknown-poison").await;
+    let key = first_key(run);
+    record_spec_intent(&s, run, &key, EffectClass::NonIdempotent).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let err = ctx
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EffectError::Unknown { .. }),
+        "получено {err:?}"
+    );
+    for _ in 0..2 {
+        let err = ctx
+            .effect(spec(EffectClass::Pure), counted(&calls, json!(2)))
+            .await
+            .unwrap_err();
+        assert_eq!(err, EffectError::Poisoned);
+        ctx.next_step();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        s.effect(run, &EffectKey::derive(run, 0, 1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Дробные числа в аргументах переживают запись в журнал без потери точности:
+/// повтор не даёт ложного [`EffectError::ReplayMismatch`].
+#[tokio::test]
+async fn float_args_replay_without_mismatch() {
+    let (s, run) = setup("float-args").await;
+    // Детерминированный набор «трудных» f64: случайные биты и крайние значения.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut vals: Vec<f64> = (0..2000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            f64::from_bits(x)
+        })
+        .filter(|v| v.is_finite())
+        .collect();
+    vals.extend([
+        0.1 + 0.2,
+        5e-324,
+        2.225_073_858_507_201_4e-308,
+        f64::MAX,
+        std::f64::consts::PI,
+    ]);
+    let sp = EffectSpec {
+        class: EffectClass::Idempotent,
+        name: "model".into(),
+        args: json!({ "temperature": vals }),
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    RunCtx::new(s.clone(), run)
+        .effect(sp.clone(), counted(&calls, json!(1)))
+        .await
+        .unwrap();
+    let r = RunCtx::new(s.clone(), run)
+        .effect(sp, counted(&calls, json!(2)))
+        .await;
+    assert_eq!(r, Ok(json!(1)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

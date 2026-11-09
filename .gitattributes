@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.ps1 text eol=crlf
+# Золотой хэш префикса: байты не трогать при checkout/commit.
+crates/za-llm/tests/golden/*.hash -text
+# Золотой хэш реплея демонстрации: байты не трогать.
+crates/zero-agent/tests/golden/*.hash -text

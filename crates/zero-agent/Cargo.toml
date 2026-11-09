@@ -1,0 +1,28 @@
+[package]
+name = "zero-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: агент"
+
+[lints]
+workspace = true
+
+[dependencies]
+za-protocol = { path = "../za-protocol" }
+za-store = { path = "../za-store" }
+za-core = { path = "../za-core" }
+za-llm = { path = "../za-llm" }
+clap.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
