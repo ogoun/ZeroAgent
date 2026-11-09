@@ -1,5 +1,6 @@
 //! Промпты приложения A (D21): тексты ролей и режимов, блоки `<env>`, `<task>`,
-//! `<control>`, экранирование недоверенного текста (D23), лимиты (PRM-002, D22)
+//! `<control>`, экранирование недоверенного текста (D23), лимиты (PRM-001, PRM-002,
+//! часть 02, §4), бюджет `AGENTS.md` (D22)
 //! и уровень мышления по тиру (MDL-010, D20).
 //!
 //! Тексты — файлы `prompts/*.txt`, байт в байт из приложения A (LF, без завершающего
@@ -118,19 +119,27 @@ pub struct EnvInfo {
 }
 
 /// Блок `<env>` (A.2) с подстановкой значений.
+///
+/// Строковые поля экранируются [`escape_untrusted`]: ветка и путь приходят из
+/// недоверенного репозитория (ARC-041), git допускает `<` в именах ссылок. Ветка
+/// обрезается до [`BRANCH_MAX_CHARS`] символов.
 pub fn render_env(e: &EnvInfo) -> String {
     let n_ctx = e.n_ctx.to_string();
+    let branch: String = e.branch.chars().take(BRANCH_MAX_CHARS).collect();
+    let esc =
+        [&e.os, &e.shell, &e.project_dir, &e.date, &e.budget, &branch].map(|v| escape_untrusted(v));
+    let [os, shell, project_dir, date, budget, branch] = &esc;
     fill(
         ENV,
         &[
-            ("os", &e.os),
-            ("shell", &e.shell),
-            ("project_dir", &e.project_dir),
-            ("date", &e.date),
+            ("os", os),
+            ("shell", shell),
+            ("project_dir", project_dir),
+            ("date", date),
             ("tier", e.tier.as_str()),
             ("n_ctx", &n_ctx),
-            ("budget", &e.budget),
-            ("branch", &e.branch),
+            ("budget", budget),
+            ("branch", branch),
         ],
     )
 }
@@ -157,23 +166,37 @@ pub struct TaskBlock {
 
 /// Блок `<task>` и `<grants>` (A.5) с подстановкой значений.
 ///
-/// Значения не экранируются: их пишет рантайм или родитель, а не недоверенный источник.
+/// Все строковые поля экранируются [`escape_untrusted`]: цель, критерии и handoff пишет
+/// модель-родитель, читавшая недоверенные данные, память — данные (MEM-006). Поддельные
+/// `</task>`, `<grants>`, `<control>` в значениях не становятся разметкой.
 pub fn render_task(t: &TaskBlock) -> String {
     let run_id = t.run_id.to_string();
     let parent_id = t.parent_id.to_string();
+    let esc = [
+        &t.goal,
+        &t.done_when,
+        &t.scope,
+        &t.workspace,
+        &t.budget,
+        &t.handoff,
+        &t.memory,
+        &t.grants,
+    ]
+    .map(|v| escape_untrusted(v));
+    let [goal, criteria, scope, path, budget, handoff, memory, grants] = &esc;
     fill(
         TASK,
         &[
             ("run_id", &run_id),
             ("parent_id", &parent_id),
-            ("goal", &t.goal),
-            ("criteria", &t.done_when),
-            ("files_or_sources", &t.scope),
-            ("path", &t.workspace),
-            ("budget", &t.budget),
-            ("minimal_handoff", &t.handoff),
-            ("zam_brief", &t.memory),
-            ("grants", &t.grants),
+            ("goal", goal),
+            ("criteria", criteria),
+            ("files_or_sources", scope),
+            ("path", path),
+            ("budget", budget),
+            ("minimal_handoff", handoff),
+            ("zam_brief", memory),
+            ("grants", grants),
         ],
     )
 }
@@ -219,7 +242,8 @@ impl ControlAction {
 
 /// Управляющее user-сообщение (A.6, шаблон `prompts/control.txt`): открывающий тег,
 /// `note` с новой строки, закрывающий тег с новой строки. `note` экранируется
-/// [`escape_untrusted`] (D23); `command` — идентификатор рантайма (D36, hex).
+/// [`escape_untrusted`] (D23); `command` — идентификатор рантайма (D36, hex), символы
+/// вне `[A-Za-z0-9_-]` заменяются на `_`.
 pub fn render_control(
     from: ControlFrom,
     action: ControlAction,
@@ -227,30 +251,37 @@ pub fn render_control(
     note: &str,
 ) -> String {
     let note = escape_untrusted(note);
+    let command = attr_id(command);
     fill(
         CONTROL,
         &[
             ("runtime|parent|user", from.as_str()),
             ("correct|resume", action.as_str()),
-            ("command_id", command),
+            ("command_id", &command),
             ("note", &note),
         ],
     )
 }
 
-/// Экранирование управляющего тега в недоверенном тексте (D23).
+/// Имена тегов разметки промпта, которые недоверенный текст не может открыть или
+/// закрыть (D23; `memory` — обёртка MEM-006 и снимка первого сообщения, `state` — resume).
+pub const RESERVED_TAGS: &[&str] = &["control", "task", "grants", "env", "memory", "state"];
+
+/// Экранирование тегов разметки промпта в недоверенном тексте (D23, PRM-011).
 ///
-/// Каждое `<`, за которым идут необязательные пробельные символы, необязательный `/`,
-/// необязательные пробельные символы и `control` без учёта регистра ASCII, заменяется
-/// на `&lt;`; остальной текст не меняется. Пробельные — по `char::is_whitespace`
-/// (шире ASCII: лишнее экранирование безопасно, пропущенное — нет).
+/// Каждое `<`, за которым идут пробельные или невидимые символы и `/` в любом порядке
+/// и количестве, а затем имя из [`RESERVED_TAGS`] без учёта регистра ASCII, заменяется
+/// на `&lt;`; остальной текст не меняется. Совпадение по префиксу (`<controller`,
+/// `<environment` тоже экранируются): лишнее экранирование безопасно, пропущенное — нет.
+/// Пробельные — `char::is_whitespace`, невидимые — нулевой ширины, мягкий перенос,
+/// управление направлением письма и BOM. Функция идемпотентна.
 pub fn escape_untrusted(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find('<') {
         out.push_str(&rest[..i]);
         let after = &rest[i + 1..];
-        if opens_control(after) {
+        if opens_reserved(after) {
             out.push_str("&lt;");
         } else {
             out.push('<');
@@ -261,13 +292,44 @@ pub fn escape_untrusted(s: &str) -> String {
     out
 }
 
-/// Текст после `<` начинается с `[пробелы][/][пробелы]control` (регистр ASCII не важен).
-fn opens_control(after: &str) -> bool {
-    let t = after.trim_start();
-    let t = t.strip_prefix('/').unwrap_or(t).trim_start();
-    t.as_bytes()
-        .get(..7)
-        .is_some_and(|w| w.eq_ignore_ascii_case(b"control"))
+/// Символ без видимого начертания, который модель может пропустить при чтении тега.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// Текст после `<` — `[пробелы, невидимые, /]*` и имя зарезервированного тега.
+fn opens_reserved(after: &str) -> bool {
+    let t = after.trim_start_matches(|c: char| c == '/' || c.is_whitespace() || is_invisible(c));
+    RESERVED_TAGS.iter().any(|tag| {
+        t.as_bytes()
+            .get(..tag.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(tag.as_bytes()))
+    })
+}
+
+/// Длина имени ветки в `<env>`, символы: длинное имя иначе раздувало бы блок сверх
+/// [`ENV_LIMIT`].
+pub const BRANCH_MAX_CHARS: usize = 64;
+
+/// Идентификатор команды в атрибуте `command`: только ASCII-буквы, цифры, `-` и `_`
+/// (D36 даёт hex); остальные символы заменяются на `_`, чтобы кавычка не закрыла атрибут.
+fn attr_id(s: &str) -> String {
+    let clean: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean != s {
+        tracing::warn!("идентификатор команды с недопустимыми символами заменён");
+    }
+    clean
 }
 
 /// Подстановка `{ключ}` за один проход: подставленные значения повторно не разбираются,
@@ -299,8 +361,18 @@ fn fill(template: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
-/// Лимит блоков 2, 3 и 5 роли (PRM-002, D22), токены; без overlay режима
-/// ([`MODE_LIMIT`]) и без `<env>` ([`ENV_LIMIT`]).
+/// Лимит системного промпта роли (PRM-001, PRM-002), токены: блоки 2–5 раздела 2.1
+/// части 02 — Core с блоками tier и инструкциями capability, адаптер, overlay режима,
+/// `AGENTS.md`.
+///
+/// Top standard и full считаются вместе с `<env>` (часть 02, §4: «Лимит 3000 считается
+/// по блокам 2–5 раздела 2.1 плюс `<env>`»; для standard — так же, консервативно). Top
+/// small — без `<env>`: у него свой слот [`ENV_LIMIT`] (PRM-002: «top small ≤ 800 +
+/// `<env>` ≤ 200»), см. [`env_in_role_limit`]. Overlay ограничен ещё и своим слотом
+/// [`MODE_LIMIT`] (PRM-008). Orchestrator 500 и worker 300 — блоки 2–5 при любом тире.
+///
+/// Соблюдение лимита фиксированными текстами проверяет CI-счётчик токенизаторами
+/// (PRM-007, план B2); [`approx_tokens`] в рантайме — только планирование с запасом.
 pub fn role_limit(role: RunRole, tier: Tier) -> u32 {
     match (role, tier) {
         (RunRole::Top, Tier::Small) => 800,
@@ -309,6 +381,80 @@ pub fn role_limit(role: RunRole, tier: Tier) -> u32 {
         (RunRole::Orchestrator, _) => 500,
         (RunRole::Worker, _) => 300,
     }
+}
+
+/// Входит ли `<env>` в [`role_limit`]: да у top standard и full, нет у top small
+/// (отдельный слот [`ENV_LIMIT`]) и у orchestrator и worker (`<env>` — данные первого
+/// сообщения, как `<task>`).
+pub fn env_in_role_limit(role: RunRole, tier: Tier) -> bool {
+    role == RunRole::Top && tier != Tier::Small
+}
+
+/// Предел блока `AGENTS.md`, токены: «`AGENTS.md` и резерв ≤ 700» распределения Full
+/// (часть 02, §4); на младших тирах — тот же потолок, остаток лимита обычно меньше.
+pub const AGENTS_MD_LIMIT: u32 = 700;
+
+/// Бюджет `AGENTS.md` (блок 5), токены: остаток [`role_limit`] после блоков 2–4
+/// (`fixed_tokens`) и, если `<env>` входит в лимит, после резерва [`ENV_LIMIT`], но не
+/// больше [`AGENTS_MD_LIMIT`]. Резерв, а не фактический `<env>`, — чтобы обрезка
+/// `AGENTS.md` (блок 5, общий префикс) не зависела от ветки и пути. Orchestrator и
+/// worker `AGENTS.md` не получают (N-07) — 0.
+pub fn agents_md_budget(role: RunRole, tier: Tier, fixed_tokens: u32) -> u32 {
+    if role != RunRole::Top {
+        return 0;
+    }
+    let env = if env_in_role_limit(role, tier) {
+        ENV_LIMIT
+    } else {
+        0
+    };
+    role_limit(role, tier)
+        .saturating_sub(fixed_tokens)
+        .saturating_sub(env)
+        .min(AGENTS_MD_LIMIT)
+}
+
+/// `AGENTS.md` в пределах `budget` токенов ([`approx_tokens`]) (D22, D23): текст
+/// экранируется [`escape_untrusted`]; не помещается — обрезается по строкам с конца,
+/// последняя строка `[AGENTS.md truncated: N lines omitted]` входит в бюджет. Не
+/// помещается и она (или текст пуст) — `None`, блок опускается целиком.
+pub fn fit_agents_md(text: &str, budget: u32) -> Option<String> {
+    let text = escape_untrusted(text.trim_end());
+    if text.is_empty() {
+        return None;
+    }
+    if approx_tokens(&text) <= budget {
+        return Some(text);
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let total = lines.len();
+    let marker = |omitted: usize| format!("[AGENTS.md truncated: {omitted} lines omitted]");
+    let fits = |len: usize| len.div_ceil(4) <= budget as usize;
+    // Длина растёт с k не убывая: строка добавляет ≥ 1 байт, маркер теряет ≤ 1 цифру.
+    let mut kept = None;
+    let mut kept_len = 0usize;
+    for (k, line) in lines.iter().enumerate() {
+        let len = if k == 0 {
+            marker(total).len()
+        } else {
+            kept_len + 1 + marker(total - k).len()
+        };
+        if !fits(len) {
+            break;
+        }
+        kept = Some(k);
+        kept_len += line.len() + usize::from(k > 0);
+    }
+    let Some(k) = kept else {
+        tracing::warn!(budget, "AGENTS.md не помещается в лимит промпта и опущен");
+        return None;
+    };
+    let mut out = lines[..k].join("\n");
+    if k > 0 {
+        out.push('\n');
+    }
+    out.push_str(&marker(total - k));
+    Some(out)
 }
 
 /// Оценка рантайма: `ceil(байты UTF-8 / 4)` (D22). Точный счёт — CI (PRM-007).
@@ -364,7 +510,7 @@ pub fn git_branch(project_dir: &Path) -> String {
         return if name.is_empty() {
             "-".into()
         } else {
-            name.into()
+            name.chars().take(BRANCH_MAX_CHARS).collect()
         };
     }
     match head.char_indices().nth(SHORT_SHA) {

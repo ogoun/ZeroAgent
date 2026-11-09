@@ -27,6 +27,8 @@ const CORE_FORBIDDEN_DEPS: &[&str] = &[
 ];
 /// Крейты workspace, от которых может зависеть `za-agent` (ADR 0004).
 const AGENT_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-store", "za-core", "za-llm", "za-res"];
+/// Крейты, подключающие `za-llm` только без функций: без HTTP и `Gateway`.
+const PURE_LLM_USERS: &[&str] = &["za-core", "za-agent"];
 /// Внешние крейты, которые `za-agent` подключать не должен: модель — только через `ModelPort`.
 const AGENT_FORBIDDEN_DEPS: &[&str] = &["reqwest"];
 /// Единственный крейт `za-*`, от которого может зависеть `za-res` (D1).
@@ -63,6 +65,9 @@ pub struct Dependency {
     /// `None` — обычная зависимость, иначе `"dev"` или `"build"`.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Явно включённые функции зависимости (`features = [...]`).
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -124,16 +129,23 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     dep.name
                 )));
             }
-            // Только то, что попадает в сборку ядра: dev-зависимости тестов не в счёт.
-            if pkg.name == "za-core"
+            // Только то, что попадает в сборку: dev-зависимости тестов не в счёт.
+            // `za-llm` — без функций по умолчанию и без явных (`http`, `gateway`, `probe`).
+            if PURE_LLM_USERS.contains(&pkg.name.as_str())
                 && dep.name == "za-llm"
                 && dep.kind.as_deref() != Some("dev")
-                && dep.uses_default_features
             {
-                out.push(Violation(
-                    "za-core подключает za-llm с функциями по умолчанию (нужно default-features = false)"
-                        .into(),
-                ));
+                if dep.uses_default_features {
+                    out.push(Violation(format!(
+                        "{} подключает za-llm с функциями по умолчанию (нужно default-features = false)",
+                        pkg.name
+                    )));
+                } else if !dep.features.is_empty() {
+                    out.push(Violation(format!(
+                        "{} подключает za-llm с функциями {:?} (допустим только пустой набор)",
+                        pkg.name, dep.features
+                    )));
+                }
             }
             // Все виды: нижние слои не видят цикл даже в тестах (ADR 0004).
             if AGENT_ALLOWED_ZA_DEPS.contains(&pkg.name.as_str()) && dep.name == "za-agent" {
@@ -160,16 +172,6 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     "za-agent не должен зависеть от {}",
                     dep.name
                 )));
-            }
-            if pkg.name == "za-agent"
-                && dep.name == "za-llm"
-                && dep.kind.as_deref() != Some("dev")
-                && dep.uses_default_features
-            {
-                out.push(Violation(
-                    "za-agent подключает za-llm с функциями по умолчанию (нужно default-features = false)"
-                        .into(),
-                ));
             }
             if pkg.name == "za-protocol" && dep.name.starts_with("za-") {
                 out.push(Violation(format!(
@@ -308,6 +310,7 @@ version = \"0.0.1\"
             name: name.into(),
             uses_default_features: true,
             kind: None,
+            features: Vec::new(),
         }
     }
     fn meta_with(name: &str, dep: Dependency) -> Metadata {
@@ -407,6 +410,34 @@ version = \"0.0.1\"
         assert_eq!(check_direction(&meta("za-agent", "zero-agent")).len(), 1);
         assert_eq!(check_direction(&meta("za-agent", "za-memory")).len(), 1);
         assert_eq!(check_direction(&meta("za-agent", "reqwest")).len(), 1);
+    }
+    #[test]
+    fn llm_features_must_be_empty_for_core_and_agent() {
+        for pkg in ["za-agent", "za-core"] {
+            for f in ["gateway", "http", "probe"] {
+                let with = Dependency {
+                    uses_default_features: false,
+                    features: vec![f.into()],
+                    ..dep("za-llm")
+                };
+                assert_eq!(
+                    check_direction(&meta_with(pkg, with)).len(),
+                    1,
+                    "{pkg}: {f}"
+                );
+            }
+            let dev = Dependency {
+                kind: Some("dev".into()),
+                features: vec!["gateway".into()],
+                ..dep("za-llm")
+            };
+            assert!(check_direction(&meta_with(pkg, dev)).is_empty(), "{pkg}");
+        }
+        let json = r#"{"packages":[{"name":"za-agent","dependencies":[
+            {"name":"za-llm","uses_default_features":false,"kind":null,"features":["gateway"]}]}]}"#;
+        let m: Metadata = serde_json::from_str(json).unwrap();
+        assert_eq!(m.packages[0].dependencies[0].features, vec!["gateway"]);
+        assert_eq!(check_direction(&m).len(), 1);
     }
     #[test]
     fn core_must_not_depend_on_res_or_http() {

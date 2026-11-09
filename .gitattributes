@@ -8,3 +8,5 @@ crates/zero-agent/tests/golden/*.hash -text
 crates/za-llm/tests/fixtures/** -text
 # Вывод nvidia-smi (CRLF под Windows): байты не трогать.
 crates/za-res/tests/fixtures/** -text
+# Золотой хэш текстов промптов: байты не трогать.
+crates/za-agent/tests/golden/*.hash -text
