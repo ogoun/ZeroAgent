@@ -1146,3 +1146,40 @@ async fn midstream_error_hides_key() {
     assert!(!err.message.contains(key), "{}", err.message);
     assert!(err.message.contains("***"), "{}", err.message);
 }
+
+// ---------- Роль System в истории (R1-B1, D10) ----------
+
+#[test]
+fn history_system_omitted() {
+    let mut req = request();
+    req.messages = vec![
+        user("a"),
+        Message {
+            role: Role::System,
+            parts: vec![Part::Text("x".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![Part::Text("b".into())],
+        },
+    ];
+    for d in [
+        ChatDialect::LlamaCpp,
+        ChatDialect::Vllm,
+        ChatDialect::OpenRouter,
+        ChatDialect::OpenAi,
+        ChatDialect::Generic,
+    ] {
+        let b = body(d, &req);
+        let msgs = b["messages"].as_array().unwrap();
+        assert!(
+            msgs.iter().all(|m| m["content"] != "x"),
+            "{d:?}: служебное сообщение в теле"
+        );
+        // system остаётся единственным и первым (CTX-004).
+        assert_eq!(msgs.len(), 3, "{d:?}");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["content"], "a");
+        assert_eq!(msgs[2]["content"], "b");
+    }
+}

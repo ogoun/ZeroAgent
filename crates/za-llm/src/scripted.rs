@@ -182,4 +182,23 @@ mod tests {
         let m = m.with_context(32768);
         assert_eq!(m.context_tokens(&ep), Some(32768));
     }
+
+    #[tokio::test]
+    async fn collect_ignores_service_message() {
+        let m = ScriptedModel::new(default_caps(BackendKind::LlamaCpp));
+        let mut events = vec![Ok(StreamEvent::ServiceMessage(Message {
+            role: Role::System,
+            parts: vec![Part::Text("x".into())],
+        }))];
+        events.extend(answer("a"));
+        m.push(events);
+        let r = m
+            .stream(call("local", "q"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(r.message.parts, vec![Part::Text("a".into())]);
+    }
 }

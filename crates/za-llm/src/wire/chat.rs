@@ -169,13 +169,26 @@ impl ChatWire {
     }
 
     /// Сообщения: system первым и единственным (CTX-004), результаты инструментов —
-    /// отдельными сообщениями `tool`.
+    /// отдельными сообщениями `tool`. Служебные `Role::System` из истории (эмуляция
+    /// принудительного выбора у Anthropic, D10) опускаются: инструкция уже погашена,
+    /// а второе system-сообщение нарушило бы CTX-004.
     fn messages(&self, req: &ChatRequest, ctx: &WireCtx<'_>) -> Vec<Value> {
         let mut out = Vec::new();
         if !req.system.is_empty() {
             out.push(json!({"role": "system", "content": req.system}));
         }
         for m in &req.messages {
+            let role = match m.role {
+                Role::Assistant => "assistant",
+                // Текст в сообщении результатов инструментов уходит от пользователя.
+                Role::User | Role::Tool => "user",
+                Role::System => {
+                    tracing::debug!(
+                        "служебное system-сообщение истории в Chat Completions опущено"
+                    );
+                    continue;
+                }
+            };
             let mut text = String::new();
             let mut reasoning = String::new();
             let mut details: Option<&Value> = None;
@@ -205,16 +218,10 @@ impl ChatWire {
                     }
                 }
             }
-            let role = match m.role {
-                Role::Assistant => "assistant",
-                // Текст в сообщении результатов инструментов уходит от пользователя.
-                Role::User | Role::Tool => "user",
-            };
-            let emit = match m.role {
-                Role::Tool => !text.is_empty(),
-                Role::User | Role::Assistant => {
-                    !text.is_empty() || !calls.is_empty() || !has_results
-                }
+            let emit = if m.role == Role::Tool {
+                !text.is_empty()
+            } else {
+                !text.is_empty() || !calls.is_empty() || !has_results
             };
             if !emit {
                 continue;

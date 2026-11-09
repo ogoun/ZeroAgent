@@ -1048,3 +1048,154 @@ fn decoder_redacted_thinking_goes_to_replay_whole() {
     };
     assert_eq!(blob.data["blocks"][0], block);
 }
+
+// ---------- Роль System и служебные сообщения (R1-B1, D10) ----------
+
+fn system_msg(text: &str) -> Message {
+    Message {
+        role: Role::System,
+        parts: vec![Part::Text(text.into())],
+    }
+}
+
+fn assistant(text: &str) -> Message {
+    Message {
+        role: Role::Assistant,
+        parts: vec![Part::Text(text.into())],
+    }
+}
+
+/// `user a, System x, assistant b, user c`.
+fn history_with_system() -> ChatRequest {
+    ChatRequest {
+        system: "Ты агент.".into(),
+        messages: vec![user("a"), system_msg("x"), assistant("b"), user("c")],
+        ..ChatRequest::default()
+    }
+}
+
+fn named_read_file() -> ChatRequest {
+    let mut req = request();
+    req.tools = vec![tool("read_file")];
+    req.tool_choice = ToolChoice::Named("read_file".into());
+    req
+}
+
+async fn events_for(model: &str, req: &ChatRequest) -> Vec<StreamEvent> {
+    let srv = FakeServer::start(vec![(
+        ROUTE,
+        vec![Reply::sse(vec![fixture("anthropic/text.sse")])],
+    )])
+    .await;
+    let caps = caps();
+    let w = AnthropicWire {
+        base_url: srv.url("/v1"),
+        model: model.into(),
+    };
+    let s = w.open(&transport(), req, &ctx(&caps)).await.unwrap();
+    drain(s).await.into_iter().map(|x| x.unwrap()).collect()
+}
+
+#[tokio::test]
+async fn emulated_required_emits_service_message() {
+    let evs = events_for(MODEL, &named_read_file()).await;
+    assert_eq!(
+        evs[0],
+        StreamEvent::ServiceMessage(Message {
+            role: Role::System,
+            parts: vec![Part::Text("Ответь вызовом инструмента `read_file`.".into())],
+        })
+    );
+    let n = evs
+        .iter()
+        .filter(|e| matches!(e, StreamEvent::ServiceMessage(_)))
+        .count();
+    assert_eq!(n, 1);
+    // Без эмуляции служебных сообщений нет.
+    let evs = events_for(MODEL, &request()).await;
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, StreamEvent::ServiceMessage(_)))
+    );
+}
+
+#[test]
+fn history_system_rendered_with_clear_at() {
+    let caps = caps();
+    let c = ctx(&caps);
+    let w = wire("http://x");
+    let b = w.build_body(&history_with_system(), &c).unwrap();
+    assert_eq!(
+        b["messages"],
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "a"}]},
+            {"role": "system", "clear_at": "next_user_message", "content": "x"},
+            {"role": "assistant", "content": [{"type": "text", "text": "b"}]},
+            {"role": "user", "content": [{"type": "text", "text": "c"}]},
+        ])
+    );
+    let h = w.headers(&c, &b).unwrap();
+    assert_eq!(h.get("anthropic-beta").unwrap(), CLEAR_AT_BETA);
+    // Погашенное сообщение пересылается байт-в-байт (preserved thinking): текст
+    // system-сообщения в теле следующего хода тот же, что отправила эмуляция.
+    let first = named_read_file();
+    let sent = w.body_text(&first, &c).unwrap();
+    let parsed: Value = serde_json::from_str(sent.get()).unwrap();
+    let service = parsed["messages"][1].to_string();
+    assert!(sent.get().contains(&service));
+    let mut next = first.clone();
+    next.tool_choice = ToolChoice::Auto;
+    next.messages.extend([
+        system_msg("Ответь вызовом инструмента `read_file`."),
+        assistant("b"),
+        user("c"),
+    ]);
+    let resent = w.body_text(&next, &c).unwrap();
+    assert!(resent.get().contains(&service), "{}", resent.get());
+}
+
+#[test]
+fn history_system_does_not_merge_with_neighbours() {
+    let caps = caps();
+    let req = ChatRequest {
+        messages: vec![user("a"), system_msg("x"), system_msg("y"), user("c")],
+        ..ChatRequest::default()
+    };
+    let b = wire("http://x").build_body(&req, &ctx(&caps)).unwrap();
+    let msgs = b["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 4);
+    assert_eq!(msgs[1]["content"], "x");
+    assert_eq!(msgs[2]["content"], "y");
+    assert_eq!(msgs[3]["role"], "user");
+}
+
+#[test]
+fn history_system_omitted_for_model_without_mid_system() {
+    let caps = caps();
+    let c = ctx(&caps);
+    let w = AnthropicWire {
+        base_url: "http://x".into(),
+        model: "claude-sonnet-5".into(),
+    };
+    let b = w.build_body(&history_with_system(), &c).unwrap();
+    assert_eq!(
+        b["messages"],
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "a"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "b"}]},
+            {"role": "user", "content": [{"type": "text", "text": "c"}]},
+        ])
+    );
+    assert!(w.headers(&c, &b).unwrap().get("anthropic-beta").is_none());
+}
+
+#[tokio::test]
+async fn text_fallback_emits_no_service_message() {
+    let evs = events_for("claude-sonnet-5", &named_read_file()).await;
+    let n = evs
+        .iter()
+        .filter(|e| matches!(e, StreamEvent::ServiceMessage(_)))
+        .count();
+    assert_eq!(n, 0);
+    assert!(matches!(evs.last(), Some(StreamEvent::Finished { .. })));
+}

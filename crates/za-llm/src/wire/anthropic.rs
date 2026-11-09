@@ -136,6 +136,16 @@ impl AnthropicWire {
     /// Тело запроса. Принудительный выбор без инструментов, неизвестное имя в
     /// `ToolChoice::Named` и повтор имени инструмента — `BadRequest` до отправки.
     pub fn build_body(&self, req: &ChatRequest, ctx: &WireCtx<'_>) -> Result<Value, ModelError> {
+        self.build(req, ctx).map(|(body, _)| body)
+    }
+
+    /// Тело запроса и служебное сообщение, которое эмуляция принудительного выбора
+    /// добавила в конец `messages` (D10), если добавила.
+    fn build(
+        &self,
+        req: &ChatRequest,
+        ctx: &WireCtx<'_>,
+    ) -> Result<(Value, Option<Message>), ModelError> {
         let mut body = Map::new();
         body.insert("model".into(), json!(self.model));
         let cache = req.cache_key.is_some();
@@ -151,6 +161,7 @@ impl AnthropicWire {
 
         let thinking = self.thinking(&mut body, &req.reasoning, ctx.thinking);
         let mut messages = self.messages(req);
+        let mut service = None;
         if req.tools.is_empty() {
             if matches!(req.tool_choice, ToolChoice::Required | ToolChoice::Named(_)) {
                 return Err(bad_request("принудительный tool_choice без инструментов"));
@@ -167,7 +178,7 @@ impl AnthropicWire {
             }
             body.insert("tool_choice".into(), choice);
             if let Some(text) = instruction {
-                self.append_instruction(&mut messages, text);
+                service = self.append_instruction(&mut messages, text);
             }
         }
         body.insert("messages".into(), Value::Array(messages));
@@ -195,17 +206,19 @@ impl AnthropicWire {
         if !s.stop.is_empty() {
             body.insert("stop_sequences".into(), json!(s.stop));
         }
-        Ok(Value::Object(body))
+        Ok((Value::Object(body), service))
     }
 
-    /// Отправляет запрос и запускает насос SSE (D2, D35).
+    /// Отправляет запрос и запускает насос SSE (D2, D35). Если эмуляция
+    /// принудительного выбора добавила system-сообщение с `clear_at`, первым событием
+    /// канала идёт [`StreamEvent::ServiceMessage`] с ним (D10), до событий провайдера.
     pub async fn open(
         &self,
         http: &HttpTransport,
         req: &ChatRequest,
         ctx: &WireCtx<'_>,
     ) -> Result<OpenedStream, ModelError> {
-        let parsed = self.build_body(req, ctx)?;
+        let (parsed, service) = self.build(req, ctx)?;
         let headers = self.headers(ctx, &parsed)?;
         let body = self.body_text_of(&parsed, req)?;
         let secrets: Vec<&Secret> = ctx.secret.into_iter().collect();
@@ -214,6 +227,17 @@ impl AnthropicWire {
             .await?;
         let limits = parse_rate_limits(&sse.headers);
         let (tx, events) = mpsc::channel(STREAM_CHANNEL);
+        if let Some(m) = service {
+            // Канал только что создан, пуст и ёмкостью больше нуля, приёмник у нас:
+            // отправка не может не пройти.
+            tx.try_send(Ok(StreamEvent::ServiceMessage(m)))
+                .map_err(|e| {
+                    ModelError::new(
+                        ErrorClass::Internal,
+                        format!("служебное сообщение не помещено в канал стрима: {e}"),
+                    )
+                })?;
+        }
         let decoder = AnthropicDecoder::new(self.model.clone());
         tokio::spawn(pump(sse, decoder, tx, ctx.secret.cloned()));
         Ok(OpenedStream { limits, events })
@@ -255,16 +279,21 @@ impl AnthropicWire {
     /// Иначе (модель без таких сообщений или последним идёт ассистент) — текст в конце
     /// последнего сообщения пользователя. Погашенное сообщение по документации
     /// пересылается в истории без изменений — это хранит цикл R1-B.
-    fn append_instruction(&self, messages: &mut Vec<Value>, text: String) {
+    ///
+    /// Возвращает служебное сообщение (`Role::System`), если инструкция ушла отдельным
+    /// system-сообщением: [`Self::open`] отдаёт его первым событием стрима (D10).
+    /// Текстовый запасной путь историю не дополняет — `None`.
+    fn append_instruction(&self, messages: &mut Vec<Value>, text: String) -> Option<Message> {
         let after_user = messages.last().is_some_and(|m| m["role"] == "user");
         if self.mid_system() && after_user {
-            messages.push(json!({
-                "role": "system",
-                "clear_at": "next_user_message",
-                "content": text,
-            }));
+            messages.push(clear_at_message(&text));
+            Some(Message {
+                role: Role::System,
+                parts: vec![Part::Text(text)],
+            })
         } else {
             append_user_text(messages, text);
+            None
         }
     }
 
@@ -338,23 +367,50 @@ impl AnthropicWire {
 
     /// Сообщения. Подряд идущие сообщения одной роли сливаются в одно: так все
     /// результаты инструментов одного хода уходят одним сообщением `user`.
+    ///
+    /// `Role::System` из истории (D10) — отдельный элемент, ни с чем не сливается и
+    /// рендерится тем же [`clear_at_message`], что и при эмуляции: погашенное
+    /// сообщение пересылается без изменений (preserved thinking). Модели без
+    /// mid-conversation system получают историю без него: инструкция уже погашена.
     fn messages(&self, req: &ChatRequest) -> Vec<Value> {
-        let mut out: Vec<(&'static str, Vec<Value>)> = Vec::new();
+        enum Item {
+            Turn(&'static str, Vec<Value>),
+            System(String),
+        }
+        let mid_system = self.mid_system();
+        let mut out: Vec<Item> = Vec::new();
         for m in &req.messages {
             let (role, blocks) = match m.role {
                 Role::Assistant => ("assistant", self.assistant_blocks(m)),
                 Role::User | Role::Tool => ("user", user_blocks(m)),
+                Role::System => {
+                    let text = system_text(m);
+                    if !mid_system {
+                        tracing::debug!(
+                            model = self.model.as_str(),
+                            "модель не принимает system-сообщений в истории, служебное опущено"
+                        );
+                    } else if text.is_empty() {
+                        tracing::debug!("пустое служебное system-сообщение опущено");
+                    } else {
+                        out.push(Item::System(text));
+                    }
+                    continue;
+                }
             };
             if blocks.is_empty() {
                 continue;
             }
             match out.last_mut() {
-                Some((r, prev)) if *r == role => prev.extend(blocks),
-                _ => out.push((role, blocks)),
+                Some(Item::Turn(r, prev)) if *r == role => prev.extend(blocks),
+                _ => out.push(Item::Turn(role, blocks)),
             }
         }
         out.into_iter()
-            .map(|(role, content)| json!({"role": role, "content": content}))
+            .map(|it| match it {
+                Item::Turn(role, content) => json!({"role": role, "content": content}),
+                Item::System(text) => clear_at_message(&text),
+            })
             .collect()
     }
 
@@ -557,6 +613,31 @@ fn write_json(
         scalar => out.push_str(&serde_json::to_string(scalar).map_err(enc)?),
     }
     Ok(())
+}
+
+/// System-сообщение на один ход: `{"role":"system","clear_at":"next_user_message",
+/// "content":…}`. Один рендер для эмуляции и для истории: байты погашенного
+/// сообщения при пересылке те же.
+fn clear_at_message(text: &str) -> Value {
+    json!({
+        "role": "system",
+        "clear_at": "next_user_message",
+        "content": text,
+    })
+}
+
+/// Текст служебного сообщения: части `Text` подряд, прочие части опускаются.
+fn system_text(m: &Message) -> String {
+    m.parts
+        .iter()
+        .filter_map(|p| match p {
+            Part::Text(t) => Some(t.as_str()),
+            _ => {
+                tracing::debug!("не текстовая часть служебного system-сообщения пропущена");
+                None
+            }
+        })
+        .collect()
 }
 
 /// Дописывает текст в конец последнего сообщения пользователя (или новым

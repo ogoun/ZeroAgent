@@ -2,6 +2,14 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-B1, задача 5: роль `System` и служебные сообщения в `za-llm`
+
+- **Канонический формат (D10).** `Role::System` — служебное system-сообщение посреди истории (первое system по-прежнему `ChatRequest.system`); `StreamEvent::ServiceMessage(Message)` — сообщение, которое коннектор добавил в конец истории запроса. Закрывает Carry R1-A (progress R1-A: 45, 48, 54): эмуляция `required` у Anthropic теперь видна потребителю и может быть сохранена в истории.
+- **Anthropic.** Если инструкция эмуляции ушла отдельным system-сообщением с `clear_at: "next_user_message"`, `open` кладёт `ServiceMessage(Message { role: System, parts: [Text(инструкция)] })` в канал первым, до насоса SSE (значит, и каждой попыткой после `Restart`). Текстовый запасной путь (модель вне `MID_SYSTEM_MODELS` или последним идёт ассистент) событий не даёт. `Role::System` из истории рендерится отдельным элементом, не сливаясь с соседями, тем же `clear_at_message`, что и эмуляция: байты погашенного сообщения в следующем запросе те же (preserved thinking, проверено тестом через `body_text`); его наличие включает заголовок `anthropic-beta: mid-conversation-system-clear-at-2026-08-21`. У моделей без mid-system (`claude-sonnet-5` и др.) и для пустого текста — опускается с `debug` (Carry 58б: инструкция уже погашена). Нетекстовые части служебного сообщения опускаются.
+- **Chat Completions и Responses.** `Role::System` из истории опускается с `debug`: system остаётся первым и единственным (CTX-004), у Responses — только `instructions`.
+- **Потребители.** `ModelStream::collect` и `zero-agent ask` событие пропускают без правки кода (`_ =>`), тест `collect_ignores_service_message`. Атомарная фиксация хода (служебные, затем ответ; Carry 58а) — задача цикла `za-agent`.
+- **Prefix.** `prefix_hash` строится из `PromptBlocks` (system и инструменты), сообщений не касается: golden `crates/za-llm/tests/golden/prefix.hash` не менялся, `golden_hash_is_stable` зелёный.
+
 ## 2026-11-09. R1-B1, задача 4: инструмент, capability и шина событий
 
 - **Инструменты (`za-core/src/tool.rs`, D14).** `ToolSpec` (схема `za_llm::ToolSchema`, класс эффекта, `ToolKind`, `Approval`, роли, `min_tier`, `timeout`, `output_limit`, `tainted`), `Tool::call(args, ToolCx) -> BoxFuture<'static, ToolOutput>`. `gate(mode, spec)`: `Read`/`Control` разрешены всегда; `Edit` — `Deny` в `read-only`/`plan`, `Ask` в `ask`, `Allow` в `accept-edits`/`auto`; `Exec` — `Deny` в `read-only`/`plan`, `Ask` в `ask`/`accept-edits`, `Allow` в `auto`; затем `Approval::Always` превращает `Allow` в `Ask`, `Never` — `Ask` в `Allow`, `Deny` неизменен. Причины `read-only mode`, `plan mode`. `ToolRegistry` — `BTreeMap` по имени: повторное имя — `DuplicateTool`, первая регистрация остаётся; `for_run(role, tier)` — инструменты роли с `min_tier <= tier` по имени.

@@ -148,13 +148,18 @@ impl ResponsesWire {
     /// Элементы `input`. Результаты инструментов — `function_call_output` в порядке
     /// частей, текст пользователя — `message` после них. Сообщение ассистента —
     /// элементы `reasoning` (из своего [`ReplayBlob`]), `message` и `function_call` в
-    /// порядке ответа.
+    /// порядке ответа. Служебные `Role::System` из истории (эмуляция принудительного
+    /// выбора у Anthropic, D10) опускаются: инструкция уже погашена, system-промпт —
+    /// только `instructions`.
     fn input(&self, req: &ChatRequest) -> Vec<Value> {
         let mut out = Vec::new();
         for m in &req.messages {
             match m.role {
                 Role::User | Role::Tool => user_items(m, &mut out),
                 Role::Assistant => self.assistant_items(m, &mut out),
+                Role::System => {
+                    tracing::debug!("служебное system-сообщение истории в Responses опущено");
+                }
             }
         }
         out

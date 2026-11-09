@@ -714,3 +714,30 @@ fn refusal_is_finish_reason() {
     assert_eq!(finish, &FinishReason::Refusal);
     assert_eq!(msg.parts, vec![Part::Text("Не могу помочь.".into())]);
 }
+
+// ---------- Роль System в истории (R1-B1, D10) ----------
+
+#[test]
+fn history_system_omitted() {
+    let mut req = request();
+    req.messages = vec![
+        user("a"),
+        Message {
+            role: Role::System,
+            parts: vec![Part::Text("x".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![Part::Text("b".into())],
+        },
+    ];
+    let b = body(&req);
+    let input = b["input"].as_array().unwrap();
+    assert!(
+        !b.to_string().contains(r#""x""#),
+        "служебное сообщение в теле: {b}"
+    );
+    assert_eq!(input.len(), 2);
+    assert_eq!(input[0]["content"], "a");
+    assert_eq!(input[1]["content"], "b");
+}
