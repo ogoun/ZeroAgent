@@ -19,10 +19,13 @@
 //!    D43); у готового эндпоинта предохранитель не пускает — `CircuitOpen` (D22,
 //!    переход в `HalfOpen` запускает повторный зонд); заявка встаёт в очередь группы.
 //! 2. Стрим возвращается сразу; его guard — [`AbortOnDrop`] фоновой задачи (D2). Первое
-//!    событие — всегда `Queued`. Эндпоинт ещё зондируется — заявка ждёт итога зонда
-//!    без места в очереди (место общей группы не простаивает); эндпоинт `Unreachable` —
-//!    повторный зонд (D40): один на всех ждущих (зонд новее постановки заявки уже дал
-//!    ответ — без нового), не чаще `reprobe_min` с удвоением до `reprobe_max`; не
+//!    событие — всегда `Queued`. Пока эндпоинт не готов, его заявки стоят в очереди
+//!    приостановленными ([`ModelQueue::hold`] по id эндпоинта): с позицией и старением
+//!    D9, но без места (место общей группы не простаивает). Успешный зонд снимает
+//!    приостановку синхронно, в шаге установки `Ready`: места раздаются одним
+//!    пересчётом в порядке D9. Эндпоинт `Unreachable` — повторный зонд (D40): один на
+//!    всех ждущих (зонд новее постановки заявки уже дал ответ — без нового), не чаще
+//!    `reprobe_min` от конца прошлого такого зонда с удвоением до `reprobe_max`; не
 //!    ответил — `ErrorClass::Unreachable` с `retry_after` до следующего разрешённого
 //!    зонда: запрос не отправлялся, предохранителю не считается.
 //!    Затем — каждое изменение статуса заявки, пока она ждёт места (D31). Отказ
@@ -238,6 +241,8 @@ struct ProbeCtl {
     started: u64,
     /// Раньше этого момента повторный зонд по заявке не запускается (D40).
     next_demand: Option<Instant>,
+    /// Поколение идущего зонда, запущенного по заявке.
+    demand: Option<u64>,
     /// Текущий интервал повторного зонда по заявке; `ZERO` — ещё не было.
     backoff: Duration,
 }
@@ -337,6 +342,9 @@ impl Gateway {
             inner.queue.configure(group, limits);
         }
         for id in inner.endpoints.keys() {
+            // До первого успешного зонда заявки эндпоинта стоят в очереди
+            // приостановленными (I6): с порядком и старением, но без места.
+            inner.queue.hold(&id.0);
             inner.request_probe(id, true);
         }
         Ok(Self { inner })
@@ -517,6 +525,12 @@ impl Endpoint {
             probe_done: watch::channel(0).0,
             slot_save_warned: AtomicBool::new(false),
         }
+    }
+
+    /// Эндпоинт готов к запросу (по применённому зонду).
+    fn ready_now(&self) -> bool {
+        let live = lock(&self.live);
+        live.probed && live.ready().is_some()
     }
 
     fn is_llama(&self) -> bool {
@@ -759,10 +773,11 @@ impl Inner {
         } else {
             c.backoff.saturating_mul(2).min(self.opts.reprobe_max)
         };
-        c.next_demand = now.checked_add(c.backoff);
         c.running = true;
         c.started += 1;
         let target = c.started;
+        // Интервал отсчитывается от конца этого зонда (задача зондов).
+        c.demand = Some(target);
         drop(c);
         self.spawn_probe_loop(&ep.cfg.id);
         Ok(target)
@@ -789,7 +804,19 @@ impl Inner {
             loop {
                 let generation = lock(&ep.probe).started;
                 let state = inner.run_probe(ep).await;
+                let ready = matches!(state, EndpointState::Ready(_));
                 inner.apply_probe(ep, generation, state).await;
+                {
+                    // Зонд по заявке кончился неудачей: следующий — не раньше интервала от
+                    // конца этого (до пробуждения ждущих: их `retry_after` уже верен).
+                    let mut c = lock(&ep.probe);
+                    if c.demand == Some(generation) {
+                        c.demand = None;
+                        if !ready {
+                            c.next_demand = Instant::now().checked_add(c.backoff);
+                        }
+                    }
+                }
                 ep.probe_done.send_replace(generation);
                 let mut c = lock(&ep.probe);
                 if c.rerun {
@@ -869,20 +896,28 @@ impl Inner {
             tracing::info!(endpoint = %ep.cfg.id, old = %old, new = %new,
                            "на эндпоинте другая связка модели: профиль заменён");
         }
+        // Места группы, затем приостановка — синхронно, до любого `await` (I6): выдача
+        // ждавшим идёт одним пересчётом очереди в порядке D9, и заявка, поставленная
+        // после `Ready`, их не опережает.
+        if ep.is_llama() {
+            self.queue
+                .set_parallel(&ep.group, self.group_parallel(&ep.group));
+        }
         if saved.is_some() {
             // Успешный зонд сбрасывает интервал повторных зондов по заявкам (D40).
-            let mut c = lock(&ep.probe);
-            c.backoff = Duration::ZERO;
-            c.next_demand = None;
+            {
+                let mut c = lock(&ep.probe);
+                c.backoff = Duration::ZERO;
+                c.next_demand = None;
+            }
+            self.queue.release(&ep.cfg.id.0);
+        } else {
+            self.queue.hold(&ep.cfg.id.0);
         }
         if let Some(p) = saved
             && let Err(e) = self.profiles.save_probed_async(p).await
         {
             tracing::warn!(endpoint = %ep.cfg.id, error = %e, "профиль эндпоинта не сохранён");
-        }
-        if ep.is_llama() {
-            self.queue
-                .set_parallel(&ep.group, self.group_parallel(&ep.group));
         }
     }
 
@@ -928,24 +963,27 @@ impl Inner {
         let run = call.meta.run_id;
         let fp = request_fingerprint(&call.endpoint, &call.request);
         lock(&self.parse_guard).check(run, &fp)?;
-        // У неготового эндпоинта разрешение и место берутся после зонда (в задаче):
-        // ожидание зонда не держит место общей группы.
-        let (permit, ticket) = if ready {
-            let permit = self.allow(ep)?;
-            match self.queue.enqueue(&ep.group, run, call.meta.priority, None) {
-                Ok(t) => (Some(permit), Some(t)),
-                Err(e) => {
-                    let err = queue_error(&e);
-                    lock(&ep.breaker).on_failure(permit, &err, Instant::now());
-                    return Err(err);
+        // Заявка встаёт в очередь сразу, с меткой эндпоинта: пока он не готов, она
+        // приостановлена (I6) — сохраняет позицию и старение, но места не занимает.
+        // Разрешение предохранителя у неготового эндпоинта берётся после зонда.
+        let permit = if ready { Some(self.allow(ep)?) } else { None };
+        let tag = Some(ep.cfg.id.0.clone());
+        let ticket = match self
+            .queue
+            .enqueue_tagged(&ep.group, run, call.meta.priority, None, tag)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let err = queue_error(&e);
+                if let Some(p) = permit {
+                    lock(&ep.breaker).on_failure(p, &err, Instant::now());
                 }
+                return Err(err);
             }
-        } else {
-            (None, None)
         };
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let outside = Arc::new(AtomicBool::new(ticket.is_none()));
+        let outside = Arc::new(AtomicBool::new(false));
         lock(&self.calls).entry(run).or_default().insert(
             id,
             CallHandle {
@@ -979,12 +1017,6 @@ impl Inner {
             self.request_probe(&ep.cfg.id, true);
         }
         Ok(permit)
-    }
-
-    /// Эндпоинт готов к запросу (по применённому зонду).
-    fn is_ready(&self, ep: &Endpoint) -> bool {
-        let live = lock(&ep.live);
-        live.probed && live.ready().is_some()
     }
 
     /// Эндпоинт готов к запросу заявки, поставленной при применённом зонде `seen`.
@@ -1173,7 +1205,7 @@ struct CallTask {
 impl CallTask {
     async fn run(
         self,
-        ticket: Option<Ticket>,
+        ticket: Ticket,
         permit: Option<BreakerPermit>,
         mut cancel: watch::Receiver<bool>,
     ) {
@@ -1226,29 +1258,38 @@ impl CallTask {
     }
 
     /// Зонд (если нужен), очередь, слот, повторы, стоимость.
-    async fn serve(
-        &self,
-        ep: &Endpoint,
-        ticket: Option<Ticket>,
-        verdict: &Verdict,
-    ) -> Result<(), Failure> {
-        let mut ticket = ticket;
-        // Первое событие — всегда `Queued`; без заявки (эндпоинт не готов) — позиция 0.
-        let first = ticket.as_ref().map_or(
-            QueueStatus {
-                position: 0,
-                waited_ms: 0,
-                state: WaitState::Queued,
-            },
-            |t| t.status().borrow().clone(),
-        );
-        send(&self.tx, Ok(StreamEvent::Queued(first))).await?;
-        let mut announced = true;
+    async fn serve(&self, ep: &Endpoint, ticket: Ticket, verdict: &Verdict) -> Result<(), Failure> {
+        let mut ticket = Some(ticket);
+        let mut announce = true;
         let place = loop {
-            if !self.inner.is_ready(ep) {
-                // Зонд ждут без места в очереди: не держать общую группу (I5, M-c).
-                drop(ticket.take());
-                self.outside.store(true, Ordering::SeqCst);
+            let t = match ticket.as_mut() {
+                Some(t) => t,
+                None => {
+                    // Место было выдано, но эндпоинт успел стать неготовым: место
+                    // отпущено, заявка — заново (редкий случай; счёт `cancel_run` — у
+                    // очереди).
+                    self.outside.store(false, Ordering::SeqCst);
+                    announce = true;
+                    let meta = &self.call.meta;
+                    let tag = Some(ep.cfg.id.0.clone());
+                    let t = self
+                        .inner
+                        .queue
+                        .enqueue_tagged(&ep.group, meta.run_id, meta.priority, None, tag)
+                        .map_err(|e| Failure::unsent(queue_error(&e)))?;
+                    ticket.insert(t)
+                }
+            };
+            // Первое событие — всегда `Queued` с настоящей позицией заявки.
+            let mut status = t.status();
+            let st = status.borrow_and_update().clone();
+            if announce {
+                send(&self.tx, Ok(StreamEvent::Queued(st))).await?;
+                announce = false;
+            }
+            if !ep.ready_now() {
+                // Заявка приостановлена в очереди (I6): ждёт зонда, сохраняя позицию и
+                // старение, место не занимает (I5).
                 self.inner
                     .ensure_ready(ep, self.seen)
                     .await
@@ -1259,30 +1300,16 @@ impl CallTask {
                 let p = self.inner.allow(ep).map_err(Failure::unsent)?;
                 *lock(verdict) = Some(p);
             }
-            let t = match ticket.take() {
-                Some(t) => t,
-                None => {
-                    // Счёт `cancel_run` переходит к очереди.
-                    self.outside.store(false, Ordering::SeqCst);
-                    let meta = &self.call.meta;
-                    self.inner
-                        .queue
-                        .enqueue(&ep.group, meta.run_id, meta.priority, None)
-                        .map_err(|e| Failure::unsent(queue_error(&e)))?
+            match wait_place(t, status, &self.tx, ep).await? {
+                Waited::NotReady => continue,
+                Waited::Granted(place) => {
+                    ticket = None;
+                    self.outside.store(true, Ordering::SeqCst);
+                    if ep.ready_now() {
+                        break place;
+                    }
+                    // Место отпускается, дальше — зонд по правилам `ensure_ready`.
                 }
-            };
-            let mut status = t.status();
-            let st = status.borrow_and_update().clone();
-            if !announced {
-                send(&self.tx, Ok(StreamEvent::Queued(st))).await?;
-            }
-            announced = false;
-            let place = wait_place(t, status, &self.tx).await?;
-            self.outside.store(true, Ordering::SeqCst);
-            // За время ожидания эндпоинт мог стать недоступным: место отпускается,
-            // дальше — зонд по правилам `ensure_ready`.
-            if self.inner.is_ready(ep) {
-                break place;
             }
         };
         let (probed, slots) = {
@@ -1405,19 +1432,41 @@ impl CallTask {
     }
 }
 
+/// Итог ожидания места.
+enum Waited {
+    Granted(PlacePermit),
+    /// Эндпоинт стал неготовым: заявка остаётся в очереди приостановленной.
+    NotReady,
+}
+
 /// Ждёт места, пересылая каждое изменение статуса заявки, пока она ждёт (первый статус
-/// уже отправлен).
+/// уже отправлен). Эндпоинт стал неготовым (зонд) — `NotReady`, заявка не снимается.
 async fn wait_place(
-    ticket: Ticket,
+    ticket: &mut Ticket,
     mut status: watch::Receiver<QueueStatus>,
     tx: &mpsc::Sender<Ev>,
-) -> Result<PlacePermit, Failure> {
-    let mut granted = pin!(ticket.granted());
+    ep: &Endpoint,
+) -> Result<Waited, Failure> {
+    let mut probes = ep.probe_done.subscribe();
+    probes.borrow_and_update();
+    if !ep.ready_now() {
+        return Ok(Waited::NotReady);
+    }
+    let mut granted = pin!(ticket.wait_granted());
     let mut watching = true;
     loop {
         tokio::select! {
             biased;
-            r = &mut granted => return r.map_err(|e| Failure::unsent(queue_error(&e))),
+            r = &mut granted => {
+                return r
+                    .map(Waited::Granted)
+                    .map_err(|e| Failure::unsent(queue_error(&e)));
+            }
+            _ = probes.changed() => {
+                if !ep.ready_now() {
+                    return Ok(Waited::NotReady);
+                }
+            }
             ch = status.changed(), if watching => {
                 if ch.is_err() {
                     watching = false;

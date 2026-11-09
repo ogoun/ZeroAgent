@@ -1541,3 +1541,114 @@ async fn reprobe_interval_doubles_and_resets_on_success() {
         .unwrap();
     assert_eq!(srv.requests(PROPS).len(), 4);
 }
+
+/// Стрим до конца с моментом события `Started`.
+async fn drain_timed(s: ModelStream) -> (Option<Instant>, Vec<Ev>) {
+    let mut s = s;
+    let mut started = None;
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(ev) = s.next().await {
+            if started.is_none() && matches!(ev, Ok(StreamEvent::Started { .. })) {
+                started = Some(Instant::now());
+            }
+            out.push(ev);
+        }
+    })
+    .await
+    .expect("стрим не закрылся за 10 с");
+    (started, out)
+}
+
+#[tokio::test]
+async fn probe_wait_keeps_priority_and_aging() {
+    // I6: эндпоинт с одним местом ещё зондируется; первым поставлен Job, затем
+    // Interactive. Обе стоят в очереди приостановленными (видны, со старением), после
+    // зонда первым место получает Interactive.
+    let chunks = sse_events(&fixture("chat/llama_text.sse"));
+    let slow = Reply::Sse {
+        chunks,
+        delay: ms(50),
+        cut_after: None,
+        then_hang: false,
+    };
+    let srv = llama_server(
+        vec![Reply::Delayed(
+            ms(600),
+            Box::new(props("probe/llama_props.json")),
+        )],
+        vec![slow],
+    )
+    .await;
+    let g = Gateway::start(
+        llama_cfg(&srv.base_url, json!({"max_parallel": 1})),
+        secrets(&[]),
+        None,
+        store("probe_priority"),
+        opts(),
+    )
+    .await
+    .unwrap();
+    let mut job_call = call_on("local", RunId::new(), "фон");
+    job_call.meta.priority = Priority::Job;
+    let job = g.stream(job_call).await.unwrap();
+    tokio::time::sleep(ms(20)).await;
+    let inter = g
+        .stream(call_on("local", RunId::new(), "пользователь"))
+        .await
+        .unwrap();
+    tokio::time::sleep(ms(100)).await;
+    assert_eq!(view_of(&g, "local").state, "probing");
+    let snap = g.view().queue;
+    let waiting = &snap.groups[0].waiting;
+    assert_eq!(waiting.len(), 2, "заявки не видны в очереди во время зонда");
+    assert_eq!(snap.groups[0].active, 0, "место занято во время зонда");
+    assert_eq!(waiting[0].priority, Priority::Interactive);
+    let (job, inter) = tokio::join!(drain_timed(job), drain_timed(inter));
+    let (job_started, job_evs) = job;
+    let (inter_started, inter_evs) = inter;
+    assert!(job_evs.iter().all(Result::is_ok), "{job_evs:?}");
+    assert!(inter_evs.iter().all(Result::is_ok), "{inter_evs:?}");
+    assert!(
+        inter_started.unwrap() < job_started.unwrap(),
+        "Job обогнал Interactive"
+    );
+    // Старение и время ожидания не сбросились: Job ждал и зонд, и запрос Interactive.
+    let waited = job_evs
+        .iter()
+        .filter_map(|e| match e {
+            Ok(StreamEvent::Queued(st)) => Some(st.waited_ms),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(waited >= 500, "waited_ms Job: {waited}");
+}
+
+#[tokio::test]
+async fn reprobe_interval_counts_from_probe_end() {
+    // Раунд 3: долгий зонд (300 мс) при интервале 100 мс — `retry_after` после него
+    // около 100 мс, а не ноль (отсчёт от конца зонда, не от запуска).
+    let slow_down = || {
+        Reply::Delayed(
+            ms(300),
+            Box::new(Reply::Json(503, json!({"error": "загрузка модели"}))),
+        )
+    };
+    let srv = llama_server(vec![slow_down()], vec![llama_text()]).await;
+    let mut o = opts();
+    o.reprobe_min = ms(100);
+    o.reprobe_max = ms(400);
+    let g = start(llama_cfg(&srv.base_url, json!({})), "reprobe_from_end", o).await;
+    let err = g
+        .stream(call_on("local", RunId::new(), "x"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::Unreachable);
+    let after = err.retry_after.unwrap();
+    assert!(after > ms(50) && after <= ms(100), "{after:?}");
+    assert_eq!(srv.requests(PROPS).len(), 2);
+}

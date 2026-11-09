@@ -236,6 +236,8 @@ pub enum WaitState {
 /// Положение заявки в очереди (RES-006).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueueStatus {
+    /// Номер среди ожидающих заявок группы в порядке выдачи, с 1. `0` — место выдано,
+    /// заявка провалена или ещё не пересчитана очередью.
     pub position: u32,
     pub waited_ms: u64,
     pub state: WaitState,

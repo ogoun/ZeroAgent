@@ -803,3 +803,56 @@ fn stopped_runtime_fails_timed_requests() {
         let _p = plain.granted().await.unwrap();
     });
 }
+
+#[tokio::test(start_paused = true)]
+async fn held_tag_keeps_order_and_aging_without_places() {
+    // Задача 15, раунд 3 (I6): приостановленные заявки стоят в очереди с порядком и
+    // временем постановки, места не получают; снятие приостановки выдаёт по D9.
+    let (q, g) = queue_with(1);
+    q.hold("ep");
+    let job = q
+        .enqueue_tagged(&g, RunId::new(), Priority::Job, None, Some("ep".into()))
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(70)).await;
+    let inter = q
+        .enqueue_tagged(
+            &g,
+            RunId::new(),
+            Priority::Interactive,
+            None,
+            Some("ep".into()),
+        )
+        .unwrap();
+    // Заявка без метки той же группы приостановкой не затронута.
+    let free = enq(&q, &g, Priority::Worker);
+    settle().await;
+    assert_eq!(active(&q, &g), 1, "заявка без метки получила место");
+    let snap = q.snapshot();
+    let view = &snap.groups[0].waiting;
+    assert_eq!(view.len(), 2, "приостановленные видны в снимке");
+    let job_view = view.iter().find(|w| w.priority == Priority::Job).unwrap();
+    assert!(
+        job_view.waited_ms >= 70_000,
+        "старение потеряно: {}",
+        job_view.waited_ms
+    );
+    assert_eq!(job_view.state, WaitState::Queued);
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let job_h = spawn_recorder(job, "job", log.clone());
+    let inter_h = spawn_recorder(inter, "interactive", log.clone());
+    settle().await;
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "приостановленная заявка получила место"
+    );
+    let p_free = free.granted().await.unwrap();
+    q.release("ep");
+    drop(p_free);
+    settle().await;
+    let p_inter = inter_h.await.unwrap();
+    assert_eq!(*log.lock().unwrap(), vec!["interactive"]);
+    drop(p_inter);
+    let _p_job = job_h.await.unwrap();
+    assert_eq!(*log.lock().unwrap(), vec!["interactive", "job"]);
+}

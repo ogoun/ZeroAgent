@@ -47,7 +47,7 @@
 //! (`max_wait`, cooldown группы, ожидание ресурса), получают [`QueueError::RuntimeStopped`];
 //! заявки без таймеров продолжают выдаваться синхронно. Время — `tokio::time::Instant`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -197,6 +197,9 @@ struct Entry {
     priority: Priority,
     enqueued: Instant,
     deadline: Option<Instant>,
+    /// Метка приостановки ([`ModelQueue::hold`]): пока она удержана, заявка ждёт, не
+    /// получая места, но сохраняет порядок и время постановки.
+    tag: Option<String>,
     phase: Phase,
     /// Последнее состояние статуса: снимок читает его, а не `watch` (без чтения `watch`
     /// под замком очереди).
@@ -299,6 +302,8 @@ struct State {
     monitor_stopped: bool,
     /// Runtime остановлен: фоновой задачи нет и не будет.
     driver_dead: bool,
+    /// Удержанные метки приостановки.
+    held: HashSet<String>,
     today: Today,
 }
 
@@ -382,6 +387,11 @@ impl State {
                     let remaining_ms = millis(left);
                     states.insert(id, WaitState::Cooldown { remaining_ms });
                 }
+                continue;
+            }
+            // Приостановленная заявка: место не выдаётся, порядок сохраняется.
+            if e.tag.as_ref().is_some_and(|t| self.held.contains(t)) {
+                states.insert(id, WaitState::Queued);
                 continue;
             }
             if g.limits.resource_gated
@@ -637,6 +647,7 @@ impl ModelQueue {
                     next_id: 0,
                     monitor_stopped: false,
                     driver_dead: false,
+                    held: HashSet::new(),
                     today: Arc::new(utc_today),
                 }),
                 admission,
@@ -695,6 +706,42 @@ impl ModelQueue {
         p: Priority,
         max_wait: Option<Duration>,
     ) -> Result<Ticket, QueueError> {
+        self.enqueue_tagged(g, run, p, max_wait, None)
+    }
+
+    /// Приостанавливает выдачу заявкам с меткой `tag` (Gateway: эндпоинт, пока идёт его
+    /// зонд или он недоступен). Приостановленные заявки остаются в очереди со своим
+    /// порядком и временем постановки (старение D9, `waited_ms`), видны в снимке в
+    /// состоянии `Queued`, но места не получают и не занимают; `max_wait`, бюджет и
+    /// `cancel_run` действуют как обычно.
+    pub fn hold(&self, tag: &str) {
+        let mut st = self.shared.lock();
+        if st.held.insert(tag.to_owned()) {
+            let now = Instant::now();
+            st.dispatch_all(self.shared.admission.as_ref(), now);
+        }
+    }
+
+    /// Снимает приостановку метки: выдача по обычным правилам (D9) одним пересчётом —
+    /// в порядке `(ранг, постановка)`.
+    pub fn release(&self, tag: &str) {
+        self.shared.ensure_driver();
+        let mut st = self.shared.lock();
+        if st.held.remove(tag) {
+            let now = Instant::now();
+            st.dispatch_all(self.shared.admission.as_ref(), now);
+        }
+    }
+
+    /// [`Self::enqueue`] с меткой приостановки (`None` — без метки).
+    pub fn enqueue_tagged(
+        &self,
+        g: &GroupId,
+        run: RunId,
+        p: Priority,
+        max_wait: Option<Duration>,
+        tag: Option<String>,
+    ) -> Result<Ticket, QueueError> {
         self.shared.ensure_driver();
         let now = Instant::now();
         let mut st = self.shared.lock();
@@ -717,6 +764,7 @@ impl ModelQueue {
                 priority: p,
                 enqueued: now,
                 deadline: max_wait.map(|w| now + w),
+                tag,
                 phase: Phase::Waiting,
                 state: WaitState::Queued,
                 status: tx,
@@ -868,6 +916,17 @@ impl Ticket {
 
     /// Ждёт места. Брошенный future снимает заявку (Drop билета).
     pub async fn granted(mut self) -> Result<Permit, QueueError> {
+        self.wait_granted().await
+    }
+
+    /// Ждёт места, не забирая билет: брошенное ожидание оставляет заявку в очереди
+    /// (выданное за это время место остаётся за ней до drop билета или следующего
+    /// ожидания). После итога (место или отказ) билет израсходован: повторный вызов —
+    /// `Cancelled`.
+    pub async fn wait_granted(&mut self) -> Result<Permit, QueueError> {
+        if self.done {
+            return Err(QueueError::Cancelled);
+        }
         loop {
             self.shared.ensure_driver();
             {
