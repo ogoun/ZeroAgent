@@ -1420,6 +1420,81 @@ async fn waiting_requests_after_unreachable_probe_fail_without_breaker() {
     assert_eq!(srv.requests(PROPS).len(), 3);
 }
 
+#[tokio::test]
+async fn slot_actions_use_endpoint_key() {
+    // Финальное ревью I1: сервер с `--api-key` требует ключ на всех маршрутах; restore
+    // сессии идёт с тем же `Authorization`, что зонд и запрос, сохранение не отключается.
+    let ok = Reply::Json(200, json!({"id_slot": 0, "n_restored": 10}));
+    let srv = FakeServer::start_with_bearer(
+        vec![
+            (PROPS, vec![props("probe/llama_props.json")]),
+            (CHAT, vec![llama_text()]),
+            ("POST /slots/0", vec![ok]),
+        ],
+        "k-llama",
+    )
+    .await;
+    let st = store("slot_key");
+    let g = started(
+        llama_cfg(&srv.base_url, json!({"key_ref": "llama"})),
+        secrets(&[("llama", "k-llama")]),
+        None,
+        st.clone(),
+        opts(),
+    )
+    .await
+    .unwrap();
+    let mut c = call_on("local", RunId::new(), "Привет");
+    c.meta.session = Some("sess-1".into());
+    g.stream(c).await.unwrap().collect().await.unwrap();
+    let reqs = srv.requests("POST /slots/0");
+    assert_eq!(reqs.len(), 1, "restore не дошёл до сервера");
+    assert_eq!(reqs[0].header("authorization"), Some("Bearer k-llama"));
+    assert_eq!(srv.unauthorized(), 0);
+    assert_ne!(
+        st.load_endpoint(&id("local")).and_then(|f| f.slot_save),
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn slot_auth_failure_disables_slot_save() {
+    // Ruling I1: 401/403 на `/slots` → `slot_save = Some(false)`, дальше без save/restore.
+    let denied = Reply::Json(
+        401,
+        json!({"error": {"code": 401, "message": "Invalid API Key"}}),
+    );
+    let srv = FakeServer::start(vec![
+        (PROPS, vec![props("probe/llama_props.json")]),
+        (CHAT, vec![llama_text()]),
+        ("POST /slots/0", vec![denied]),
+    ])
+    .await;
+    let st = store("slot_auth");
+    let g = started(
+        llama_cfg(&srv.base_url, json!({})),
+        secrets(&[]),
+        None,
+        st.clone(),
+        opts(),
+    )
+    .await
+    .unwrap();
+    let mut c = call_on("local", RunId::new(), "Привет");
+    c.meta.session = Some("sess-1".into());
+    g.stream(c.clone()).await.unwrap().collect().await.unwrap();
+    assert!(
+        eventually(Duration::from_secs(2), || st
+            .load_endpoint(&id("local"))
+            .is_some_and(|f| f.slot_save == Some(false)))
+        .await,
+        "slot_save не выключен после 401"
+    );
+    let before = srv.total_requests();
+    g.stream(c).await.unwrap().collect().await.unwrap();
+    assert_eq!(srv.total_requests() - before, 1, "save/restore после 401");
+}
+
 /// Ключ для зонда, паника — при запросе (сбой кода внутри задачи запроса).
 struct PanicOnSecondGet(std::sync::atomic::AtomicUsize);
 

@@ -2,6 +2,10 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-A, финальный fix-раунд (final-review.md)
+
+- **I1. Ключ на `/slots`.** `LlamaSlots::with_secret` — save/restore идут с тем же `Authorization: Bearer`, что зонд и запрос модели (`Gateway` передаёт ключ эндпоинта, текст ошибки очищается `redact`). 401/403 на `/slots` (`ErrorClass::Auth`) — «не поддержано»: `slot_save = Some(false)` и одно предупреждение с причиной «llama-server отклонил ключ на /slots». Поддельный сервер тестов умеет требовать ключ (`FakeServer::start_with_bearer`).
+
 ## 2026-11-09. R1-A, задача 16: команды `models`, `ask`, `resources`; `doctor` с GPU и моделями; приёмка R1-A
 
 - **Конфигурация** (`zero-agent::config`, D23). `ZA_HOME/config.toml`: `AgentConfig { models: Option<ModelsConfig>, resources: ResourcesConfig }`, `deny_unknown_fields`, раздел `[resources]` необязателен (умолчания D10). Файла нет — пустая конфигурация; раздела `[models]` нет, а `LLAMA_URL` задан — один эндпоинт `local` (`llama_cpp`, `default = "local"`): совместимость с `doctor` R0. Уточнение брифа: запасной эндпоинт создаётся при отсутствии раздела `[models]`, а не только файла — файл с одним `[resources]` не лишает `LLAMA_URL` смысла. При загрузке вызываются `ResourcesConfig::validate` и `ModelsConfig::validate` (ошибка — код 1).

@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::json;
 use support::{FakeServer, Reply};
 use za_llm::ErrorClass;
-use za_llm::http::{HttpTransport, Timeouts};
+use za_llm::http::{HttpTransport, Secret, Timeouts};
 use za_llm::slots::{
     LlamaSlots, SlotManager, SlotPlan, restore_unsupported, save_unsupported, slot_file,
 };
@@ -336,4 +336,34 @@ fn retired_slot_is_not_assigned_and_vanishes_when_freed() {
     drop(l2);
     drop(l3);
     assert!(m.lock().unwrap().busy_slots().is_empty());
+}
+
+#[tokio::test]
+async fn slot_actions_carry_bearer_key() {
+    // Финальное ревью I1: llama-server с `--api-key` проверяет ключ и на `/slots`.
+    let ok = Reply::Json(200, json!({"id_slot": 1, "filename": slot_file("a")}));
+    let srv = FakeServer::start_with_bearer(vec![(SLOT1, vec![ok])], "k-llama").await;
+    let slots = LlamaSlots::new(srv.base_url.clone(), transport())
+        .with_secret(Some(Secret::new("k-llama".into())));
+    slots.save(1, &slot_file("a")).await.unwrap();
+    slots.restore(1, &slot_file("a")).await.unwrap();
+    let reqs = srv.requests(SLOT1);
+    assert_eq!(reqs.len(), 2);
+    for r in &reqs {
+        assert_eq!(r.header("authorization"), Some("Bearer k-llama"));
+    }
+    assert_eq!(srv.unauthorized(), 0);
+}
+
+#[tokio::test]
+async fn slot_auth_failure_is_unsupported_without_key_echo() {
+    // 401/403 на `/slots` — сохранение для этого сервера отключается (Ruling I1);
+    // ключ в текст ошибки не попадает.
+    let srv = FakeServer::start_with_bearer(vec![], "k-right").await;
+    let slots = LlamaSlots::new(srv.base_url.clone(), transport())
+        .with_secret(Some(Secret::new("k-wrong".into())));
+    let err = slots.save(1, &slot_file("a")).await.unwrap_err();
+    assert_eq!(err.class, ErrorClass::Auth);
+    assert!(save_unsupported(&err) && restore_unsupported(&err));
+    assert!(!err.message.contains("k-wrong"));
 }

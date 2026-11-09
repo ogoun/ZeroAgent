@@ -89,6 +89,10 @@ struct Route {
 struct State {
     routes: HashMap<String, Route>,
     total: usize,
+    unauthorized: usize,
+    /// `Some(k)` — каждый запрос без `Authorization: Bearer k` получает 401 (как
+    /// llama-server с `--api-key`) и в маршрут не записывается.
+    bearer: Option<String>,
 }
 
 /// Поддельный сервер на `127.0.0.1:<свободный порт>`; живёт до конца теста.
@@ -99,7 +103,24 @@ pub struct FakeServer {
 
 impl FakeServer {
     pub async fn start(routes: Vec<(&'static str, Vec<Reply>)>) -> Self {
-        let mut st = State::default();
+        Self::start_inner(routes, None).await
+    }
+
+    /// Сервер, требующий `Authorization: Bearer <key>` на всех маршрутах.
+    pub async fn start_with_bearer(routes: Vec<(&'static str, Vec<Reply>)>, key: &str) -> Self {
+        Self::start_inner(routes, Some(key.to_owned())).await
+    }
+
+    /// Запросы, отвергнутые с 401 из-за отсутствия или неверного ключа.
+    pub fn unauthorized(&self) -> usize {
+        self.state.lock().unwrap().unauthorized
+    }
+
+    async fn start_inner(routes: Vec<(&'static str, Vec<Reply>)>, bearer: Option<String>) -> Self {
+        let mut st = State {
+            bearer,
+            ..State::default()
+        };
         for (key, replies) in routes {
             assert!(!replies.is_empty(), "маршрут {key} без ответов");
             st.routes.insert(
@@ -165,7 +186,7 @@ async fn handle(state: Arc<Mutex<State>>, req: Request) -> Response {
         .path_and_query()
         .map(|p| p.as_str().to_owned())
         .unwrap_or_default();
-    let headers = parts
+    let headers: Vec<(String, String)> = parts
         .headers
         .iter()
         .map(|(n, v)| {
@@ -183,6 +204,20 @@ async fn handle(state: Arc<Mutex<State>>, req: Request) -> Response {
     let picked = {
         let mut st = state.lock().unwrap();
         st.total += 1;
+        let denied = st
+            .bearer
+            .as_ref()
+            .is_some_and(|k| !headers_ok(&headers, &format!("Bearer {k}")));
+        if denied {
+            st.unauthorized += 1;
+            return respond(
+                401,
+                &[],
+                Body::from(
+                    r#"{"error":{"code":401,"message":"Invalid API Key","type":"authentication_error"}}"#,
+                ),
+            );
+        }
         st.routes.get_mut(&key).map(|r| {
             r.requests.push(RecordedRequest {
                 path_and_query,
@@ -228,6 +263,12 @@ async fn handle(state: Arc<Mutex<State>>, req: Request) -> Response {
             )
         }
     }
+}
+
+fn headers_ok(headers: &[(String, String)], want: &str) -> bool {
+    headers
+        .iter()
+        .any(|(n, v)| n.eq_ignore_ascii_case("authorization") && v == want)
 }
 
 fn json(status: u16, headers: &[(String, String)], v: &Value) -> Response {

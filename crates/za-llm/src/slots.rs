@@ -37,6 +37,8 @@
 //! - [`SlotLease`] объявляется полем раньше `Permit` очереди (поля дропаются в порядке
 //!   объявления): иначе очередь выдаст место до освобождения слота, и два запроса
 //!   получат один слот;
+//! - действия идут с тем же `Authorization: Bearer`, что зонд и запрос модели
+//!   ([`LlamaSlots::with_secret`]); 401/403 на `/slots` — «не поддержано»;
 //! - порядок: `save_evicted`, затем `restore`, затем запрос. Предел каждого действия —
 //!   [`SLOT_ACTION_TIMEOUT`], суммарно save и restore держат место очереди до 60 с;
 //!   при `slot_save == Some(false)` оба действия пропускаются, привязка к слоту остаётся;
@@ -58,7 +60,8 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::error::{ErrorClass, ModelError};
-use crate::http::{HeaderMap, HttpTransport};
+use crate::http::{HeaderMap, HttpTransport, Secret};
+use reqwest::header::AUTHORIZATION;
 
 /// Предел одного запроса save или restore. Сохранение идёт, пока заявка держит
 /// разрешение очереди, поэтому ждать дольше нельзя: при таймауте вызывающий
@@ -317,19 +320,20 @@ pub fn slot_file(session: &str) -> String {
 }
 
 /// Ошибка save означает «сохранение не поддержано» (D29): 501 (нет `--slot-save-path`
-/// или состояние модели не сериализуется) или `NotFound` (нет маршрута). Вызывающий
+/// или состояние модели не сериализуется), `NotFound` (нет маршрута) или `Auth`
+/// (401/403: сервер с `--api-key` не принял ключ эндпоинта на `/slots`). Вызывающий
 /// ставит `slot_save = Some(false)`, предупреждает один раз и больше не сохраняет.
 /// Прочие ошибки (400 — неверный запрос, таймаут, сбой соединения, 500 «Unable to save
 /// slot») — разовые.
 pub fn save_unsupported(e: &ModelError) -> bool {
-    e.http_status == Some(501) || e.class == ErrorClass::NotFound
+    e.http_status == Some(501) || matches!(e.class, ErrorClass::NotFound | ErrorClass::Auth)
 }
 
-/// Ошибка restore означает «сохранение не поддержано»: 501 или `NotFound`. Прочие 4xx —
-/// нет файла или он не подходит (400 «Unable to restore slot»): обычный случай для
-/// новой сессии, вызывающий пишет `debug` и продолжает.
+/// Ошибка restore означает «сохранение не поддержано»: 501, `NotFound` или `Auth`.
+/// Прочие 4xx — нет файла или он не подходит (400 «Unable to restore slot»): обычный
+/// случай для новой сессии, вызывающий пишет `debug` и продолжает.
 pub fn restore_unsupported(e: &ModelError) -> bool {
-    e.http_status == Some(501) || e.class == ErrorClass::NotFound
+    save_unsupported(e)
 }
 
 /// Вызовы `/slots` llama-server. `base_url` — корень сервера (D37).
@@ -338,6 +342,7 @@ pub struct LlamaSlots {
     base_url: String,
     http: HttpTransport,
     timeout: Duration,
+    secret: Option<Secret>,
 }
 
 impl LlamaSlots {
@@ -346,7 +351,16 @@ impl LlamaSlots {
             base_url,
             http,
             timeout: SLOT_ACTION_TIMEOUT,
+            secret: None,
         }
+    }
+
+    /// Ключ эндпоинта: `Authorization: Bearer <ключ>`, как у зонда и запроса модели
+    /// (llama-server с `--api-key` проверяет ключ на `/slots`). Текст ошибки очищается
+    /// от ключа.
+    pub fn with_secret(mut self, secret: Option<Secret>) -> Self {
+        self.secret = secret;
+        self
     }
 
     /// Другой предел запроса вместо [`SLOT_ACTION_TIMEOUT`].
@@ -372,7 +386,12 @@ impl LlamaSlots {
             self.base_url.trim_end_matches('/')
         );
         let body = json!({ "filename": file });
-        let fut = self.http.post_json(&url, HeaderMap::new(), &body, &[]);
+        let mut headers = HeaderMap::new();
+        if let Some(s) = &self.secret {
+            headers.insert(AUTHORIZATION, s.header_value("Bearer ")?);
+        }
+        let redact: Vec<&Secret> = self.secret.iter().collect();
+        let fut = self.http.post_json(&url, headers, &body, &redact);
         match tokio::time::timeout(self.timeout, fut).await {
             Err(_) => {
                 tracing::debug!(slot, action, "действие со слотом: таймаут");

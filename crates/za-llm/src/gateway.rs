@@ -1091,41 +1091,46 @@ impl Inner {
     }
 
     /// `save` вытесненной сессии, затем `restore` своей (D29). Ошибки влияют только на
-    /// скорость; «не поддержано» (нет `--slot-save-path`) выключает сохранение.
-    async fn prepare_slot(&self, ep: &Endpoint, plan: &SlotPlan) {
+    /// скорость; «не поддержано» (нет `--slot-save-path` или 401/403 на `/slots`)
+    /// выключает сохранение. Ключ — тот же, что у запроса модели.
+    async fn prepare_slot(&self, ep: &Endpoint, plan: &SlotPlan, secret: Option<Secret>) {
         let disabled = lock(&ep.live)
             .ready()
             .is_some_and(|p| p.facts.slot_save == Some(false));
         if disabled || (plan.save_evicted.is_none() && plan.restore.is_none()) {
             return;
         }
-        let slots = LlamaSlots::new(ep.cfg.effective_base_url(), ep.http.clone());
-        let mut unsupported = false;
+        let slots =
+            LlamaSlots::new(ep.cfg.effective_base_url(), ep.http.clone()).with_secret(secret);
+        let mut unsupported = None;
         if let Some((slot, file)) = &plan.save_evicted {
             match slots.save(*slot, file).await {
                 Ok(()) => {}
-                Err(e) if save_unsupported(&e) => unsupported = true,
+                Err(e) if save_unsupported(&e) => unsupported = Some(e.class),
                 Err(e) => tracing::debug!(endpoint = %ep.cfg.id, slot, class = ?e.class,
                                           "слот не сохранён"),
             }
         }
-        if !unsupported && let Some(file) = &plan.restore {
+        if unsupported.is_none()
+            && let Some(file) = &plan.restore
+        {
             match slots.restore(plan.slot, file).await {
                 Ok(()) => tracing::debug!(endpoint = %ep.cfg.id, slot = plan.slot,
                                           "слот восстановлен"),
-                Err(e) if restore_unsupported(&e) => unsupported = true,
+                Err(e) if restore_unsupported(&e) => unsupported = Some(e.class),
                 // 400 — файла нет: новая сессия.
                 Err(e) => tracing::debug!(endpoint = %ep.cfg.id, slot = plan.slot,
                                           class = ?e.class, "слот не восстановлен"),
             }
         }
-        if unsupported {
-            self.disable_slot_save(ep);
+        if let Some(class) = unsupported {
+            self.disable_slot_save(ep, class == ErrorClass::Auth);
         }
     }
 
-    /// `slot_save = Some(false)` в фактах эндпоинта, одно предупреждение (D29).
-    fn disable_slot_save(&self, ep: &Endpoint) {
+    /// `slot_save = Some(false)` в фактах эндпоинта, одно предупреждение (D29). `auth` —
+    /// причина в отказе ключа на `/slots` (401/403), иначе — нет `--slot-save-path`.
+    fn disable_slot_save(&self, ep: &Endpoint, auth: bool) {
         let facts = {
             let mut live = lock(&ep.live);
             let mut out = None;
@@ -1142,8 +1147,13 @@ impl Inner {
         };
         let Some(facts) = facts else { return };
         if !ep.slot_save_warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(endpoint = %ep.cfg.id,
-                "llama-server не сохраняет слоты (нет --slot-save-path): работа без сохранения KV-кэша");
+            if auth {
+                tracing::warn!(endpoint = %ep.cfg.id,
+                    "llama-server отклонил ключ на /slots (401/403): работа без сохранения KV-кэша; проверьте key_ref эндпоинта и --api-key сервера");
+            } else {
+                tracing::warn!(endpoint = %ep.cfg.id,
+                    "llama-server не сохраняет слоты (нет --slot-save-path): работа без сохранения KV-кэша");
+            }
         }
         let store = self.profiles.clone();
         self.rt.spawn_blocking(move || {
@@ -1334,7 +1344,7 @@ impl CallTask {
                     .as_ref()
                     .map(|s| format!("{}:{s}", probed.facts.bundle_key));
                 let (lease, plan) = SlotManager::lease(&manager, key.as_deref());
-                self.inner.prepare_slot(ep, &plan).await;
+                self.inner.prepare_slot(ep, &plan, secret.clone()).await;
                 (Some(lease), Some(plan.slot))
             }
             None => (None, None),
