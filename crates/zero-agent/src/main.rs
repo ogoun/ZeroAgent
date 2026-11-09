@@ -1,7 +1,9 @@
-//! Бинарник `zero-agent` этапа R0: `doctor`, `demo-run`, `replay`.
+//! Бинарник `zero-agent`: `doctor`, `demo-run`, `replay` (R0), `models`, `ask`,
+//! `resources` (R1-A).
 //!
-//! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы),
-//! 3 — нужно решение пользователя. Журнал проекта лежит в
+//! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы, ошибка
+//! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя.
+//! Журнал проекта лежит в
 //! `ZA_HOME/projects/<project_id>/` (ARC-020), `log.txt` демонстрации — в
 //! каталоге проекта.
 //!
@@ -12,16 +14,19 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use za_core::{CrashPoint, DemoConfig, DemoOutcome, EffectError, replay_hash, run_demo};
-use za_protocol::RunId;
+use za_protocol::{Priority, RunId};
 use za_store::{ProjectStore, StoreError};
 use zero_agent::doctor::{self, LLAMA_URL_ENV};
 use zero_agent::home::{self, NoHome};
 use zero_agent::journal::open_retrying;
+use zero_agent::models::{self, AskArgs, CommandError};
+use zero_agent::resources;
 
 /// Код выхода «нужно решение пользователя».
 const EXIT_NEEDS_DECISION: u8 = 3;
@@ -31,12 +36,15 @@ const JOURNAL_FILE: &str = "journal.db";
 const LOG_ENV: &str = "ZA_LOG";
 /// Фильтр логов по умолчанию.
 const DEFAULT_LOG: &str = "warn";
+/// Сколько runtime ждёт фоновые задачи при выходе: зависший замер тома (`statvfs`) или
+/// обход каталога отменить нельзя, команда не должна из-за них висеть.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
 #[command(
     name = "zero-agent",
     version,
-    about = "zero-agent, этап R0: журнал, эффекты, зонды"
+    about = "zero-agent, этапы R0 и R1-A: журнал, эффекты, модели, ресурсы"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,7 +53,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Проверка окружения: SQLite, llama.cpp (`LLAMA_URL`), версия Rust.
+    /// Проверка окружения: SQLite, llama.cpp (`LLAMA_URL`), GPU, модели, версия Rust.
     Doctor {
         /// Отчёт в JSON.
         #[arg(long)]
@@ -75,6 +83,63 @@ enum Cmd {
         #[arg(long, value_parser = parse_run)]
         run: RunId,
     },
+    /// Модели из `ZA_HOME/config.toml` с состоянием после первого зонда.
+    Models {
+        /// Вывод в JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<ModelsCmd>,
+    },
+    /// Проверочный вопрос модели через Gateway: текст — в stdout, usage — в stderr.
+    Ask {
+        /// id эндпоинта; без него — `models.default`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Класс приоритета заявки в очереди.
+        #[arg(long, value_enum, default_value_t = AskPriority::Interactive)]
+        priority: AskPriority,
+        /// Текст вопроса.
+        text: String,
+    },
+    /// Ресурсы узла, очередь к моделям и эндпоинты.
+    Resources {
+        /// Вывод в JSON (с `--watch` — по строке на снимок).
+        #[arg(long)]
+        json: bool,
+        /// Печатать каждые 2 с до прерывания.
+        #[arg(long)]
+        watch: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCmd {
+    /// Повторный зонд эндпоинта и сохранение профиля; код 0 — эндпоинт готов.
+    Probe {
+        /// id эндпоинта.
+        id: String,
+    },
+}
+
+/// Приоритет `ask` (RES-003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AskPriority {
+    Interactive,
+    Top,
+    Worker,
+    Job,
+}
+
+impl From<AskPriority> for Priority {
+    fn from(p: AskPriority) -> Self {
+        match p {
+            AskPriority::Interactive => Priority::Interactive,
+            AskPriority::Top => Priority::Top,
+            AskPriority::Worker => Priority::Worker,
+            AskPriority::Job => Priority::Job,
+        }
+    }
 }
 
 /// Ошибки команд.
@@ -98,6 +163,8 @@ enum AppError {
     Runtime(std::io::Error),
     #[error("отчёт в JSON: {0}")]
     Json(serde_json::Error),
+    #[error(transparent)]
+    Command(#[from] CommandError),
 }
 
 fn parse_run(s: &str) -> Result<RunId, String> {
@@ -176,21 +243,53 @@ fn run(cli: Cli) -> Result<ExitCode, AppError> {
         .enable_all()
         .build()
         .map_err(AppError::Runtime)?;
-    match cli.cmd {
-        Cmd::Doctor { json } => rt.block_on(cmd_doctor(json)),
+    let result = rt.block_on(dispatch(cli.cmd));
+    // Фоновые задачи (зонды, монитор, обход каталогов) отменяются; блокирующие вызовы
+    // ждутся не дольше `SHUTDOWN_TIMEOUT`.
+    rt.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    result
+}
+
+async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
+    match cmd {
+        Cmd::Doctor { json } => cmd_doctor(json).await,
         Cmd::DemoRun {
             project,
             steps,
             resume,
             crash_at,
-        } => rt.block_on(cmd_demo(&project, steps, resume, crash_at)),
-        Cmd::Replay { project, run } => rt.block_on(cmd_replay(&project, run)),
+        } => cmd_demo(&project, steps, resume, crash_at).await,
+        Cmd::Replay { project, run } => cmd_replay(&project, run).await,
+        Cmd::Models { json, action } => {
+            let home = home::za_home()?;
+            Ok(match action {
+                None => models::cmd_models(&home, json).await?,
+                Some(ModelsCmd::Probe { id }) => models::cmd_probe(&home, &id, json).await?,
+            })
+        }
+        Cmd::Ask {
+            model,
+            priority,
+            text,
+        } => {
+            let home = home::za_home()?;
+            let args = AskArgs {
+                model,
+                priority: priority.into(),
+                text,
+            };
+            Ok(models::cmd_ask(&home, args).await?)
+        }
+        Cmd::Resources { json, watch } => {
+            let home = home::za_home()?;
+            Ok(resources::cmd_resources(&home, json, watch).await?)
+        }
     }
 }
 
 async fn cmd_doctor(json: bool) -> Result<ExitCode, AppError> {
     let url = std::env::var(LLAMA_URL_ENV).ok();
-    let report = doctor::run(url.as_deref()).await;
+    let report = doctor::run(url.as_deref(), home::za_home().ok().as_deref()).await;
     if json {
         let text = serde_json::to_string_pretty(&report).map_err(AppError::Json)?;
         println!("{text}");

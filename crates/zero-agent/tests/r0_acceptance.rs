@@ -355,7 +355,8 @@ fn demo_replay_hash_matches_golden() {
 }
 
 /// Журнал записан с другим `prefix_hash` у `model` шага 1: `--resume`
-/// завершается кодом 1 с понятным сообщением и шагов не выполняет.
+/// завершается кодом 1 с понятным сообщением, шагов не выполняет и оставляет
+/// run в `paused`.
 #[test]
 fn resume_with_prefix_drift_fails() {
     let e = env("prefix_drift");
@@ -397,6 +398,12 @@ fn resume_with_prefix_drift_fails() {
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("расходится с журналом"), "{err}");
     assert!(!e.project.join("log.txt").exists(), "шаги не выполнены");
+    let r = rt().block_on(e.store().get_run(run)).unwrap().unwrap();
+    assert_eq!(
+        r.status,
+        RunStatus::Paused,
+        "run на паузе после расхождения"
+    );
 }
 
 /// Логи ядра и хранилища идут в stderr: по умолчанию только `warn` и выше,

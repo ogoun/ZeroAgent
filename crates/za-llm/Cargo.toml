@@ -11,23 +11,79 @@ workspace = true
 
 [dependencies]
 za-protocol = { path = "../za-protocol" }
+serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
-# Нужны только зонду llama.cpp (`probe`).
-tracing = { workspace = true, optional = true }
-thiserror = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+# Канал стрима, задача стрима и её отмена (D2), время повторов и очереди.
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 reqwest = { workspace = true, optional = true }
+# Распознавание ошибок TLS в цепочке причин reqwest (не повторяются).
+rustls = { workspace = true, optional = true }
+# Даты `Retry-After` (HTTP-дата RFC 9110) и сброса лимитов Anthropic (RFC 3339).
+jiff = { workspace = true, optional = true }
+# Допуск очереди по ресурсам узла (D1: `za-res` не зависит от `za-llm`).
+za-res = { path = "../za-res", optional = true }
 
 [features]
-# Без `probe` крейт — только рендер префикса и его хэш, без HTTP-клиента:
-# так его подключает `za-core`.
-default = ["probe"]
-probe = ["dep:reqwest", "dep:thiserror", "dep:tracing"]
+# Без функций крейт даёт только чистые части: канонический формат, возможности,
+# ошибки, `ModelPort`, `ScriptedModel`, префикс. Так его подключает `za-core`.
+# `http` — транспорт, коннекторы и зонды; `gateway` — очередь, повторы и `Gateway`.
+default = ["gateway"]
+gateway = ["http", "dep:za-res"]
+# `tokio/macros` — `select!` насоса SSE коннекторов на `tx.closed()` (D2).
+http = ["dep:reqwest", "dep:rustls", "dep:jiff", "tokio/macros"]
+# Псевдоним R0 для совместимости.
+probe = ["http"]
 
 [[test]]
 name = "probe"
-required-features = ["probe"]
+required-features = ["http"]
+
+[[test]]
+name = "sse"
+required-features = ["http"]
+
+[[test]]
+name = "chat_wire"
+required-features = ["http"]
+
+[[test]]
+name = "anthropic_wire"
+required-features = ["http"]
+
+[[test]]
+name = "responses_wire"
+required-features = ["http"]
+
+[[test]]
+name = "profiles"
+required-features = ["http"]
+
+[[test]]
+name = "resilience"
+required-features = ["gateway"]
+
+[[test]]
+name = "queue"
+required-features = ["gateway"]
+
+[[test]]
+name = "slots"
+required-features = ["gateway"]
+
+[[test]]
+name = "gateway"
+required-features = ["gateway"]
+
+# Живые проверки бэкендов (`#[ignore]`, переменные `LLAMA_TEST_URL` и др.).
+[[test]]
+name = "live"
+required-features = ["gateway"]
 
 [dev-dependencies]
 axum.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+toml.workspace = true
+http-body.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }

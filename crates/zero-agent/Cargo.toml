@@ -14,8 +14,11 @@ za-protocol = { path = "../za-protocol" }
 za-store = { path = "../za-store" }
 za-core = { path = "../za-core" }
 za-llm = { path = "../za-llm" }
+za-res = { path = "../za-res" }
 clap.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+# `macros` — `join!` проверок doctor, `time` — ожидание зондов и `resources --watch`.
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -25,4 +28,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+# Поддельный llama-server в процессе теста `r1a_models` (axum на многопоточном runtime).
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "net", "time"] }
+axum.workspace = true
+# Тело ответа с обрывом посреди стрима (`Frame`) в тесте повтора `ask`.
+http-body.workspace = true

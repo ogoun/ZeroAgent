@@ -1,11 +1,20 @@
 //! `zero-agent doctor`: проверка окружения (OPS-014, частично).
 //!
-//! Этап R0 проверяет встроенную SQLite (ARC-031) и доступность llama.cpp
-//! (`LLAMA_URL`) и показывает версию компилятора. Внешние системы
-//! необязательны: их недоступность — предупреждение, не отказ. Проверка
-//! памяти ZeroAIMemory появится вместе с её клиентом (задача 9).
+//! Проверяет встроенную SQLite (ARC-031), доступность llama.cpp (`LLAMA_URL`, R0),
+//! GPU (`nvidia-smi`, D6) и состояние каждой модели из `config.toml` после первого
+//! зонда, показывает версию компилятора. Внешние системы необязательны: их
+//! недоступность — предупреждение, не отказ (нет GPU, модель `inactive` или
+//! `unreachable` — `Warn`). Отказ — старая SQLite и ошибка конфигурации. Проверка
+//! памяти ZeroAIMemory появится вместе с её клиентом.
+
+use std::path::Path;
 
 use serde::Serialize;
+use za_llm::EndpointView;
+use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query_nvidia_smi};
+
+use crate::config::{AgentConfig, AppConfigError, LLAMA_URL_ENDPOINT, load_config};
+use crate::models::{PROBE_WAIT, start_gateway, state_text};
 
 /// Переменная окружения с адресом `llama-server`.
 pub const LLAMA_URL_ENV: &str = "LLAMA_URL";
@@ -51,6 +60,10 @@ pub struct DoctorReport {
     pub sqlite: Check,
     /// `llama-server` по `LLAMA_URL`.
     pub llama: Check,
+    /// GPU по `nvidia-smi`; недоступен — `Warn`.
+    pub gpu: Check,
+    /// Модели по id эндпоинта; `config` — ошибка или предупреждение конфигурации.
+    pub models: Vec<(String, Check)>,
     /// Компилятор сборки и MSRV.
     pub rust: String,
 }
@@ -58,28 +71,151 @@ pub struct DoctorReport {
 impl DoctorReport {
     /// Есть ли отказ: `doctor` завершается с кодом 1.
     pub fn has_failure(&self) -> bool {
-        [&self.sqlite, &self.llama]
-            .iter()
+        [&self.sqlite, &self.llama, &self.gpu]
+            .into_iter()
+            .chain(self.models.iter().map(|(_, c)| c))
             .any(|c| matches!(c, Check::Fail(_)))
     }
 
     /// Человекочитаемый вывод.
     pub fn render(&self) -> String {
         let mut out = String::from("zero-agent doctor\n");
-        for (name, c) in [("sqlite", &self.sqlite), ("llama", &self.llama)] {
+        for (name, c) in [
+            ("sqlite", &self.sqlite),
+            ("llama", &self.llama),
+            ("gpu", &self.gpu),
+        ] {
             out.push_str(&format!("  {name:<7} {:<5} {}\n", c.label(), c.detail()));
         }
         out.push_str(&format!("  {:<7} {:<5} {}\n", "rust", "", self.rust));
+        if self.models.is_empty() {
+            out.push_str("  модели: не настроены ([models] в config.toml или LLAMA_URL)\n");
+        } else {
+            out.push_str("  модели:\n");
+        }
+        for (id, c) in &self.models {
+            out.push_str(&format!("    {id:<16} {:<5} {}\n", c.label(), c.detail()));
+        }
         out
     }
 }
 
-/// Собирает отчёт; `llama_url` — значение `LLAMA_URL`.
-pub async fn run(llama_url: Option<&str>) -> DoctorReport {
+/// Собирает отчёт; `llama_url` — значение `LLAMA_URL`, `home` — `ZA_HOME` (`None` — не
+/// определён: GPU и модели не проверяются, `Warn`). Проверки идут параллельно.
+///
+/// Если эндпоинт `local` создан из `LLAMA_URL` (нет раздела `[models]`), сервер
+/// зондируется один раз — как модель, и строка `llama` повторяет её итог.
+pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
+    let cfg = home.map(load_config);
+    let covered = matches!(&cfg, Some(Ok(c)) if c.llama_url_fallback);
+    let llama = async {
+        if covered {
+            None
+        } else {
+            Some(check_llama(llama_url).await)
+        }
+    };
+    let (llama, (gpu, models)) = tokio::join!(llama, check_home(home, cfg));
+    let llama = llama.unwrap_or_else(|| {
+        let shown = llama_url.map(display_url).unwrap_or_default();
+        match models.iter().find(|(id, _)| id == LLAMA_URL_ENDPOINT) {
+            Some((_, Check::Ok(d))) => {
+                Check::Ok(format!("{shown}: модель {LLAMA_URL_ENDPOINT}, {d}"))
+            }
+            Some((_, Check::Warn(d))) => {
+                Check::Warn(format!("{shown}: модель {LLAMA_URL_ENDPOINT}, {d}"))
+            }
+            Some((_, Check::Fail(d))) => {
+                Check::Fail(format!("{shown}: модель {LLAMA_URL_ENDPOINT}, {d}"))
+            }
+            None => Check::Warn(format!("{shown}: модель {LLAMA_URL_ENDPOINT} не проверена")),
+        }
+    });
     DoctorReport {
         sqlite: check_sqlite(za_store::sqlite_library_version(), za_store::MIN_SQLITE),
-        llama: check_llama(llama_url).await,
+        llama,
+        gpu,
+        models,
         rust: rust_version(),
+    }
+}
+
+/// GPU и модели по конфигурации `home`.
+async fn check_home(
+    home: Option<&Path>,
+    cfg: Option<Result<AgentConfig, AppConfigError>>,
+) -> (Check, Vec<(String, Check)>) {
+    let (Some(home), Some(cfg)) = (home, cfg) else {
+        let w = || Check::Warn("каталог данных не определён (ZA_HOME)".to_owned());
+        return (w(), vec![("config".to_owned(), w())]);
+    };
+    let cfg = match cfg {
+        Ok(c) => c,
+        Err(e) => {
+            // Конфигурация не прочитана: GPU — по `nvidia-smi` из PATH.
+            let gpu = gpu_check(home, &ResourcesConfig::default()).await;
+            return (gpu, vec![("config".to_owned(), Check::Fail(e.to_string()))]);
+        }
+    };
+    let models = async {
+        if cfg.models.as_ref().is_none_or(|m| m.endpoints.is_empty()) {
+            return Vec::new();
+        }
+        match start_gateway(home, &cfg, false).await {
+            Ok(s) => {
+                s.gateway.wait_probed(PROBE_WAIT).await;
+                let view = s.gateway.view();
+                let warnings = view
+                    .warnings
+                    .into_iter()
+                    .map(|w| ("config".to_owned(), Check::Warn(w)));
+                view.endpoints
+                    .iter()
+                    .map(|v| (v.id.0.clone(), check_endpoint(v)))
+                    .chain(warnings)
+                    .collect()
+            }
+            Err(e) => vec![("config".to_owned(), Check::Fail(e.to_string()))],
+        }
+    };
+    tokio::join!(gpu_check(home, &cfg.resources), models)
+}
+
+/// Один вызов `nvidia-smi` (D6) с очищенным окружением и временным каталогом
+/// монитора `ZA_HOME/work/tmp/monitor` (D33).
+async fn gpu_check(home: &Path, res: &ResourcesConfig) -> Check {
+    let mc = MonitorConfig::from_resources(res, home.to_path_buf(), Vec::new(), None);
+    let tmp = mc.tmp_dir();
+    if let Err(e) = std::fs::create_dir_all(&tmp) {
+        tracing::warn!(dir = %tmp.display(), error = %e, "не создан временный каталог монитора");
+    }
+    check_gpu(&query_nvidia_smi(&mc.nvidia_smi, GPU_QUERY_TIMEOUT, &tmp).await)
+}
+
+/// Итог проверки GPU: карты — `Ok`, недоступен (нет NVIDIA, нет `nvidia-smi`) — `Warn`.
+pub fn check_gpu(g: &GpuStatus) -> Check {
+    match g {
+        GpuStatus::Available(cards) if !cards.is_empty() => {
+            Check::Ok(crate::resources::render_gpu(g).join("; "))
+        }
+        GpuStatus::Available(_) => Check::Warn("nvidia-smi не вернул ни одной карты".to_owned()),
+        GpuStatus::Unavailable { reason } => Check::Warn(format!("GPU недоступен: {reason}")),
+    }
+}
+
+/// Итог проверки модели: `ready` — `Ok`, прочие состояния (`inactive`, `unreachable`,
+/// `probing`, `open`, `disabled`) — `Warn` с причиной.
+pub fn check_endpoint(v: &EndpointView) -> Check {
+    if v.state == "ready" {
+        let ctx = v
+            .context_tokens
+            .map(|n| format!(", контекст {n}"))
+            .unwrap_or_default();
+        let slots = v.slots.map(|n| format!(", слотов {n}")).unwrap_or_default();
+        let model = v.model.as_deref().unwrap_or("модель не названа");
+        Check::Ok(format!("ready: {model}{ctx}{slots}"))
+    } else {
+        Check::Warn(state_text(v, Some(PROBE_WAIT)))
     }
 }
 
@@ -110,10 +246,20 @@ fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
 }
 
 /// Зонд `llama-server`: адрес не задан или сервер недоступен — `Warn`, не `Fail`.
+///
+/// Адрес печатается без учётных данных, параметров запроса и фрагмента
+/// ([`display_url`]); адрес с ними не зондируется: текст ошибки HTTP-клиента содержит
+/// адрес целиком.
 pub async fn check_llama(url: Option<&str>) -> Check {
     let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) else {
         return Check::Warn(format!("{LLAMA_URL_ENV} не задан, llama.cpp не проверялся"));
     };
+    let shown = display_url(url);
+    if shown != url {
+        return Check::Warn(format!(
+            "{shown}: {LLAMA_URL_ENV} с учётными данными или параметрами запроса не проверяется"
+        ));
+    }
     match za_llm::probe_llama(url).await {
         Ok(p) => {
             let model = if p.model.is_empty() {
@@ -131,9 +277,50 @@ pub async fn check_llama(url: Option<&str>) -> Check {
     }
 }
 
+/// Адрес для вывода: схема, хост, порт и путь — без `user:password@`, `?query` и
+/// `#fragment`.
+pub fn display_url(url: &str) -> String {
+    let url = url.trim();
+    let url = url.split(['?', '#']).next().unwrap_or("");
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (Some(s), r),
+        None => (None, url),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    match scheme {
+        Some(s) => format!("{s}://{host}{path}"),
+        None => format!("{host}{path}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_url_hides_credentials_and_query() {
+        assert_eq!(
+            display_url("http://u:sk-test-xyz@127.0.0.1:9/v1?key=sk-q#f"),
+            "http://127.0.0.1:9/v1"
+        );
+        assert_eq!(
+            display_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(display_url("sk-a@host:1/p"), "host:1/p");
+    }
+
+    #[tokio::test]
+    async fn llama_url_with_credentials_is_not_printed() {
+        let c = check_llama(Some("http://u:sk-test-xyz@127.0.0.1:9/?t=sk-q")).await;
+        assert!(matches!(c, Check::Warn(_)), "{c:?}");
+        assert!(!c.detail().contains("sk-"), "{c:?}");
+        assert!(c.detail().contains("http://127.0.0.1:9/"), "{c:?}");
+    }
 
     #[test]
     fn sqlite_minimum_is_inclusive() {
@@ -166,13 +353,27 @@ mod tests {
     }
 
     #[test]
+    fn gpu_unavailable_is_a_warning() {
+        let c = check_gpu(&GpuStatus::Unavailable {
+            reason: "nvidia-smi не найден".to_owned(),
+        });
+        assert!(matches!(c, Check::Warn(_)), "{c:?}");
+    }
+
+    #[test]
     fn failure_only_from_fail() {
         let mut r = DoctorReport {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
+            gpu: Check::Warn("нет".to_owned()),
+            models: vec![("local".to_owned(), Check::Warn("inactive".to_owned()))],
             rust: rust_version(),
         };
         assert!(!r.has_failure());
+        r.models
+            .push(("config".to_owned(), Check::Fail("ошибка".to_owned())));
+        assert!(r.has_failure());
+        r.models.clear();
         r.sqlite = Check::Fail("старая".to_owned());
         assert!(r.has_failure());
     }
@@ -182,6 +383,8 @@ mod tests {
         let r = DoctorReport {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
+            gpu: Check::Ok("RTX".to_owned()),
+            models: vec![("local".to_owned(), Check::Ok("ready".to_owned()))],
             rust: "rustc 1.99.1".to_owned(),
         };
         let v = serde_json::to_value(&r).unwrap();
@@ -190,6 +393,8 @@ mod tests {
             serde_json::json!({
                 "sqlite": {"status": "ok", "detail": "3.54.1"},
                 "llama": {"status": "warn", "detail": "нет"},
+                "gpu": {"status": "ok", "detail": "RTX"},
+                "models": [["local", {"status": "ok", "detail": "ready"}]],
                 "rust": "rustc 1.99.1",
             })
         );

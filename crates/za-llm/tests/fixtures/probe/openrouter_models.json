@@ -1,0 +1,24 @@
+{
+  "data": [
+    {
+      "id": "other/model",
+      "name": "Other",
+      "context_length": 4096,
+      "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+      "supported_parameters": ["max_tokens"]
+    },
+    {
+      "id": "qwen/qwen3.8-235b",
+      "canonical_slug": "qwen/qwen3.8-235b",
+      "name": "Qwen: Qwen3.8 235B",
+      "created": 1762646400,
+      "description": "Test model.",
+      "context_length": 131072,
+      "architecture": {"modality": "text->text", "input_modalities": ["text"], "output_modalities": ["text"], "tokenizer": "Qwen"},
+      "pricing": {"prompt": "0.000003", "completion": "0.000015", "request": "0", "image": "0"},
+      "top_provider": {"context_length": 131072, "max_completion_tokens": 32768, "is_moderated": false},
+      "per_request_limits": null,
+      "supported_parameters": ["max_tokens", "temperature", "tools", "tool_choice", "structured_outputs", "response_format"]
+    }
+  ]
+}

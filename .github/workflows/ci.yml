@@ -6,6 +6,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Множитель длительностей тестов в реальном времени (gateway): запас для медленного
+  # раннера, соотношения таймаутов не меняются.
+  ZA_TEST_TIME_SCALE: "4"
 
 jobs:
   check:
@@ -29,5 +32,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # Чистые части `za-llm` без функций — так его подключает `za-core`.
+      - run: cargo test -p za-llm --no-default-features --locked
+      # Ядро отдельно: при --workspace функции объединяются, и za-core видел бы za-llm
+      # с gateway/http (ARC-011).
+      - run: cargo check -p za-core --locked
       - run: cargo --locked xtask policy
       - run: cargo deny --locked check

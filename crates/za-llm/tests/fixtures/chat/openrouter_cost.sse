@@ -1,0 +1,14 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1762650000-AbCdEf","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1762650000,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"Коротко.","reasoning_details":[{"type":"reasoning.text","text":"Коротко.","format":"anthropic-claude-v1","index":0}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1762650000-AbCdEf","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1762650000,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"","reasoning_details":[{"type":"reasoning.text","signature":"EqQBCkgIBxABGAIiQL","format":"anthropic-claude-v1","index":0}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1762650000-AbCdEf","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1762650000,"choices":[{"index":0,"delta":{"role":"assistant","content":"Да."},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1762650000-AbCdEf","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1762650000,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop","native_finish_reason":"end_turn","logprobs":null}]}
+
+data: {"id":"gen-1762650000-AbCdEf","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1762650000,"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":5,"total_tokens":25,"cost":0.00042,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0},"cost_details":{"upstream_inference_cost":null},"completion_tokens_details":{"reasoning_tokens":2}}}
+
+data: [DONE]
+

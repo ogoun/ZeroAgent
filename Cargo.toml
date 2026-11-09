@@ -17,7 +17,9 @@ unsafe_code = "forbid"
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip: дробные числа читаются из журнала без потери точности, иначе
 # сверка аргументов эффекта при повторе давала бы ложное расхождение.
-serde_json = { version = "1", features = ["float_roundtrip"] }
+# raw_value: тело запроса Anthropic уходит готовым текстом, чтобы входы `tool_use`
+# возвращались провайдеру байт-в-байт (preserved thinking); новых крейтов нет.
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 uuid = { version = "1", default-features = false, features = ["std", "v7", "serde"] }
 jiff = { version = "0.2", default-features = false, features = ["serde", "std"] }
 # SQLite со встроенной сборкой: версия библиотеки фиксирована крейтом (ARC-031, ≥ 3.51.3).
@@ -34,7 +36,21 @@ blake3 = "1.8.7"
 # HTTP-клиент к llama-server: без native TLS и OpenSSL, только rustls (ring).
 # Встроенные корни (webpki-roots), не хранилище ОС: одинаковое поведение на Windows и Linux.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+# Только тип `rustls::Error` — распознать ошибку TLS в цепочке причин reqwest (сертификат,
+# рукопожатие) и не повторять её. Версия — та же, что у reqwest; новых крейтов нет.
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 # Только для поддельного HTTP-сервера в тестах.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+# Тело ответа поддельного сервера в тестах (`Frame`): SSE с задержками, обрывом и счётчиком
+# отключений клиента. Крейт уже в дереве через axum и reqwest, новых крейтов нет.
+http-body = "1.1.0"
+# Разбор `ZA_HOME/config.toml` (D23): разделы `[models]` и `[resources]` в бинарнике
+# `zero-agent`; dev-зависимость `za-llm` — тест ошибок разбора без фрагментов исходника
+# (`ConfigParseError`). Без `display`/`preserve_order`: только разбор и serde.
+toml = { version = "1.1.8", default-features = false, features = ["std", "serde", "parse"] }
 # Разбор командной строки бинарника zero-agent.
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+# Монитор ресурсов `za-res` (D7): CPU, RAM и тома без `unsafe` в нашем коде на Windows и Linux
+# (своя реализация через WinAPI потребовала бы `unsafe`). Только `system` и `disk`, без
+# сети, компонентов и пользователей. Лицензия MIT.
+sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }

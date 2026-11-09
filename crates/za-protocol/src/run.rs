@@ -28,6 +28,25 @@ pub enum RunStatus {
     Cancelled,
 }
 
+/// Причины паузы run: поле `reason` события `run.status` при переходе в `paused`.
+///
+/// Значения — часть протокола: их читают UI, статус и автоподъём после старта,
+/// поэтому менять строки нельзя.
+pub mod pause_reason {
+    /// Нужно решение человека: исход `NonIdempotent`-эффекта неизвестен.
+    pub const NEEDS_DECISION: &str = "needs_decision";
+    /// Записанный в журнале эффект расходится с тем, что run делает сейчас.
+    pub const REPLAY_MISMATCH: &str = "replay_mismatch";
+    /// Заявка в очереди к модели ждала дольше `max_wait` (RES-007).
+    pub const QUEUE: &str = "queue";
+    /// Не хватает ресурса узла: RAM, VRAM, места на диске (RES-012).
+    pub const RESOURCE: &str = "resource";
+    /// Провайдер модели недоступен или отказал, повторы исчерпаны (MDL-016).
+    pub const PROVIDER: &str = "provider";
+    /// Дневной бюджет облачной группы исчерпан (RES-004, `QueueError::BudgetExhausted`).
+    pub const BUDGET: &str = "budget";
+}
+
 impl RunStatus {
     /// Допустим ли переход `self -> to` (схема ТЗ, часть 01, раздел 4.3).
     pub fn can_transition(self, to: RunStatus) -> bool {
