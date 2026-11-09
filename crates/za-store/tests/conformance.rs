@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use serde_json::json;
 use za_protocol::{Actor, BlobHash, EventKind, NewEvent, RunId, RunRole, RunStatus, Seq};
 use za_store::{
-    BLOB_THRESHOLD, Durability, NewRun, ProjectStore, StoreError, StoreOptions, UsageRow,
-    UsageTotals,
+    BLOB_THRESHOLD, Durability, NewRun, ProjectStore, StatusChange, StoreError, StoreOptions,
+    UsageRow, UsageTotals,
 };
 
 /// Путь каталога теста внутри `CARGO_TARGET_TMPDIR` без очистки.
@@ -481,7 +481,13 @@ async fn child_inherits_root() {
 async fn set_status_bumps_generation_and_logs_event() {
     let s = open("run-status");
     let r = s.create_run(new_run(None)).await.unwrap();
-    assert_eq!(s.set_status(r.id, RunStatus::Running, 0).await, Ok(1));
+    assert_eq!(
+        s.set_status(r.id, RunStatus::Running, 0).await,
+        Ok(StatusChange {
+            from: RunStatus::Queued,
+            generation: 1
+        })
+    );
     let got = s.get_run(r.id).await.unwrap().unwrap();
     assert_eq!((got.status, got.generation), (RunStatus::Running, 1));
     let evs = s.read_run(r.id, Seq(0), 10).await.unwrap();
@@ -506,7 +512,10 @@ async fn set_status_with_reason_logs_reason() {
     assert_eq!(
         s.set_status_with_reason(r.id, RunStatus::Paused, 1, Some("needs_decision"))
             .await,
-        Ok(2)
+        Ok(StatusChange {
+            from: RunStatus::Running,
+            generation: 2
+        })
     );
     let got = s.get_run(r.id).await.unwrap().unwrap();
     assert_eq!((got.status, got.generation), (RunStatus::Paused, 2));
@@ -530,7 +539,11 @@ async fn set_status_with_reason_logs_reason() {
 async fn invalid_transition_is_rejected() {
     let s = open("run-invalid");
     let r = s.create_run(new_run(None)).await.unwrap();
-    let g = s.set_status(r.id, RunStatus::Cancelled, 0).await.unwrap();
+    let g = s
+        .set_status(r.id, RunStatus::Cancelled, 0)
+        .await
+        .unwrap()
+        .generation;
     assert_eq!(
         s.set_status(r.id, RunStatus::Running, g).await,
         Err(StoreError::InvalidTransition {

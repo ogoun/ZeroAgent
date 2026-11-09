@@ -3,11 +3,19 @@
 //! Шина — `tokio::sync::broadcast`: отстающий подписчик получает
 //! `RecvError::Lagged` и теряет старые события; источник истины — журнал, по
 //! которому подписчик дочитывает пропущенное (`read_run` после последнего `seq`).
+//!
+//! Опубликованное событие совпадает с записанным (kind, actor, payload). После
+//! дочитывания журнала шина отдаёт и уже прочитанные события, поэтому подписчик
+//! отсеивает дубликаты: события с `seq` — по `seq <= курсор`, `run.status`
+//! (`seq = None`, D34) — по `payload.generation <= последнее известное` этого run
+//! (`generation` строго растёт на каждой смене статуса run). Порядок на шине —
+//! порядок завершения записей; при записи из нескольких задач одновременно
+//! подписчик упорядочивает события с `seq` по `seq`.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::broadcast;
 use za_protocol::{Actor, EventKind, NewEvent, RunId, RunStatus, Seq};
-use za_store::{ProjectStore, StoreError, UsageRow};
+use za_store::{ProjectStore, StoreError, UsageRow, run_status_payload};
 
 /// Событие на шине; `seq` — номер в журнале, `None` у `run.status` (D34).
 #[derive(Debug, Clone)]
@@ -68,8 +76,9 @@ impl Journal {
 
     /// set_status_with_reason + публикация run.status с seq None (D34: курсор — read_run по последнему seq).
     ///
-    /// Payload опубликованного события — `{to, generation[, reason]}`: прежний
-    /// статус (`from`) есть только в событии журнала.
+    /// Payload опубликованного события тот же, что в журнале: `{from, to,
+    /// generation[, reason]}`; `from` хранилище возвращает из той же транзакции.
+    /// Возвращает новую `generation`.
     pub async fn set_status(
         &self,
         run: RunId,
@@ -77,14 +86,10 @@ impl Journal {
         generation: u64,
         reason: Option<&str>,
     ) -> Result<u64, StoreError> {
-        let next = self
+        let change = self
             .store
             .set_status_with_reason(run, to, generation, reason)
             .await?;
-        let mut payload = json!({ "to": to, "generation": next });
-        if let Some(reason) = reason {
-            payload["reason"] = Value::String(reason.to_owned());
-        }
         self.bus.publish(
             None,
             NewEvent {
@@ -92,11 +97,11 @@ impl Journal {
                 parent_seq: None,
                 actor: Actor::Runtime,
                 kind: EventKind::RunStatus,
-                payload,
+                payload: run_status_payload(change.from, to, change.generation, reason),
                 tainted: false,
             },
         );
-        Ok(next)
+        Ok(change.generation)
     }
 
     /// [`ProjectStore::record_usage`] + публикация `model.usage` с `seq`.

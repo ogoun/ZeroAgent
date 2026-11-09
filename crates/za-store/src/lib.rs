@@ -20,7 +20,7 @@ mod writer;
 
 pub use blobs::BLOB_THRESHOLD;
 pub use effects::{EffectRow, INTERRUPT_OPEN, INTERRUPT_RESOLVED, InterruptRow};
-pub use runs::{NewRun, Run};
+pub use runs::{NewRun, Run, StatusChange, run_status_payload};
 pub use usage::{UsageRow, UsageTotals};
 
 use std::fs::{File, OpenOptions, TryLockError};

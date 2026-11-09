@@ -44,7 +44,10 @@ pub enum Approval {
 pub struct ToolSpec {
     /// Схема для модели; `schema.name` — имя инструмента в реестре.
     pub schema: ToolSchema,
-    /// Класс эффекта вызова по идемпотентности.
+    /// Класс эффекта вызова по идемпотентности: решает повтор при восстановлении
+    /// (CORE-003). Гейт режима на него не смотрит, только на `kind`; ТЗ
+    /// соответствия `kind` и `class` не задаёт, согласованность (например, `Read`
+    /// не бывает `NonIdempotent`) — ответственность автора инструмента.
     pub class: EffectClass,
     pub kind: ToolKind,
     pub approval: Approval,
@@ -107,7 +110,7 @@ const DENY_PLAN: &str = "plan mode";
 /// `Ask` в `ask`, `Allow` в `accept-edits` и `auto`; `Exec` — `Deny` в `read-only`
 /// и `plan`, `Ask` в `ask` и `accept-edits`, `Allow` в `auto`. Затем
 /// [`Approval::Always`] превращает `Allow` в `Ask`, [`Approval::Never`] — `Ask`
-/// в `Allow`; `Deny` не меняется.
+/// в `Allow`; `Deny` не меняется. Класс эффекта (`spec.class`) не учитывается.
 pub fn gate(mode: RunMode, spec: &ToolSpec) -> Gate {
     let by_mode = match (spec.kind, mode) {
         (ToolKind::Read | ToolKind::Control, _) => Gate::Allow,

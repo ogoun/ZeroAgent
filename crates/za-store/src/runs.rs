@@ -37,6 +37,16 @@ pub struct Run {
     pub generation: u64,
 }
 
+/// Итог смены статуса: те `from` и `generation`, что записаны в событие `run.status`
+/// той же транзакции. По ним шина событий публикует копию события без чтения (D34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusChange {
+    /// Статус до перехода.
+    pub from: RunStatus,
+    /// Новая `generation`.
+    pub generation: u64,
+}
+
 impl ProjectStore {
     /// Создаёт run в статусе `Queued` с `generation` 0 и пишет событие `run.created`.
     /// `root_id` наследуется от родителя; неизвестный родитель даёт
@@ -131,7 +141,7 @@ impl ProjectStore {
         .await
     }
 
-    /// Меняет статус run и возвращает новую `generation`.
+    /// Меняет статус run и возвращает [`StatusChange`]: прежний статус и новую `generation`.
     ///
     /// Отказы ничего не меняют: [`StoreError::UnknownRun`], если run нет;
     /// [`StoreError::StaleGeneration`], если `expected_generation` не текущая;
@@ -142,7 +152,7 @@ impl ProjectStore {
         id: RunId,
         to: RunStatus,
         expected_generation: u64,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<StatusChange, StoreError> {
         self.set_status_with_reason(id, to, expected_generation, None)
             .await
     }
@@ -155,7 +165,7 @@ impl ProjectStore {
         to: RunStatus,
         expected_generation: u64,
         reason: Option<&str>,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<StatusChange, StoreError> {
         let dir = self.dir();
         let reason = reason.map(str::to_owned);
         self.write(move |c| {
@@ -183,12 +193,12 @@ impl ProjectStore {
             if n != 1 {
                 return Err(corrupt("строка run изменилась внутри транзакции"));
             }
-            let mut payload = json!({ "from": from, "to": to, "generation": next });
-            if let Some(reason) = reason {
-                payload["reason"] = Value::String(reason);
-            }
+            let payload = run_status_payload(from, to, next, reason.as_deref());
             events::insert(c, &dir, &runtime_event(id, EventKind::RunStatus, payload))?;
-            Ok(next)
+            Ok(StatusChange {
+                from,
+                generation: next,
+            })
         })
         .await
     }
@@ -242,6 +252,21 @@ fn current_status(c: &Connection, id: RunId) -> Result<(RunStatus, u64), StoreEr
         .optional()?
         .ok_or(StoreError::UnknownRun(id))?;
     Ok((parse_name(status, "status")?, generation_from(generation)?))
+}
+
+/// Payload события `run.status`: `{from, to, generation}` и `reason`, если задана.
+/// Одна функция для журнала и шины событий, чтобы их копии не расходились.
+pub fn run_status_payload(
+    from: RunStatus,
+    to: RunStatus,
+    generation: u64,
+    reason: Option<&str>,
+) -> Value {
+    let mut payload = json!({ "from": from, "to": to, "generation": generation });
+    if let Some(reason) = reason {
+        payload["reason"] = Value::String(reason.to_owned());
+    }
+    payload
 }
 
 pub(crate) fn runtime_event(run: RunId, kind: EventKind, payload: Value) -> NewEvent {

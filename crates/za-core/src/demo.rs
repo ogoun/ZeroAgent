@@ -121,6 +121,7 @@ pub async fn run_demo(
             store
                 .set_status(run, RunStatus::Running, current.generation)
                 .await?
+                .generation
         }
         RunStatus::Running => current.generation,
         RunStatus::Paused => {
@@ -130,6 +131,7 @@ pub async fn run_demo(
             store
                 .set_status(run, RunStatus::Running, current.generation)
                 .await?
+                .generation
         }
         from => {
             return Err(StoreError::InvalidTransition {

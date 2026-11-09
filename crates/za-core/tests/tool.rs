@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use za_core::{
     AgentEvent, Approval, BoxFuture, DuplicateTool, EventBus, Gate, Journal, Tool, ToolCx,
     ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
 };
 use za_llm::ToolSchema;
 use za_protocol::{
-    Actor, EffectClass, EventKind, NewEvent, RunId, RunMode, RunRole, RunStatus, Tier,
+    Actor, EffectClass, EventKind, NewEvent, RunId, RunMode, RunRole, RunStatus, Seq, Tier,
 };
 use za_store::{NewRun, ProjectStore, UsageRow};
 
@@ -185,7 +186,7 @@ async fn journal_publishes_after_commit() {
     assert_eq!(got.seq, Some(seq));
     assert_eq!(got.event, e);
     // Опубликованное событие уже в журнале.
-    let stored = s.read_run(run, za_protocol::Seq(0), 100).await.unwrap();
+    let stored = s.read_run(run, Seq(0), 100).await.unwrap();
     assert!(
         stored
             .iter()
@@ -201,8 +202,17 @@ async fn journal_publishes_after_commit() {
     assert_eq!(got.seq, None);
     assert_eq!(got.event.kind, EventKind::RunStatus);
     assert_eq!(got.event.run_id, run);
-    assert_eq!(got.event.payload["to"], json!("running"));
-    assert_eq!(got.event.payload["generation"], json!(1));
+    assert_eq!(got.event.actor, Actor::Runtime);
+    assert_eq!(
+        got.event.payload,
+        json!({"from": "queued", "to": "running", "generation": 1})
+    );
+    // Копия на шине совпадает с событием журнала.
+    let last = s.read_run(run, seq, 100).await.unwrap();
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0].kind, EventKind::RunStatus);
+    assert_eq!(last[0].actor, got.event.actor);
+    assert_eq!(last[0].payload, got.event.payload);
 
     let row = UsageRow {
         model: "m".into(),
@@ -242,10 +252,136 @@ async fn journal_without_subscribers_and_failed_write_publish_nothing() {
             .await
             .is_err()
     );
-    assert!(rx.try_recv().is_err());
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     j.set_status(run, RunStatus::Pausing, 1, Some("command"))
         .await
         .unwrap();
     let got = rx.recv().await.unwrap();
-    assert_eq!(got.event.payload["reason"], json!("command"));
+    assert_eq!(
+        got.event.payload,
+        json!({"from": "running", "to": "pausing", "generation": 2, "reason": "command"})
+    );
+}
+
+#[tokio::test]
+async fn zero_capacity_bus_holds_one_event() {
+    let (s, run) = store_with_run("cap0").await;
+    let bus = EventBus::new(0);
+    let j = Journal::new(s, bus.clone());
+    let mut rx = bus.subscribe();
+    let seq = j.append(turn(run, 1)).await.unwrap();
+    let got = rx.recv().await.unwrap();
+    assert_eq!(got.seq, Some(seq));
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+}
+
+fn turn(run: RunId, n: u32) -> NewEvent {
+    NewEvent {
+        run_id: run,
+        parent_seq: None,
+        actor: Actor::Runtime,
+        kind: EventKind::TurnStarted,
+        payload: json!({"turn": n}),
+        tainted: false,
+    }
+}
+
+/// Подписчик по правилу отсева из doc `bus.rs`: события с `seq` — по курсору,
+/// `run.status` — по `generation`.
+struct Follower {
+    cursor: Seq,
+    status_generation: u64,
+    /// (seq, kind, payload) принятых событий по порядку.
+    seen: Vec<(Option<Seq>, EventKind, Value)>,
+}
+
+impl Follower {
+    fn new() -> Self {
+        Self {
+            cursor: Seq(0),
+            status_generation: 0,
+            seen: Vec::new(),
+        }
+    }
+
+    fn accept(&mut self, seq: Option<Seq>, kind: EventKind, payload: Value) {
+        if kind == EventKind::RunStatus {
+            let g = payload["generation"].as_u64().unwrap();
+            if g <= self.status_generation {
+                return;
+            }
+            self.status_generation = g;
+        } else if let Some(sq) = seq
+            && sq <= self.cursor
+        {
+            return;
+        }
+        if let Some(sq) = seq {
+            self.cursor = self.cursor.max(sq);
+        }
+        self.seen.push((seq, kind, payload));
+    }
+}
+
+#[tokio::test]
+async fn lagged_subscriber_catches_up_without_duplicates() {
+    let (s, run) = store_with_run("lagged").await;
+    let bus = EventBus::new(4);
+    let j = Journal::new(s.clone(), bus.clone());
+    let mut rx = bus.subscribe();
+
+    // 8 событий в шину ёмкостью 4: подписчик отстаёт.
+    let mut generation = j
+        .set_status(run, RunStatus::Running, 0, None)
+        .await
+        .unwrap();
+    for n in 1..=3 {
+        j.append(turn(run, n)).await.unwrap();
+    }
+    generation = j
+        .set_status(run, RunStatus::Pausing, generation, Some("command"))
+        .await
+        .unwrap();
+    generation = j
+        .set_status(run, RunStatus::Running, generation, None)
+        .await
+        .unwrap();
+    j.append(turn(run, 4)).await.unwrap();
+    j.set_status(run, RunStatus::Done, generation, None)
+        .await
+        .unwrap();
+
+    let mut f = Follower::new();
+    assert!(matches!(rx.recv().await, Err(RecvError::Lagged(4))));
+    // Догоняем из журнала: всё после run.created.
+    for e in s.read_run(run, Seq(0), 100).await.unwrap() {
+        if e.kind != EventKind::RunCreated {
+            f.accept(Some(e.seq), e.kind, e.payload);
+        }
+    }
+    let from_journal = f.seen.len();
+    assert_eq!(from_journal, 8);
+    // Остаток шины — уже прочитанные события: всё отсеивается.
+    loop {
+        match rx.try_recv() {
+            Ok(ev) => f.accept(ev.seq, ev.event.kind, ev.event.payload),
+            Err(TryRecvError::Empty) => break,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert_eq!(f.seen.len(), from_journal);
+    let statuses: Vec<u64> = f
+        .seen
+        .iter()
+        .filter(|x| x.1 == EventKind::RunStatus)
+        .map(|x| x.2["generation"].as_u64().unwrap())
+        .collect();
+    assert_eq!(statuses, [1, 2, 3, 4]);
+
+    // Новое событие после догона принимается ровно один раз.
+    let seq = j.append(turn(run, 5)).await.unwrap();
+    let ev = rx.recv().await.unwrap();
+    f.accept(ev.seq, ev.event.kind, ev.event.payload);
+    assert_eq!(f.seen.len(), from_journal + 1);
+    assert_eq!(f.seen.last().unwrap().0, Some(seq));
 }
