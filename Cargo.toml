@@ -36,5 +36,8 @@ blake3 = "1.8.7"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 # Только для поддельного HTTP-сервера в тестах.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+# Тело ответа поддельного сервера в тестах (`Frame`): SSE с задержками, обрывом и счётчиком
+# отключений клиента. Крейт уже в дереве через axum и reqwest, новых крейтов нет.
+http-body = "1.1.0"
 # Разбор командной строки бинарника zero-agent.
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }

@@ -4,3 +4,5 @@
 crates/za-llm/tests/golden/*.hash -text
 # Золотой хэш реплея демонстрации: байты не трогать.
 crates/zero-agent/tests/golden/*.hash -text
+# Записанные ответы провайдеров (SSE с CRLF и т. п.): байты не трогать.
+crates/za-llm/tests/fixtures/** -text

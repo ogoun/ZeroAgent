@@ -19,6 +19,8 @@ tracing.workspace = true
 # Канал стрима, задача стрима и её отмена (D2), время повторов и очереди.
 tokio = { workspace = true, features = ["sync", "rt", "time"] }
 reqwest = { workspace = true, optional = true }
+# Даты `Retry-After` (HTTP-дата RFC 9110) и сброса лимитов Anthropic (RFC 3339).
+jiff = { workspace = true, optional = true }
 
 [features]
 # Без функций крейт даёт только чистые части: канонический формат, возможности,
@@ -26,7 +28,7 @@ reqwest = { workspace = true, optional = true }
 # `http` — транспорт, коннекторы и зонды; `gateway` — очередь, повторы и `Gateway`.
 default = ["gateway"]
 gateway = ["http"]
-http = ["dep:reqwest"]
+http = ["dep:reqwest", "dep:jiff"]
 # Псевдоним R0 для совместимости.
 probe = ["http"]
 
@@ -34,6 +36,11 @@ probe = ["http"]
 name = "probe"
 required-features = ["http"]
 
+[[test]]
+name = "sse"
+required-features = ["http"]
+
 [dev-dependencies]
 axum.workspace = true
+http-body.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
