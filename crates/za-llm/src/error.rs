@@ -19,7 +19,7 @@ pub enum ErrorClass {
     Server,
     ContextOverflow,
     BadRequest,
-    /// Ключ отвергнут.
+    /// Ключ отвергнут или не пройдена проверка TLS сервера (сертификат, рукопожатие).
     Auth,
     NotFound,
     ContentFilter,

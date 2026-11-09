@@ -398,6 +398,18 @@ fn mark_sensitive(headers: &mut HeaderMap, secrets: &[&Secret]) {
 
 /// Ошибка reqwest → класс. `in_body` — ошибка при чтении тела: обрыв стрима.
 fn from_reqwest(e: &reqwest::Error, in_body: bool, secrets: &[&Secret]) -> ModelError {
+    // Ошибка TLS при установке соединения (сертификат, рукопожатие, `https://` на
+    // порт без TLS) ожиданием не лечится: это ошибка конфигурации или безопасности.
+    // Класс `Auth` (проверка подлинности сервера не пройдена): без повторов, зонд
+    // даёт `Inactive`, предохранитель выключает эндпоинт до сброса пользователем
+    // вместо циклов «открыт — проба» (D22). Ошибка TLS посреди тела после успешного
+    // рукопожатия — обрыв (`StreamCut`), как прочие сбои чтения.
+    if !in_body && is_tls_error(e) {
+        return ModelError::new(
+            ErrorClass::Auth,
+            format!("TLS: {}", redact(&error_chain(e), secrets)),
+        );
+    }
     // Сбой соединения, в том числе таймаут connect (на Windows закрытый порт
     // отвечает только по таймауту), — `Transport`: сервер недоступен.
     let class = if e.is_connect() {
@@ -414,6 +426,26 @@ fn from_reqwest(e: &reqwest::Error, in_body: bool, secrets: &[&Secret]) -> Model
     ModelError::new(class, redact(&error_chain(e), secrets))
 }
 
+/// В цепочке причин есть `rustls::Error`. tokio-rustls отдаёт его внутри `io::Error`,
+/// а hyper-rustls заворачивает ещё раз в `io::Error`; `io::Error::source` пропускает
+/// вложенную ошибку, поэтому спуск через `io::Error` идёт по `get_ref`.
+fn is_tls_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(c) = cur {
+        if c.is::<rustls::Error>() {
+            return true;
+        }
+        cur = match c
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+        {
+            Some(inner) => Some(inner as &(dyn std::error::Error + 'static)),
+            None => c.source(),
+        };
+    }
+    false
+}
+
 /// Текст ошибки вместе с цепочкой причин: `Display` reqwest без них неинформативен.
 fn error_chain(e: &dyn std::error::Error) -> String {
     let mut s = e.to_string();
@@ -424,4 +456,39 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         src = c.source();
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Обёртка с причиной, как ошибки hyper-util и reqwest.
+    #[derive(Debug)]
+    struct Wrap(Box<dyn std::error::Error + Send + Sync>);
+    impl std::fmt::Display for Wrap {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("client error (Connect)")
+        }
+    }
+    impl std::error::Error for Wrap {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&*self.0)
+        }
+    }
+
+    #[test]
+    fn tls_error_found_in_cause_chain() {
+        let cert = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        let io = std::io::Error::new(std::io::ErrorKind::InvalidData, cert);
+        // Как у hyper-rustls: `io::Error` внутри `io::Error`.
+        let io = std::io::Error::other(io);
+        assert!(is_tls_error(&Wrap(Box::new(Wrap(Box::new(io))))));
+        let alert = rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure);
+        assert!(is_tls_error(&Wrap(Box::new(alert))));
+
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        assert!(!is_tls_error(&Wrap(Box::new(refused))));
+        let plain = std::io::Error::other("timed out");
+        assert!(!is_tls_error(&plain));
+    }
 }

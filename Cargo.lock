@@ -1596,6 +1596,7 @@ dependencies = [
  "http-body",
  "jiff",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",

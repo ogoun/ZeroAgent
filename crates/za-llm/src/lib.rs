@@ -6,7 +6,8 @@
 //! промпта (`prefix`), нормализация вызовов инструментов (`normalize`). Функция
 //! `http` добавляет транспорт, SSE и секреты (`http`), конфигурацию эндпоинтов
 //! (`config`), зонды (`probe`) и профили моделей (`profile`), коннекторы
-//! (`wire`, внутренние, D38), `gateway` — очередь и `Gateway` (включена по умолчанию).
+//! (`wire`, внутренние, D38), `gateway` — повторы и предохранитель (`resilience`),
+//! очередь и `Gateway` (включена по умолчанию).
 
 pub mod caps;
 #[cfg(feature = "http")]
@@ -21,6 +22,8 @@ pub mod prefix;
 pub mod probe;
 #[cfg(feature = "http")]
 pub mod profile;
+#[cfg(feature = "gateway")]
+pub mod resilience;
 pub mod scripted;
 pub mod types;
 #[cfg(feature = "http")]

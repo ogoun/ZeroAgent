@@ -563,3 +563,48 @@ async fn json_instead_of_stream_is_malformed() {
     assert_eq!(err.class, ErrorClass::Malformed, "{err:?}");
     assert!(err.message.contains("text/event-stream"), "{}", err.message);
 }
+
+/// Сервер на голом TCP: читает начало запроса (ClientHello) и отвечает `reply`.
+async fn raw_tcp_server(reply: &'static [u8]) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(reply).await;
+                let _ = s.flush().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+        }
+    });
+    port
+}
+
+/// Ошибки TLS при соединении (рукопожатие отвергнуто, `https://` на порт без TLS) —
+/// `Auth`, не `Transport`: повтор их не лечит, предохранитель выключает эндпоинт
+/// (задача 10, отложено из ревью задачи 3).
+#[tokio::test]
+async fn tls_handshake_errors_are_not_retryable() {
+    // Запись TLS alert: fatal (2), handshake_failure (40).
+    let alert = raw_tcp_server(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]).await;
+    let plain = raw_tcp_server(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n").await;
+    for port in [alert, plain] {
+        let t = HttpTransport::local(short(2000, 2000));
+        let err = t
+            .post_sse(
+                &format!("https://127.0.0.1:{port}/v1/chat/completions"),
+                HeaderMap::new(),
+                &json!({}),
+                &[],
+            )
+            .await
+            .err()
+            .expect("ожидалась ошибка TLS");
+        assert_eq!(err.class, ErrorClass::Auth, "{err:?}");
+        assert!(err.message.starts_with("TLS: "), "{err:?}");
+        assert!(!err.class.retryable() && !err.class.counts_for_breaker());
+    }
+}

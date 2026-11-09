@@ -36,6 +36,9 @@ blake3 = "1.8.7"
 # HTTP-клиент к llama-server: без native TLS и OpenSSL, только rustls (ring).
 # Встроенные корни (webpki-roots), не хранилище ОС: одинаковое поведение на Windows и Linux.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+# Только тип `rustls::Error` — распознать ошибку TLS в цепочке причин reqwest (сертификат,
+# рукопожатие) и не повторять её. Версия — та же, что у reqwest; новых крейтов нет.
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 # Только для поддельного HTTP-сервера в тестах.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 # Тело ответа поддельного сервера в тестах (`Frame`): SSE с задержками, обрывом и счётчиком

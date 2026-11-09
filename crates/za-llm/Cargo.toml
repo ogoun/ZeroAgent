@@ -19,6 +19,8 @@ tracing.workspace = true
 # Канал стрима, задача стрима и её отмена (D2), время повторов и очереди.
 tokio = { workspace = true, features = ["sync", "rt", "time"] }
 reqwest = { workspace = true, optional = true }
+# Распознавание ошибок TLS в цепочке причин reqwest (не повторяются).
+rustls = { workspace = true, optional = true }
 # Даты `Retry-After` (HTTP-дата RFC 9110) и сброса лимитов Anthropic (RFC 3339).
 jiff = { workspace = true, optional = true }
 
@@ -29,7 +31,7 @@ jiff = { workspace = true, optional = true }
 default = ["gateway"]
 gateway = ["http"]
 # `tokio/macros` — `select!` насоса SSE коннекторов на `tx.closed()` (D2).
-http = ["dep:reqwest", "dep:jiff", "tokio/macros"]
+http = ["dep:reqwest", "dep:rustls", "dep:jiff", "tokio/macros"]
 # Псевдоним R0 для совместимости.
 probe = ["http"]
 
@@ -57,8 +59,12 @@ required-features = ["http"]
 name = "profiles"
 required-features = ["http"]
 
+[[test]]
+name = "resilience"
+required-features = ["gateway"]
+
 [dev-dependencies]
 axum.workspace = true
 toml.workspace = true
 http-body.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
