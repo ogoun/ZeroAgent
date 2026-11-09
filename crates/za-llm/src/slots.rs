@@ -97,6 +97,10 @@ pub struct SlotManager {
     clock: u64,
     /// Счётчик номеров аренд.
     next_lease: u64,
+    /// Действующих слотов (`total_slots` сервера). Слоты с номером `>= active`
+    /// выведены сбросом с уменьшением числа слотов: держатся, только пока заняты
+    /// старой арендой, и не выдаются.
+    active: usize,
 }
 
 impl SlotManager {
@@ -107,6 +111,7 @@ impl SlotManager {
             slots: vec![SlotState::default(); n],
             clock: 0,
             next_lease: 0,
+            active: n,
         }
     }
 
@@ -117,20 +122,33 @@ impl SlotManager {
     /// между тем исчезали и появлялись снова.
     pub fn reset(&mut self, total_slots: u32) {
         let n = total_slots.max(1) as usize;
-        self.slots.resize_with(n, SlotState::default);
+        if self.slots.len() < n {
+            self.slots.resize_with(n, SlotState::default);
+        }
+        self.active = n;
         for st in &mut self.slots {
             st.owner = None;
         }
+        self.trim();
     }
 
-    /// Число слотов.
+    /// Убирает выведенные слоты в конце, которые больше никто не занимает. Занятый
+    /// выведенный слот остаётся занятым и при новом росте числа слотов: второй аренде
+    /// он не достанется, пока жива первая.
+    fn trim(&mut self) {
+        while self.slots.len() > self.active && self.slots.last().is_some_and(|s| !s.busy) {
+            self.slots.pop();
+        }
+    }
+
+    /// Число действующих слотов.
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.active
     }
 
     /// Слотов нет (не бывает: минимум один).
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.active == 0
     }
 
     /// Занятые слоты по возрастанию номера.
@@ -203,6 +221,7 @@ impl SlotManager {
         st.busy = false;
         st.lease = 0;
         st.last_used = self.clock;
+        self.trim();
     }
 
     /// Освобождает слот аренды `id`; слот, занятый уже другой арендой, не трогается.
@@ -242,15 +261,14 @@ impl SlotManager {
     /// в очередь к занятому слоту, это медленно, но не ошибка.
     fn pick_free(&self) -> usize {
         let lru = |busy_ok: bool| {
-            self.slots
+            self.slots[..self.active]
                 .iter()
                 .enumerate()
                 .filter(|(_, st)| busy_ok || !st.busy)
                 .min_by_key(|(_, st)| st.last_used)
                 .map(|(i, _)| i)
         };
-        if let Some(i) = self
-            .slots
+        if let Some(i) = self.slots[..self.active]
             .iter()
             .position(|st| !st.busy && st.owner.is_none())
         {

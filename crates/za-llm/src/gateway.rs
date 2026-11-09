@@ -19,12 +19,15 @@
 //!    D43); у готового эндпоинта предохранитель не пускает — `CircuitOpen` (D22,
 //!    переход в `HalfOpen` запускает повторный зонд); заявка встаёт в очередь группы.
 //! 2. Стрим возвращается сразу; его guard — [`AbortOnDrop`] фоновой задачи (D2). Первое
-//!    событие — всегда `Queued`. Эндпоинт ещё зондируется — заявка ждёт итога зонда,
-//!    стоя в очереди; эндпоинт `Unreachable` — один повторный зонд (D40); не ответил —
-//!    `ErrorClass::Unreachable`: запрос не отправлялся, предохранителю не считается.
+//!    событие — всегда `Queued`. Эндпоинт ещё зондируется — заявка ждёт итога зонда
+//!    без места в очереди (место общей группы не простаивает); эндпоинт `Unreachable` —
+//!    повторный зонд (D40): один на всех ждущих (зонд новее постановки заявки уже дал
+//!    ответ — без нового), не чаще `reprobe_min` с удвоением до `reprobe_max`; не
+//!    ответил — `ErrorClass::Unreachable` с `retry_after` до следующего разрешённого
+//!    зонда: запрос не отправлялся, предохранителю не считается.
 //!    Затем — каждое изменение статуса заявки, пока она ждёт места (D31). Отказ
 //!    очереди: `cancelled` → `Cancelled`, прочие — `Queue` с кодом [`QueueError::code`].
-//! 3. Место выдано: если эндпоинт за время ожидания стал недоступен — то же, что в п. 2.
+//! 3. Место выдано: если эндпоинт за время ожидания стал недоступен — место отпускается, дальше — как в п. 2.
 //!    У llama.cpp слот (`SlotManager`, ключ `"{bundle_key}:{session}"`), порядок `save`
 //!    вытесненной сессии → `restore` → запрос (D29); каждое действие со слотом — до
 //!    30 с, вместе до 60 с, место очереди при этом занято, событий потребителю нет.
@@ -90,7 +93,7 @@ use crate::slots::{
     LlamaSlots, SlotLease, SlotManager, SlotPlan, restore_unsupported, save_unsupported,
 };
 use crate::types::{
-    CostSource, EndpointId, ReasoningMode, StreamEvent, ToolChoice, Usage, WaitState,
+    CostSource, EndpointId, QueueStatus, ReasoningMode, StreamEvent, ToolChoice, Usage, WaitState,
 };
 use crate::wire::{AnthropicWire, ChatDialect, ChatWire, Connector, ResponsesWire, WireCtx};
 
@@ -99,6 +102,11 @@ pub const DEFAULT_LOCAL_PARALLEL: u32 = 4;
 
 /// Общий предел одного зонда по умолчанию (несколько запросов зонда вместе).
 pub const DEFAULT_PROBE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Первый интервал повторного зонда по заявкам (D40).
+pub const DEFAULT_REPROBE_MIN: Duration = Duration::from_secs(5);
+/// Потолок интервала повторного зонда по заявкам.
+pub const DEFAULT_REPROBE_MAX: Duration = Duration::from_secs(60);
 
 /// Ёмкость канала стрима для потребителя.
 const STREAM_CHANNEL: usize = 64;
@@ -134,10 +142,16 @@ pub struct GatewayOptions {
     pub breaker: BreakerOptions,
     /// Общий предел одного зонда эндпоинта; истёк — эндпоинт `Unreachable`.
     pub probe_deadline: Duration,
+    /// Первый интервал между повторными зондами по заявкам к недоступному эндпоинту
+    /// (D40); удваивается при каждом таком зонде до `reprobe_max`, сбрасывается при
+    /// успешном зонде.
+    pub reprobe_min: Duration,
+    pub reprobe_max: Duration,
 }
 
 impl Default for GatewayOptions {
-    /// D19 (повторы), D26 (таймауты), D22 (предохранитель), зонд — 30 с.
+    /// D19 (повторы), D26 (таймауты), D22 (предохранитель), зонд — 30 с, повторный
+    /// зонд по заявкам — не чаще 5 с, до 60 с.
     fn default() -> Self {
         Self {
             retry: RetryPolicy::default(),
@@ -145,6 +159,8 @@ impl Default for GatewayOptions {
             timeouts_cloud: Timeouts::cloud(),
             breaker: BreakerOptions::default(),
             probe_deadline: DEFAULT_PROBE_DEADLINE,
+            reprobe_min: DEFAULT_REPROBE_MIN,
+            reprobe_max: DEFAULT_REPROBE_MAX,
         }
     }
 }
@@ -220,6 +236,10 @@ struct ProbeCtl {
     rerun: bool,
     /// Поколение последнего начатого (или назначенного) зонда.
     started: u64,
+    /// Раньше этого момента повторный зонд по заявке не запускается (D40).
+    next_demand: Option<Instant>,
+    /// Текущий интервал повторного зонда по заявке; `ZERO` — ещё не было.
+    backoff: Duration,
 }
 
 /// Изменяемое состояние эндпоинта.
@@ -249,10 +269,11 @@ impl Live {
     }
 }
 
-/// Идущий запрос run: сигнал отмены и признак забранного места очереди.
+/// Идущий запрос run: сигнал отмены и признак «запрос вне очереди» (место забрано
+/// или ждёт зонда без заявки): такой запрос `cancel_run` считает сам.
 struct CallHandle {
     cancel: watch::Sender<bool>,
-    claimed: Arc<AtomicBool>,
+    outside: Arc<AtomicBool>,
 }
 
 struct Inner {
@@ -395,7 +416,7 @@ impl Gateway {
         let calls = lock(&self.inner.calls);
         if let Some(m) = calls.get(&run) {
             for c in m.values() {
-                if c.claimed.load(Ordering::SeqCst) {
+                if c.outside.load(Ordering::SeqCst) {
                     n += 1;
                 }
                 let _ = c.cancel.send(true);
@@ -718,6 +739,42 @@ impl Inner {
         }
     }
 
+    /// Повторный зонд по заявке к недоступному эндпоинту (D40) с ограничением частоты.
+    /// Идёт зонд — присоединиться (`Ok(поколение)`). Интервал с прошлого такого зонда не
+    /// истёк — `Err(остаток)`. Иначе — новый зонд; интервал удваивается от
+    /// `reprobe_min` до `reprobe_max` и сбрасывается успешным зондом.
+    fn demand_probe(self: &Arc<Self>, ep: &Endpoint) -> Result<u64, Duration> {
+        let now = Instant::now();
+        let mut c = lock(&ep.probe);
+        if c.running {
+            return Ok(c.started);
+        }
+        if let Some(t) = c.next_demand
+            && t > now
+        {
+            return Err(t - now);
+        }
+        c.backoff = if c.backoff.is_zero() {
+            self.opts.reprobe_min
+        } else {
+            c.backoff.saturating_mul(2).min(self.opts.reprobe_max)
+        };
+        c.next_demand = now.checked_add(c.backoff);
+        c.running = true;
+        c.started += 1;
+        let target = c.started;
+        drop(c);
+        self.spawn_probe_loop(&ep.cfg.id);
+        Ok(target)
+    }
+
+    /// Пауза до следующего разрешённого повторного зонда по заявке.
+    fn reprobe_after(&self, ep: &Endpoint) -> Duration {
+        lock(&ep.probe).next_demand.map_or(Duration::ZERO, |t| {
+            t.saturating_duration_since(Instant::now())
+        })
+    }
+
     /// Задача зондов эндпоинта: зонд, затем назначенный следующий, пока назначают.
     fn spawn_probe_loop(self: &Arc<Self>, id: &EndpointId) {
         let guard = ProbeLoopGuard {
@@ -812,6 +869,12 @@ impl Inner {
             tracing::info!(endpoint = %ep.cfg.id, old = %old, new = %new,
                            "на эндпоинте другая связка модели: профиль заменён");
         }
+        if saved.is_some() {
+            // Успешный зонд сбрасывает интервал повторных зондов по заявкам (D40).
+            let mut c = lock(&ep.probe);
+            c.backoff = Duration::ZERO;
+            c.next_demand = None;
+        }
         if let Some(p) = saved
             && let Err(e) = self.profiles.save_probed_async(p).await
         {
@@ -853,38 +916,41 @@ impl Inner {
                 format!("эндпоинт {} не описан в models.endpoints", call.endpoint),
             ));
         };
-        let ready = {
+        let (ready, seen) = {
             let live = lock(&ep.live);
             if live.probed
                 && let EndpointState::Inactive { reason } = &live.state
             {
                 return Err(inactive(&ep.cfg.id, reason));
             }
-            live.probed && live.ready().is_some()
+            (live.probed && live.ready().is_some(), live.applied)
         };
         let run = call.meta.run_id;
         let fp = request_fingerprint(&call.endpoint, &call.request);
         lock(&self.parse_guard).check(run, &fp)?;
-        // У неготового эндпоинта разрешение берётся после зонда (в задаче).
-        let permit = if ready { Some(self.allow(ep)?) } else { None };
-        let ticket = match self.queue.enqueue(&ep.group, run, call.meta.priority, None) {
-            Ok(t) => t,
-            Err(e) => {
-                let err = queue_error(&e);
-                if let Some(p) = permit {
-                    lock(&ep.breaker).on_failure(p, &err, Instant::now());
+        // У неготового эндпоинта разрешение и место берутся после зонда (в задаче):
+        // ожидание зонда не держит место общей группы.
+        let (permit, ticket) = if ready {
+            let permit = self.allow(ep)?;
+            match self.queue.enqueue(&ep.group, run, call.meta.priority, None) {
+                Ok(t) => (Some(permit), Some(t)),
+                Err(e) => {
+                    let err = queue_error(&e);
+                    lock(&ep.breaker).on_failure(permit, &err, Instant::now());
+                    return Err(err);
                 }
-                return Err(err);
             }
+        } else {
+            (None, None)
         };
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let claimed = Arc::new(AtomicBool::new(false));
+        let outside = Arc::new(AtomicBool::new(ticket.is_none()));
         lock(&self.calls).entry(run).or_default().insert(
             id,
             CallHandle {
                 cancel: cancel_tx,
-                claimed: claimed.clone(),
+                outside: outside.clone(),
             },
         );
         let reg = Registration {
@@ -897,8 +963,9 @@ impl Inner {
             inner: self.clone(),
             call,
             fp,
+            seen,
             tx,
-            claimed,
+            outside,
             _reg: reg,
         };
         let handle = self.rt.spawn(task.run(ticket, permit, cancel_rx));
@@ -914,33 +981,68 @@ impl Inner {
         Ok(permit)
     }
 
-    /// Эндпоинт готов к запросу: идёт зонд — ждать его итога; `Unreachable` — один
-    /// повторный зонд (D40), если зонда ещё не ждали. Отказ — `Inactive` или
-    /// `Unreachable` (запрос не отправлялся).
-    async fn ensure_ready(self: &Arc<Self>, ep: &Endpoint) -> Result<(), ModelError> {
-        let mut waited = false;
+    /// Эндпоинт готов к запросу (по применённому зонду).
+    fn is_ready(&self, ep: &Endpoint) -> bool {
+        let live = lock(&ep.live);
+        live.probed && live.ready().is_some()
+    }
+
+    /// Эндпоинт готов к запросу заявки, поставленной при применённом зонде `seen`.
+    /// - первый зонд ещё идёт — ждать его;
+    /// - зонд новее `seen` сказал «недоступен» — сразу `Unreachable`: один повторный
+    ///   зонд отвечает всем ждущим;
+    /// - иначе повторный зонд по заявке (D40): идёт — присоединиться; интервал не
+    ///   истёк — `Unreachable` без зонда.
+    ///
+    /// `Unreachable` несёт `retry_after` — паузу до следующего разрешённого повторного
+    /// зонда. Запрос модели при отказе не отправлялся.
+    async fn ensure_ready(self: &Arc<Self>, ep: &Endpoint, seen: u64) -> Result<(), ModelError> {
         loop {
-            let (probed, state) = {
+            let (probed, applied, state) = {
                 let live = lock(&ep.live);
-                (live.probed, live.state.clone())
+                (live.probed, live.applied, live.state.clone())
             };
-            match state {
+            let reason = match state {
                 EndpointState::Ready(_) if probed => return Ok(()),
                 EndpointState::Inactive { reason } if probed => {
                     return Err(inactive(&ep.cfg.id, &reason));
                 }
-                EndpointState::Unreachable { reason } if waited => {
-                    return Err(ModelError::new(
-                        ErrorClass::Unreachable,
-                        format!("эндпоинт {} недоступен: {reason}", ep.cfg.id),
-                    ));
+                EndpointState::Unreachable { reason } => reason,
+                // Не бывает: до первого зонда состояние — `Unreachable`.
+                _ => String::new(),
+            };
+            if !probed {
+                let target = self.request_probe(&ep.cfg.id, false);
+                wait_probe(ep, target).await;
+                if !lock(&ep.live).probed {
+                    // Задача зонда отменена (runtime останавливается).
+                    return Err(self.unreachable(ep, &reason));
                 }
-                _ => {
-                    let target = self.request_probe(&ep.cfg.id, false);
-                    wait_probe(ep, target).await;
-                    waited = true;
-                }
+                continue;
             }
+            if applied > seen {
+                return Err(self.unreachable(ep, &reason));
+            }
+            match self.demand_probe(ep) {
+                Ok(target) => {
+                    wait_probe(ep, target).await;
+                    if lock(&ep.live).applied <= seen {
+                        return Err(self.unreachable(ep, &reason));
+                    }
+                }
+                Err(_) => return Err(self.unreachable(ep, &reason)),
+            }
+        }
+    }
+
+    /// `Unreachable` с паузой до следующего разрешённого повторного зонда.
+    fn unreachable(&self, ep: &Endpoint, reason: &str) -> ModelError {
+        ModelError {
+            retry_after: Some(self.reprobe_after(ep)),
+            ..ModelError::new(
+                ErrorClass::Unreachable,
+                format!("эндпоинт {} недоступен: {reason}", ep.cfg.id),
+            )
         }
     }
 
@@ -1062,14 +1164,16 @@ struct CallTask {
     call: ModelCall,
     fp: String,
     tx: mpsc::Sender<Ev>,
-    claimed: Arc<AtomicBool>,
+    /// Применённый зонд на момент постановки заявки.
+    seen: u64,
+    outside: Arc<AtomicBool>,
     _reg: Registration,
 }
 
 impl CallTask {
     async fn run(
         self,
-        ticket: Ticket,
+        ticket: Option<Ticket>,
         permit: Option<BreakerPermit>,
         mut cancel: watch::Receiver<bool>,
     ) {
@@ -1122,20 +1226,65 @@ impl CallTask {
     }
 
     /// Зонд (если нужен), очередь, слот, повторы, стоимость.
-    async fn serve(&self, ep: &Endpoint, ticket: Ticket, verdict: &Verdict) -> Result<(), Failure> {
-        let mut status = ticket.status();
-        let first = status.borrow_and_update().clone();
+    async fn serve(
+        &self,
+        ep: &Endpoint,
+        ticket: Option<Ticket>,
+        verdict: &Verdict,
+    ) -> Result<(), Failure> {
+        let mut ticket = ticket;
+        // Первое событие — всегда `Queued`; без заявки (эндпоинт не готов) — позиция 0.
+        let first = ticket.as_ref().map_or(
+            QueueStatus {
+                position: 0,
+                waited_ms: 0,
+                state: WaitState::Queued,
+            },
+            |t| t.status().borrow().clone(),
+        );
         send(&self.tx, Ok(StreamEvent::Queued(first))).await?;
-        let deferred = lock(verdict).is_none();
-        if deferred {
-            self.inner.ensure_ready(ep).await.map_err(Failure::unsent)?;
-            let p = self.inner.allow(ep).map_err(Failure::unsent)?;
-            *lock(verdict) = Some(p);
-        }
-        let place = wait_place(ticket, status, &self.tx).await?;
-        self.claimed.store(true, Ordering::SeqCst);
-        // За время ожидания эндпоинт мог стать недоступным (I4): зонд, а не отказ.
-        self.inner.ensure_ready(ep).await.map_err(Failure::unsent)?;
+        let mut announced = true;
+        let place = loop {
+            if !self.inner.is_ready(ep) {
+                // Зонд ждут без места в очереди: не держать общую группу (I5, M-c).
+                drop(ticket.take());
+                self.outside.store(true, Ordering::SeqCst);
+                self.inner
+                    .ensure_ready(ep, self.seen)
+                    .await
+                    .map_err(Failure::unsent)?;
+            }
+            let deferred = lock(verdict).is_none();
+            if deferred {
+                let p = self.inner.allow(ep).map_err(Failure::unsent)?;
+                *lock(verdict) = Some(p);
+            }
+            let t = match ticket.take() {
+                Some(t) => t,
+                None => {
+                    // Счёт `cancel_run` переходит к очереди.
+                    self.outside.store(false, Ordering::SeqCst);
+                    let meta = &self.call.meta;
+                    self.inner
+                        .queue
+                        .enqueue(&ep.group, meta.run_id, meta.priority, None)
+                        .map_err(|e| Failure::unsent(queue_error(&e)))?
+                }
+            };
+            let mut status = t.status();
+            let st = status.borrow_and_update().clone();
+            if !announced {
+                send(&self.tx, Ok(StreamEvent::Queued(st))).await?;
+            }
+            announced = false;
+            let place = wait_place(t, status, &self.tx).await?;
+            self.outside.store(true, Ordering::SeqCst);
+            // За время ожидания эндпоинт мог стать недоступным: место отпускается,
+            // дальше — зонд по правилам `ensure_ready`.
+            if self.inner.is_ready(ep) {
+                break place;
+            }
+        };
         let (probed, slots) = {
             let live = lock(&ep.live);
             match live.ready() {
@@ -1212,9 +1361,7 @@ impl CallTask {
         };
         let policy = &self.inner.opts.retry;
         let handled = AtomicBool::new(false);
-        let mut attempts: u32 = 0;
-        let on_attempt_error = |e: &ModelError| {
-            attempts = attempts.saturating_add(1);
+        let on_attempt_error = |e: &ModelError, decision: RetryDecision| {
             if e.class == ErrorClass::RateLimited {
                 // Без `Retry-After` — хотя бы базовая пауза повтора: следующая заявка
                 // группы не бьёт сразу в тот же лимит.
@@ -1223,10 +1370,10 @@ impl CallTask {
                     queue.cooldown(group, until);
                 }
             }
-            // Итоговая ошибка (то же решение, что примет `drive_with_retry`; джиттер на
-            // него не влияет): исход сообщается до того, как ошибка уйдёт потребителю —
+            // Итоговая ошибка (решение принял `drive_with_retry` и передал сюда до его
+            // исполнения): исход сообщается до того, как ошибка уйдёт потребителю —
             // иначе его следующий запрос мог бы опередить предохранитель и `ParseGuard`.
-            if policy.decide(attempts - 1, e, 0.5) == RetryDecision::GiveUp {
+            if decision == RetryDecision::GiveUp {
                 self.report_failure(ep, verdict, e);
                 handled.store(true, Ordering::SeqCst);
             }
@@ -1262,7 +1409,7 @@ impl CallTask {
 /// уже отправлен).
 async fn wait_place(
     ticket: Ticket,
-    mut status: watch::Receiver<crate::types::QueueStatus>,
+    mut status: watch::Receiver<QueueStatus>,
     tx: &mpsc::Sender<Ev>,
 ) -> Result<PlacePermit, Failure> {
     let mut granted = pin!(ticket.granted());

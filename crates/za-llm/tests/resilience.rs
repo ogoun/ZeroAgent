@@ -191,7 +191,7 @@ async fn cut_after_deltas_emits_restart_and_clean_finish() {
                 ]),
             })
         },
-        |_| {},
+        |_, _| {},
     )
     .await;
     assert_eq!(res, Ok(()));
@@ -256,7 +256,7 @@ async fn failed_open_after_restart_does_not_repeat_restart() {
                 _ => Ok(attempt_rx(vec![Ok(tool_finished(json!({})))])),
             }
         },
-        |_| {},
+        |_, _| {},
     )
     .await;
     assert_eq!(res, Ok(()));
@@ -287,7 +287,7 @@ async fn five_retries_then_error() {
             calls.set(v);
             async { Err(err(ErrorClass::StreamCut)) }
         },
-        |_| {},
+        |_, _| {},
     )
     .await;
     assert_eq!(calls.take(), vec![1, 2, 3, 4, 5, 6]);
@@ -327,7 +327,7 @@ async fn on_attempt_error_sees_every_failure() {
                 Ok(attempt_rx(vec![Ok(tool_finished(json!({})))]))
             }
         },
-        |e| {
+        |e, _| {
             assert_eq!(e.class, ErrorClass::RateLimited);
             seen.set(seen.get() + 1);
         },
@@ -356,7 +356,7 @@ async fn non_retryable_error_is_final_at_once() {
             opens.set(opens.get() + 1);
             async { Ok(attempt_rx(vec![Err(err(ErrorClass::Malformed))])) }
         },
-        |_| {},
+        |_, _| {},
     )
     .await;
     assert_eq!(opens.get(), 1);
@@ -383,7 +383,7 @@ async fn closed_attempt_channel_without_finished_is_retried() {
                 })
             }
         },
-        |e| assert_eq!(e.class, ErrorClass::StreamCut),
+        |e, _| assert_eq!(e.class, ErrorClass::StreamCut),
     )
     .await;
     assert_eq!(res, Ok(()));
@@ -403,7 +403,7 @@ async fn consumer_drop_stops_retries() {
             opens.set(opens.get() + 1);
             async { Err(err(ErrorClass::Server)) }
         },
-        |_| {},
+        |_, _| {},
     )
     .await;
     assert_eq!(res.unwrap_err().class, ErrorClass::Cancelled);
@@ -429,7 +429,7 @@ async fn consumer_drop_during_backoff_cancels() {
             opens.set(opens.get() + 1);
             async { Err(err(ErrorClass::Server)) }
         },
-        |_| {},
+        |_, _| {},
     );
     let consumer = async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -468,7 +468,7 @@ async fn dropping_model_stream_mid_attempt_ends_network_task() {
             })));
             async move { Ok(arx) }
         },
-        |_| panic!("отмена — не неудачная попытка"),
+        |_, _| panic!("отмена — не неудачная попытка"),
     );
     let consumer = async move {
         let mut stream = ModelStream::from_channel(rx, Box::new(()));
@@ -505,7 +505,7 @@ async fn restart_reason_is_truncated() {
                 attempt_rx(vec![Ok(tool_finished(json!({})))])
             })
         },
-        |_| {},
+        |_, _| {},
     )
     .await;
     assert_eq!(res, Ok(()));
@@ -862,4 +862,35 @@ fn fingerprint_ignores_tool_order_but_not_temperature() {
         parts: vec![Part::Text("ещё".into())],
     });
     assert_ne!(fp, request_fingerprint(&ep, &longer));
+}
+
+#[tokio::test(start_paused = true)]
+async fn on_attempt_error_receives_the_decision_taken() {
+    // Задача 15, раунд 2 (M-b): обратный вызов получает то решение, которое драйвер
+    // затем исполняет, — Gateway не вычисляет его второй раз.
+    let (tx, mut rx) = mpsc::channel(64);
+    let policy = RetryPolicy {
+        max_retries: 2,
+        ..RetryPolicy::default()
+    };
+    let decisions = std::cell::RefCell::new(Vec::new());
+    let res = drive_with_retry(
+        &policy,
+        "fp",
+        &tx,
+        |_| async { Err(err(ErrorClass::Server)) },
+        |e, d| {
+            assert_eq!(e.class, ErrorClass::Server);
+            decisions.borrow_mut().push(d);
+        },
+    )
+    .await;
+    assert_eq!(res.map_err(|e| e.class), Err(ErrorClass::Server));
+    let d = decisions.into_inner();
+    assert_eq!(d.len(), 3);
+    assert!(matches!(d[0], RetryDecision::Retry(_)));
+    assert!(matches!(d[1], RetryDecision::Retry(_)));
+    assert_eq!(d[2], RetryDecision::GiveUp);
+    drop(tx);
+    assert!(matches!(drain(&mut rx).last(), Some(Err(_))));
 }

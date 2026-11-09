@@ -18,9 +18,9 @@ use za_llm::http::{Secret, SecretSource, Timeouts};
 use za_llm::profile::{EndpointState, ProfileStore};
 use za_llm::resilience::{BreakerOptions, RetryPolicy};
 use za_llm::{
-    ChatRequest, CostSource, EndpointId, ErrorClass, Gateway, GatewayOptions, Message, ModelCall,
-    ModelError, ModelPort, ModelStream, Part, RequestMeta, Role, SelectError, Selection,
-    StreamEvent, WaitState,
+    ChatRequest, CostSource, DEFAULT_REPROBE_MAX, DEFAULT_REPROBE_MIN, EndpointId, ErrorClass,
+    Gateway, GatewayOptions, Message, ModelCall, ModelError, ModelPort, ModelStream, Part,
+    RequestMeta, Role, SelectError, Selection, StreamEvent, WaitState,
 };
 use za_protocol::{Priority, RunId, RunRole};
 use za_res::{Admission, CpuSample, GpuStatus, MemSample, ResourceSnapshot, ResourcesConfig};
@@ -75,6 +75,8 @@ fn opts() -> GatewayOptions {
             ..BreakerOptions::default()
         },
         probe_deadline: Duration::from_secs(2),
+        reprobe_min: DEFAULT_REPROBE_MIN,
+        reprobe_max: DEFAULT_REPROBE_MAX,
     }
 }
 
@@ -1367,12 +1369,13 @@ async fn concurrent_probes_apply_fresh() {
 
 #[tokio::test]
 async fn waiting_requests_after_unreachable_probe_fail_without_breaker() {
-    // I4: пока заявки ждут места, зонд нашёл эндпоинт недоступным. Каждая получает
-    // `Unreachable` после своего повторного зонда, без запроса модели; предохранитель
-    // (порог 5) не открывается — следующий запрос после восстановления проходит.
+    // I4/I5: пока заявки ждут места, зонд нашёл эндпоинт недоступным. Каждая получает
+    // `Unreachable` без своего зонда (зонд после постановки уже ответил) и без запроса
+    // модели; предохранитель (порог 5) не открывается — следующий запрос после
+    // восстановления проходит.
     let down = || Reply::Json(503, json!({"error": "загрузка модели"}));
     let mut props_replies = vec![props("probe/llama_props.json")];
-    props_replies.extend((0..6).map(|_| down()));
+    props_replies.push(down());
     props_replies.push(props("probe/llama_props.json"));
     let srv = llama_server(props_replies, vec![hang_after_first(), llama_text()]).await;
     let g = start(
@@ -1403,8 +1406,10 @@ async fn waiting_requests_after_unreachable_probe_fail_without_breaker() {
     for s in waiting {
         let err = s.collect().await.unwrap_err();
         assert_eq!(err.class, ErrorClass::Unreachable, "{err:?}");
+        assert!(err.retry_after.is_some());
     }
     assert_eq!(srv.requests(CHAT).len(), 1);
+    assert_eq!(srv.requests(PROPS).len(), 2, "ждущие не зондировали");
     g.stream(call_on("local", RunId::new(), "после"))
         .await
         .unwrap()
@@ -1412,7 +1417,7 @@ async fn waiting_requests_after_unreachable_probe_fail_without_breaker() {
         .await
         .unwrap();
     assert_eq!(srv.requests(CHAT).len(), 2);
-    assert_eq!(srv.requests(PROPS).len(), 8);
+    assert_eq!(srv.requests(PROPS).len(), 3);
 }
 
 /// Ключ для зонда, паника — при запросе (сбой кода внутри задачи запроса).
@@ -1453,4 +1458,86 @@ async fn panic_in_request_task_is_internal_error() {
         "место не освобождено"
     );
     assert_eq!(srv.requests(CHAT).len(), 0);
+}
+
+#[tokio::test]
+async fn waiting_requests_share_one_reprobe_with_rate_limit() {
+    // I5: эндпоинт недоступен; пять заявок → ровно один повторный зонд на всех, каждая —
+    // `Unreachable` с `retry_after`. Следующая заявка в пределах интервала — без зонда.
+    let down = || Reply::Json(503, json!({"error": "загрузка модели"}));
+    let srv = llama_server(vec![down()], vec![llama_text()]).await;
+    let g = start(llama_cfg(&srv.base_url, json!({})), "one_reprobe", opts()).await;
+    assert_eq!(view_of(&g, "local").state, "unreachable");
+    assert_eq!(srv.requests(PROPS).len(), 1);
+    let mut streams = Vec::new();
+    for i in 0..5 {
+        streams.push(
+            g.stream(call_on("local", RunId::new(), &format!("заявка {i}")))
+                .await
+                .unwrap(),
+        );
+    }
+    for s in streams {
+        let err = s.collect().await.unwrap_err();
+        assert_eq!(err.class, ErrorClass::Unreachable, "{err:?}");
+        let after = err.retry_after.expect("retry_after");
+        assert!(
+            after > Duration::ZERO && after <= DEFAULT_REPROBE_MIN,
+            "{after:?}"
+        );
+    }
+    assert_eq!(srv.requests(PROPS).len(), 2, "повторный зонд не один");
+    // Интервал не истёк: без зонда, `retry_after` до следующего разрешённого.
+    let err = g
+        .stream(call_on("local", RunId::new(), "ещё"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, ErrorClass::Unreachable);
+    assert!(err.retry_after.is_some_and(|d| d > Duration::ZERO));
+    assert_eq!(srv.requests(PROPS).len(), 2);
+    assert_eq!(srv.requests(CHAT).len(), 0);
+}
+
+#[tokio::test]
+async fn reprobe_interval_doubles_and_resets_on_success() {
+    // D40: интервал повторного зонда по заявкам удваивается и сбрасывается успехом.
+    let down = || Reply::Json(503, json!({"error": "загрузка модели"}));
+    let srv = llama_server(
+        vec![down(), down(), down(), props("probe/llama_props.json")],
+        vec![llama_text()],
+    )
+    .await;
+    let mut o = opts();
+    o.reprobe_min = ms(100);
+    o.reprobe_max = ms(250);
+    let g = start(llama_cfg(&srv.base_url, json!({})), "reprobe_backoff", o).await;
+    let fail = |g: &Gateway| {
+        let g = g.clone();
+        async move {
+            g.stream(call_on("local", RunId::new(), "x"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap_err()
+        }
+    };
+    let e1 = fail(&g).await; // зонд №2, интервал 100 мс
+    assert!(e1.retry_after.unwrap() <= ms(100));
+    tokio::time::sleep(ms(120)).await;
+    let e2 = fail(&g).await; // зонд №3, интервал 200 мс
+    assert!(e2.retry_after.unwrap() > ms(100), "{:?}", e2.retry_after);
+    assert_eq!(srv.requests(PROPS).len(), 3);
+    tokio::time::sleep(ms(220)).await;
+    // Зонд №4 успешен: запрос проходит, интервал сброшен.
+    g.stream(call_on("local", RunId::new(), "ok"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(srv.requests(PROPS).len(), 4);
 }

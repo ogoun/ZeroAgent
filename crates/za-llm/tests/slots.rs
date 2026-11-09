@@ -299,19 +299,41 @@ fn reset_keeps_busy_slots_and_old_lease_frees_only_its_own() {
         assert_eq!(g.busy_slots(), vec![0, 1]);
         assert_eq!(g.slot_of("a"), None, "владельцы забыты");
     }
-    // Слот 1 исчезает и появляется снова (сервер с -np 1, затем -np 2).
+    // Слот 1 выводится и возвращается (сервер с -np 1, затем -np 2) при живой аренде b:
+    // он остаётся занятым и второй аренде не достаётся (раунд 2, M-a).
     m.lock().unwrap().reset(1);
+    assert_eq!(m.lock().unwrap().len(), 1);
+    assert_eq!(m.lock().unwrap().busy_slots(), vec![0, 1]);
     m.lock().unwrap().reset(2);
+    assert_eq!(m.lock().unwrap().busy_slots(), vec![0, 1]);
+    drop(l1);
     assert_eq!(m.lock().unwrap().busy_slots(), vec![0]);
     let (l2, p2) = SlotManager::lease(&m, Some("c"));
     assert_eq!(p2.slot, 1);
-    drop(l1);
-    assert_eq!(
-        m.lock().unwrap().busy_slots(),
-        vec![0, 1],
-        "старая аренда освободила чужой слот"
-    );
     drop(l2);
     drop(l0);
+    assert!(m.lock().unwrap().busy_slots().is_empty());
+}
+
+#[test]
+fn retired_slot_is_not_assigned_and_vanishes_when_freed() {
+    // Сброс с уменьшением числа слотов: занятый слот за пределами выведен — не
+    // выдаётся и исчезает после освобождения; освобождение старой арендой выведенного
+    // слота после повторного роста не трогает слот новой аренды.
+    let m = Arc::new(Mutex::new(SlotManager::new(2)));
+    let (l0, _) = SlotManager::lease(&m, None);
+    let (l1, p1) = SlotManager::lease(&m, None);
+    assert_eq!(p1.slot, 1);
+    drop(l0);
+    m.lock().unwrap().reset(1);
+    let (l2, p2) = SlotManager::lease(&m, None);
+    assert_eq!(p2.slot, 0, "выведенный слот 1 выдан");
+    drop(l1);
+    assert_eq!(m.lock().unwrap().busy_slots(), vec![0]);
+    m.lock().unwrap().reset(2);
+    let (l3, p3) = SlotManager::lease(&m, None);
+    assert_eq!(p3.slot, 1);
+    drop(l2);
+    drop(l3);
     assert!(m.lock().unwrap().busy_slots().is_empty());
 }

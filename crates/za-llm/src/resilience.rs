@@ -419,8 +419,10 @@ type Ev = Result<StreamEvent, ModelError>;
 /// `open(attempt)` получает номер попытки начиная с 1. Перед попыткой n ≥ 2, если события
 /// попытки n−1 уже ушли в `tx`, шлёт `Restart { attempt: n, reason }` (D20) — сразу
 /// после решения о повторе, до паузы.
-/// `on_attempt_error` вызывается на каждой неудачной попытке до решения о повторе
-/// (Gateway ставит по нему cooldown группы на каждый 429). Итог — Ok после Finished
+/// `on_attempt_error(err, decision)` вызывается на каждой неудачной попытке с принятым
+/// решением, до его исполнения: до паузы повтора и до отправки итоговой ошибки в `tx`
+/// (Gateway ставит по нему cooldown группы на каждый 429, а при `GiveUp` сообщает
+/// исход предохранителю раньше, чем ошибку увидит потребитель). Итог — Ok после Finished
 /// или последняя ошибка; ошибка также уходит в `tx` последним событием.
 ///
 /// Канал попытки, закрытый до `Finished`, — `StreamCut`. Закрытый `tx` (потребитель
@@ -436,7 +438,7 @@ pub async fn drive_with_retry<F, Fut, E>(
 where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<mpsc::Receiver<Ev>, ModelError>>,
-    E: FnMut(&ModelError),
+    E: FnMut(&ModelError, RetryDecision),
 {
     let cancelled = || ModelError::new(ErrorClass::Cancelled, "потребитель стрима закрыл канал");
     let mut retries_done: u32 = 0;
@@ -457,8 +459,9 @@ where
             Err(AttemptError::Cancelled) => return Err(cancelled()),
             Err(AttemptError::Model(e)) => e,
         };
-        on_attempt_error(&err);
-        match policy.decide(retries_done, &err, jitter_unit(seed, attempt)) {
+        let decision = policy.decide(retries_done, &err, jitter_unit(seed, attempt));
+        on_attempt_error(&err, decision);
+        match decision {
             RetryDecision::GiveUp => {
                 tracing::debug!(attempt, class = ?err.class, "повторы прекращены");
                 // Потребитель мог уйти: итог всё равно возвращается.
