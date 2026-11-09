@@ -291,15 +291,17 @@ impl ChatWire {
 }
 
 /// `reasoning_effort` OpenAI-совместимых серверов не знает `max`: он отправляется как `high`.
-fn effort_no_max(e: Effort) -> &'static str {
+pub(super) fn effort_no_max(e: Effort) -> &'static str {
     match e {
         Effort::Max => Effort::High.as_str(),
         e => e.as_str(),
     }
 }
 
-/// Инструменты в порядке и нормализации `render_tools` (CTX-001).
-fn tools(req: &ChatRequest, strict: bool) -> Result<Value, ModelError> {
+/// Описания инструментов `{name, description, parameters}` в порядке и нормализации
+/// `render_tools` (CTX-001); повтор имени — `BadRequest`. Общие для Chat Completions и
+/// Responses.
+pub(super) fn rendered_tools(req: &ChatRequest) -> Result<Vec<Value>, ModelError> {
     let mut seen = HashSet::new();
     if let Some(dup) = req.tools.iter().find(|t| !seen.insert(t.name.as_str())) {
         return Err(bad_request(format!(
@@ -316,7 +318,12 @@ fn tools(req: &ChatRequest, strict: bool) -> Result<Value, ModelError> {
     else {
         return Err(bad_request("описания инструментов не массив"));
     };
-    let out = arr
+    Ok(arr)
+}
+
+/// Инструменты в порядке и нормализации `render_tools` (CTX-001).
+fn tools(req: &ChatRequest, strict: bool) -> Result<Value, ModelError> {
+    let out = rendered_tools(req)?
         .into_iter()
         .map(|t| {
             let mut f = Map::new();
@@ -377,7 +384,7 @@ const STRICT_MAX_DEPTH: usize = 10;
 /// `required` перечисляет все ключи `properties`; `items` — одна схема, не кортеж;
 /// вложенность объектов не больше 10. Проверка консервативна: лишний отказ безопасен,
 /// схема просто уходит без `strict`. Схема не переписывается.
-fn strict_compatible_root(s: &Value) -> bool {
+pub(super) fn strict_compatible_root(s: &Value) -> bool {
     s.as_object()
         .is_some_and(|m| is_object_schema(m) && !m.contains_key("anyOf"))
         && strict_compatible(s, 1)
@@ -490,7 +497,7 @@ fn arguments_string(c: &ToolCall) -> String {
 }
 
 /// `f32` в JSON без хвоста двоичного представления (`0.1`, а не `0.10000000149…`).
-fn f32_json(v: f32) -> Value {
+pub(super) fn f32_json(v: f32) -> Value {
     v.to_string()
         .parse::<f64>()
         .ok()
@@ -880,7 +887,7 @@ fn finish_reason(r: &str) -> FinishReason {
 
 /// Ошибка внутри стрима `{"error": {...}}`: класс по числовому `code` как по
 /// HTTP-статусу, иначе по строковому `code` или `type`; неизвестное — `Server`.
-fn stream_error(err: &Value) -> ModelError {
+pub(super) fn stream_error(err: &Value) -> ModelError {
     let code = err.get("code");
     let numeric = code
         .and_then(|c| {

@@ -17,9 +17,11 @@ use crate::types::{ChatRequest, Message, Part, ReplayBlob, Role, StreamEvent, To
 
 mod anthropic;
 mod chat;
+mod responses;
 
 pub use anthropic::{ANTHROPIC_VERSION, AnthropicDecoder, AnthropicWire, CLEAR_AT_BETA};
 pub use chat::{ChatDecoder, ChatDialect, ChatWire};
+pub use responses::{ResponsesDecoder, ResponsesWire};
 
 /// Ёмкость канала событий стрима одной попытки.
 pub(crate) const STREAM_CHANNEL: usize = 64;
@@ -47,11 +49,12 @@ pub struct OpenedStream {
     pub events: mpsc::Receiver<Result<StreamEvent, ModelError>>,
 }
 
-/// Коннектор эндпоинта. Задача 6 добавляет вариант Responses.
+/// Коннектор эндпоинта (D35).
 #[derive(Debug, Clone)]
 pub enum Connector {
     Chat(ChatWire),
     Anthropic(AnthropicWire),
+    Responses(ResponsesWire),
 }
 
 impl Connector {
@@ -61,6 +64,7 @@ impl Connector {
         match self {
             Self::Chat(w) => w.build_body(req, ctx),
             Self::Anthropic(w) => w.build_body(req, ctx),
+            Self::Responses(w) => w.build_body(req, ctx),
         }
     }
 
@@ -75,6 +79,7 @@ impl Connector {
         match self {
             Self::Chat(w) => w.open(http, req, ctx).await,
             Self::Anthropic(w) => w.open(http, req, ctx).await,
+            Self::Responses(w) => w.open(http, req, ctx).await,
         }
     }
 }
