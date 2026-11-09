@@ -5,7 +5,9 @@
 //! стрим SSE переводится в [`StreamEvent`] декодером [`ChatDecoder`]. Итоговое
 //! сообщение собирает общий [`MessageAssembler`] (D35).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
@@ -89,6 +91,7 @@ impl ChatWire {
         } else {
             body.insert("tools".into(), tools(req, ctx.caps.strict_schema)?);
             body.insert("tool_choice".into(), tool_choice(req)?);
+            body.insert("parallel_tool_calls".into(), json!(ctx.caps.parallel_tools));
         }
         body.insert("stream".into(), json!(true));
         body.insert("stream_options".into(), json!({"include_usage": true}));
@@ -258,11 +261,13 @@ impl ChatWire {
             (D::Vllm | D::Generic, ReasoningMode::Off) => {
                 body.insert("chat_template_kwargs".into(), no_thinking());
             }
-            (D::OpenAi, ReasoningMode::Off) => {
-                body.insert("reasoning_effort".into(), json!("none"));
-            }
-            (D::OpenRouter, ReasoningMode::Off) => {
-                body.insert("reasoning".into(), json!({"effort": "none"}));
+            (D::OpenAi | D::OpenRouter, ReasoningMode::Off) => {
+                // Как у Responses (D36): `none` понимают не все модели, а модели без
+                // рассуждений (и с обязательным рассуждением у OpenRouter) отвечают 400
+                // на само поле. Поле не отправляется; отсечение по профилю — задача 9.
+                tracing::debug!(
+                    "ReasoningMode::Off у облачного Chat Completions: поле не отправляется"
+                );
             }
             (D::OpenRouter, ReasoningMode::Effort(e)) => {
                 // OpenRouter принимает и `max`.
@@ -318,12 +323,86 @@ fn tools(req: &ChatRequest, strict: bool) -> Result<Value, ModelError> {
                 f.insert(k.into(), t.get(k).cloned().unwrap_or(Value::Null));
             }
             if strict {
-                f.insert("strict".into(), json!(true));
+                if t.get("parameters").is_some_and(strict_compatible_root) {
+                    f.insert("strict".into(), json!(true));
+                } else {
+                    let name = t.get("name").and_then(Value::as_str).unwrap_or_default();
+                    tracing::debug!(
+                        tool = name,
+                        "схема несовместима со strict-режимом, strict не отправляется"
+                    );
+                }
             }
             json!({"type": "function", "function": f})
         })
         .collect();
     Ok(Value::Array(out))
+}
+
+/// Схема совместима со strict-режимом OpenAI: корень — объект, и у каждого объекта
+/// (в `properties`, `items`, `$defs`, `definitions`, `anyOf`, `oneOf`, `allOf`)
+/// `additionalProperties: false`, а `required` перечисляет все ключи `properties`.
+/// Схема не переписывается: несовместимая уходит без `strict`.
+fn strict_compatible_root(s: &Value) -> bool {
+    s.as_object().is_some_and(is_object_schema) && strict_compatible(s)
+}
+
+fn is_object_schema(m: &Map<String, Value>) -> bool {
+    let typed = match m.get("type") {
+        Some(Value::String(t)) => t == "object",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t == "object"),
+        _ => false,
+    };
+    typed || m.contains_key("properties")
+}
+
+fn strict_compatible(s: &Value) -> bool {
+    let Value::Object(m) = s else {
+        return false;
+    };
+    if is_object_schema(m) {
+        if m.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return false;
+        }
+        let empty = Map::new();
+        let props = m
+            .get("properties")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        let required: HashSet<&str> = m
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if !props.keys().all(|k| required.contains(k.as_str())) {
+            return false;
+        }
+        if !props.values().all(strict_compatible) {
+            return false;
+        }
+    }
+    let nested_ok = |v: &Value| match v {
+        Value::Array(xs) => xs.iter().all(strict_compatible),
+        other => strict_compatible(other),
+    };
+    if let Some(items) = m.get("items")
+        && !nested_ok(items)
+    {
+        return false;
+    }
+    for k in ["$defs", "definitions"] {
+        if let Some(defs) = m.get(k).and_then(Value::as_object)
+            && !defs.values().all(strict_compatible)
+        {
+            return false;
+        }
+    }
+    ["anyOf", "oneOf", "allOf"]
+        .into_iter()
+        .filter_map(|k| m.get(k))
+        .all(nested_ok)
 }
 
 fn tool_choice(req: &ChatRequest) -> Result<Value, ModelError> {
@@ -416,12 +495,16 @@ async fn pump(
 /// итог. `Finished` — на `[DONE]` или по концу стрима после `finish_reason`.
 #[derive(Debug)]
 pub struct ChatDecoder {
+    /// Задел для разбора, зависящего от диалекта; сейчас все поля принимаются при
+    /// любом диалекте (бриф: `reasoning_content` и `reasoning` — всегда).
     dialect: ChatDialect,
     /// Модель запроса: для `ReplayBlob` (`reasoning_details` OpenRouter).
     model: String,
     asm: MessageAssembler,
-    /// Индексы вызовов, для которых уже отправлен `ToolCallStart`.
-    started: BTreeSet<u32>,
+    /// Начатые вызовы: `index` провайдера → (`index` события, `id`).
+    calls: BTreeMap<u32, (u32, String)>,
+    /// Индексы событий, уже занятые вызовами.
+    used: BTreeSet<u32>,
     usage: Usage,
     /// В `usage` было `prompt_tokens_details.cached_tokens`.
     usage_cached: bool,
@@ -440,7 +523,8 @@ impl ChatDecoder {
             dialect,
             model: String::new(),
             asm: MessageAssembler::new(),
-            started: BTreeSet::new(),
+            calls: BTreeMap::new(),
+            used: BTreeSet::new(),
             usage: Usage::default(),
             usage_cached: false,
             has_usage: false,
@@ -584,25 +668,43 @@ impl ChatDecoder {
         }
         let calls = delta.get("tool_calls").and_then(Value::as_array);
         for (pos, tc) in calls.into_iter().flatten().enumerate() {
-            let index = tc
+            let provider_index = tc
                 .get("index")
                 .and_then(Value::as_u64)
                 .and_then(|i| u32::try_from(i).ok())
                 .unwrap_or(u32::try_from(pos).unwrap_or(u32::MAX));
             let f = tc.get("function");
-            if self.started.insert(index) {
-                let id = tc
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map_or_else(|| format!("call_{index}"), str::to_owned);
+            let new_id = tc
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            // Новый `id` на уже начатом `index` — другой вызов: часть совместимых
+            // серверов шлёт все вызовы с `index: 0`.
+            let fresh = match self.calls.get(&provider_index) {
+                None => true,
+                Some((_, cur)) => new_id.is_some_and(|i| i != cur),
+            };
+            let index = if fresh {
+                let index = if self.used.contains(&provider_index) {
+                    self.used.last().map_or(0, |m| m.saturating_add(1))
+                } else {
+                    provider_index
+                };
+                self.used.insert(index);
+                let id = new_id.map_or_else(|| fallback_id(index), str::to_owned);
+                self.calls.insert(provider_index, (index, id.clone()));
                 let name = f
                     .and_then(|f| f.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
                 out.push(StreamEvent::ToolCallStart { index, id, name });
-            }
+                index
+            } else {
+                self.calls
+                    .get(&provider_index)
+                    .map_or(provider_index, |c| c.0)
+            };
             if let Some(a) = f.and_then(|f| f.get("arguments")).and_then(Value::as_str)
                 && !a.is_empty()
             {
@@ -698,6 +800,17 @@ fn merge_detail(details: &mut Vec<Value>, item: &Value) {
         }
     }
     details.push(item.clone());
+}
+
+/// `id` вызова, если провайдер его не прислал: уникален в процессе и между ходами
+/// (время в наносекундах и счётчик), чтобы `tool_call_id` истории не совпадали.
+fn fallback_id(index: u32) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("call_{nanos:x}_{n:x}_{index}")
 }
 
 fn finish_reason(r: &str) -> FinishReason {

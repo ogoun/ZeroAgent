@@ -195,12 +195,75 @@ fn body_tools_order_is_canonical() {
     assert_eq!(names, ["a", "b"]);
     assert_eq!(ba["tools"][0]["type"], "function");
     assert_eq!(ba["tool_choice"], "auto");
-    // strict — только при caps.strict_schema.
+    // strict — только при caps.strict_schema и совместимой схеме: у `{"type":"object",
+    // "properties":{}}` нет `additionalProperties: false`.
     assert!(ba["tools"][0]["function"].get("strict").is_none());
-    assert_eq!(
-        body(ChatDialect::OpenAi, &a)["tools"][0]["function"]["strict"],
-        true
+    assert!(
+        body(ChatDialect::OpenAi, &a)["tools"][0]["function"]
+            .get("strict")
+            .is_none()
     );
+    assert_eq!(ba["parallel_tool_calls"], true);
+    assert_eq!(
+        body(ChatDialect::LlamaCpp, &a)["parallel_tool_calls"],
+        false
+    );
+}
+
+fn strict_of(parameters: Value) -> Option<Value> {
+    let mut req = request();
+    req.tools = vec![ToolSchema {
+        name: "t".into(),
+        description: "d".into(),
+        parameters,
+    }];
+    body(ChatDialect::OpenAi, &req)["tools"][0]["function"]
+        .get("strict")
+        .cloned()
+}
+
+#[test]
+fn strict_only_for_compatible_schema() {
+    let ok = json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "opts": {"type": "object", "properties": {"n": {"type": "integer"}},
+                     "required": ["n"], "additionalProperties": false},
+            "list": {"type": "array", "items": {"$ref": "#/$defs/item"}}
+        },
+        "required": ["path", "opts", "list"],
+        "additionalProperties": false,
+        "$defs": {"item": {"type": "object", "properties": {"x": {"type": "string"}},
+                           "required": ["x"], "additionalProperties": false}}
+    });
+    assert_eq!(strict_of(ok.clone()), Some(json!(true)));
+    let empty = json!({"type": "object", "properties": {}, "additionalProperties": false});
+    assert_eq!(strict_of(empty), Some(json!(true)));
+    // Не все свойства в `required`.
+    let mut bad = ok.clone();
+    bad["required"] = json!(["path", "opts"]);
+    assert_eq!(strict_of(bad), None);
+    // Вложенный объект без `additionalProperties: false`.
+    let mut bad = ok.clone();
+    bad["properties"]["opts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("additionalProperties");
+    assert_eq!(strict_of(bad), None);
+    // Нарушение в `$defs`.
+    let mut bad = ok.clone();
+    bad["$defs"]["item"]["required"] = json!([]);
+    assert_eq!(strict_of(bad), None);
+    // Нарушение в `items` и `anyOf`.
+    let mut bad = ok.clone();
+    bad["properties"]["list"]["items"] = json!({"type": "object", "properties": {"y": {}}});
+    assert_eq!(strict_of(bad), None);
+    let mut bad = ok;
+    bad["properties"]["path"] = json!({"anyOf": [{"type": "string"}, {"type": "object"}]});
+    assert_eq!(strict_of(bad), None);
+    // Корень не объект.
+    assert_eq!(strict_of(json!({"type": "string"})), None);
 }
 
 #[test]
@@ -376,6 +439,11 @@ fn reasoning_per_cloud_and_vllm_dialect() {
         body(ChatDialect::Vllm, &req)["chat_template_kwargs"]["enable_thinking"],
         false
     );
+    // Облако: при `Off` полей рассуждения нет (как у Responses, D36).
+    let b = body(ChatDialect::OpenAi, &req);
+    assert!(b.get("reasoning_effort").is_none());
+    let b = body(ChatDialect::OpenRouter, &req);
+    assert!(b.get("reasoning").is_none() && b.get("reasoning_effort").is_none());
     req.max_output_tokens = Some(100);
     assert_eq!(
         body(ChatDialect::OpenAi, &req)["max_completion_tokens"],
@@ -803,4 +871,134 @@ fn decoder_ignores_events_after_finished() {
         d.on_event(&ev("{oops")).unwrap_err().class,
         ErrorClass::Malformed
     );
+}
+
+fn sse(data: &str) -> SseEvent {
+    SseEvent {
+        event: None,
+        data: data.into(),
+        id: None,
+    }
+}
+
+fn final_message(evs: &[StreamEvent]) -> Message {
+    finished(evs).0.clone()
+}
+
+#[test]
+fn same_index_with_new_id_is_new_call() {
+    let mut d = ChatDecoder::new(ChatDialect::Generic);
+    let mut evs = Vec::new();
+    for data in [
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"f","arguments":"{\"x\":1}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"g","arguments":"{\"y\":"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"2}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c","function":{"name":"h","arguments":"{}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ] {
+        evs.extend(d.on_event(&sse(data)).unwrap());
+    }
+    let starts: Vec<(u32, &str)> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolCallStart { index, id, .. } => Some((*index, id.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, [(0, "a"), (1, "b"), (2, "c")]);
+    let calls: Vec<(String, Value)> = final_message(&evs)
+        .parts
+        .into_iter()
+        .filter_map(|p| match p {
+            Part::ToolCall(c) => Some((c.name, c.arguments)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("f".to_owned(), json!({"x": 1})),
+            ("g".to_owned(), json!({"y": 2})),
+            ("h".to_owned(), json!({})),
+        ]
+    );
+}
+
+#[test]
+fn missing_call_id_gets_unique_fallback() {
+    let data = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":""}}]}}]}"#;
+    let id_of = || {
+        let mut d = ChatDecoder::new(ChatDialect::Generic);
+        match d.on_event(&sse(data)).unwrap().into_iter().next() {
+            Some(StreamEvent::ToolCallStart { id, .. }) => id,
+            other => panic!("{other:?}"),
+        }
+    };
+    let (a, b) = (id_of(), id_of());
+    assert!(a.starts_with("call_") && !a.is_empty());
+    assert_ne!(a, b);
+}
+
+#[test]
+fn empty_arguments_are_empty_object() {
+    let mut a = MessageAssembler::new();
+    a.on_event(&StreamEvent::ToolCallStart {
+        index: 0,
+        id: "c".into(),
+        name: "now".into(),
+    });
+    let Part::ToolCall(c) = &a.finish().parts[0] else {
+        panic!()
+    };
+    assert_eq!(c.arguments, json!({}));
+    assert_eq!(c.raw_arguments.as_deref(), Some(""));
+}
+
+#[test]
+fn midstream_error_string_codes() {
+    let class = |err: &str| {
+        let mut d = ChatDecoder::new(ChatDialect::OpenRouter);
+        d.on_event(&sse(&format!(r#"{{"error":{err}}}"#)))
+            .unwrap_err()
+            .class
+    };
+    assert_eq!(
+        class(r#"{"code":"rate_limit_exceeded","message":"slow down"}"#),
+        ErrorClass::RateLimited
+    );
+    assert_eq!(
+        class(r#"{"code":"server_error","message":"boom"}"#),
+        ErrorClass::Server
+    );
+    assert_eq!(
+        class(r#"{"code":"context_length_exceeded","message":"too long"}"#),
+        ErrorClass::ContextOverflow
+    );
+    assert_eq!(
+        class(r#"{"type":"overloaded_error","message":"x"}"#),
+        ErrorClass::Overloaded
+    );
+    assert_eq!(class(r#"{"code":"502","message":"x"}"#), ErrorClass::Server);
+    assert_eq!(class(r#"{"message":"???"}"#), ErrorClass::Server);
+}
+
+#[tokio::test]
+async fn midstream_error_hides_key() {
+    let key = "sk-or-secret-777";
+    let body = format!("data: {{\"error\":{{\"code\":401,\"message\":\"bad key {key}\"}}}}\n\n");
+    let srv = FakeServer::start(vec![(API_ROUTE, vec![Reply::sse(vec![body.into_bytes()])])]).await;
+    let caps = default_caps(BackendKind::OpenRouter);
+    let secret = Secret::new(key.into());
+    let mut c = ctx(&caps);
+    c.secret = Some(&secret);
+    let s = wire(ChatDialect::OpenRouter, &srv.base_url)
+        .open(&transport(), &request(), &c)
+        .await
+        .unwrap();
+    let items = drain(s).await;
+    let err = items.last().unwrap().as_ref().unwrap_err();
+    assert_eq!(err.class, ErrorClass::Auth);
+    assert!(!err.message.contains(key), "{}", err.message);
+    assert!(err.message.contains("***"), "{}", err.message);
 }

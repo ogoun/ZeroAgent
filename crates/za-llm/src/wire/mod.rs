@@ -125,7 +125,8 @@ impl MessageAssembler {
 
     /// Итоговое сообщение. Порядок частей: рассуждение, текст, вызовы по `index`.
     /// Аргументы, не разобранные как JSON, остаются только в `raw_arguments`, а
-    /// `arguments` равно `Null`: ремонт делает нормализация.
+    /// `arguments` равно `Null`: ремонт делает нормализация. Пустая строка
+    /// аргументов — `{}`. Исходная строка всегда в `raw_arguments`.
     pub fn finish(self) -> Message {
         let mut parts = Vec::new();
         if !self.reasoning.is_empty() || self.replay.is_some() {
@@ -138,7 +139,12 @@ impl MessageAssembler {
             parts.push(Part::Text(self.text));
         }
         for (_, c) in self.tool_calls {
-            let arguments = serde_json::from_str(&c.arguments).unwrap_or(Value::Null);
+            // Пустая строка — вызов без параметров (так шлёт часть серверов).
+            let arguments = if c.arguments.trim().is_empty() {
+                Value::Object(serde_json::Map::new())
+            } else {
+                serde_json::from_str(&c.arguments).unwrap_or(Value::Null)
+            };
             parts.push(Part::ToolCall(ToolCall {
                 id: c.id,
                 name: c.name,

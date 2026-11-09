@@ -28,7 +28,8 @@ jiff = { workspace = true, optional = true }
 # `http` — транспорт, коннекторы и зонды; `gateway` — очередь, повторы и `Gateway`.
 default = ["gateway"]
 gateway = ["http"]
-http = ["dep:reqwest", "dep:jiff"]
+# `tokio/macros` — `select!` насоса SSE коннекторов на `tx.closed()` (D2).
+http = ["dep:reqwest", "dep:jiff", "tokio/macros"]
 # Псевдоним R0 для совместимости.
 probe = ["http"]
 
