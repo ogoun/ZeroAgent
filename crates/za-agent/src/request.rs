@@ -281,16 +281,21 @@ pub fn build_request(
     }
 }
 
-/// BLAKE3 hex канонического JSON запроса (D7).
-pub fn request_hash(req: &ChatRequest) -> String {
-    let canon = match serde_json::to_value(req) {
-        Ok(v) => canonical_json(&v),
-        // Сериализация канонических типов не падает; на всякий случай — отладочный вид,
-        // разные запросы всё равно дают разные хэши.
-        Err(e) => {
-            tracing::error!(error = %e, "запрос не сериализован в JSON");
-            format!("{req:?}")
-        }
-    };
-    hex(&canon)
+/// Метка формата хэша запроса; смена формата не совпадёт со старыми квитанциями.
+const REQUEST_FORMAT_TAG: &[u8] = b"za-request-v1 ";
+
+/// BLAKE3 hex запроса (D7): метка `za-request-v1 `, затем канонический JSON
+/// `ChatRequest` (`canonical_json`, как у блобов истории и `render_tools`).
+///
+/// Хэш входит в аргументы эффекта модели и сверяется при реплее, поэтому зависит
+/// только от канонического JSON, а не от отладочного вида. Все поля `ChatRequest`
+/// сериализуемы (строковые ключи, без своих `Serialize` с ошибкой), так что ошибка
+/// `serde_json` на практике не возникает; если возникнет — она возвращается, а не
+/// подменяется другим представлением.
+pub fn request_hash(req: &ChatRequest) -> Result<String, serde_json::Error> {
+    let canon = canonical_json(&serde_json::to_value(req)?);
+    let mut h = blake3::Hasher::new();
+    h.update(REQUEST_FORMAT_TAG);
+    h.update(canon.as_bytes());
+    Ok(h.finalize().to_hex().to_string())
 }

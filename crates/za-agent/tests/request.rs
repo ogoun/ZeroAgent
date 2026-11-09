@@ -458,17 +458,77 @@ fn request_hash_is_canonical_blake3() {
     c.push_user("hi".into()).unwrap();
     let req = build_request(&f, &s, &c, &TurnOptions::default());
     let canon = za_protocol::canonical_json(&serde_json::to_value(&req).unwrap());
+    let mut h = blake3::Hasher::new();
+    h.update(b"za-request-v1 ");
+    h.update(canon.as_bytes());
     assert_eq!(
-        request_hash(&req),
-        blake3::hash(canon.as_bytes()).to_hex().to_string()
+        request_hash(&req).unwrap(),
+        h.finalize().to_hex().to_string()
     );
-    assert_eq!(request_hash(&req), request_hash(&req.clone()));
+    assert_eq!(
+        request_hash(&req).unwrap(),
+        request_hash(&req.clone()).unwrap()
+    );
     let mut other = req.clone();
     other.messages.push(Message {
         role: Role::Assistant,
         parts: vec![Part::Text("x".into())],
     });
-    assert_ne!(request_hash(&req), request_hash(&other));
+    assert_ne!(request_hash(&req).unwrap(), request_hash(&other).unwrap());
+}
+
+#[test]
+fn request_hash_matches_golden() {
+    // D7: хэш запроса входит в аргументы эффекта модели и сверяется при реплее. Запрос
+    // собран вручную (не зависит от текстов промптов); смена формата хэша, канонического
+    // JSON или сериализации `ChatRequest` ломает тест — и реплей старых журналов.
+    let req = ChatRequest {
+        system: "sys".into(),
+        tools: vec![ToolSchema {
+            name: "read".into(),
+            description: "Read a file.".into(),
+            parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
+        }],
+        messages: vec![
+            Message {
+                role: Role::User,
+                parts: vec![Part::Text("hi <ü>".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![Part::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "a.txt"}),
+                    raw_arguments: None,
+                })],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![Part::ToolResult {
+                    call_id: "c1".into(),
+                    content: "data".into(),
+                    is_error: false,
+                }],
+            },
+        ],
+        tool_choice: za_llm::ToolChoice::Required,
+        max_output_tokens: Some(512),
+        sampling: za_llm::Sampling {
+            temperature: Some(0.5),
+            top_p: None,
+            seed: Some(7),
+            presence_penalty: None,
+            stop: vec!["END".into()],
+        },
+        reasoning: ReasoningMode::Effort(Effort::Low),
+        cache_key: Some("proj-1".into()),
+    };
+    let golden = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/request_hash.hash"),
+    )
+    .unwrap();
+    assert_eq!(request_hash(&req).unwrap(), golden.trim_end());
 }
 
 #[test]
