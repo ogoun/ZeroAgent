@@ -1,11 +1,20 @@
 //! `zero-agent doctor`: проверка окружения (OPS-014, частично).
 //!
-//! Этап R0 проверяет встроенную SQLite (ARC-031) и доступность llama.cpp
-//! (`LLAMA_URL`) и показывает версию компилятора. Внешние системы
-//! необязательны: их недоступность — предупреждение, не отказ. Проверка
-//! памяти ZeroAIMemory появится вместе с её клиентом (задача 9).
+//! Проверяет встроенную SQLite (ARC-031), доступность llama.cpp (`LLAMA_URL`, R0),
+//! GPU (`nvidia-smi`, D6) и состояние каждой модели из `config.toml` после первого
+//! зонда, показывает версию компилятора. Внешние системы необязательны: их
+//! недоступность — предупреждение, не отказ (нет GPU, модель `inactive` или
+//! `unreachable` — `Warn`). Отказ — старая SQLite и ошибка конфигурации. Проверка
+//! памяти ZeroAIMemory появится вместе с её клиентом.
+
+use std::path::Path;
 
 use serde::Serialize;
+use za_llm::EndpointView;
+use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query_nvidia_smi};
+
+use crate::config::load_config;
+use crate::models::{PROBE_WAIT, start_gateway, state_text};
 
 /// Переменная окружения с адресом `llama-server`.
 pub const LLAMA_URL_ENV: &str = "LLAMA_URL";
@@ -51,6 +60,10 @@ pub struct DoctorReport {
     pub sqlite: Check,
     /// `llama-server` по `LLAMA_URL`.
     pub llama: Check,
+    /// GPU по `nvidia-smi`; недоступен — `Warn`.
+    pub gpu: Check,
+    /// Модели по id эндпоинта; `config` — ошибка или предупреждение конфигурации.
+    pub models: Vec<(String, Check)>,
     /// Компилятор сборки и MSRV.
     pub rust: String,
 }
@@ -58,28 +71,121 @@ pub struct DoctorReport {
 impl DoctorReport {
     /// Есть ли отказ: `doctor` завершается с кодом 1.
     pub fn has_failure(&self) -> bool {
-        [&self.sqlite, &self.llama]
-            .iter()
+        [&self.sqlite, &self.llama, &self.gpu]
+            .into_iter()
+            .chain(self.models.iter().map(|(_, c)| c))
             .any(|c| matches!(c, Check::Fail(_)))
     }
 
     /// Человекочитаемый вывод.
     pub fn render(&self) -> String {
         let mut out = String::from("zero-agent doctor\n");
-        for (name, c) in [("sqlite", &self.sqlite), ("llama", &self.llama)] {
+        for (name, c) in [
+            ("sqlite", &self.sqlite),
+            ("llama", &self.llama),
+            ("gpu", &self.gpu),
+        ] {
             out.push_str(&format!("  {name:<7} {:<5} {}\n", c.label(), c.detail()));
         }
         out.push_str(&format!("  {:<7} {:<5} {}\n", "rust", "", self.rust));
+        if self.models.is_empty() {
+            out.push_str("  модели: не настроены ([models] в config.toml или LLAMA_URL)\n");
+        } else {
+            out.push_str("  модели:\n");
+        }
+        for (id, c) in &self.models {
+            out.push_str(&format!("    {id:<16} {:<5} {}\n", c.label(), c.detail()));
+        }
         out
     }
 }
 
-/// Собирает отчёт; `llama_url` — значение `LLAMA_URL`.
-pub async fn run(llama_url: Option<&str>) -> DoctorReport {
+/// Собирает отчёт; `llama_url` — значение `LLAMA_URL`, `home` — `ZA_HOME` (`None` — не
+/// определён: GPU и модели не проверяются, `Warn`). Проверки идут параллельно.
+pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
+    let (llama, (gpu, models)) = tokio::join!(check_llama(llama_url), check_home(home));
     DoctorReport {
         sqlite: check_sqlite(za_store::sqlite_library_version(), za_store::MIN_SQLITE),
-        llama: check_llama(llama_url).await,
+        llama,
+        gpu,
+        models,
         rust: rust_version(),
+    }
+}
+
+/// GPU и модели по конфигурации `home`.
+async fn check_home(home: Option<&Path>) -> (Check, Vec<(String, Check)>) {
+    let Some(home) = home else {
+        let w = || Check::Warn("каталог данных не определён (ZA_HOME)".to_owned());
+        return (w(), vec![("config".to_owned(), w())]);
+    };
+    let cfg = match load_config(home) {
+        Ok(c) => c,
+        Err(e) => {
+            // Конфигурация не прочитана: GPU — по `nvidia-smi` из PATH.
+            let gpu = gpu_check(home, &ResourcesConfig::default()).await;
+            return (gpu, vec![("config".to_owned(), Check::Fail(e.to_string()))]);
+        }
+    };
+    let models = async {
+        if cfg.models.as_ref().is_none_or(|m| m.endpoints.is_empty()) {
+            return Vec::new();
+        }
+        match start_gateway(home, &cfg, false).await {
+            Ok(s) => {
+                s.gateway.wait_probed(PROBE_WAIT).await;
+                let view = s.gateway.view();
+                let warnings = view
+                    .warnings
+                    .into_iter()
+                    .map(|w| ("config".to_owned(), Check::Warn(w)));
+                view.endpoints
+                    .iter()
+                    .map(|v| (v.id.0.clone(), check_endpoint(v)))
+                    .chain(warnings)
+                    .collect()
+            }
+            Err(e) => vec![("config".to_owned(), Check::Fail(e.to_string()))],
+        }
+    };
+    tokio::join!(gpu_check(home, &cfg.resources), models)
+}
+
+/// Один вызов `nvidia-smi` (D6) с очищенным окружением и временным каталогом
+/// монитора `ZA_HOME/work/tmp/monitor` (D33).
+async fn gpu_check(home: &Path, res: &ResourcesConfig) -> Check {
+    let mc = MonitorConfig::from_resources(res, home.to_path_buf(), Vec::new(), None);
+    let tmp = mc.tmp_dir();
+    if let Err(e) = std::fs::create_dir_all(&tmp) {
+        tracing::warn!(dir = %tmp.display(), error = %e, "не создан временный каталог монитора");
+    }
+    check_gpu(&query_nvidia_smi(&mc.nvidia_smi, GPU_QUERY_TIMEOUT, &tmp).await)
+}
+
+/// Итог проверки GPU: карты — `Ok`, недоступен (нет NVIDIA, нет `nvidia-smi`) — `Warn`.
+pub fn check_gpu(g: &GpuStatus) -> Check {
+    match g {
+        GpuStatus::Available(cards) if !cards.is_empty() => {
+            Check::Ok(crate::resources::render_gpu(g).join("; "))
+        }
+        GpuStatus::Available(_) => Check::Warn("nvidia-smi не вернул ни одной карты".to_owned()),
+        GpuStatus::Unavailable { reason } => Check::Warn(format!("GPU недоступен: {reason}")),
+    }
+}
+
+/// Итог проверки модели: `ready` — `Ok`, прочие состояния (`inactive`, `unreachable`,
+/// `probing`, `open`, `disabled`) — `Warn` с причиной.
+pub fn check_endpoint(v: &EndpointView) -> Check {
+    if v.state == "ready" {
+        let ctx = v
+            .context_tokens
+            .map(|n| format!(", контекст {n}"))
+            .unwrap_or_default();
+        let slots = v.slots.map(|n| format!(", слотов {n}")).unwrap_or_default();
+        let model = v.model.as_deref().unwrap_or("модель не названа");
+        Check::Ok(format!("ready: {model}{ctx}{slots}"))
+    } else {
+        Check::Warn(state_text(v))
     }
 }
 
@@ -166,13 +272,27 @@ mod tests {
     }
 
     #[test]
+    fn gpu_unavailable_is_a_warning() {
+        let c = check_gpu(&GpuStatus::Unavailable {
+            reason: "nvidia-smi не найден".to_owned(),
+        });
+        assert!(matches!(c, Check::Warn(_)), "{c:?}");
+    }
+
+    #[test]
     fn failure_only_from_fail() {
         let mut r = DoctorReport {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
+            gpu: Check::Warn("нет".to_owned()),
+            models: vec![("local".to_owned(), Check::Warn("inactive".to_owned()))],
             rust: rust_version(),
         };
         assert!(!r.has_failure());
+        r.models
+            .push(("config".to_owned(), Check::Fail("ошибка".to_owned())));
+        assert!(r.has_failure());
+        r.models.clear();
         r.sqlite = Check::Fail("старая".to_owned());
         assert!(r.has_failure());
     }
@@ -182,6 +302,8 @@ mod tests {
         let r = DoctorReport {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
+            gpu: Check::Ok("RTX".to_owned()),
+            models: vec![("local".to_owned(), Check::Ok("ready".to_owned()))],
             rust: "rustc 1.99.1".to_owned(),
         };
         let v = serde_json::to_value(&r).unwrap();
@@ -190,6 +312,8 @@ mod tests {
             serde_json::json!({
                 "sqlite": {"status": "ok", "detail": "3.54.1"},
                 "llama": {"status": "warn", "detail": "нет"},
+                "gpu": {"status": "ok", "detail": "RTX"},
+                "models": [["local", {"status": "ok", "detail": "ready"}]],
                 "rust": "rustc 1.99.1",
             })
         );

@@ -29,5 +29,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # Чистые части `za-llm` без функций — так его подключает `za-core`.
+      - run: cargo test -p za-llm --no-default-features --locked
       - run: cargo --locked xtask policy
       - run: cargo deny --locked check

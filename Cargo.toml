@@ -44,8 +44,9 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 # Тело ответа поддельного сервера в тестах (`Frame`): SSE с задержками, обрывом и счётчиком
 # отключений клиента. Крейт уже в дереве через axum и reqwest, новых крейтов нет.
 http-body = "1.1.0"
-# Разбор `ZA_HOME/config.toml` (D23): в R1-A — dev-зависимость `za-llm` для теста ошибок
-# разбора без фрагментов исходника (`ConfigParseError`), в задаче 16 — бинарник.
+# Разбор `ZA_HOME/config.toml` (D23): разделы `[models]` и `[resources]` в бинарнике
+# `zero-agent`; dev-зависимость `za-llm` — тест ошибок разбора без фрагментов исходника
+# (`ConfigParseError`). Без `display`/`preserve_order`: только разбор и serde.
 toml = { version = "1.1.8", default-features = false, features = ["std", "serde", "parse"] }
 # Разбор командной строки бинарника zero-agent.
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }

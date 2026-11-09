@@ -77,6 +77,11 @@ required-features = ["gateway"]
 name = "gateway"
 required-features = ["gateway"]
 
+# Живые проверки бэкендов (`#[ignore]`, переменные `LLAMA_TEST_URL` и др.).
+[[test]]
+name = "live"
+required-features = ["gateway"]
+
 [dev-dependencies]
 axum.workspace = true
 toml.workspace = true

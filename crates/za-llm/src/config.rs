@@ -391,10 +391,22 @@ impl ParseErrorKind {
     }
 }
 
-/// Имена полей, которые ошибка разбора может назвать: поля схемы `[models]` и частые
-/// ошибочные имена поля ключа. Любое другое имя (в том числе ключ, записанный именем
-/// поля TOML) не выводится.
+/// Имена полей, которые ошибка разбора может назвать: разделы `config.toml`, поля схемы
+/// `[models]` и `[resources]` (`za-res::ResourcesConfig`) и частые ошибочные имена поля
+/// ключа. Любое другое имя (в том числе ключ, записанный именем поля TOML) не выводится.
 const SHOWN_FIELDS: &[&str] = &[
+    "models",
+    "resources",
+    "ram_reserve_mib",
+    "ram_floor_mib",
+    "vram_reserve_mib",
+    "vram_floor_mib",
+    "disk_margin_mib",
+    "journal_low_mib",
+    "cpu_busy_percent",
+    "cpu_busy_for_s",
+    "hysteresis",
+    "nvidia_smi",
     "default",
     "endpoints",
     "roles",
@@ -481,7 +493,7 @@ impl ConfigParseError {
     }
 
     fn render(&self) -> String {
-        let mut out = String::from("конфигурация моделей");
+        let mut out = String::from("конфигурация");
         match (self.line, self.column) {
             (Some(l), Some(c)) => out.push_str(&format!(", строка {l}, столбец {c}")),
             (Some(l), None) => out.push_str(&format!(", строка {l}")),
