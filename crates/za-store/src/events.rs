@@ -95,6 +95,17 @@ const SELECT: &str = "SELECT seq, id, run_id, parent_seq, ts, actor, kind, schem
 /// Вставляет событие в открытой транзакции писателя; id и ts назначаются здесь.
 /// Большой payload сначала сохраняется blob в той же транзакции.
 pub(crate) fn insert(c: &Connection, dir: &Path, e: &NewEvent) -> Result<Seq, StoreError> {
+    insert_at(c, dir, e, Timestamp::now())
+}
+
+/// Как [`insert`], но с отметкой времени вызывающего: так строка проекции
+/// (например, `usage`) получает тот же `ts`, что и её событие.
+pub(crate) fn insert_at(
+    c: &Connection,
+    dir: &Path,
+    e: &NewEvent,
+    ts: Timestamp,
+) -> Result<Seq, StoreError> {
     let id = EventId::new();
     let mut payload = canonical_json(&e.payload);
     let mut blob_ref = None;
@@ -109,7 +120,7 @@ pub(crate) fn insert(c: &Connection, dir: &Path, e: &NewEvent) -> Result<Seq, St
             id.0.as_bytes().as_slice(),
             e.run_id.0.as_bytes().as_slice(),
             e.parent_seq.map(seq_sql),
-            Timestamp::now().to_string(),
+            ts.to_string(),
             name_of(e.actor)?,
             e.kind.as_str(),
             SCHEMA_V,

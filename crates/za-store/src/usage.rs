@@ -45,7 +45,7 @@ pub struct UsageTotals {
 
 impl ProjectStore {
     /// Событие `model.usage` (actor `model`, payload — как передан) и строка `usage`
-    /// в одной транзакции. Неизвестный run — [`StoreError::UnknownRun`].
+    /// в одной транзакции с одним `ts`. Неизвестный run — [`StoreError::UnknownRun`].
     pub async fn record_usage(
         &self,
         run: RunId,
@@ -63,7 +63,9 @@ impl ProjectStore {
                 payload,
                 tainted: false,
             };
-            let seq = events::insert(c, &dir, &ev)?;
+            // Одна отметка времени на событие и строку: это один факт.
+            let ts = Timestamp::now();
+            let seq = events::insert_at(c, &dir, &ev, ts)?;
             c.execute(
                 "INSERT INTO usage (run_id, seq, model, input, cached, output, reasoning, \
                  gpu_ms, cost_eq, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -77,7 +79,7 @@ impl ProjectStore {
                     count_sql(row.reasoning)?,
                     row.gpu_ms.map(count_sql).transpose()?,
                     row.cost_usd,
-                    Timestamp::now().to_string(),
+                    ts.to_string(),
                 ],
             )?;
             Ok(seq)

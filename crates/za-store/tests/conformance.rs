@@ -659,6 +659,29 @@ async fn usage_rows_sum_per_run() {
 }
 
 #[tokio::test]
+async fn usage_row_shares_ts_and_seq_with_its_event() {
+    let d = dir("usage-ts");
+    let s = ProjectStore::open(&d).unwrap();
+    let run = s.create_run(new_run(None)).await.unwrap().id;
+    let seq = s.record_usage(run, usage_row(), json!({})).await.unwrap();
+    let ev = s
+        .read_run(run, Seq(0), 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == EventKind::ModelUsage)
+        .unwrap();
+    let (row_seq, row_ts): (i64, String) = rusqlite::Connection::open(d.join("journal.db"))
+        .unwrap()
+        .query_row("SELECT seq, ts FROM usage", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((ev.seq, row_seq as u64), (seq, seq.0));
+    assert_eq!(row_ts, ev.ts.to_string());
+}
+
+#[tokio::test]
 async fn usage_without_gpu_and_cost_sums_as_zero() {
     let s = open("usage-null");
     let run = s.create_run(new_run(None)).await.unwrap().id;

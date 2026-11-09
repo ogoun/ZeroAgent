@@ -27,6 +27,15 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// Множитель времени тестов в реальном времени: `ZA_TEST_TIME_SCALE` (целое 1–6,
+/// по умолчанию 1; в CI — 4), как в тестах `za-llm` (`tests/support`).
+fn time_scale() -> u32 {
+    std::env::var("ZA_TEST_TIME_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(1, |n| n.clamp(1, 6))
+}
+
 fn write_bytes(path: &Path, n: usize) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, vec![b'x'; n]).unwrap();
@@ -478,7 +487,10 @@ async fn monitor_publishes_and_stops_on_drop() {
         "D33: каталог монитора"
     );
     // Нет nvidia-smi: GPU недоступен, а CPU и RAM всё равно публикуются.
-    let deadline = Duration::from_secs(10);
+    // Ждём событие снимка; предел только от зависания. Первый обход категорий идёт по
+    // настоящим кэшам cargo и uv и под нагрузкой полного `cargo test --workspace`
+    // занимал больше прежних 10 с, поэтому база 30 с с множителем времени.
+    let deadline = Duration::from_secs(30) * time_scale();
     let ok = tokio::time::timeout(deadline, async {
         loop {
             rx.changed().await.unwrap();
@@ -498,7 +510,7 @@ async fn monitor_publishes_and_stops_on_drop() {
     assert_eq!(mon.latest().ram.total, ok.ram.total);
     drop(mon);
     // Опрос отменён: все отправители закрыты, канал сообщает об этом.
-    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+    let closed = tokio::time::timeout(Duration::from_secs(5) * time_scale(), async {
         while rx.changed().await.is_ok() {}
     })
     .await;

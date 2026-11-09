@@ -12,7 +12,9 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use za_protocol::{BlobHash, EffectClass, EffectKey, EventKind, RunId, Seq, canonical_json};
+use za_protocol::{
+    Actor, BlobHash, EffectClass, EffectKey, EventKind, NewEvent, RunId, Seq, canonical_json,
+};
 
 use crate::blobs::{self, BLOB_THRESHOLD};
 use crate::events::{self, corrupt, name_of, parse_name, seq_from, seq_sql, uuid};
@@ -279,12 +281,24 @@ impl ProjectStore {
         .await
     }
 
+    /// Решение пользователя: [`Self::resolve_interrupt_as`] с actor `user`.
+    pub async fn resolve_interrupt(&self, id: &str, response: Value) -> Result<bool, StoreError> {
+        self.resolve_interrupt_as(id, response, Actor::User).await
+    }
+
     /// Переводит прерывание `open` в `resolved`, сохраняет `response` и пишет событие
-    /// `interrupt.resolved {id, kind, response}`.
+    /// `interrupt.resolved {id, kind, response}` от имени `actor` — того, кто решил:
+    /// человек (`User`; одобрение, ответ, решение неизвестного исхода), рантайм
+    /// (`Runtime`; таймер), инструмент или соседний агент (внешний результат).
     ///
     /// Уже решённое прерывание не меняется: `Ok(false)` без события (решение
     /// принимается один раз). Неизвестный id — [`StoreError::UnknownInterrupt`].
-    pub async fn resolve_interrupt(&self, id: &str, response: Value) -> Result<bool, StoreError> {
+    pub async fn resolve_interrupt_as(
+        &self,
+        id: &str,
+        response: Value,
+        actor: Actor,
+    ) -> Result<bool, StoreError> {
         let dir = self.dir();
         let id = id.to_owned();
         self.write(move |c| {
@@ -310,12 +324,15 @@ impl ProjectStore {
                 return Ok(false);
             }
             let run = RunId(uuid(&run_id)?);
-            let ev = json!({"id": id, "kind": kind, "response": response});
-            events::insert(
-                c,
-                &dir,
-                &runtime_event(run, EventKind::InterruptResolved, ev),
-            )?;
+            let ev = NewEvent {
+                actor,
+                ..runtime_event(
+                    run,
+                    EventKind::InterruptResolved,
+                    json!({"id": id, "kind": kind, "response": response}),
+                )
+            };
+            events::insert(c, &dir, &ev)?;
             Ok(true)
         })
         .await

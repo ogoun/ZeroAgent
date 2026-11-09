@@ -22,6 +22,7 @@
 
 ### Изменено
 - CI: `actions/checkout@v7` (Node 24) вместо `@v4`.
+- `za-store`: журнал доводится до версии схемы 2 (таблица `usage`); после этого бинарники R0 и R1-A его не открывают (`SchemaTooNew`), откат — только с копией `journal.db`.
 - `zero-agent doctor`: `LLAMA_URL` печатается без учётных данных и параметров запроса, адрес с ними не зондируется; без `[models]` сервер `LLAMA_URL` зондируется один раз (как модель `local`). `ask` вне терминала выводит только итог последней попытки, без обрывков до повтора. `resources` показывает `probing` без срока. `za-llm`: причина «ключ не настроен» называет переменную `ZA_SECRET_<ИМЯ>`.
 - `zero-agent doctor`: в отчёте `gpu` (один вызов `nvidia-smi`; нет NVIDIA — `warn`) и `models` — состояние каждого эндпоинта из `config.toml` после первого зонда (`inactive`, `unreachable` — `warn`, ошибка конфигурации — `fail`). JSON: `"gpu": {...}`, `"models": [["<id>", {...}], ...]`.
 - `za-llm`: текст `ConfigParseError` начинается с «конфигурация» (файл общий для `[models]` и `[resources]`); белый список имён полей дополнен разделами и полями `[resources]`.
@@ -30,7 +31,7 @@
 - `za-store`: `StoreError` помечен `#[non_exhaustive]`, новые варианты `Corrupt` (повреждение журнала), `SchemaTooNew { found, supported }`, `Serde` вместо общего `Sqlite`.
 
 ### Добавлено
-- `za-store`: миграция 0002 — таблица `usage` (расход модели по вызовам); `record_usage` (событие `model.usage` и строка в одной транзакции), `usage_totals`; `interrupt`, `resolve_interrupt` (один раз, событие `interrupt.resolved`), `InterruptRow.response`, `StoreError::UnknownInterrupt`; `step_has_effects`.
+- `za-store`: миграция 0002 — таблица `usage` (расход модели по вызовам); `record_usage` (событие `model.usage` и строка в одной транзакции), `usage_totals`; `interrupt`, `resolve_interrupt` и `resolve_interrupt_as` (один раз, событие `interrupt.resolved` от решившего: по умолчанию `user`), `InterruptRow.response`, `StoreError::UnknownInterrupt`; `step_has_effects`.
 - `za-protocol`: виды событий цикла `model.delta`, `agent.heartbeat`, `turn.input`, `turn.finished`, `control.requested`, `control.applied`, `budget.exceeded`; причины паузы `command`, `needs_input`, `needs_approval`, `waiting`, `internal`, `context`, `refusal`; `RunMode`, `Tier` (`for_context`), `Budget`, `BudgetKind`.
 - `zero-agent`: конфигурация `ZA_HOME/config.toml` (разделы `[models]` и `[resources]`, D23; без `[models]` и с `LLAMA_URL` — эндпоинт `local`). Команды `models [--json]`, `models probe <id>`, `ask [--model <id>] [--priority …] "<текст>"` (через `Gateway`, текст в stdout, `usage` в stderr), `resources [--json] [--watch]` (`ResourcesView`). Коды выхода: 0 — успех, 1 — ошибка, в том числе модели и конфигурации. Runtime команд завершается с пределом 2 с.
 - `za-llm`: живые тесты `tests/live.rs` (`#[ignore]`; `LLAMA_TEST_URL`, `VLLM_TEST_URL`, `OPENROUTER_TEST_KEY`, `ANTHROPIC_TEST_KEY`, `OPENAI_TEST_KEY`, модели — `ZA_TEST_<PROVIDER>_MODEL`).

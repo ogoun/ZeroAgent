@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use serde_json::json;
-use za_protocol::{EffectClass, EffectKey, EventKind, RunId, RunRole, Seq};
+use za_protocol::{Actor, EffectClass, EffectKey, EventKind, RunId, RunRole, Seq};
 use za_store::{BLOB_THRESHOLD, NewRun, ProjectStore, StoreError};
 
 fn dir(name: &str) -> PathBuf {
@@ -236,6 +236,7 @@ async fn resolve_interrupt_once() {
         resolved[0].payload,
         json!({"id": "appr-k", "kind": "approval", "response": {"approved": true}})
     );
+    assert_eq!(resolved[0].actor, Actor::User);
 
     assert_eq!(
         s.resolve_interrupt("nope", json!({})).await,
@@ -293,4 +294,54 @@ async fn step_has_effects_by_prefix() {
     .unwrap();
     assert_eq!(s.step_has_effects(other, 3).await, Ok(false));
     assert_eq!(s.step_has_effects(other, 30).await, Ok(true));
+}
+
+#[tokio::test]
+async fn concurrent_resolves_have_one_winner() {
+    let (s, run) = setup("resolve-race").await;
+    s.open_interrupt("input-k", run, "input", json!({}))
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        s.resolve_interrupt("input-k", json!({"answer": "a"})),
+        s.resolve_interrupt("input-k", json!({"answer": "b"})),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(a ^ b, "ровно одно решение побеждает: {a} {b}");
+    let resolved: Vec<_> = s
+        .read_run(run, Seq(0), 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::InterruptResolved)
+        .collect();
+    assert_eq!(resolved.len(), 1);
+    let row = s.interrupt("input-k").await.unwrap().unwrap();
+    assert_eq!(
+        Some(&resolved[0].payload["response"]),
+        row.response.as_ref()
+    );
+    let winner = if a { "a" } else { "b" };
+    assert_eq!(row.response, Some(json!({"answer": winner})));
+}
+
+#[tokio::test]
+async fn resolve_as_records_the_deciding_actor() {
+    let (s, run) = setup("resolve-actor").await;
+    s.open_interrupt("timer-k", run, "timer", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.resolve_interrupt_as("timer-k", json!({"fired": true}), Actor::Runtime)
+            .await,
+        Ok(true)
+    );
+    let ev = s
+        .read_run(run, Seq(0), 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == EventKind::InterruptResolved)
+        .unwrap();
+    assert_eq!(ev.actor, Actor::Runtime);
 }
