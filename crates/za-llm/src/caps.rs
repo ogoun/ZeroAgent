@@ -53,13 +53,45 @@ pub enum TextFormat {
     Llama3Json,
 }
 
-/// Способ мышления модели (не поле MDL-002): заполняет зонд, читают коннекторы.
+/// Способ мышления модели (не поле MDL-002): заполняет зонд (задача 9), читают
+/// коннекторы Anthropic и Responses. У Anthropic — из Models API (`capabilities`), у
+/// OpenAI Responses — по имени модели (API возможностей не сообщает), у прочих —
+/// `Default` (коннектор Chat Completions поле не читает).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ThinkingSupport {
     /// Адаптивное мышление (`{"type":"adaptive"}`).
     pub adaptive: bool,
-    /// Поддерживается уровень усилия (`effort`).
+    /// Поддерживается уровень усилия: `output_config.effort` у Anthropic,
+    /// `reasoning.effort` у Responses (у Responses — признак рассуждающей модели).
     pub effort: bool,
+    /// Мышление с бюджетом `{"type":"enabled","budget_tokens":n}` (Anthropic
+    /// `capabilities.thinking.types.enabled`).
+    #[serde(default)]
+    pub budget: bool,
+    /// Уровень усилия `xhigh`.
+    #[serde(default)]
+    pub effort_xhigh: bool,
+    /// Уровень усилия `max`.
+    #[serde(default)]
+    pub effort_max: bool,
+    /// Модель принимает `temperature` и `top_p` (Responses; у Anthropic на
+    /// `2026-10-21` — никогда, D15).
+    #[serde(default)]
+    pub sampling: bool,
+}
+
+impl ThinkingSupport {
+    /// Значение `effort` для [`crate::Effort::Max`]: `max`, если модель его принимает,
+    /// иначе `xhigh`, иначе `high`.
+    pub fn max_effort(&self) -> &'static str {
+        if self.effort_max {
+            "max"
+        } else if self.effort_xhigh {
+            "xhigh"
+        } else {
+            "high"
+        }
+    }
 }
 
 /// Где провайдер сообщает число токенов из кэша.
@@ -91,13 +123,18 @@ pub enum ContextSource {
     Conservative,
 }
 
-/// Чем считаются токены.
+/// Чем считаются токены промпта до отправки (компакция, допуск по контексту).
+///
+/// Единый смысл (задача 9): точный подсчёт там, где у провайдера есть метод подсчёта;
+/// иначе `Usage`. `Usage.input` прошлых ответов в токенах всего входа (включая кэш,
+/// см. [`crate::Usage`]), до первого ответа и для нового хвоста — оценка символы / 4.
+/// `CharsDiv4` — только оценка: провайдер заведомо не отдаёт `usage`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenCountSource {
     LlamaTokenize,
     AnthropicCountTokens,
-    /// По `usage` прошлых ответов.
+    /// По `usage` прошлых ответов; до первого ответа — символы / 4.
     Usage,
     /// Оценка: символы / 4.
     CharsDiv4,
@@ -180,8 +217,14 @@ pub fn default_caps(kind: BackendKind) -> ProviderCapabilities {
     // Возврат рассуждения обязателен там, где провайдер отдаёт непрозрачные данные
     // для повтора: подпись thinking, encrypted_content, reasoning_details.
     let reasoning_roundtrip = matches!(kind, B::Anthropic | B::OpenAiResponses | B::OpenRouter);
-    // llama-server по умолчанию не даёт параллельных вызовов; о произвольном
-    // совместимом сервере ничего не известно — консервативно.
+    // Параллельные вызовы до зонда. llama-server принимает `parallel_tool_calls`, а
+    // без поля берёт `chat_template_caps.supports_parallel_tool_calls` шаблона
+    // (`server-common.cpp`, master 2026-11): шаблон может их не уметь, поэтому до
+    // зонда `false`, зонд берёт значение из `/props`. vLLM: у запроса
+    // `parallel_tool_calls` по умолчанию `true` (`chat_completion/protocol.py`), число
+    // вызовов определяет парсер модели — `true` совпадает с поведением сервера.
+    // Облака умеют параллельные вызовы. О произвольном совместимом сервере ничего не
+    // известно — консервативно.
     let parallel_tools = !matches!(kind, B::LlamaCpp | B::OpenAiCompatible);
     let tool_choice_required = !matches!(kind, B::OpenAiCompatible);
     let strict_schema = matches!(kind, B::OpenAiResponses | B::OpenAiChat);
@@ -197,8 +240,11 @@ pub fn default_caps(kind: BackendKind) -> ProviderCapabilities {
     let token_count_source = match kind {
         B::LlamaCpp => TokenCountSource::LlamaTokenize,
         B::Anthropic => TokenCountSource::AnthropicCountTokens,
-        B::Vllm | B::OpenRouter | B::OpenAiResponses | B::OpenAiChat => TokenCountSource::Usage,
-        B::OpenAiCompatible => TokenCountSource::CharsDiv4,
+        // Коннектор Chat Completions просит `stream_options.include_usage` у всех, в том
+        // числе у совместимого сервера: источник один — `Usage` (с оценкой до ответа).
+        B::Vllm | B::OpenRouter | B::OpenAiResponses | B::OpenAiChat | B::OpenAiCompatible => {
+            TokenCountSource::Usage
+        }
     };
     let tool_id_format = match kind {
         B::Anthropic => ToolIdFormat::Prefixed("toolu_".into()),

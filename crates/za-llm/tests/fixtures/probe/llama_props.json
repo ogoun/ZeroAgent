@@ -1,0 +1,20 @@
+{
+  "default_generation_settings": {
+    "n_ctx": 32768,
+    "params": {"temperature": 0.8}
+  },
+  "total_slots": 4,
+  "model_path": "/models/Qwen3.8-27B-Q4_K_M.gguf",
+  "chat_template": "...",
+  "chat_template_caps": {
+    "supports_tools": true,
+    "supports_tool_calls": true,
+    "supports_parallel_tool_calls": true,
+    "supports_system_role": true,
+    "supports_preserve_reasoning": false,
+    "supports_reasoning_effort": false
+  },
+  "modalities": {"vision": false},
+  "build_info": "b7100-abc",
+  "is_sleeping": false
+}

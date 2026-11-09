@@ -43,10 +43,19 @@ fn ctx(caps: &ProviderCapabilities) -> WireCtx<'_> {
 const ADAPTIVE: ThinkingSupport = ThinkingSupport {
     adaptive: true,
     effort: true,
+    budget: false,
+    effort_xhigh: true,
+    effort_max: true,
+    sampling: false,
 };
+/// Старая модель: `enabled` с бюджетом, без adaptive и effort.
 const OLD: ThinkingSupport = ThinkingSupport {
     adaptive: false,
     effort: false,
+    budget: true,
+    effort_xhigh: false,
+    effort_max: false,
+    sampling: false,
 };
 
 fn user(text: &str) -> Message {
@@ -212,6 +221,54 @@ fn budget_thinking_for_old_models() {
 }
 
 #[test]
+fn max_effort_follows_profile() {
+    let mut req = request();
+    req.reasoning = ReasoningMode::Effort(Effort::Max);
+    assert_eq!(
+        body_with(&req, Some(&ADAPTIVE))["output_config"]["effort"],
+        "max"
+    );
+    let xhigh = ThinkingSupport {
+        effort_max: false,
+        ..ADAPTIVE
+    };
+    assert_eq!(
+        body_with(&req, Some(&xhigh))["output_config"]["effort"],
+        "xhigh"
+    );
+    let high = ThinkingSupport {
+        effort_xhigh: false,
+        ..xhigh
+    };
+    assert_eq!(
+        body_with(&req, Some(&high))["output_config"]["effort"],
+        "high"
+    );
+    // До зонда — `max`.
+    assert_eq!(body_with(&req, None)["output_config"]["effort"], "max");
+}
+
+#[test]
+fn no_adaptive_no_budget_sends_no_thinking() {
+    // Models API: ни adaptive, ни enabled (модель без мышления) — поле не отправляется.
+    let none = ThinkingSupport {
+        budget: false,
+        ..OLD
+    };
+    let mut req = request();
+    for mode in [
+        ReasoningMode::Effort(Effort::High),
+        ReasoningMode::Budget(4096),
+    ] {
+        req.reasoning = mode;
+        let b = body_with(&req, Some(&none));
+        assert!(b.get("thinking").is_none(), "{b}");
+        assert!(!b.to_string().contains("budget_tokens"));
+        assert_eq!(b["max_tokens"], 8192);
+    }
+}
+
+#[test]
 fn no_profile_means_adaptive() {
     let mut req = request();
     req.reasoning = ReasoningMode::Effort(Effort::High);
@@ -255,8 +312,8 @@ fn default_and_off_send_no_thinking() {
     }
     // Без поддержки effort output_config не отправляется.
     let no_effort = ThinkingSupport {
-        adaptive: true,
         effort: false,
+        ..ADAPTIVE
     };
     assert!(
         body_with(&off, Some(&no_effort))
@@ -720,7 +777,8 @@ async fn thinking_signature_and_tool_use_roundtrip() {
 async fn cache_read_tokens_map_to_cached() {
     let evs = events_of("anthropic/text.sse").await;
     let (msg, finish, usage) = finished(&evs);
-    assert_eq!(usage.input, 12);
+    // `Usage.input` — весь вход: `input_tokens` 12 + чтение кэша 2048 + запись 100.
+    assert_eq!(usage.input, 12 + 2048 + 100);
     assert_eq!(usage.cached, 2048);
     assert_eq!(usage.cache_write, 100);
     assert_eq!(usage.output, 15);

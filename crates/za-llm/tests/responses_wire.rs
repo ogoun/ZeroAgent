@@ -10,8 +10,8 @@ use za_llm::__test::{Connector, OpenedStream, ResponsesDecoder, ResponsesWire, W
 use za_llm::http::{HttpTransport, SseEvent, Timeouts};
 use za_llm::{
     BackendKind, ChatRequest, Effort, ErrorClass, FinishReason, Message, ModelError, Part,
-    ProviderCapabilities, ReasoningMode, ReplayBlob, Role, Sampling, Secret, StreamEvent, ToolCall,
-    ToolChoice, ToolSchema, Wire, default_caps,
+    ProviderCapabilities, ReasoningMode, ReplayBlob, Role, Sampling, Secret, StreamEvent,
+    ThinkingSupport, ToolCall, ToolChoice, ToolSchema, Wire, default_caps,
 };
 
 const ROUTE: &str = "POST /v1/responses";
@@ -66,6 +66,48 @@ fn tool(name: &str) -> ToolSchema {
 fn body(req: &ChatRequest) -> Value {
     let caps = caps();
     wire("http://x").build_body(req, &ctx(&caps)).unwrap()
+}
+
+fn body_with(req: &ChatRequest, thinking: &ThinkingSupport) -> Value {
+    let caps = caps();
+    let mut c = ctx(&caps);
+    c.thinking = Some(thinking);
+    wire("http://x").build_body(req, &c).unwrap()
+}
+
+#[test]
+fn profile_gates_reasoning_include_and_sampling() {
+    let mut req = request();
+    req.reasoning = ReasoningMode::Effort(Effort::Max);
+    req.sampling = Sampling {
+        temperature: Some(0.5),
+        top_p: Some(0.9),
+        ..Sampling::default()
+    };
+    // Рассуждающая модель с `max`: без сэмплирования, `include` есть.
+    let gpt6 = za_llm::probe::openai_thinking("gpt-6-astra");
+    let b = body_with(&req, &gpt6);
+    assert_eq!(b["reasoning"]["effort"], "max");
+    assert_eq!(b["include"], json!(["reasoning.encrypted_content"]));
+    assert!(b.get("temperature").is_none() && b.get("top_p").is_none());
+    // `xhigh` без `max`.
+    let gpt52 = za_llm::probe::openai_thinking("gpt-5.2");
+    assert_eq!(body_with(&req, &gpt52)["reasoning"]["effort"], "xhigh");
+    // Ни того, ни другого — `high`.
+    let gpt5 = za_llm::probe::openai_thinking("gpt-5-mini");
+    assert_eq!(body_with(&req, &gpt5)["reasoning"]["effort"], "high");
+    // Модель без рассуждений: ни `reasoning`, ни `include`, сэмплирование уходит.
+    let gpt41 = za_llm::probe::openai_thinking("gpt-4.1");
+    let b = body_with(&req, &gpt41);
+    assert!(b.get("reasoning").is_none(), "{b}");
+    assert!(b.get("include").is_none(), "{b}");
+    assert_eq!(b["temperature"], 0.5);
+    assert_eq!(b["top_p"], 0.9);
+    // До зонда — как раньше: `include`, `temperature`, `Max` → `high`.
+    let b = body(&req);
+    assert_eq!(b["reasoning"]["effort"], "high");
+    assert_eq!(b["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(b["temperature"], 0.5);
 }
 
 fn transport() -> HttpTransport {

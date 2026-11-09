@@ -53,6 +53,10 @@ required-features = ["http"]
 name = "responses_wire"
 required-features = ["http"]
 
+[[test]]
+name = "profiles"
+required-features = ["http"]
+
 [dev-dependencies]
 axum.workspace = true
 http-body.workspace = true

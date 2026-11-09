@@ -188,8 +188,15 @@ pub enum CostSource {
 }
 
 /// Расход токенов и стоимость вызова.
+///
+/// Единицы одинаковы у всех провайдеров (задача 9): `input` — все входные токены
+/// запроса, включая прочитанные из кэша (`cached`) и записанные в кэш (`cache_write`),
+/// как `prompt_tokens` у OpenAI. Коннектор Anthropic складывает `input_tokens`,
+/// `cache_read_input_tokens` и `cache_creation_input_tokens` (у Anthropic
+/// `input_tokens` кэш не включает), llama.cpp — `prompt_n + cache_n`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// Все входные токены, включая `cached` и `cache_write`.
     pub input: u64,
     /// Входные токены, прочитанные из кэша провайдера.
     pub cached: u64,

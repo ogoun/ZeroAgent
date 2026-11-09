@@ -18,7 +18,7 @@ use super::{
     MessageAssembler, OpenedStream, STREAM_CHANNEL, StreamDecoder, WireCtx, bad_request, pump,
     u64_at,
 };
-use crate::caps::Wire;
+use crate::caps::{ThinkingSupport, Wire};
 use crate::error::{ErrorClass, ModelError};
 use crate::http::{HttpTransport, Secret, SseEvent, classify_status, parse_rate_limits};
 use crate::types::{
@@ -77,24 +77,50 @@ impl ResponsesWire {
             body.insert("max_output_tokens".into(), json!(n));
         }
         let s = &req.sampling;
-        if let Some(t) = s.temperature {
-            body.insert("temperature".into(), f32_json(t));
-        }
-        if let Some(p) = s.top_p {
-            body.insert("top_p".into(), f32_json(p));
+        // Рассуждающие модели OpenAI отвечают 400 «Unsupported parameter» на
+        // `temperature`/`top_p`: поля уходят только модели, которая их принимает
+        // (профиль, задача 9); до зонда — как в запросе.
+        let thinking = ctx.thinking;
+        if thinking.is_none_or(|t| t.sampling) {
+            if let Some(t) = s.temperature {
+                body.insert("temperature".into(), f32_json(t));
+            }
+            if let Some(p) = s.top_p {
+                body.insert("top_p".into(), f32_json(p));
+            }
+        } else if s.temperature.is_some() || s.top_p.is_some() {
+            tracing::debug!(
+                model = self.model.as_str(),
+                "temperature/top_p модель не принимает, не отправляются"
+            );
         }
         if s.seed.is_some() || s.presence_penalty.is_some() || !s.stop.is_empty() {
             tracing::debug!("seed/presence_penalty/stop Responses не принимает, не отправляются");
         }
-        if let Some(effort) = reasoning_effort(&req.reasoning) {
-            body.insert(
-                "reasoning".into(),
-                json!({"effort": effort, "summary": "auto"}),
-            );
+        // Модель без рассуждений (профиль: `effort = false`) отвечает 400 на `reasoning`
+        // и на `include: ["reasoning.encrypted_content"]`.
+        let reasons = thinking.is_none_or(|t| t.effort);
+        match reasoning_effort(&req.reasoning, thinking) {
+            Some(effort) if reasons => {
+                body.insert(
+                    "reasoning".into(),
+                    json!({"effort": effort, "summary": "auto"}),
+                );
+            }
+            Some(_) => tracing::debug!(
+                model = self.model.as_str(),
+                "модель без рассуждений: поле reasoning не отправляется"
+            ),
+            None => {}
         }
         body.insert("stream".into(), json!(true));
         body.insert("store".into(), json!(false));
-        body.insert("include".into(), json!(["reasoning.encrypted_content"]));
+        // При `store: false` элементы `reasoning` и так несут `encrypted_content`
+        // («Reasoning» → stateless mode: «doesn't require it»); поле оставлено для
+        // совместимых реализаций Responses, но только рассуждающим моделям.
+        if reasons {
+            body.insert("include".into(), json!(["reasoning.encrypted_content"]));
+        }
         if let Some(k) = &req.cache_key {
             body.insert("prompt_cache_key".into(), json!(k));
         }
@@ -251,15 +277,24 @@ fn function_call(c: &ToolCall) -> Value {
 /// `reasoning.effort` (D36): только при `Effort` и `Budget`; `Max` → `high`.
 /// `Off` поля не даёт: модели без рассуждений отвечают 400 на само поле, а `none`
 /// понимают не все модели; отсечение по профилю — задача 9.
-fn reasoning_effort(mode: &ReasoningMode) -> Option<&'static str> {
+fn reasoning_effort(
+    mode: &ReasoningMode,
+    support: Option<&ThinkingSupport>,
+) -> Option<&'static str> {
+    // `Max` — наибольший уровень модели по профилю (`max`, иначе `xhigh`), иначе и до
+    // зонда — `high`: не все модели принимают каждое значение («Reasoning»).
+    let effort = |e: Effort| match (e, support) {
+        (Effort::Max, Some(t)) => t.max_effort(),
+        (e, _) => effort_no_max(e),
+    };
     match mode {
         ReasoningMode::Default => None,
         ReasoningMode::Off => {
             tracing::debug!("ReasoningMode::Off у Responses: поле reasoning не отправляется");
             None
         }
-        ReasoningMode::Effort(e) => Some(effort_no_max(*e)),
-        ReasoningMode::Budget(n) => Some(effort_no_max(Effort::nearest(*n))),
+        ReasoningMode::Effort(e) => Some(effort(*e)),
+        ReasoningMode::Budget(n) => Some(effort(Effort::nearest(*n))),
     }
 }
 

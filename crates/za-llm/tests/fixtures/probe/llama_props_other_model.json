@@ -1,0 +1,8 @@
+{
+  "default_generation_settings": {
+    "n_ctx": 32768
+  },
+  "total_slots": 4,
+  "model_path": "/models/gemma-4-12b-it-IQ3_XXS.gguf",
+  "build_info": "b7100-abc"
+}

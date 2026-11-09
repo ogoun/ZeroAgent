@@ -21,7 +21,10 @@
 //!   сообщении пользователя;
 //! - до зонда (профиля нет) модель считается актуальной: adaptive и
 //!   `output_config.effort`; `budget_tokens` — только если профиль говорит, что
-//!   adaptive не поддерживается (решение контроллера, отступление от брифа);
+//!   adaptive не поддерживается, а `enabled` поддерживается (решение контроллера,
+//!   отступление от брифа; Models API `capabilities.thinking.types`, задача 9);
+//!   `Effort::Max` — наибольший уровень модели (`max`, иначе `xhigh`, иначе `high`)
+//!   по `capabilities.effort`;
 //! - входы `tool_use` возвращаются байт-в-байт, как пришли (исходный текст из
 //!   `raw_arguments`), — тело уходит готовым текстом ([`AnthropicWire::body_text`]).
 
@@ -67,6 +70,8 @@ pub const CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
 /// platforms as mid-conversation system messages»; не Sonnet 5, Opus 4.7/4.6, Haiku 4.5.
 /// `claude-mythos-preview` есть только в метаданных страницы, в тексте нет — не
 /// включён. Сравнение — точное имя или имя с суффиксом `-…` (снимки по дате).
+/// Models API (`GET /v1/models/{id}`, проверено 2026-11-09) этой возможности в
+/// `capabilities` не сообщает, поэтому список остаётся источником и после зонда.
 const MID_SYSTEM_MODELS: &[&str] = &[
     "claude-opus-5-5",
     "claude-opus-5",
@@ -274,9 +279,18 @@ impl AnthropicWire {
     ) -> Thinking {
         let adaptive = support.is_none_or(|t| t.adaptive);
         let effort_ok = support.is_none_or(|t| t.effort);
+        // `enabled` с бюджетом — только если Models API его разрешает
+        // (`capabilities.thinking.types.enabled`); иначе мышление не включается.
+        let budget_ok = support.is_some_and(|t| t.budget);
         let mut put_effort = |e: Effort| {
             if effort_ok {
-                body.insert("output_config".into(), json!({"effort": e.as_str()}));
+                // `Max` — наибольший уровень, который принимает модель (Models API
+                // `capabilities.effort.{max,xhigh}`); до зонда — `max`.
+                let v = match (e, support) {
+                    (Effort::Max, Some(t)) => t.max_effort(),
+                    (e, _) => e.as_str(),
+                };
+                body.insert("output_config".into(), json!({"effort": v}));
             }
         };
         let thinking = match mode {
@@ -296,6 +310,13 @@ impl AnthropicWire {
             ReasoningMode::Budget(n) if adaptive => {
                 put_effort(Effort::nearest(*n));
                 Thinking::Adaptive
+            }
+            ReasoningMode::Effort(_) | ReasoningMode::Budget(_) if !budget_ok => {
+                tracing::debug!(
+                    model = self.model.as_str(),
+                    "модель не принимает ни adaptive, ни enabled: мышление не включается"
+                );
+                Thinking::Omitted
             }
             ReasoningMode::Effort(e) => Thinking::Enabled(e.budget_tokens()),
             ReasoningMode::Budget(n) => Thinking::Enabled((*n).max(MIN_BUDGET)),
@@ -1057,6 +1078,8 @@ impl AnthropicDecoder {
         }
     }
 
+    /// Поля `usage` как есть: `input` здесь — `input_tokens` Anthropic без кэша;
+    /// кэш прибавляется к нему при сборке `Finished`.
     fn read_usage(&mut self, u: &Value) {
         if let Some(n) = u64_at(u, &["input_tokens"]) {
             self.usage.input = n;
@@ -1124,10 +1147,18 @@ impl AnthropicDecoder {
             tracing::warn!("стрим Anthropic закончен без stop_reason");
             FinishReason::Other("missing".to_owned())
         });
+        // `Usage.input` — весь вход (задача 9): у Anthropic `input_tokens` не включает
+        // токены, прочитанные из кэша и записанные в него («Prompt caching» → «Tracking
+        // cache performance»: total = cache_read + cache_creation + input).
+        let mut usage = std::mem::take(&mut self.usage);
+        usage.input = usage
+            .input
+            .saturating_add(usage.cached)
+            .saturating_add(usage.cache_write);
         StreamEvent::Finished {
             message: asm.finish(),
             finish,
-            usage: std::mem::take(&mut self.usage),
+            usage,
         }
     }
 }
