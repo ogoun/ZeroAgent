@@ -18,7 +18,7 @@ use crate::types::{ChatRequest, Message, Part, ReplayBlob, Role, StreamEvent, To
 mod anthropic;
 mod chat;
 
-pub use anthropic::{AnthropicDecoder, AnthropicWire};
+pub use anthropic::{ANTHROPIC_VERSION, AnthropicDecoder, AnthropicWire, CLEAR_AT_BETA};
 pub use chat::{ChatDecoder, ChatDialect, ChatWire};
 
 /// Ёмкость канала событий стрима одной попытки.

@@ -2,7 +2,7 @@
 //!
 //! Тело запроса собирается из канонического [`ChatRequest`]: `system` на верхнем
 //! уровне, результаты инструментов — блоками `tool_result` в сообщении `user`,
-//! рассуждение той же модели возвращается блоками `thinking` без изменений. Стрим SSE
+//! рассуждение (любой модели Anthropic) возвращается блоками `thinking` без изменений. Стрим SSE
 //! переводится в [`StreamEvent`] декодером [`AnthropicDecoder`]; итоговое сообщение
 //! собирает общий [`MessageAssembler`] (D35).
 //!
@@ -16,7 +16,7 @@
 //! - принудительный `tool_choice` (`any`, `tool`) у Opus 5.5, Sonnet 5.5, Fable 5.1 и
 //!   при включённом мышлении даёт 400: он отправляется только старым моделям без
 //!   мышления в запросе, иначе — `auto` и инструкция модели отдельным
-//!   mid-conversation system-сообщением (добавление, а не правка истории — preserved
+//!   system-сообщением на один ход (`clear_at`; добавление, а не правка истории — preserved
 //!   thinking); модели без таких сообщений получают инструкцию текстом в последнем
 //!   сообщении пользователя;
 //! - до зонда (профиля нет) модель считается актуальной: adaptive и
@@ -57,9 +57,16 @@ const MIN_BUDGET: u32 = 1024;
 /// Запас `max_tokens` сверх бюджета мышления на сам ответ.
 const ANSWER_RESERVE: u32 = 1024;
 
-/// Модели, принимающие mid-conversation system-сообщения (`{"role":"system"}` в
-/// `messages`) без beta: справочник Claude API, 2026-10 (не Sonnet 5, Opus 4.7/4.6,
-/// Haiku 4.5). Сравнение — точное имя или имя с суффиксом `-…` (снимки по дате).
+/// Beta-функция system-сообщения с областью действия на один ход
+/// (`clear_at: "next_user_message"`).
+pub const CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
+
+/// Модели, принимающие mid-conversation system-сообщения и их вариант с
+/// `clear_at: "next_user_message"` (beta [`CLEAR_AT_BETA`]): страница
+/// «Mid-conversation system messages», проверено 2026-11-09 — «on the same models and
+/// platforms as mid-conversation system messages»; не Sonnet 5, Opus 4.7/4.6, Haiku 4.5.
+/// `claude-mythos-preview` есть только в метаданных страницы, в тексте нет — не
+/// включён. Сравнение — точное имя или имя с суффиксом `-…` (снимки по дате).
 const MID_SYSTEM_MODELS: &[&str] = &[
     "claude-opus-5-5",
     "claude-opus-5",
@@ -96,9 +103,11 @@ impl AnthropicWire {
         format!("{}/messages", self.base_url.trim_end_matches('/'))
     }
 
-    /// Заголовки: `x-api-key` (если ключ задан) и `anthropic-version`.
+    /// Заголовки: `x-api-key` (если ключ задан), `anthropic-version` и
+    /// `anthropic-beta: ` [`CLEAR_AT_BETA`], если в `messages` тела есть сообщение с
+    /// `clear_at` (своё или из истории: без заголовка поле даёт 400).
     /// `content-type: application/json` ставит транспорт вместе с телом.
-    pub fn headers(&self, ctx: &WireCtx<'_>) -> Result<HeaderMap, ModelError> {
+    pub fn headers(&self, ctx: &WireCtx<'_>, body: &Value) -> Result<HeaderMap, ModelError> {
         let mut h = HeaderMap::new();
         if let Some(s) = ctx.secret {
             h.insert(HeaderName::from_static("x-api-key"), s.header_value("")?);
@@ -107,6 +116,15 @@ impl AnthropicWire {
             HeaderName::from_static("anthropic-version"),
             HeaderValue::from_static(ANTHROPIC_VERSION),
         );
+        let clear_at = body["messages"]
+            .as_array()
+            .is_some_and(|ms| ms.iter().any(|m| m.get("clear_at").is_some()));
+        if clear_at {
+            h.insert(
+                HeaderName::from_static("anthropic-beta"),
+                HeaderValue::from_static(CLEAR_AT_BETA),
+            );
+        }
         Ok(h)
     }
 
@@ -182,8 +200,9 @@ impl AnthropicWire {
         req: &ChatRequest,
         ctx: &WireCtx<'_>,
     ) -> Result<OpenedStream, ModelError> {
-        let body = self.body_text(req, ctx)?;
-        let headers = self.headers(ctx)?;
+        let parsed = self.build_body(req, ctx)?;
+        let headers = self.headers(ctx, &parsed)?;
+        let body = self.body_text_of(&parsed, req)?;
         let secrets: Vec<&Secret> = ctx.secret.into_iter().collect();
         let sse = http
             .post_sse(&self.url(), headers, &*body, &secrets)
@@ -204,10 +223,13 @@ impl AnthropicWire {
         req: &ChatRequest,
         ctx: &WireCtx<'_>,
     ) -> Result<Box<RawValue>, ModelError> {
-        let body = self.build_body(req, ctx)?;
+        self.body_text_of(&self.build_body(req, ctx)?, req)
+    }
+
+    fn body_text_of(&self, body: &Value, req: &ChatRequest) -> Result<Box<RawValue>, ModelError> {
         let raws = raw_inputs(req);
         let mut out = String::new();
-        write_json(&body, &raws, &mut out)?;
+        write_json(body, &raws, &mut out)?;
         RawValue::from_string(out)
             .map_err(|e| bad_request(format!("тело запроса Anthropic не JSON: {e}")))
     }
@@ -220,14 +242,22 @@ impl AnthropicWire {
             .any(|id| m == *id || m.strip_prefix(id).is_some_and(|rest| rest.starts_with('-')))
     }
 
-    /// Инструкция эмуляции принудительного выбора. Отдельное system-сообщение в конце
-    /// `messages` — добавление к истории, а не её правка; оно допустимо только сразу
-    /// после сообщения пользователя. Иначе (модель без таких сообщений или последним
-    /// идёт ассистент) — текст в конце последнего сообщения пользователя.
+    /// Инструкция эмуляции принудительного выбора. System-сообщение с
+    /// `clear_at: "next_user_message"` в конце `messages`: добавление к истории, а не
+    /// её правка, и действует только на этот ход (следующее сообщение `user`, в том
+    /// числе с `tool_result`, его гасит — иначе модель вызывала бы инструмент и дальше).
+    /// Допустимо только сразу после сообщения пользователя, без `cache_control`.
+    /// Иначе (модель без таких сообщений или последним идёт ассистент) — текст в конце
+    /// последнего сообщения пользователя. Погашенное сообщение по документации
+    /// пересылается в истории без изменений — это хранит цикл R1-B.
     fn append_instruction(&self, messages: &mut Vec<Value>, text: String) {
         let after_user = messages.last().is_some_and(|m| m["role"] == "user");
         if self.mid_system() && after_user {
-            messages.push(json!({"role": "system", "content": text}));
+            messages.push(json!({
+                "role": "system",
+                "clear_at": "next_user_message",
+                "content": text,
+            }));
         } else {
             append_user_text(messages, text);
         }
@@ -307,7 +337,7 @@ impl AnthropicWire {
             .collect()
     }
 
-    /// Блоки ассистента. Если в сообщении есть рассуждение этой модели с данными
+    /// Блоки ассистента. Если в сообщении есть рассуждение Anthropic с данными
     /// повтора, блоки идут в исходном порядке ответа, `thinking` и
     /// `redacted_thinking` — без изменений. Иначе — текст, затем вызовы.
     fn assistant_blocks(&self, m: &Message) -> Vec<Value> {
@@ -330,7 +360,7 @@ impl AnthropicWire {
         let layout = m.parts.iter().find_map(|p| match p {
             Part::Reasoning {
                 replay: Some(b), ..
-            } if self.replay_matches(b) => b.data.get("blocks").and_then(Value::as_array),
+            } if Self::replay_matches(b) => b.data.get("blocks").and_then(Value::as_array),
             _ => None,
         });
         let mut out = Vec::new();
@@ -381,9 +411,12 @@ impl AnthropicWire {
         out
     }
 
-    /// Данные повтора действительны только для того же протокола и той же модели.
-    fn replay_matches(&self, b: &ReplayBlob) -> bool {
-        b.wire == Wire::AnthropicMessages && b.model == self.model
+    /// Данные повтора Anthropic Messages возвращаются при любой модели (решение
+    /// контроллера, отменяет фильтр плана): блоки мышления передаются без изменений и
+    /// при смене модели, нечитаемые API отбрасывает сам и бесплатно (страница
+    /// «Preserved thinking»); Fable 5.1, например, читает блоки Opus 5 и Opus 5.5.
+    fn replay_matches(b: &ReplayBlob) -> bool {
+        b.wire == Wire::AnthropicMessages
     }
 }
 
@@ -866,6 +899,15 @@ impl AnthropicDecoder {
             "content_block_stop" => self.block_stop(&v, &mut out),
             "message_delta" => {
                 if let Some(r) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    if r == "model_context_window_exceeded" {
+                        // Ответ упёрся в окно контекста: тот же класс, что 400 о длине
+                        // запроса, — нужна компакция, а не повтор (решение контроллера).
+                        return Err(ModelError::new(
+                            ErrorClass::ContextOverflow,
+                            "ответ остановлен окном контекста модели \
+                             (stop_reason model_context_window_exceeded)",
+                        ));
+                    }
                     self.finish = Some(finish_reason(r));
                     if r == "refusal" {
                         let details = v
@@ -1036,6 +1078,11 @@ impl AnthropicDecoder {
         }
         if let Some(n) = u64_at(u, &["output_tokens"]) {
             self.usage.output = n;
+        }
+        // Часть `output_tokens`, ушедшая на мышление; в стриме — только в последнем
+        // `message_delta` («Steering thinking» → Pricing).
+        if let Some(n) = u64_at(u, &["output_tokens_details", "thinking_tokens"]) {
+            self.usage.reasoning = n;
         }
     }
 

@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use support::{FakeServer, Reply, fixture};
-use za_llm::__test::{AnthropicDecoder, AnthropicWire, Connector, OpenedStream, WireCtx};
+use za_llm::__test::{
+    AnthropicDecoder, AnthropicWire, CLEAR_AT_BETA, Connector, OpenedStream, WireCtx,
+};
 use za_llm::http::{HttpTransport, SseEvent, Timeouts};
 use za_llm::{
     BackendKind, ChatRequest, Effort, ErrorClass, FinishReason, Message, ModelError, Part,
@@ -351,16 +353,31 @@ fn reasoning_message(model: &str) -> Message {
 }
 
 #[test]
-fn foreign_reasoning_blob_is_not_sent() {
+fn foreign_reasoning_blob_is_sent_unchanged() {
+    // Решение контроллера (отменяет фильтр плана): блоки мышления другой модели
+    // передаются без изменений, нечитаемые API отбрасывает сам.
     let mut req = request();
-    req.messages.push(reasoning_message("другая"));
+    req.messages.push(reasoning_message("claude-opus-5"));
     let b = body_with(&req, None);
-    let s = b["messages"].to_string();
-    assert!(!s.contains("\"thinking\""));
-    assert!(!s.contains("sig-1"));
     let asst = &b["messages"][1]["content"];
-    assert_eq!(asst[0], json!({"type": "text", "text": "Читаю файл."}));
-    assert_eq!(asst[1]["type"], "tool_use");
+    assert_eq!(
+        asst[0],
+        json!({"type": "thinking", "thinking": "Нужно прочитать README.", "signature": "sig-1"})
+    );
+    assert_eq!(asst[1], json!({"type": "text", "text": "Читаю файл."}));
+    assert_eq!(asst[2]["type"], "tool_use");
+    // Данные другого протокола не отправляются.
+    let mut req = request();
+    let mut m = reasoning_message(MODEL);
+    if let Part::Reasoning {
+        replay: Some(b), ..
+    } = &mut m.parts[0]
+    {
+        b.wire = Wire::Responses;
+    }
+    req.messages.push(m);
+    let s = body_with(&req, None)["messages"].to_string();
+    assert!(!s.contains("sig-1"));
 }
 
 #[test]
@@ -432,6 +449,8 @@ fn tool_choice_auto_none_and_emulated_required() {
             json!({"role": "user", "content": [{"type": "text", "text": "Привет"}]})
         );
         assert_eq!(msgs[1]["role"], "system");
+        assert_eq!(msgs[1]["clear_at"], "next_user_message");
+        assert!(msgs[1].get("cache_control").is_none());
         assert!(msgs[1]["content"].as_str().unwrap().contains("read_file"));
     }
     req.tool_choice = ToolChoice::Required;
@@ -755,6 +774,7 @@ async fn headers_carry_key_and_version() {
             .is_some_and(|c| c.starts_with("application/json"))
     );
     assert!(reqs[0].header("authorization").is_none());
+    assert!(reqs[0].header("anthropic-beta").is_none());
     assert_eq!(reqs[0].json()["stream"], true);
 }
 
@@ -818,6 +838,75 @@ fn decoder_stop_reasons() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn clear_at_instruction_carries_beta_header() {
+    let srv = FakeServer::start(vec![(
+        ROUTE,
+        vec![Reply::sse(vec![fixture("anthropic/text.sse")])],
+    )])
+    .await;
+    let caps = self::caps();
+    let mut req = request();
+    req.tools = vec![tool("read_file")];
+    req.tool_choice = ToolChoice::Named("read_file".into());
+    let w = wire(&srv.url("/v1"));
+    drain(w.open(&transport(), &req, &ctx(&caps)).await.unwrap()).await;
+    let r = &srv.requests(ROUTE)[0];
+    assert_eq!(r.header("anthropic-beta"), Some(CLEAR_AT_BETA));
+    assert_eq!(CLEAR_AT_BETA, "mid-conversation-system-clear-at-2026-08-21");
+    let msgs = r.json()["messages"].clone();
+    assert_eq!(
+        msgs[1],
+        json!({"role": "system", "clear_at": "next_user_message",
+               "content": "Ответь вызовом инструмента `read_file`."})
+    );
+    // Погашенное сообщение из истории (R1-B пересылает его без изменений) тоже
+    // требует заголовка; запасной путь без clear_at — без заголовка.
+    let c = ctx(&caps);
+    let hist = json!({"messages": [{"role": "user", "content": "a"},
+        {"role": "system", "clear_at": "next_user_message", "content": "x"},
+        {"role": "assistant", "content": "b"}]});
+    let h = w.headers(&c, &hist).unwrap();
+    assert_eq!(h.get("anthropic-beta").unwrap(), CLEAR_AT_BETA);
+    let old = AnthropicWire {
+        base_url: "http://x".into(),
+        model: "claude-sonnet-5".into(),
+    };
+    let b = old.build_body(&req, &c).unwrap();
+    assert!(old.headers(&c, &b).unwrap().get("anthropic-beta").is_none());
+}
+
+#[test]
+fn context_window_stop_is_overflow_error() {
+    let mut d = AnthropicDecoder::new(MODEL.into());
+    let e = d
+        .on_event(&sse(json!({"type": "message_delta",
+            "delta": {"stop_reason": "model_context_window_exceeded"},
+            "usage": {"output_tokens": 10}})))
+        .unwrap_err();
+    assert_eq!(e.class, ErrorClass::ContextOverflow);
+}
+
+#[test]
+fn thinking_tokens_go_to_usage_reasoning() {
+    let mut d = AnthropicDecoder::new(MODEL.into());
+    d.on_event(&sse(json!({"type": "message_start", "message": {"usage":
+        {"input_tokens": 25, "output_tokens": 1}}})))
+        .unwrap();
+    d.on_event(&sse(
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+        "usage": {"output_tokens": 348, "output_tokens_details": {"thinking_tokens": 312}}}),
+    ))
+    .unwrap();
+    let evs = d.on_event(&sse(json!({"type": "message_stop"}))).unwrap();
+    let Some(StreamEvent::Finished { usage, .. }) = evs.last() else {
+        panic!("{evs:?}");
+    };
+    assert_eq!(usage.output, 348);
+    assert_eq!(usage.reasoning, 312);
+    assert_eq!(usage.input, 25);
 }
 
 #[test]
