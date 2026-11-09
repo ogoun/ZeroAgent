@@ -12,15 +12,25 @@
 //! [`Interrupt`] с id из ключа эффекта (CORE-007, D16) останавливает граф до
 //! решения, модуль [`interrupt`] открывает прерывания и читает их состояние.
 //!
+//! Инструменты описываются [`ToolSpec`], режим run решает о вызове через [`gate`]
+//! (D14), [`ToolRegistry`] выдаёт инструменты по роли и тиру; [`Capability`]
+//! объединяет инструменты, инструкции и хуки границы шага. [`Journal`] пишет
+//! события и публикует их после COMMIT в [`EventBus`] (D34, D35).
+//!
 //! [`run_demo`] — детерминированный демонстрационный run для сквозной проверки
 //! журнала и протокола эффектов, [`replay_hash`] — хэш его значимых событий.
 
+mod bus;
+mod capability;
 mod demo;
 mod graph;
 pub mod interrupt;
 mod recovery;
 mod runtime;
+mod tool;
 
+pub use bus::{AgentEvent, EventBus, Journal};
+pub use capability::{BoundaryInfo, Capability, Hook};
 pub use demo::{CrashPoint, DemoConfig, DemoOutcome, replay_hash, run_demo};
 pub use graph::{BoxFuture, Exit, Graph, GraphError, Node, NodeId, Transition};
 pub use interrupt::{Interrupt, InterruptKind, InterruptState, pause_reason_for};
@@ -28,5 +38,8 @@ pub use recovery::{
     NOT_DONE_MESSAGE, Recovery, UNKNOWN_OUTCOME, UnknownDecision, recover, resolve_unknown,
 };
 pub use runtime::{EffectError, EffectSlot, EffectSource, EffectSpec, RunCtx};
+pub use tool::{
+    Approval, DuplicateTool, Gate, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
+};
 /// Прежнее имя причины паузы; значение живёт в [`za_protocol::pause_reason`].
 pub use za_protocol::pause_reason::NEEDS_DECISION;

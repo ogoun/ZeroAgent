@@ -2,6 +2,14 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-B1, задача 4: инструмент, capability и шина событий
+
+- **Инструменты (`za-core/src/tool.rs`, D14).** `ToolSpec` (схема `za_llm::ToolSchema`, класс эффекта, `ToolKind`, `Approval`, роли, `min_tier`, `timeout`, `output_limit`, `tainted`), `Tool::call(args, ToolCx) -> BoxFuture<'static, ToolOutput>`. `gate(mode, spec)`: `Read`/`Control` разрешены всегда; `Edit` — `Deny` в `read-only`/`plan`, `Ask` в `ask`, `Allow` в `accept-edits`/`auto`; `Exec` — `Deny` в `read-only`/`plan`, `Ask` в `ask`/`accept-edits`, `Allow` в `auto`; затем `Approval::Always` превращает `Allow` в `Ask`, `Never` — `Ask` в `Allow`, `Deny` неизменен. Причины `read-only mode`, `plan mode`. `ToolRegistry` — `BTreeMap` по имени: повторное имя — `DuplicateTool`, первая регистрация остаётся; `for_run(role, tier)` — инструменты роли с `min_tier <= tier` по имени.
+- **Capability (`capability.rs`).** Имя, инструменты, инструкции (блок 2 промпта после Core, D21), хуки `Hook::at_boundary(&BoundaryInfo { run, step, turn }) -> Option<String>` (чистые функции позиции: реплей вызывает их снова), настройки `Value`.
+- **Шина и журнал (`bus.rs`, D34, D35).** `EventBus` — `tokio::sync::broadcast`, `DEFAULT_CAPACITY = 1024`; ёмкость 0 поднимается до 1 (`broadcast` пустой буфер не допускает); отправка без подписчиков не ошибка. `Journal { store, bus }`: `append` и `record_usage` публикуют событие с `seq` после COMMIT, `set_status` — `run.status` с `seq = None` и payload `{to, generation[, reason]}` (`from` есть только в событии журнала: `set_status_with_reason` возвращает поколение, а не событие). Ошибка записи ничего не публикует. Подписчику, которому нужен курсор, — `read_run` после последнего известного `seq`.
+- **Зависимости `za-core`.** `tokio` перешёл из dev в обычные с функцией `sync` (`broadcast` шины), `serde` — `ToolOutput` сериализуется в квитанцию. Новых крейтов в workspace нет.
+- **Отклонение от брифа.** Параметр `Journal::set_status` назван `generation`, а не `gen`: в edition 2024 `gen` — зарезервированное слово.
+
 ## 2026-11-09. R1-B1, задача 3: граф и прерывания
 
 - **Граф (`za-core/src/graph.rs`, D2).** `Graph<S, E>` из узлов `Node<S, E>` (`run(&mut S) -> BoxFuture<Result<Transition, E>>`, `BoxFuture` — реэкспорт `za_llm::BoxFuture`), рёбер и входа. Переходы только `Goto`, `Suspend(Interrupt)`, `Done`; `run_from(at, st)` идёт до `Done` (`Exit::Done`) или `Suspend` (`Exit::Suspended`). `Goto` без объявленного ребра — `GraphError::UndeclaredEdge`, неизвестный узел (в том числе цель объявленного ребра) — `UnknownNode`, ошибка узла — `Node(e)`. Доменных выходов в `Exit` нет (D31): потребитель кладёт их в своё состояние и возвращает `Done`. Параллельные ветви `Fan` отложены до R2 (субагенты): слияние состояний ветвей ни одному потребителю R1 не нужно, параллельные чтения внутри узла делаются слотами эффектов (D3).

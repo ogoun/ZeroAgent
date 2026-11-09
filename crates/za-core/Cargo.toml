@@ -15,8 +15,12 @@ za-store = { path = "../za-store" }
 # Только префикс и его хэш: без зонда и HTTP-клиента.
 za-llm = { path = "../za-llm", default-features = false }
 blake3.workspace = true
+# `ToolOutput` сериализуется в квитанцию эффекта вызова инструмента.
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# `sync`: `broadcast` шины событий run (`EventBus`, D35).
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
