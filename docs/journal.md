@@ -2,6 +2,17 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-B1, задача 9: сборка запроса
+
+- **`FrozenPrefix` (`crates/za-agent/src/request.rs`, CTX-001, CTX-003…005).** `freeze(setup, tools, caps, agents_md)` замораживает блоки 1–5 на run: tools отсортированы по имени; блок 2 — Core роли и инструкции capability после него через пустую строку (D21); адаптер пуст (PRM-009); overlay режима (блок 4); `AGENTS.md` (блок 5). Хранит `system`, `tools`, `prefix_hash` (`za_llm::prefix_hash`, формат R0 не менялся), BLAKE3 каждого блока (`BlockHashes`, tools — от `render_tools`), `PROMPT_VERSION` и `prompt_texts_hash()` (PRM-010). Окружение, дата, путь и история в префикс не входят: тест `prefix_ignores_env_and_history`. Золотой хэш top small Coder — `tests/golden/prefix_top_small.hash` (байты защищены `-text` в `.gitattributes`).
+- **Лимит `AGENTS.md` (D22 с решениями контроллера по задаче 7).** Бриф задачи 9 считал остаток `role_limit × 4 − len(блоки 2 и 3) − 2` байт без overlay; код задачи 7 после ревью (решение контроллера: лимит по блокам 2–5 вместе с `<env>` и overlay; недоверенный текст — верхней оценкой в байтах) задаёт другое правило, и сборка следует коду: `fixed = approx_tokens(render_system(блоки 2–4)) + 1` (разделитель перед блоком 5), бюджет — `agents_md_budget(role, tier, fixed)` (у top standard и full за вычетом резерва `ENV_LIMIT`, потолок 700), обрезка — `fit_agents_md` (экранирование всех угловых скобок, счёт в байтах, строка `[AGENTS.md truncated: N lines omitted]`). Итог строже брифа: overlay входит в лимит роли. Top small: Core 798 из 800 — `AGENTS.md` опускается с `warn`. Worker и orchestrator `AGENTS.md` не получают (N-07).
+- **Инструкции capability на small.** Не входят в system (решение контроллера по задаче 7: на small они придут в описаниях инструментов, R1-C), пропуск — `debug`. Фиксированные блоки сверх лимита роли — `warn` (точную проверку делает CI-счётчик плана B2).
+- **Блок 6 (D24).** `first_message(env, memory, task)`: `render_env`, затем `<memory>
+…
+</memory>` только при непустом снимке (снимок экранируется `escape_untrusted`, MEM-006), затем задача как есть (текст top или готовый `<task>`).
+- **Запрос хода.** `build_request` — `system` и `tools` из `FrozenPrefix`, история как есть, `reasoning` из `TurnOptions` или `setup.reasoning` (MDL-010), `cache_key = Some(project_id)` (MDL-022). `request_hash` — BLAKE3 канонического JSON запроса (D7). `RunSetup.n_ctx` и `tier` здесь не вычисляются (D37: только `start_run`).
+- **Байт-в-байт стабильность префикса.** Тест `prefix_is_byte_stable_across_turns` собирает тела llama.cpp Chat Completions и Anthropic Messages (`za_llm::__test`, только тесты) для двух ходов: всё, кроме `messages`, совпадает в каноническом JSON, сообщения прежнего хода сериализуются одинаково, повторный `freeze` тех же входов даёт тот же префикс.
+
 ## 2026-11-09. R1-B1, задача 8: история диалога
 
 - **`Conversation` (`crates/za-agent/src/conversation.rs`).** История run только дополняется: изменять добавленные сообщения API не даёт (preserved thinking Anthropic требует пересылать прежние сообщения без изменений, включая погашенные system с `clear_at`; опускание их для моделей без mid-system — дело коннектора при рендере, задача 5). Операции: `push_user`, `commit_turn(service, assistant)`, `push_results`, `close_interrupted`, `pending_calls`, `validate`.
