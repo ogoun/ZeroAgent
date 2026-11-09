@@ -2,6 +2,15 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-A, задача 2: канонический формат, возможности, ошибки, `ModelPort`
+
+- **Функции `za-llm`.** `default = ["gateway"]`, `gateway = ["http"]` (`za-res` добавит задача 13), `http = ["dep:reqwest"]`, `probe = ["http"]` — псевдоним R0. Модуль `probe` и тест `probe` теперь за функцией `http`. `serde`, `thiserror`, `tracing` и `tokio` (`sync`, `rt`, `time`) стали обязательными зависимостями: они нужны чистым частям (ошибки, канал стрима, отмена задачи). Новых крейтов в дереве нет; `za-core` по-прежнему без `reqwest` (`cargo tree -p za-core -e normal`).
+- **Канонический формат (MDL-001)** в `types.rs`: `Message`/`Part` (текст, рассуждение с `ReplayBlob`, вызов и результат инструмента), `ChatRequest`, `StreamEvent`, `Usage`, `QueueStatus`, `EndpointId`. `Effort::budget_tokens` — 2048/8192/16384/32000 (D36), `Effort::nearest` при равном расстоянии берёт меньший уровень. `ToolSchema` получил `Serialize`/`Deserialize`; золотой хэш префикса не изменился.
+- **Возможности (MDL-002)** в `caps.rs`: 13 полей `ProviderCapabilities`, `BackendKind` с serde-именами `llama_cpp`, `vllm`, `openrouter`, `anthropic`, `openai_responses`, `openai_chat`, `openai_compatible`, `default_caps` по бэкендам до зонда. Значения, которые бриф не задал, выбраны консервативно: `reasoning_roundtrip` только у Anthropic, Responses и OpenRouter; `parallel_tools` выключен у llama.cpp и произвольного совместимого сервера; `tool_choice_required` выключен у совместимого; `strict_schema` только у OpenAI; `prefill` только у llama.cpp; у совместимого сервера `reasoning_content`, `prompt_tokens_details` и оценка токенов `символы / 4`. Зонд (задача 9) уточняет их.
+- **Ошибки** в `error.rs`: 17 классов `ErrorClass`; повторяемые — `Transport`, `Timeout`, `RateLimited`, `Overloaded`, `Server`, `StreamCut`; для предохранителя те же без `RateLimited` (D22). `ModelError` сериализуем, сообщение вида `Класс: текст`.
+- **`ModelPort`** в `port.rs`: `stream`, `capabilities`, `context_tokens`, `record_parse_error` (D43). `ModelStream` — канал `mpsc` и guard; `AbortOnDrop` в `Drop` отменяет задачу (D2). `collect` берёт `Finished` последней попытки, ошибка из канала — итог, закрытие канала до `Finished` — `StreamCut`. `ScriptedModel` отвечает сценариями по порядку, записывает все вызовы (и тот, на который сценария не нашлось — он даёт `Inactive`) и ошибки разбора.
+- **`za-protocol`**: `Priority` (`Interactive` … `Arena`, ранги 0–5 по D9, фоновые `Job` и `Arena`).
+
 ## 2026-11-09. R1-A, задача 1: остатки R0
 
 Источник: `.superpowers/sdd/2026-11-06-r0-foundation/final-re-review.md` (Н1–Н3, сомнение 4).

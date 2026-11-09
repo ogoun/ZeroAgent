@@ -14,9 +14,11 @@
 - `deny.toml`: убрана неиспользуемая лицензия `Zlib`.
 
 ### Изменено
+- `za-llm`: функции `default = ["gateway"]`, `gateway`, `http`; `probe` — псевдоним `http`. `serde`, `thiserror`, `tracing`, `tokio` стали обязательными зависимостями. `ToolSchema` сериализуем.
 - `za-store`: `StoreError` помечен `#[non_exhaustive]`, новые варианты `Corrupt` (повреждение журнала), `SchemaTooNew { found, supported }`, `Serde` вместо общего `Sqlite`.
 
 ### Добавлено
+- `za-llm`: канонический формат сообщений (`Message`, `Part`, `ChatRequest`, `StreamEvent`, `Usage`, `Effort`), возможности провайдера `ProviderCapabilities` и `default_caps` по бэкендам, таксономия ошибок `ErrorClass`/`ModelError`, трейт `ModelPort` со стримом `ModelStream` и отменой по drop (`AbortOnDrop`), тестовая модель `ScriptedModel`. `za-protocol`: приоритет заявки `Priority`.
 - `za-protocol`: причины паузы run `pause_reason` (`needs_decision`, `replay_mismatch`, `queue`, `resource`, `provider`).
 - `zero-agent`: логи `tracing` в stderr (`tracing-subscriber 0.3.23`, фильтр `filter::Targets`), уровень по умолчанию `warn`, переопределение `ZA_LOG` или `RUST_LOG`. Golden-хэш реплея демонстрации `crates/zero-agent/tests/golden/demo-replay.hash`; реплей после сбоя проверяется в приёмке. Раздел «Быстрый старт» в README.
 - `zero-agent`: бинарник с командами `doctor [--json]` (SQLite ≥ 3.51.3, llama.cpp по `LLAMA_URL` — только предупреждение, версия компилятора сборки), `demo-run` (`--steps`, `--resume`, `--crash-at intent:N|execute:N`, id run первой строкой) и `replay` (хэш значимых событий); коды выхода 0/1/3. Каталог данных `ZA_HOME` (по умолчанию `%LOCALAPPDATA%\zero-agent`, `~/.local/share/zero-agent`), журнал в `ZA_HOME/projects/<project_id>/`. Приёмочные тесты R0. `za-store`: `sqlite_library_version`, `MIN_SQLITE`. Зависимость `clap 4.6.7`.

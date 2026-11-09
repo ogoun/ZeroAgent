@@ -1,10 +1,11 @@
 //! Стабильный префикс промпта: описания инструментов и единственное system-сообщение.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use za_protocol::canonical_json;
 
 /// Описание инструмента для модели.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSchema {
     pub name: String,
     pub description: String,
@@ -233,6 +234,15 @@ mod tests {
         let b = PromptBlocks::default();
         assert_ne!(prefix_hash(&a), prefix_hash(&b));
         assert_eq!(prefix_hash(&b).len(), 64);
+    }
+
+    #[test]
+    fn tool_schema_serializes() {
+        let t = fixture().tools[0].clone();
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["name"], "read_file");
+        let back: ToolSchema = serde_json::from_value(v).unwrap();
+        assert_eq!(back, t);
     }
 
     #[test]

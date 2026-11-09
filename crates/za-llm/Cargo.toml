@@ -11,23 +11,29 @@ workspace = true
 
 [dependencies]
 za-protocol = { path = "../za-protocol" }
+serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
-# Нужны только зонду llama.cpp (`probe`).
-tracing = { workspace = true, optional = true }
-thiserror = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+# Канал стрима, задача стрима и её отмена (D2), время повторов и очереди.
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 reqwest = { workspace = true, optional = true }
 
 [features]
-# Без `probe` крейт — только рендер префикса и его хэш, без HTTP-клиента:
-# так его подключает `za-core`.
-default = ["probe"]
-probe = ["dep:reqwest", "dep:thiserror", "dep:tracing"]
+# Без функций крейт даёт только чистые части: канонический формат, возможности,
+# ошибки, `ModelPort`, `ScriptedModel`, префикс. Так его подключает `za-core`.
+# `http` — транспорт, коннекторы и зонды; `gateway` — очередь, повторы и `Gateway`.
+default = ["gateway"]
+gateway = ["http"]
+http = ["dep:reqwest"]
+# Псевдоним R0 для совместимости.
+probe = ["http"]
 
 [[test]]
 name = "probe"
-required-features = ["probe"]
+required-features = ["http"]
 
 [dev-dependencies]
 axum.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
