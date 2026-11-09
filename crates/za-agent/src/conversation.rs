@@ -9,6 +9,13 @@
 //! - служебное system-сообщение стоит после `user` или результатов инструментов (для
 //!   Anthropic это `user`-сообщение с `tool_result`): Anthropic принимает system посреди
 //!   истории только сразу после `user`;
+//! - сообщение пользователя не пусто, части сообщений допустимы для роли (текст у
+//!   `User` и `System`; текст, рассуждение и вызовы у `Assistant`; только результаты
+//!   у `Tool`), `id` вызовов одного ответа не повторяются;
+//! - пустой ответ ассистента (без непустого текста и без вызовов) допустим, но
+//!   служебные system его хода не фиксируются: коннектор пропускает пустое сообщение,
+//!   и на проводе system оказался бы перед `user`; инструкцию игнорировали, на
+//!   следующем ходе коннектор добавит новую;
 //! - каждый результат отвечает ждущему вызову последнего ответа ассистента, один раз;
 //!   новое сообщение пользователя и новый ход не принимаются, пока есть ждущие вызовы.
 //!
@@ -30,6 +37,7 @@ const INTERRUPTED: &str = "interrupted: call not executed";
 
 /// Нарушение инвариантов истории.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum HistoryError {
     #[error("первое сообщение не от пользователя")]
     FirstNotUser,
@@ -41,6 +49,12 @@ pub enum HistoryError {
     TurnNotAssistant,
     #[error("в сообщении результатов не результат инструмента")]
     NotToolResult,
+    #[error("часть {part} недопустима в сообщении {role:?}")]
+    PartNotAllowed { role: Role, part: &'static str },
+    #[error("пустое сообщение {0:?}")]
+    EmptyMessage(Role),
+    #[error("повторный id вызова {0} в ответе ассистента")]
+    DuplicateCallId(String),
     #[error("результат без вызова {0}")]
     UnknownCallId(String),
     #[error("повторный результат вызова {0}")]
@@ -83,7 +97,8 @@ impl Conversation {
         &self.msgs
     }
 
-    /// Сообщение пользователя; `PendingCalls`, если есть ждущие вызовы.
+    /// Сообщение пользователя; `PendingCalls`, если есть ждущие вызовы; `EmptyMessage`
+    /// для пустого текста.
     pub fn push_user(&mut self, text: String) -> Result<(), HistoryError> {
         self.push_user_message(Message {
             role: Role::User,
@@ -93,7 +108,8 @@ impl Conversation {
 
     /// Ход атомарно: service (только Role::System), затем assistant (D10).
     ///
-    /// При ошибке история не меняется.
+    /// Пустой ответ ассистента (нет непустого текста и вызовов) фиксируется без
+    /// `service`: см. инварианты модуля. При ошибке история не меняется.
     pub fn commit_turn(
         &mut self,
         service: Vec<Message>,
@@ -105,6 +121,17 @@ impl Conversation {
         if service.iter().any(|m| m.role != Role::System) {
             return Err(HistoryError::SystemNotBeforeAssistant);
         }
+        for m in service.iter().chain([&assistant]) {
+            check_parts(m)?;
+        }
+        let mut ids = HashSet::new();
+        for p in &assistant.parts {
+            if let Part::ToolCall(c) = p
+                && !ids.insert(c.id.as_str())
+            {
+                return Err(HistoryError::DuplicateCallId(c.id.clone()));
+            }
+        }
         let Some(last) = self.msgs.last() else {
             return Err(HistoryError::FirstNotUser);
         };
@@ -112,6 +139,15 @@ impl Conversation {
         if !pending.is_empty() {
             return Err(HistoryError::PendingCalls(pending));
         }
+        let service = if !service.is_empty() && is_empty_answer(&assistant) {
+            tracing::debug!(
+                n = service.len(),
+                "история: пустой ответ, служебные system хода не фиксируются"
+            );
+            Vec::new()
+        } else {
+            service
+        };
         if !service.is_empty() && !matches!(last.role, Role::User | Role::Tool) {
             return Err(HistoryError::SystemNotAfterUser);
         }
@@ -183,17 +219,24 @@ impl Conversation {
 
     /// Проверка инвариантов всей истории: повтор операций добавления с начала.
     ///
-    /// Ждущие вызовы в конце допустимы (история посреди пакета инструментов).
+    /// Ждущие вызовы в конце допустимы (история посреди пакета инструментов). Формы,
+    /// которые операции не создают, а молча нормализуют, — ошибка: пустое `Tool`
+    /// (`EmptyMessage`) и system перед пустым ответом (`SystemNotBeforeAssistant`: на
+    /// проводе ответа нет).
     pub fn validate(&self) -> Result<(), HistoryError> {
         let mut shadow = Conversation::default();
         let mut i = 0;
         while i < self.msgs.len() {
             let m = &self.msgs[i];
+            // Отдельно ради точного варианта: первое `Tool` иначе дало бы `UnknownCallId`.
             if i == 0 && m.role != Role::User {
                 return Err(HistoryError::FirstNotUser);
             }
             match m.role {
                 Role::User => shadow.push_user_message(m.clone())?,
+                Role::Tool if m.parts.is_empty() => {
+                    return Err(HistoryError::EmptyMessage(Role::Tool));
+                }
                 Role::Tool => shadow.push_results(m.parts.clone())?,
                 Role::Assistant | Role::System => {
                     let start = i;
@@ -204,6 +247,9 @@ impl Conversation {
                     else {
                         return Err(HistoryError::SystemNotBeforeAssistant);
                     };
+                    if i > start && is_empty_answer(assistant) {
+                        return Err(HistoryError::SystemNotBeforeAssistant);
+                    }
                     shadow.commit_turn(self.msgs[start..i].to_vec(), assistant.clone())?;
                 }
             }
@@ -249,6 +295,10 @@ impl Conversation {
 
     /// Сообщение пользователя как есть (общий путь `push_user` и `validate`).
     fn push_user_message(&mut self, m: Message) -> Result<(), HistoryError> {
+        check_parts(&m)?;
+        if !has_text(&m) {
+            return Err(HistoryError::EmptyMessage(Role::User));
+        }
         let pending = self.pending_calls();
         if !pending.is_empty() {
             return Err(HistoryError::PendingCalls(pending));
@@ -293,4 +343,33 @@ impl Conversation {
         self.msgs.push(m);
         self.refs.push(None);
     }
+}
+
+/// Есть ли непустой текст.
+fn has_text(m: &Message) -> bool {
+    m.parts
+        .iter()
+        .any(|p| matches!(p, Part::Text(t) if !t.is_empty()))
+}
+
+/// Пустой ответ ассистента: нет непустого текста и нет вызовов. Рассуждение не в счёт:
+/// без данных повтора коннекторы его не рендерят.
+fn is_empty_answer(m: &Message) -> bool {
+    !has_text(m) && !m.parts.iter().any(|p| matches!(p, Part::ToolCall(_)))
+}
+
+/// Части, допустимые для роли сообщения.
+fn check_parts(m: &Message) -> Result<(), HistoryError> {
+    for p in &m.parts {
+        let (ok, part) = match p {
+            Part::Text(_) => (m.role != Role::Tool, "text"),
+            Part::Reasoning { .. } => (m.role == Role::Assistant, "reasoning"),
+            Part::ToolCall(_) => (m.role == Role::Assistant, "tool_call"),
+            Part::ToolResult { .. } => (m.role == Role::Tool, "tool_result"),
+        };
+        if !ok {
+            return Err(HistoryError::PartNotAllowed { role: m.role, part });
+        }
+    }
+    Ok(())
 }

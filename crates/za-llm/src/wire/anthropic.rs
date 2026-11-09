@@ -68,8 +68,9 @@ pub const CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
 /// `clear_at: "next_user_message"` (beta [`CLEAR_AT_BETA`]): страница
 /// «Mid-conversation system messages», проверено 2026-11-09 — «on the same models and
 /// platforms as mid-conversation system messages»; не Sonnet 5, Opus 4.7/4.6, Haiku 4.5.
-/// `claude-mythos-preview` есть только в метаданных страницы, в тексте нет — не
-/// включён. Сравнение — точное имя или имя с суффиксом `-…` (снимки по дате).
+/// Claude Mythos Preview указана в таблице Availability страницы (ревью задачи 8,
+/// 2026-11-09), но в список не включена: доступ к preview ограничен, идентификатор
+/// модели не сверен с Models API — сверить при следующем касании коннектора. Сравнение — точное имя или имя с суффиксом `-…` (снимки по дате).
 /// Models API (`GET /v1/models/{id}`, проверено 2026-11-09) этой возможности в
 /// `capabilities` не сообщает, поэтому список остаётся источником и после зонда.
 const MID_SYSTEM_MODELS: &[&str] = &[
