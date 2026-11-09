@@ -176,12 +176,15 @@ impl Permit {
 ///
 /// Считает запросы, а не попытки: Gateway сообщает исход после исчерпания повторов.
 /// Поколение растёт при каждом открытии, закрытии пробой, выключении и сбросе.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CircuitBreaker {
     endpoint: EndpointId,
     opts: BreakerOptions,
     state: BreakerState,
     generation: u64,
+    /// Поколение, начатое последним `reset`: `Auth` от разрешений, выданных до него
+    /// (запоздалый 401 со старым ключом после смены ключа), эндпоинт не выключает.
+    reset_generation: u64,
     /// Отказы подряд в `Closed` текущего поколения.
     failures: u32,
     /// Пауза следующего открытия из `HalfOpen`; после успеха — `opts.cooldown`.
@@ -199,6 +202,7 @@ impl CircuitBreaker {
             opts,
             state: BreakerState::Closed,
             generation: 0,
+            reset_generation: 0,
             failures: 0,
             probe: Weak::new(),
         }
@@ -257,7 +261,8 @@ impl CircuitBreaker {
     }
 
     /// Заявка завершилась ошибкой `err`. `Auth` выключает эндпоинт (`Disabled`) при
-    /// любом поколении: ключ (или TLS) отвергнут независимо от времени начала заявки.
+    /// любом поколении после последнего `reset`: ключ (или TLS) отвергнут независимо
+    /// от времени начала заявки; `Auth` заявки, начатой до `reset`, игнорируется.
     /// Прочее учитывается только у заявки текущего поколения и только для классов
     /// `counts_for_breaker()`; остальные (429, отмена, 400) счёт не меняют, у пробы —
     /// лишь освобождают её (с drop разрешения). Отказ пробы открывает предохранитель
@@ -267,6 +272,9 @@ impl CircuitBreaker {
             return;
         }
         if err.class == ErrorClass::Auth {
+            if permit.generation < self.reset_generation {
+                return;
+            }
             tracing::warn!(
                 endpoint = %self.endpoint,
                 reason = %err.message,
@@ -329,6 +337,7 @@ impl CircuitBreaker {
     /// Сброс пользователем («повторить», D22): `Closed`, счёт и пауза — с начала.
     pub fn reset(&mut self) {
         self.close();
+        self.reset_generation = self.generation;
     }
 
     pub fn state(&self) -> BreakerState {

@@ -783,6 +783,24 @@ fn auth_from_stale_request_still_disables() {
 }
 
 #[test]
+fn late_auth_from_before_reset_is_ignored() {
+    // Ключ сменили и нажали «повторить» (reset); затем приходит запоздалый 401
+    // заявки со старым ключом — эндпоинт не выключается. Новый 401 — выключает.
+    let t = Instant::now();
+    let mut b = breaker();
+    let first = b.allow(t).unwrap();
+    let late = b.allow(t).unwrap();
+    b.on_failure(first, &err(ErrorClass::Auth), t);
+    assert!(matches!(b.state(), BreakerState::Disabled { .. }));
+    b.reset();
+    b.on_failure(late, &err(ErrorClass::Auth), t + secs(1));
+    assert_eq!(b.state(), BreakerState::Closed);
+    let fresh = b.allow(t + secs(2)).unwrap();
+    b.on_failure(fresh, &err(ErrorClass::Auth), t + secs(2));
+    assert!(matches!(b.state(), BreakerState::Disabled { .. }));
+}
+
+#[test]
 fn identical_request_after_parse_error_is_refused() {
     let mut g = ParseGuard::new();
     let run = RunId::new();
