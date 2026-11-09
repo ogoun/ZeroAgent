@@ -22,6 +22,6 @@ pub use prompt::{
     role_limit, upper_tokens, utility_rules,
 };
 pub use request::{
-    BlockHashes, FrozenPrefix, RunSetup, TurnOptions, build_request, first_message, freeze,
-    request_hash,
+    BlockHashes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request,
+    first_message, freeze, request_hash,
 };

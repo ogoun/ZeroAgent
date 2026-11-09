@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use za_agent::{
-    Conversation, EnvInfo, FrozenPrefix, RunSetup, TurnOptions, WorkMode, approx_tokens,
-    build_request, first_message, freeze, mode_overlay, reasoning_for, render_env, request_hash,
-    role_core,
+    CAPABILITY_LIMIT, Conversation, ENV_LIMIT, EnvInfo, FrozenPrefix, PrefixError, RunSetup,
+    TurnOptions, WorkMode, approx_tokens, build_request, env_in_role_limit, first_message,
+    mode_overlay, reasoning_for, render_env, request_hash, role_core, role_limit,
 };
 use za_core::Capability;
 use za_llm::{
@@ -49,6 +49,64 @@ fn env() -> EnvInfo {
         n_ctx: 8192,
         budget: "-".into(),
         branch: "main".into(),
+    }
+}
+
+/// `freeze` с заведомо различными именами инструментов.
+fn freeze(
+    s: &RunSetup,
+    tools: &[ToolSchema],
+    caps: &[Capability],
+    agents_md: Option<&str>,
+) -> FrozenPrefix {
+    za_agent::freeze(s, tools, caps, agents_md).unwrap()
+}
+
+const MODES: [Option<WorkMode>; 5] = [
+    None,
+    Some(WorkMode::Coder),
+    Some(WorkMode::Researcher),
+    Some(WorkMode::Operator),
+    Some(WorkMode::Writer),
+];
+
+/// Сильный инвариант лимита роли (решение контроллера): оценка фиксированных текстов
+/// (Core и overlay, если он в лимите роли — у всех, кроме top small; `approx_tokens`,
+/// как в рантайме) + байты всего переменного текста system (инструкции capability,
+/// `AGENTS.md`, их разделители) + резерв `<env>` ≤ `role_limit`. Если фиксированные
+/// тексты уже не оставляют места, переменного текста нет вовсе.
+fn assert_within_role_limit(s: &RunSetup, f: &FrozenPrefix) {
+    let overlay = s.work_mode.map(mode_overlay).unwrap_or_default();
+    let core = role_core(s.role);
+    let fixed_text = if overlay.is_empty() {
+        core.to_string()
+    } else {
+        format!("{core}\n\n{overlay}")
+    };
+    // Переменный текст стоит между Core и overlay (блок 2) и после overlay (блок 5).
+    let variable = f.system.len() - fixed_text.len();
+    let counted = if s.role == RunRole::Top && s.tier == Tier::Small {
+        core.to_string()
+    } else {
+        fixed_text
+    };
+    let reserve = if env_in_role_limit(s.role, s.tier) {
+        ENV_LIMIT
+    } else {
+        0
+    };
+    let limit = role_limit(s.role, s.tier);
+    let fixed = approx_tokens(&counted) + reserve;
+    if fixed >= limit {
+        assert_eq!(variable, 0, "{:?}/{:?}/{:?}", s.role, s.tier, s.work_mode);
+    } else {
+        assert!(
+            fixed + variable as u32 <= limit,
+            "{:?}/{:?}/{:?}: {fixed} + {variable} > {limit}",
+            s.role,
+            s.tier,
+            s.work_mode
+        );
     }
 }
 
@@ -171,6 +229,91 @@ fn capability_instructions_follow_core() {
 }
 
 #[test]
+fn capability_instructions_bounded_by_role_limit() {
+    // I1: инструкции capability — переменный текст, считаются байтами и берутся целиком
+    // по порядку, пока помещаются; 40 КБ инструкций не выводят system за лимит роли.
+    let big: Vec<Capability> = (0..10)
+        .map(|i| Capability {
+            name: format!("big{i}"),
+            instructions: Some(format!("{{}}[]();<>{i}").repeat(400)),
+            ..Capability::default()
+        })
+        .collect();
+    let small = Capability {
+        name: "small".into(),
+        instructions: Some("Use small wisely.".into()),
+        ..Capability::default()
+    };
+    let caps: Vec<Capability> = big.iter().cloned().chain([small]).collect();
+    let total: usize = caps
+        .iter()
+        .map(|c| c.instructions.as_ref().unwrap().len())
+        .sum();
+    assert!(total >= 40_000, "{total}");
+    let doc = big_agents_md();
+    for role in [RunRole::Top, RunRole::Orchestrator, RunRole::Worker] {
+        for tier in [Tier::Small, Tier::Standard, Tier::Full] {
+            for mode in MODES {
+                let s = setup(role, tier, mode);
+                for agents in [None, Some(doc.as_str())] {
+                    let f = freeze(&s, &[], &caps, agents);
+                    assert_within_role_limit(&s, &f);
+                    assert!(!f.system.contains("();<>"), "{role:?}/{tier:?}");
+                }
+            }
+        }
+    }
+    // Top full: итог ≤ 3000; большие инструкции опущены целиком, малая — после них —
+    // вошла сразу после Core, раньше AGENTS.md (часть 02, §4: правила инструментов до
+    // `AGENTS.md`).
+    for mode in MODES {
+        let s = setup(RunRole::Top, Tier::Full, mode);
+        let f = freeze(&s, &[], &caps, Some(&doc));
+        assert!(approx_tokens(&f.system) <= 3000);
+        assert!(
+            f.system
+                .starts_with(&format!("{}\n\nUse small wisely.", role_core(RunRole::Top)))
+        );
+        assert!(f.system.contains("[AGENTS.md truncated: "));
+    }
+    // Инструкция ровно в потолок CAPABILITY_LIMIT (с разделителем) входит, на байт
+    // больше — нет.
+    let s = setup(RunRole::Top, Tier::Full, None);
+    let exact = |n: usize| Capability {
+        name: "x".into(),
+        instructions: Some("a".repeat(n)),
+        ..Capability::default()
+    };
+    let limit = CAPABILITY_LIMIT as usize - 2;
+    let f = freeze(&s, &[], &[exact(limit)], None);
+    assert_eq!(f.system.len(), role_core(RunRole::Top).len() + 2 + limit);
+    let f = freeze(&s, &[], &[exact(limit + 1)], None);
+    assert_eq!(f.system, role_core(RunRole::Top));
+    // Worker: Core почти весь лимит 300 — инструкции не помещаются ни на одном тире.
+    for tier in [Tier::Small, Tier::Standard, Tier::Full] {
+        let f = freeze(
+            &setup(RunRole::Worker, tier, None),
+            &[],
+            &[caps[10].clone()],
+            None,
+        );
+        assert_eq!(f.system, role_core(RunRole::Worker));
+    }
+}
+
+#[test]
+fn duplicate_tool_names_rejected() {
+    // M6: повтор имени сделал бы порядок в префиксе зависимым от входа.
+    let s = setup(RunRole::Top, Tier::Full, None);
+    let mut other = tool("a");
+    other.description = "another".into();
+    assert_eq!(
+        za_agent::freeze(&s, &[tool("b"), tool("a"), other], &[], None),
+        Err(PrefixError::DuplicateTool("a".into()))
+    );
+}
+
+#[test]
 fn agents_md_truncated_to_role_limit() {
     let doc = big_agents_md();
     assert_eq!(doc.len(), 16_000);
@@ -184,6 +327,7 @@ fn agents_md_truncated_to_role_limit() {
     );
     assert!(f.system.contains(marker));
     assert!(approx_tokens(&f.system) <= 2000);
+    assert_within_role_limit(&setup(RunRole::Top, Tier::Standard, None), &f);
     let last = f.system.lines().last().unwrap();
     assert!(last.starts_with(marker), "{last}");
     assert!(last.ends_with(" lines omitted]"), "{last}");
@@ -200,7 +344,20 @@ fn agents_md_truncated_to_role_limit() {
     assert!(f.system.contains(mode_overlay(WorkMode::Coder)));
     assert!(f.system.contains(marker));
     assert!(approx_tokens(&f.system) <= 2000 + approx_tokens(mode_overlay(WorkMode::Coder)) + 1);
-    assert!(approx_tokens(&f.system) + za_agent::ENV_LIMIT <= 2000);
+    assert!(approx_tokens(&f.system) + ENV_LIMIT <= 2000);
+    assert_within_role_limit(
+        &setup(RunRole::Top, Tier::Standard, Some(WorkMode::Coder)),
+        &f,
+    );
+    // Все роли, тиры и режимы: итог в лимите роли.
+    for role in [RunRole::Top, RunRole::Orchestrator, RunRole::Worker] {
+        for tier in [Tier::Small, Tier::Standard, Tier::Full] {
+            for mode in MODES {
+                let s = setup(role, tier, mode);
+                assert_within_role_limit(&s, &freeze(&s, &[], &[], Some(&doc)));
+            }
+        }
+    }
     // Top small: Core 798 из 800 — AGENTS.md опущен целиком.
     let f = freeze(
         &setup(RunRole::Top, Tier::Small, None),
@@ -254,6 +411,11 @@ fn first_message_order() {
     // Пустой снимок памяти — блока нет (D24, MEM-030).
     assert_eq!(
         first_message(&e, Some(""), "task"),
+        render_env(&e) + "\n\ntask"
+    );
+    // Снимок из одних пробельных символов — тоже пустой.
+    assert_eq!(
+        first_message(&e, Some(" \n\t "), "task"),
         render_env(&e) + "\n\ntask"
     );
     // Память — данные (MEM-006): разметка в ней экранируется.
@@ -323,7 +485,7 @@ fn frozen_prefix_roundtrips_serde() {
 
 mod wire {
     use serde_json::Value;
-    use za_llm::__test::{AnthropicWire, ChatDialect, ChatWire, WireCtx};
+    use za_llm::__test::{AnthropicWire, ChatDialect, ChatWire, ResponsesWire, WireCtx};
     use za_llm::{BackendKind, ChatRequest, default_caps};
 
     /// Тело llama.cpp Chat Completions.
@@ -360,12 +522,34 @@ mod wire {
         };
         w.build_body(req, &ctx).unwrap()
     }
+
+    /// Тело OpenAI Responses.
+    pub fn responses(req: &ChatRequest) -> Value {
+        let caps = default_caps(BackendKind::OpenAiResponses);
+        let ctx = WireCtx {
+            caps: &caps,
+            slot: None,
+            secret: None,
+            thinking: None,
+            max_output_tokens: None,
+        };
+        let w = ResponsesWire {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            model: "gpt-5".into(),
+        };
+        w.build_body(req, &ctx).unwrap()
+    }
 }
 
-/// Тело без `messages` — всё, что идёт до истории и вокруг неё.
+/// Тело без истории (`messages`, у Responses — `input`) — всё, что идёт до неё и вокруг.
 fn without_messages(mut body: Value) -> (Value, Vec<Value>) {
-    let msgs = body["messages"].as_array().unwrap().clone();
-    body.as_object_mut().unwrap().remove("messages");
+    let key = if body.get("input").is_some() {
+        "input"
+    } else {
+        "messages"
+    };
+    let msgs = body[key].as_array().unwrap().clone();
+    body.as_object_mut().unwrap().remove(key);
     (body, msgs)
 }
 
@@ -410,19 +594,15 @@ fn prefix_is_byte_stable_across_turns() {
     assert_eq!(r1.cache_key, r2.cache_key);
     // Тела на проводе: всё, кроме messages, совпадает, сообщения прежнего хода
     // сериализуются одинаково — префикс промпта не меняется.
-    for body in [wire::llama, wire::anthropic] {
+    // Сравниваются байты `serde_json::to_string` — то, что уходит в HTTP-тело.
+    let bytes = |v: &Value| serde_json::to_string(v).unwrap();
+    for body in [wire::llama, wire::anthropic, wire::responses] {
         let (rest1, m1) = without_messages(body(&r1));
         let (rest2, m2) = without_messages(body(&r2));
-        assert_eq!(
-            za_protocol::canonical_json(&rest1),
-            za_protocol::canonical_json(&rest2)
-        );
+        assert_eq!(bytes(&rest1), bytes(&rest2));
         assert!(m2.len() > m1.len());
         for (a, b) in m1.iter().zip(&m2) {
-            assert_eq!(
-                za_protocol::canonical_json(a),
-                za_protocol::canonical_json(b)
-            );
+            assert_eq!(bytes(a), bytes(b));
         }
     }
     // Новый freeze тех же входов — тот же префикс (resume, повтор процесса).
