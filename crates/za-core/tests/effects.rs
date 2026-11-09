@@ -642,27 +642,44 @@ fn read_spec(i: u64) -> EffectSpec {
     }
 }
 
-/// Резервирует три слота текущего шага и выполняет их в `JoinSet`; задержки
-/// обратны порядку резервирования, поэтому слоты завершаются в обратном порядке.
+/// Резервирует три слота текущего шага и выполняет их в `JoinSet` в обратном
+/// порядке без часов: замыкание слота `i` ждёт, пока задача слота `i + 1`
+/// завершит свой эффект (квитанция записана), и только после этого работает;
+/// слот 2 начинает сразу. На `current_thread` задача, отправившая сигнал,
+/// завершается в том же опросе, поэтому порядок завершения — 2, 1, 0.
+/// При реплее замыкания не вызываются и никого не ждут.
 /// Возвращает ключи слотов, значения по номеру слота и порядок завершения.
 async fn run_three_reserved(
     ctx: &mut RunCtx,
     calls: &Arc<AtomicUsize>,
 ) -> (Vec<String>, Vec<Value>, Vec<u64>) {
+    use tokio::sync::oneshot;
     let slots: Vec<_> = (0..3).map(|_| ctx.reserve().unwrap()).collect();
     let keys: Vec<String> = slots.iter().map(|s| s.key().0.clone()).collect();
+    // Канал `j` ведёт от задачи слота `j + 1` к замыканию слота `j`.
+    let (mut txs, mut rxs): (Vec<_>, Vec<_>) = (0..2).map(|_| oneshot::channel::<()>()).unzip();
+    let mut waits: Vec<Option<oneshot::Receiver<()>>> = rxs.drain(..).map(Some).collect();
+    waits.push(None);
+    let mut notifies: Vec<Option<oneshot::Sender<()>>> = vec![None];
+    notifies.extend(txs.drain(..).map(Some));
     let mut set = tokio::task::JoinSet::new();
-    for (i, slot) in slots.into_iter().enumerate() {
+    for (((i, slot), wait), notify) in slots.into_iter().enumerate().zip(waits).zip(notifies) {
         let i = i as u64;
         let c = Arc::clone(calls);
         set.spawn(async move {
             let r = slot
                 .run(read_spec(i), move || async move {
+                    if let Some(w) = wait {
+                        w.await.unwrap();
+                    }
                     c.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(std::time::Duration::from_millis(30 - 10 * i)).await;
                     Ok(json!(i))
                 })
                 .await;
+            if let Some(n) = notify {
+                // При реплее получатель уже брошен вместе с невызванным замыканием.
+                let _ = n.send(());
+            }
             (i, r)
         });
     }
@@ -864,9 +881,10 @@ async fn unknown_at_step_1(s: &ProjectStore, run: RunId) -> String {
 async fn resolved_unknown_closes_effect() {
     let (s, run) = setup("resolve-done").await;
     let id = unknown_at_step_1(&s, run).await;
-    resolve_unknown(&s, &id, UnknownDecision::Done)
-        .await
-        .unwrap();
+    assert_eq!(
+        resolve_unknown(&s, &id, UnknownDecision::Done).await,
+        Ok(UnknownDecision::Done)
+    );
     assert_eq!(recover(&s, run).await.unwrap(), Recovery::Clean);
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -879,11 +897,13 @@ async fn resolved_unknown_closes_effect() {
     assert_eq!(int.status, "resolved");
     assert_eq!(int.response, Some(json!({"decision": "done"})));
 
-    // Повтор — без изменений: другое решение не перезаписывает первое.
+    // Повтор — без изменений: другое решение не перезаписывает первое,
+    // вызывающий получает действующее решение.
     let before = s.read_run(run, Seq(0), 1000).await.unwrap().len();
-    resolve_unknown(&s, &id, UnknownDecision::NotDone)
-        .await
-        .unwrap();
+    assert_eq!(
+        resolve_unknown(&s, &id, UnknownDecision::NotDone).await,
+        Ok(UnknownDecision::Done)
+    );
     assert_eq!(s.read_run(run, Seq(0), 1000).await.unwrap().len(), before);
     assert_eq!(
         s.interrupt(&id).await.unwrap().unwrap().response,
@@ -895,9 +915,10 @@ async fn resolved_unknown_closes_effect() {
 async fn resolved_unknown_not_done_fails_effect() {
     let (s, run) = setup("resolve-not-done").await;
     let id = unknown_at_step_1(&s, run).await;
-    resolve_unknown(&s, &id, UnknownDecision::NotDone)
-        .await
-        .unwrap();
+    assert_eq!(
+        resolve_unknown(&s, &id, UnknownDecision::NotDone).await,
+        Ok(UnknownDecision::NotDone)
+    );
     assert_eq!(recover(&s, run).await.unwrap(), Recovery::Clean);
     let calls = Arc::new(AtomicUsize::new(0));
     let r = RunCtx::resume_at(s.clone(), run, 1, 0)
@@ -916,6 +937,16 @@ async fn resolved_unknown_not_done_fails_effect() {
     );
 }
 
+/// Число квитанций в журнале run.
+async fn receipts(s: &ProjectStore, run: RunId) -> usize {
+    s.read_run(run, Seq(0), 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::EffectReceipt)
+        .count()
+}
+
 /// Сбой между квитанцией и решением: повтор только записывает решение.
 #[tokio::test]
 async fn resolve_unknown_after_receipt_only_resolves() {
@@ -925,20 +956,137 @@ async fn resolve_unknown_after_receipt_only_resolves() {
     s.record_receipt(run, &key, ok(json!({"resolved": "done"})))
         .await
         .unwrap();
-    resolve_unknown(&s, &id, UnknownDecision::Done)
-        .await
-        .unwrap();
+    assert_eq!(
+        resolve_unknown(&s, &id, UnknownDecision::Done).await,
+        Ok(UnknownDecision::Done)
+    );
     let int = s.interrupt(&id).await.unwrap().unwrap();
     assert_eq!(int.status, "resolved");
     assert_eq!(int.response, Some(json!({"decision": "done"})));
-    let receipts = s
-        .read_run(run, Seq(0), 1000)
+    assert_eq!(receipts(&s, run).await, 1);
+}
+
+/// Квитанция `done` записана, решение — нет (сбой), человек снова отвечает
+/// иначе: решение выводится из квитанции, аудит совпадает с тем, что увидит run.
+#[tokio::test]
+async fn resolve_unknown_follows_existing_receipt() {
+    let (s, run) = setup("resolve-follows-receipt").await;
+    let id = unknown_at_step_1(&s, run).await;
+    let key = EffectKey::derive(run, 1, 0);
+    s.record_receipt(run, &key, ok(json!({"resolved": "done"})))
         .await
-        .unwrap()
-        .into_iter()
-        .filter(|e| e.kind == EventKind::EffectReceipt)
-        .count();
-    assert_eq!(receipts, 1);
+        .unwrap();
+    assert_eq!(
+        resolve_unknown(&s, &id, UnknownDecision::NotDone).await,
+        Ok(UnknownDecision::Done)
+    );
+    assert_eq!(
+        s.interrupt(&id).await.unwrap().unwrap().response,
+        Some(json!({"decision": "done"}))
+    );
+    assert_eq!(receipts(&s, run).await, 1);
+    let r = RunCtx::resume_at(s.clone(), run, 1, 0)
+        .effect(spec(EffectClass::NonIdempotent), || async { Ok(json!(0)) })
+        .await;
+    assert_eq!(r, Ok(json!({"resolved": "done"})));
+}
+
+/// Квитанция-отказ `not_done` и повтор с `Done` — действует `NotDone`.
+#[tokio::test]
+async fn resolve_unknown_follows_existing_not_done_receipt() {
+    let (s, run) = setup("resolve-follows-not-done").await;
+    let id = unknown_at_step_1(&s, run).await;
+    let key = EffectKey::derive(run, 1, 0);
+    s.record_receipt(
+        run,
+        &key,
+        json!({"outcome": "error", "message": za_core::NOT_DONE_MESSAGE}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resolve_unknown(&s, &id, UnknownDecision::Done).await,
+        Ok(UnknownDecision::NotDone)
+    );
+    assert_eq!(
+        s.interrupt(&id).await.unwrap().unwrap().response,
+        Some(json!({"decision": "not_done"}))
+    );
+}
+
+/// Два одновременных решения: действует одно, оба вызова получают его,
+/// квитанция и ответ прерывания совпадают.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_resolve_unknown_agrees() {
+    for round in 0..8 {
+        let (s, run) = setup(&format!("resolve-race-{round}")).await;
+        let id = unknown_at_step_1(&s, run).await;
+        let (a, b) = tokio::join!(
+            tokio::spawn({
+                let (s, id) = (s.clone(), id.clone());
+                async move { resolve_unknown(&s, &id, UnknownDecision::Done).await }
+            }),
+            tokio::spawn({
+                let (s, id) = (s.clone(), id.clone());
+                async move { resolve_unknown(&s, &id, UnknownDecision::NotDone).await }
+            }),
+        );
+        let (a, b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
+        assert_eq!(a, b, "раунд {round}: оба вызова видят одно решение");
+        let want = match a {
+            UnknownDecision::Done => (json!({"decision": "done"}), Ok(json!({"resolved": "done"}))),
+            UnknownDecision::NotDone => (
+                json!({"decision": "not_done"}),
+                Err(EffectError::Failed(za_core::NOT_DONE_MESSAGE.into())),
+            ),
+        };
+        assert_eq!(
+            s.interrupt(&id).await.unwrap().unwrap().response,
+            Some(want.0)
+        );
+        assert_eq!(receipts(&s, run).await, 1);
+        let r = RunCtx::resume_at(s.clone(), run, 1, 0)
+            .effect(spec(EffectClass::NonIdempotent), || async { Ok(json!(0)) })
+            .await;
+        assert_eq!(r, want.1, "раунд {round}");
+    }
+}
+
+/// Прерывание, чей ключ принадлежит другому run, или эффект не `NonIdempotent` —
+/// повреждение данных, а не решение.
+#[tokio::test]
+async fn resolve_unknown_rejects_inconsistent_payload() {
+    let (s, run) = setup("resolve-inconsistent").await;
+    let key = EffectKey::derive(run, 1, 0);
+    record_spec_intent(&s, run, &key, EffectClass::Idempotent).await;
+    let id = format!("unk-{}", key.0);
+    s.open_interrupt(
+        &id,
+        run,
+        za_core::UNKNOWN_OUTCOME,
+        json!({"effect_key": key.0}),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        resolve_unknown(&s, &id, UnknownDecision::Done).await,
+        Err(za_store::StoreError::Corrupt(_))
+    ));
+    let other = EffectKey::derive(RunId::new(), 1, 0);
+    let id2 = format!("unk-{}", other.0);
+    s.open_interrupt(
+        &id2,
+        run,
+        za_core::UNKNOWN_OUTCOME,
+        json!({"effect_key": other.0}),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        resolve_unknown(&s, &id2, UnknownDecision::Done).await,
+        Err(za_store::StoreError::Corrupt(_))
+    ));
+    assert_eq!(receipts(&s, run).await, 0);
 }
 
 #[tokio::test]

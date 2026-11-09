@@ -78,6 +78,26 @@ impl UnknownDecision {
             Self::NotDone => "not_done",
         }
     }
+
+    /// Разбор поля `decision` ответа прерывания.
+    fn parse(response: Option<&Value>) -> Option<Self> {
+        match response?.get("decision")?.as_str()? {
+            "done" => Some(Self::Done),
+            "not_done" => Some(Self::NotDone),
+            _ => None,
+        }
+    }
+
+    /// Решение, которое выражает уже записанная квитанция эффекта: успех — `Done`,
+    /// отказ — `NotDone`. Квитанция действует, а не новый ответ человека: её
+    /// получит run при реплее.
+    fn from_receipt(envelope: &Value) -> Option<Self> {
+        match envelope.get("outcome")?.as_str()? {
+            "ok" => Some(Self::Done),
+            "error" => Some(Self::NotDone),
+            _ => None,
+        }
+    }
 }
 
 /// Текст отказа эффекта, который человек признал невыполненным; читает модель.
@@ -87,20 +107,26 @@ pub const NOT_DONE_MESSAGE: &str = "not executed: the user decided the action di
 const INTERRUPT_OPEN: &str = "open";
 
 /// Закрывает эффект прерывания `unk-…` квитанцией (D16) и решает прерывание
-/// ответом `{"decision": "done" | "not_done"}`.
+/// ответом `{"decision": "done" | "not_done"}`. Возвращает действующее решение.
 ///
 /// Порядок — квитанция, затем решение: сбой между ними оставляет закрытый эффект
-/// и открытое прерывание, повторный вызов только записывает решение (квитанция
-/// уже есть — `EffectConflict` терпится). Уже решённое прерывание не меняется,
-/// даже при другом решении. Id не `unk-…`, прерывание другого вида, неизвестное
-/// прерывание или нет намерения под его ключом — [`StoreError::UnknownInterrupt`];
-/// прерывание без `payload.effect_key` — [`StoreError::Corrupt`].
+/// и открытое прерывание. Если квитанция уже есть (повтор после такого сбоя или
+/// одновременный вызов), действует она: решение выводится из её исхода, даже если
+/// `d` другое (`warn`), — аудит прерывания совпадает с тем, что run получит при
+/// реплее. Уже решённое прерывание не меняется; проигравший гонку
+/// `resolve_interrupt` вызов возвращает записанное решение.
+///
+/// Id не `unk-…`, прерывание другого вида, неизвестное прерывание или нет
+/// намерения под его ключом — [`StoreError::UnknownInterrupt`]. Нет
+/// `payload.effect_key`, ключ чужого run, эффект не `NonIdempotent`, квитанция
+/// или ответ без разбираемого исхода — [`StoreError::Corrupt`].
 pub async fn resolve_unknown(
     store: &ProjectStore,
     interrupt_id: &str,
     d: UnknownDecision,
-) -> Result<(), StoreError> {
+) -> Result<UnknownDecision, StoreError> {
     let unknown = || StoreError::UnknownInterrupt(interrupt_id.to_owned());
+    let corrupt = |what: &str| StoreError::Corrupt(format!("прерывание {interrupt_id}: {what}"));
     if !interrupt_id.starts_with("unk-") {
         return Err(unknown());
     }
@@ -109,9 +135,17 @@ pub async fn resolve_unknown(
         _ => return Err(unknown()),
     };
     if int.status != INTERRUPT_OPEN {
-        tracing::info!(id = interrupt_id, response = ?int.response,
-            "прерывание уже решено, решение не меняется");
-        return Ok(());
+        let recorded = UnknownDecision::parse(int.response.as_ref())
+            .ok_or_else(|| corrupt("ответ без decision"))?;
+        if recorded != d {
+            tracing::warn!(
+                id = interrupt_id,
+                requested = d.as_str(),
+                recorded = recorded.as_str(),
+                "прерывание уже решено иначе, решение не меняется"
+            );
+        }
+        return Ok(recorded);
     }
     let key = int
         .payload
@@ -119,30 +153,60 @@ pub async fn resolve_unknown(
         .and_then(|p| p.get("effect_key"))
         .and_then(Value::as_str)
         .map(|k| EffectKey(k.to_owned()))
-        .ok_or_else(|| {
-            StoreError::Corrupt(format!("прерывание {interrupt_id} без payload.effect_key"))
-        })?;
-    if store.effect(int.run, &key).await?.is_none() {
+        .ok_or_else(|| corrupt("нет payload.effect_key"))?;
+    if !key.0.starts_with(&format!("{}:", int.run)) {
+        return Err(corrupt("ключ эффекта другого run"));
+    }
+    let Some(row) = store.effect(int.run, &key).await? else {
         return Err(unknown());
-    }
-    let envelope = match d {
-        UnknownDecision::Done => ok_envelope(&json!({ "resolved": "done" })),
-        UnknownDecision::NotDone => error_envelope(NOT_DONE_MESSAGE),
     };
-    match store.record_receipt(int.run, &key, envelope).await {
-        Ok(_) => {}
-        Err(StoreError::EffectConflict(_)) => {
-            tracing::info!(key = %key.0, "квитанция уже записана, остаётся решение");
-        }
-        Err(e) => return Err(e),
+    if row.class != EffectClass::NonIdempotent {
+        return Err(corrupt("эффект не NonIdempotent"));
     }
-    store
-        .resolve_interrupt(interrupt_id, json!({ "decision": d.as_str() }))
+    let actual = match row.result {
+        Some(envelope) => UnknownDecision::from_receipt(&envelope)
+            .ok_or_else(|| corrupt("квитанция без исхода"))?,
+        None => {
+            let envelope = match d {
+                UnknownDecision::Done => ok_envelope(&json!({ "resolved": "done" })),
+                UnknownDecision::NotDone => error_envelope(NOT_DONE_MESSAGE),
+            };
+            match store.record_receipt(int.run, &key, envelope).await {
+                Ok(_) => d,
+                // Квитанцию успел записать одновременный вызов: действует она.
+                Err(StoreError::EffectConflict(_)) => {
+                    let envelope = store
+                        .effect(int.run, &key)
+                        .await?
+                        .and_then(|r| r.result)
+                        .ok_or_else(|| corrupt("квитанция пропала"))?;
+                    UnknownDecision::from_receipt(&envelope)
+                        .ok_or_else(|| corrupt("квитанция без исхода"))?
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    if actual != d {
+        tracing::warn!(key = %key.0, requested = d.as_str(), receipt = actual.as_str(),
+            "квитанция уже записана с другим исходом, действует она");
+    }
+    let won = store
+        .resolve_interrupt(interrupt_id, json!({ "decision": actual.as_str() }))
         .await?;
+    if !won {
+        // Решение записал одновременный вызов; оно выведено из той же квитанции.
+        let recorded = store
+            .interrupt(interrupt_id)
+            .await?
+            .and_then(|i| UnknownDecision::parse(i.response.as_ref()))
+            .ok_or_else(|| corrupt("ответ без decision"))?;
+        return Ok(recorded);
+    }
     tracing::info!(
         id = interrupt_id,
-        decision = d.as_str(),
+        decision = actual.as_str(),
         "неизвестный исход решён"
     );
-    Ok(())
+    Ok(actual)
 }

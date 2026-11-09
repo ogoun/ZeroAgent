@@ -116,11 +116,16 @@ impl EffectSlot {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Value, String>>,
     {
-        match self.prepare(spec).await {
+        let out = match self.prepare(spec).await {
             Ok(Prepared::Recorded(r)) => (r, EffectSource::Journal),
             Ok(Prepared::Execute) => (self.execute(f).await, EffectSource::Live),
             Err(e) => (Err(e), EffectSource::Live),
+        };
+        // `observe` ключа не знает: ошибки, отравляющие контекст, логируются здесь.
+        if let Err(e @ (EffectError::Store(_) | EffectError::ReplayMismatch { .. })) = &out.0 {
+            tracing::error!(key = %self.key.0, error = %e, "ошибка эффекта");
         }
+        out
     }
 
     /// Сверяет спецификацию с журналом; если намерения нет, записывает его.
