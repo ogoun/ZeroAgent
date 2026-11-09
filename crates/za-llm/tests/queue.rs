@@ -718,6 +718,45 @@ async fn crashed_driver_is_restarted() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn permit_drop_restarts_crashed_driver() {
+    // Заявка уже ждёт в `granted()` (cooldown), фоновая задача падает; единственное
+    // последующее событие — Drop `Permit`. Он перезапускает задачу, и cooldown кончается.
+    quiet_expected_panics();
+    let boom = Arc::new(AtomicBool::new(false));
+    let b = boom.clone();
+    let today = Arc::new(move || {
+        if b.swap(false, Ordering::SeqCst) {
+            panic!("{EXPECTED_PANIC}: источник даты");
+        }
+        jiff::civil::date(2026, 11, 9)
+    });
+    let (tx, adm) = admission(snapshot_with_ram(32 * GIB));
+    let q = ModelQueue::new(Handle::current(), Some(adm)).with_today(today);
+    let g = gid("llama-local");
+    q.configure(g.clone(), gated(1));
+    let c = gid("cloud:openai:api.openai.com");
+    q.configure(c.clone(), cloud(4, None));
+    let holder = enq(&q, &g, Priority::Interactive).granted().await.unwrap();
+    let _w = enq(&q, &g, Priority::Worker);
+    q.cooldown(&c, Instant::now() + Duration::from_secs(10));
+    let cooled = q.enqueue(&c, RunId::new(), Priority::Worker, None).unwrap();
+    let h = tokio::spawn(cooled.granted());
+    settle().await;
+    boom.store(true, Ordering::SeqCst);
+    tx.send(snapshot_with_ram(32 * GIB)).unwrap();
+    settle().await;
+    assert!(
+        !boom.load(Ordering::SeqCst),
+        "фоновая задача не пересчитала"
+    );
+    drop(holder);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let r = tokio::time::timeout(Duration::from_secs(60), h).await;
+    let p = r.expect("фоновая задача не перезапущена").unwrap().unwrap();
+    assert_eq!(p.group(), &c);
+}
+
 #[test]
 fn stopped_runtime_fails_timed_requests() {
     // Runtime очереди остановлен: заявки, которым нужен таймер, получают явную ошибку.

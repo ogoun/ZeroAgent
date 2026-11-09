@@ -623,6 +623,11 @@ pub struct ModelQueue {
 impl ModelQueue {
     /// `rt` — runtime фоновой задачи очереди (таймеры, снимки ресурсов); `admission` —
     /// допуск для групп с `resource_gated`, `None` — без проверки ресурсов.
+    ///
+    /// Runtime `rt` должен опрашиваться (работать `block_on` или рабочие потоки): фоновая
+    /// задача только порождается в нём. Если runtime жив, но не опрашивается (например,
+    /// `current_thread` без `block_on`), cooldown, `max_wait`, старение позиций и
+    /// возобновление по ресурсам не срабатывают, хотя синхронная выдача работает.
     pub fn new(rt: Handle, admission: Option<Admission>) -> Self {
         let q = Self {
             shared: Arc::new(Shared {
@@ -949,6 +954,10 @@ impl Drop for Permit {
             g.release(self.background);
         }
         self.shared.dispatch(&mut st, &self.group);
+        drop(st);
+        // Ждущие в `granted()` не должны застревать после падения фоновой задачи до
+        // следующего вызова очереди; замок `state` уже отпущен (порядок `driver` → `state`).
+        self.shared.ensure_driver();
     }
 }
 
