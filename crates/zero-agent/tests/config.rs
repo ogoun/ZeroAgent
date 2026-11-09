@@ -52,3 +52,30 @@ fn resources_section_alone_keeps_llama_url_fallback() {
     assert_eq!(cfg.resources.ram_floor_mib, 512);
     assert!(cfg.models.is_some());
 }
+
+#[test]
+fn readme_models_example_is_valid() {
+    // Пример раздела «Модели» в README проходит разбор и проверку (финальное ревью I2:
+    // пример с бюджетом без `price` не действовал).
+    let readme = include_str!("../../../README.md");
+    let start = readme
+        .find(
+            "```toml
+[models]",
+        )
+        .expect("пример [models] в README");
+    let body = &readme[start
+        + "```toml
+"
+        .len()..];
+    let end = body.find("```").expect("конец примера");
+    let cfg = zero_agent::config::parse_config(&body[..end]).unwrap();
+    zero_agent::config::validate(&cfg).unwrap();
+    assert!(
+        cfg.models
+            .unwrap()
+            .endpoints
+            .iter()
+            .any(|e| e.daily_budget_usd.is_some())
+    );
+}

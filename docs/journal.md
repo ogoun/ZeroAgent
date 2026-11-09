@@ -5,6 +5,7 @@
 ## 2026-11-09. R1-A, финальный fix-раунд (final-review.md)
 
 - **I1. Ключ на `/slots`.** `LlamaSlots::with_secret` — save/restore идут с тем же `Authorization: Bearer`, что зонд и запрос модели (`Gateway` передаёт ключ эндпоинта, текст ошибки очищается `redact`). 401/403 на `/slots` (`ErrorClass::Auth`) — «не поддержано»: `slot_save = Some(false)` и одно предупреждение с причиной «llama-server отклонил ключ на /slots». Поддельный сервер тестов умеет требовать ключ (`FakeServer::start_with_bearer`).
+- **I2. Бюджет без источника стоимости.** `ModelsConfig::validate` → `ConfigError::BudgetWithoutPrice(id)`, если у группы есть `daily_budget_usd`, а у эндпоинта группы нет `price` и бэкенд не OpenRouter (стоимость в `usage.cost` и цены в зонде сообщает только он). Проверяется каждый эндпоинт группы, в том числе без собственного бюджета: его расход входит в бюджет группы. Выбрана ошибка, а не предупреждение (Ruling I2). Пример README дополнен `price`; тест бинарника разбирает и проверяет пример из README.
 
 ## 2026-11-09. R1-A, задача 16: команды `models`, `ask`, `resources`; `doctor` с GPU и моделями; приёмка R1-A
 

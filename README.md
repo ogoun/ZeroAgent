@@ -46,7 +46,8 @@ id = "claude"
 backend = "anthropic"
 model = "claude-sonnet-5-5"
 key_ref = "anthropic"              # ключ — в ZA_SECRET_ANTHROPIC
-daily_budget_usd = 5.0
+daily_budget_usd = 5.0              # дневной предел расхода группы, USD
+price = { input_per_mtok = 3.0, output_per_mtok = 15.0 }   # USD за миллион токенов; без price бюджет — ошибка (стоимость сообщает только openrouter)
 
 [models.roles]
 worker = "local"

@@ -113,6 +113,13 @@ pub enum ConfigError {
         "models.endpoints[{0}].key_ref: ожидается имя ключа (латиница, цифры, `_`, `-`, `.`, до 64 символов), а не сам ключ"
     )]
     BadKeyRef(String),
+    /// У группы задан `daily_budget_usd`, а у эндпоинта группы нет источника стоимости:
+    /// нет `price`, и бэкенд не сообщает стоимость (её сообщает только OpenRouter).
+    /// Расход такого эндпоинта не учитывался бы, и бюджет не наступил бы никогда.
+    #[error(
+        "models.endpoints[{0}]: у группы задан daily_budget_usd, но стоимость запросов неизвестна —          этот бэкенд её не сообщает; задайте price (USD за миллион токенов: input_per_mtok, output_per_mtok)          или уберите бюджет"
+    )]
+    BudgetWithoutPrice(EndpointId),
 }
 
 /// Предупреждение конфигурации.
@@ -159,7 +166,20 @@ impl ModelsConfig {
                 });
             }
         }
+        self.validate_budget_cost()?;
         Ok(self.budget_warnings())
+    }
+
+    /// Бюджет группы действует, только если стоимость известна для каждого эндпоинта
+    /// группы (D16): `price` в конфигурации или стоимость от провайдера (OpenRouter).
+    fn validate_budget_cost(&self) -> Result<(), ConfigError> {
+        for ep in &self.endpoints {
+            let reports_cost = ep.backend == BackendKind::OpenRouter;
+            if ep.price.is_none() && !reports_cost && self.group_budget(&ep.group_key()).is_some() {
+                return Err(ConfigError::BudgetWithoutPrice(ep.id.clone()));
+            }
+        }
+        Ok(())
     }
 
     /// Эндпоинт роли run (по serde-имени роли).

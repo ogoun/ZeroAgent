@@ -579,6 +579,52 @@ fn roles_use_run_role_names() {
 }
 
 #[test]
+fn budget_without_cost_source_is_config_error() {
+    // Финальное ревью I2: стоимость сообщает только OpenRouter; у прочих бэкендов без
+    // `price` расход не учитывается и бюджет не наступил бы никогда.
+    for backend in ["anthropic", "openai_responses", "openai_chat"] {
+        let c = cfg(json!({"endpoints": [
+            {"id": "c", "backend": backend, "model": "m", "key_ref": "k", "daily_budget_usd": 5.0}
+        ]}));
+        let err = c.validate().unwrap_err();
+        assert_eq!(err, ConfigError::BudgetWithoutPrice(EndpointId("c".into())));
+        let text = err.to_string();
+        assert!(
+            text.contains("price") && text.contains("daily_budget_usd"),
+            "{text}"
+        );
+    }
+    let c = cfg(json!({"endpoints": [
+        {"id": "v", "backend": "openai_compatible", "base_url": "https://api.example.com/v1",
+         "daily_budget_usd": 5.0}
+    ]}));
+    assert_eq!(
+        c.validate(),
+        Err(ConfigError::BudgetWithoutPrice(EndpointId("v".into())))
+    );
+    // Эндпоинт группы без собственного бюджета тоже должен иметь источник стоимости:
+    // его расход входит в бюджет группы.
+    let c = cfg(json!({"endpoints": [
+        {"id": "a1", "backend": "anthropic", "model": "m", "key_ref": "k", "daily_budget_usd": 5.0,
+         "price": {"input_per_mtok": 3.0, "output_per_mtok": 15.0}},
+        {"id": "a2", "backend": "anthropic", "model": "m2", "key_ref": "k"}
+    ]}));
+    assert_eq!(
+        c.validate(),
+        Err(ConfigError::BudgetWithoutPrice(EndpointId("a2".into())))
+    );
+    // С `price` и у OpenRouter (стоимость в `usage.cost`) — без ошибки; без бюджета
+    // `price` не нужен.
+    let ok = cfg(json!({"endpoints": [
+        {"id": "a", "backend": "anthropic", "model": "m", "key_ref": "k", "daily_budget_usd": 5.0,
+         "price": {"input_per_mtok": 3.0, "output_per_mtok": 15.0}},
+        {"id": "or", "backend": "openrouter", "model": "a/b", "key_ref": "or", "daily_budget_usd": 2.0},
+        {"id": "o", "backend": "openai_responses", "model": "m", "key_ref": "o"}
+    ]}));
+    assert_eq!(ok.validate(), Ok(vec![]));
+}
+
+#[test]
 fn group_budget_is_minimum_with_warning() {
     let c = cfg(json!({"endpoints": [
         {"id": "or1", "backend": "openrouter", "model": "a/b", "key_ref": "or", "daily_budget_usd": 5.0},
