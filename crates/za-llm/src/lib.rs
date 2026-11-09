@@ -3,14 +3,15 @@
 //! Без функций — чистые части: канонический формат сообщений (`types`), возможности
 //! провайдера (`caps`), таксономия ошибок (`error`), трейт `ModelPort` и стрим (`port`),
 //! детерминированная `ScriptedModel` для тестов (`scripted`), стабильный префикс
-//! промпта (`prefix`). Функция `http` добавляет транспорт, SSE и секреты (`http`)
-//! и зонды (`probe`), коннекторы (`wire`, внутренние, D38), `gateway` — очередь
-//! и `Gateway` (включена по умолчанию).
+//! промпта (`prefix`), нормализация вызовов инструментов (`normalize`). Функция
+//! `http` добавляет транспорт, SSE и секреты (`http`) и зонды (`probe`), коннекторы
+//! (`wire`, внутренние, D38), `gateway` — очередь и `Gateway` (включена по умолчанию).
 
 pub mod caps;
 pub mod error;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod normalize;
 pub mod port;
 pub mod prefix;
 #[cfg(feature = "http")]

@@ -2,6 +2,31 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-A, задача 7: нормализация вызовов, форматы P0
+
+- **`za_llm::normalize`** (ядро, без функций): `normalize(msg, tools, formats) -> NormalizeOutcome` — чистая функция по порядку MDL-005. Нативные `Part::ToolCall` первыми; затем всегда (D39) скан `Text`, потом `Reasoning` форматами по порядку (пустой `formats` — `all_formats()`: Hermes, Qwen XML, Harmony, затем пять форматов P1 задачи 8, пока без разбора). Разметка вызовов вырезается из `text`/`reasoning`; пробелы на стыке схлопываются в `"
+
+"`, `"
+"`, `" "` или ничего. Текст без находок не меняется.
+- **Дубли (D39)**: извлечённый вызов отбрасывается (`dropped_duplicates`), если имя и `canonical_json` аргументов совпали с нативным — до нормализации или после неё (Qwen XML `"5"` и нативный `5` — дубль). Сравнение со множеством ключей: один нативный поглощает любое число повторов (план в рассуждении плюс эхо в тексте).
+- **Аргументы**: `RawArgs::Text`, строка вместо объекта и нативный `Null` с `raw_arguments` — разбор JSON (`ArgsParsedFromString`; пустая строка — `{}`, обёртка ```` ```json ```` снимается); `Pairs` — объект строк. Не разобралось — `Unparseable { raw }`.
+- **Имя (D28)**: полный Дамерау — Левенштейн (Лоуренс — Вагнер) по символам Unicode; единственный кандидат на расстоянии ≤ 2 — `NameCorrected`, иначе `UnknownTool` с тремя ближайшими (расстояние, затем имя). Имя длиннее 256 символов не исправляется.
+- **Схема (D5)** `validate_and_coerce`: своё подмножество (`type` и массив типов, `properties`, `required`, `additionalProperties`, `items`, `enum`, `const` с числами по значению, `minimum`/`maximum`, `minLength`/`maxLength` в символах, `minItems`/`maxItems`, `anyOf`/`oneOf` — сначала ветки без приведения, затем первая с приведением, локальный `$ref` любым JSON Pointer, глубина ≤ 64); прочие ключевые слова — `debug`. Приведение только при несовпадении типа. Ошибки — JSON Pointer пути; при ошибке аргументы не меняются.
+- **id** вызова без id: `call_` + 12 hex `blake3(name + canonical_json(args))`; совпавший id (тот же вызов дважды) разводится суффиксом `#n` в хэше — детерминированно (CORE-007).
+- **`extracted_mutation_blocked`** (D27): не `Native` и класс не `Pure`/`ReadOnly`.
+- **Форматы P0** (разбор без regex). Сверены 2026-11-09 с шаблонами: Hermes-3 `tokenizer_config.json` (NousResearch, «within <tool_call></tool_call> XML tags»), Qwen3-Coder `chat_template.jinja` (`<tool_call>
+<function=NAME>
+<parameter=K>
+V
+</parameter>
+</function>
+</tool_call>`), OpenAI «Harmony response format» (developers.openai.com/cookbook, получатель в разделе роли или канала, стоп-токены `<|call|>`, `<|end|>`, `<|return|>`).
+  - Hermes: несколько блоков и несколько объектов в блоке; `arguments` или `parameters`; незакрытый блок — до следующего `<tool_call>` или конца; блок с `<function=` отдаётся Qwen XML.
+  - Qwen XML: обёртка необязательна, у значения снимается по одному краевому `
+`; пропущенный `</parameter>` терпится; без `</function>` вызов обрезан и отклоняется (значение могло оборваться).
+  - Harmony: вырез от `<|start|>`/`<|channel|>`/`to=`, тело до `<|call|>`/`<|end|>`/`<|return|>`/`<|start|>`/конца; `to=functions.` в прозе без маркеров Harmony не вызов и не захватывает следующий настоящий вызов.
+  - Битая разметка формата — `RawCall` с пустым именем и `RawArgs::Text(разметка)` → `Unparseable`; тест обрыва ответа на каждом символе: без паники, принятые вызовы проходят схему.
+
 ## 2026-11-09. R1-A, задача 6: коннектор OpenAI Responses
 
 - **`ResponsesWire`, `ResponsesDecoder`** (`wire/responses.rs`, `Connector::Responses`). Запрос `POST {base}/responses` (D37), `Authorization: Bearer`. Насос SSE общий (`pump`); из `chat.rs` переиспользуются (стали `pub(super)`) `rendered_tools` (выделена из `tools`), `strict_compatible_root`, `effort_no_max`, `f32_json`, `stream_error`.
