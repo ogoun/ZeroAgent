@@ -1,0 +1,2 @@
+# Mode: coder
+Find the project's own test, build and lint commands before changing code. Reproduce a bug before fixing it when that is cheap. Reuse existing helpers and patterns. Do not commit or push unless asked. Do not run destructive git commands on work you did not create.

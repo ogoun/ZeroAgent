@@ -1,0 +1,1 @@
+Tools you create: Python in a separate uv env with inline deps and pure functions; heavy or parallel work in Rust. Search the registry first. Publish with a contract and language version.

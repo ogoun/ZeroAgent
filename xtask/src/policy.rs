@@ -2,7 +2,8 @@
 //!
 //! Правила: только crates.io в `Cargo.lock`, запрет перечисленных
 //! агентных фреймворков, направление зависимостей между `za-*`
-//! (`za-res` — только от `za-protocol`, `za-core` — `za-llm` без функций по умолчанию),
+//! (`za-res` — только от `za-protocol`, `za-core` и `za-agent` — `za-llm` без функций
+//! по умолчанию, `za-agent` — только над нижними слоями, и они от него не зависят),
 //! лимит размера `za-core` (ARC-011).
 
 use std::fmt;
@@ -16,7 +17,18 @@ const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 /// Запрещённые пакеты (чужие агентные фреймворки).
 const FORBIDDEN_PACKAGES: &[&str] = &["rig-core", "adk-rust", "autoagents"];
 /// Крейты, от которых `za-core` зависеть не должен.
-const CORE_FORBIDDEN_DEPS: &[&str] = &["za-server", "za-peer", "za-browser"];
+const CORE_FORBIDDEN_DEPS: &[&str] = &[
+    "za-server",
+    "za-peer",
+    "za-browser",
+    // `za-agent` — общим правилом нижних слоёв ниже.
+    "za-res",
+    "reqwest",
+];
+/// Крейты workspace, от которых может зависеть `za-agent` (ADR 0004).
+const AGENT_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-store", "za-core", "za-llm", "za-res"];
+/// Внешние крейты, которые `za-agent` подключать не должен: модель — только через `ModelPort`.
+const AGENT_FORBIDDEN_DEPS: &[&str] = &["reqwest"];
 /// Единственный крейт `za-*`, от которого может зависеть `za-res` (D1).
 const RES_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol"];
 
@@ -123,6 +135,42 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                         .into(),
                 ));
             }
+            // Все виды: нижние слои не видят цикл даже в тестах (ADR 0004).
+            if AGENT_ALLOWED_ZA_DEPS.contains(&pkg.name.as_str()) && dep.name == "za-agent" {
+                out.push(Violation(format!(
+                    "{} не должен зависеть от za-agent",
+                    pkg.name
+                )));
+            }
+            if pkg.name == "za-agent"
+                && is_workspace_crate(&dep.name)
+                && !AGENT_ALLOWED_ZA_DEPS.contains(&dep.name.as_str())
+            {
+                out.push(Violation(format!(
+                    "za-agent не должен зависеть от {} (допустимы {})",
+                    dep.name,
+                    AGENT_ALLOWED_ZA_DEPS.join(", ")
+                )));
+            }
+            if pkg.name == "za-agent"
+                && dep.kind.as_deref() != Some("dev")
+                && AGENT_FORBIDDEN_DEPS.contains(&dep.name.as_str())
+            {
+                out.push(Violation(format!(
+                    "za-agent не должен зависеть от {}",
+                    dep.name
+                )));
+            }
+            if pkg.name == "za-agent"
+                && dep.name == "za-llm"
+                && dep.kind.as_deref() != Some("dev")
+                && dep.uses_default_features
+            {
+                out.push(Violation(
+                    "za-agent подключает za-llm с функциями по умолчанию (нужно default-features = false)"
+                        .into(),
+                ));
+            }
             if pkg.name == "za-protocol" && dep.name.starts_with("za-") {
                 out.push(Violation(format!(
                     "za-protocol не должен зависеть от {}",
@@ -132,6 +180,11 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
         }
     }
     out
+}
+
+/// Крейт workspace: `za-*` или бинарник `zero-agent`.
+fn is_workspace_crate(name: &str) -> bool {
+    name.starts_with("za-") || name == "zero-agent"
 }
 
 /// Проверяет, что размер `za-core` в строках не превышает лимит.
@@ -315,6 +368,50 @@ version = \"0.0.1\"
     fn protocol_must_not_depend_on_za_crates() {
         assert_eq!(check_direction(&meta("za-protocol", "za-store")).len(), 1);
         assert!(check_direction(&meta("za-protocol", "serde")).is_empty());
+    }
+    #[test]
+    fn policy_rejects_core_on_agent() {
+        assert_eq!(check_direction(&meta("za-core", "za-agent")).len(), 1);
+        let dev = Dependency {
+            kind: Some("dev".into()),
+            ..dep("za-agent")
+        };
+        assert_eq!(check_direction(&meta_with("za-core", dev)).len(), 1);
+        for lower in ["za-protocol", "za-store", "za-llm", "za-res"] {
+            assert!(
+                !check_direction(&meta(lower, "za-agent")).is_empty(),
+                "{lower} → za-agent"
+            );
+        }
+        assert!(check_direction(&meta("zero-agent", "za-agent")).is_empty());
+    }
+    #[test]
+    fn agent_uses_llm_without_defaults() {
+        assert_eq!(check_direction(&meta("za-agent", "za-llm")).len(), 1);
+        let no_defaults = Dependency {
+            uses_default_features: false,
+            ..dep("za-llm")
+        };
+        assert!(check_direction(&meta_with("za-agent", no_defaults)).is_empty());
+        let dev = Dependency {
+            kind: Some("dev".into()),
+            ..dep("za-llm")
+        };
+        assert!(check_direction(&meta_with("za-agent", dev)).is_empty());
+    }
+    #[test]
+    fn agent_depends_only_on_lower_layers() {
+        for ok in ["za-protocol", "za-store", "za-core", "za-res", "serde"] {
+            assert!(check_direction(&meta("za-agent", ok)).is_empty(), "{ok}");
+        }
+        assert_eq!(check_direction(&meta("za-agent", "zero-agent")).len(), 1);
+        assert_eq!(check_direction(&meta("za-agent", "za-memory")).len(), 1);
+        assert_eq!(check_direction(&meta("za-agent", "reqwest")).len(), 1);
+    }
+    #[test]
+    fn core_must_not_depend_on_res_or_http() {
+        assert_eq!(check_direction(&meta("za-core", "za-res")).len(), 1);
+        assert_eq!(check_direction(&meta("za-core", "reqwest")).len(), 1);
     }
     #[test]
     fn core_over_limit_is_reported() {

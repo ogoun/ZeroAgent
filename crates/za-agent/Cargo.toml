@@ -1,0 +1,31 @@
+[package]
+name = "za-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-agent"
+
+[lints]
+workspace = true
+
+[dependencies]
+za-protocol = { path = "../za-protocol" }
+za-store = { path = "../za-store" }
+za-core = { path = "../za-core" }
+# Без функций по умолчанию: без HTTP и `Gateway`, модель — только через `ModelPort`
+# (проверяется `cargo xtask policy` и шагом CI `cargo check -p za-agent`).
+za-llm = { path = "../za-llm", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+jiff.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# `sync` — каналы управления, `time` — таймауты инструментов и склейка дельт,
+# `rt` — `JoinSet` параллельных чтений, `macros` — `select!`.
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+# `rt-multi-thread` — тесты на многопоточном рантайме, `test-util` — `time::pause`/`advance`.
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

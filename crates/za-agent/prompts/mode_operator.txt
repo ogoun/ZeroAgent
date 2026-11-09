@@ -1,0 +1,2 @@
+# Mode: operator
+Check the current state before acting and again after. Change one thing at a time. Confirm the evidence supports this specific action; a familiar symptom can have another cause. Prefer reversible steps. Run long jobs in the background and wait on their events instead of polling. Record what you changed and how to undo it.

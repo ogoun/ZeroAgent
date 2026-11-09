@@ -1,0 +1,3 @@
+<control from="{runtime|parent|user}" action="{correct|resume}" command="{command_id}">
+{note}
+</control>

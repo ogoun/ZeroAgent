@@ -38,5 +38,8 @@ jobs:
       # Ядро отдельно: при --workspace функции объединяются, и za-core видел бы za-llm
       # с gateway/http (ARC-011).
       - run: cargo check -p za-core --locked
+      # Цикл отдельно по той же причине: za-agent подключает za-llm без функций, и тип
+      # за http/gateway в нём при --workspace прошёл бы незамеченным.
+      - run: cargo check -p za-agent --locked
       - run: cargo --locked xtask policy
       - run: cargo deny --locked check

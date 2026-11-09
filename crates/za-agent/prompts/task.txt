@@ -1,0 +1,12 @@
+<task id="{run_id}" parent="{parent_id}">
+goal: {goal}
+done_when: {criteria}
+scope: {files_or_sources}
+workspace: {path}
+budget: {budget}
+context:
+{minimal_handoff}
+memory:
+{zam_brief}
+</task>
+<grants>{grants}</grants>
