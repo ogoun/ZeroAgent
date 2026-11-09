@@ -5,7 +5,10 @@ use std::path::PathBuf;
 
 use serde_json::json;
 use za_protocol::{Actor, BlobHash, EventKind, NewEvent, RunId, RunRole, RunStatus, Seq};
-use za_store::{BLOB_THRESHOLD, Durability, NewRun, ProjectStore, StoreError, StoreOptions};
+use za_store::{
+    BLOB_THRESHOLD, Durability, NewRun, ProjectStore, StoreError, StoreOptions, UsageRow,
+    UsageTotals,
+};
 
 /// Путь каталога теста внутри `CARGO_TARGET_TMPDIR` без очистки.
 fn dir_path(name: &str) -> PathBuf {
@@ -597,4 +600,113 @@ fn garbage_file_is_corrupt_not_sqlite() {
         Err(StoreError::Corrupt(_)) => {}
         other => panic!("ожидался Corrupt, получено {:?}", other.err()),
     }
+}
+
+fn usage_row() -> UsageRow {
+    UsageRow {
+        model: "local".into(),
+        input: 100,
+        cached: 40,
+        output: 10,
+        reasoning: 5,
+        gpu_ms: Some(7),
+        cost_usd: Some(0.25),
+    }
+}
+
+#[tokio::test]
+async fn usage_rows_sum_per_run() {
+    let s = open("usage-sum");
+    let run_a = s.create_run(new_run(None)).await.unwrap().id;
+    let run_b = s.create_run(new_run(None)).await.unwrap().id;
+    let payloads = [json!({"turn": 1, "x": "a"}), json!({"turn": 2, "x": "b"})];
+    for p in &payloads {
+        s.record_usage(run_a, usage_row(), p.clone()).await.unwrap();
+    }
+    s.record_usage(run_b, usage_row(), json!({"turn": 1}))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        s.usage_totals(run_a).await.unwrap(),
+        UsageTotals {
+            calls: 2,
+            input: 200,
+            cached: 80,
+            output: 20,
+            reasoning: 10,
+            gpu_ms: 14,
+            cost_usd: 0.5,
+        }
+    );
+    assert_eq!(s.usage_totals(run_b).await.unwrap().calls, 1);
+    assert_eq!(
+        s.usage_totals(RunId::new()).await.unwrap(),
+        UsageTotals::default()
+    );
+
+    let usage: Vec<_> = s
+        .read_run(run_a, Seq(0), 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::ModelUsage)
+        .collect();
+    assert_eq!(usage.len(), 2);
+    assert!(usage.iter().all(|e| e.actor == Actor::Model));
+    assert_eq!(usage[0].payload, payloads[0]);
+    assert_eq!(usage[1].payload, payloads[1]);
+}
+
+#[tokio::test]
+async fn usage_without_gpu_and_cost_sums_as_zero() {
+    let s = open("usage-null");
+    let run = s.create_run(new_run(None)).await.unwrap().id;
+    let mut row = usage_row();
+    row.gpu_ms = None;
+    row.cost_usd = None;
+    s.record_usage(run, row, json!({})).await.unwrap();
+    let t = s.usage_totals(run).await.unwrap();
+    assert_eq!((t.calls, t.gpu_ms, t.cost_usd), (1, 0, 0.0));
+}
+
+#[tokio::test]
+async fn usage_for_unknown_run_is_rejected() {
+    let s = open("usage-unknown");
+    let run = RunId::new();
+    assert_eq!(
+        s.record_usage(run, usage_row(), json!({})).await,
+        Err(StoreError::UnknownRun(run))
+    );
+}
+
+#[tokio::test]
+async fn migration_2_applies_to_v1_journal() {
+    let d = dir("migrate-v1");
+    let (run, seq) = {
+        let s = ProjectStore::open(&d).unwrap();
+        let run = s.create_run(new_run(None)).await.unwrap().id;
+        let seq = s.append(ev_for(run)).await.unwrap();
+        (run, seq)
+    };
+    // Журнал R0: схема версии 1 без таблицы `usage`.
+    {
+        let c = rusqlite::Connection::open(d.join("journal.db")).unwrap();
+        c.execute_batch("DROP TABLE usage; PRAGMA user_version = 1;")
+            .unwrap();
+    }
+
+    let s = ProjectStore::open(&d).unwrap();
+    let version: u32 = rusqlite::Connection::open(d.join("journal.db"))
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let old = s.read_run(run, Seq(0), 100).await.unwrap();
+    assert!(
+        old.iter()
+            .any(|e| e.seq == seq && e.kind == EventKind::TurnStarted)
+    );
+    s.record_usage(run, usage_row(), json!({})).await.unwrap();
+    assert_eq!(s.usage_totals(run).await.unwrap().calls, 1);
 }

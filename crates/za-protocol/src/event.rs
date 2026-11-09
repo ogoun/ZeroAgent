@@ -33,6 +33,20 @@ pub enum EventKind {
     EffectReceipt,
     InterruptOpened,
     InterruptResolved,
+    /// Склеенный фрагмент стрима модели (D8 R1-B1).
+    ModelDelta,
+    /// Состояние ожидания модели: очередь, ресурс, генерация.
+    AgentHeartbeat,
+    /// Ввод пользователя в run (actor `user`).
+    TurnInput,
+    /// Итог хода модели.
+    TurnFinished,
+    /// Запрошена управляющая команда, применяется на границе шага.
+    ControlRequested,
+    /// Управляющая команда применена.
+    ControlApplied,
+    /// Превышен бюджет run.
+    BudgetExceeded,
     Unknown(String),
 }
 
@@ -51,6 +65,13 @@ impl EventKind {
             Self::EffectReceipt => "effect.receipt",
             Self::InterruptOpened => "interrupt.opened",
             Self::InterruptResolved => "interrupt.resolved",
+            Self::ModelDelta => "model.delta",
+            Self::AgentHeartbeat => "agent.heartbeat",
+            Self::TurnInput => "turn.input",
+            Self::TurnFinished => "turn.finished",
+            Self::ControlRequested => "control.requested",
+            Self::ControlApplied => "control.applied",
+            Self::BudgetExceeded => "budget.exceeded",
             Self::Unknown(s) => s,
         }
     }
@@ -69,6 +90,13 @@ impl EventKind {
             "effect.receipt" => Self::EffectReceipt,
             "interrupt.opened" => Self::InterruptOpened,
             "interrupt.resolved" => Self::InterruptResolved,
+            "model.delta" => Self::ModelDelta,
+            "agent.heartbeat" => Self::AgentHeartbeat,
+            "turn.input" => Self::TurnInput,
+            "turn.finished" => Self::TurnFinished,
+            "control.requested" => Self::ControlRequested,
+            "control.applied" => Self::ControlApplied,
+            "budget.exceeded" => Self::BudgetExceeded,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -145,6 +173,23 @@ mod tests {
         ] {
             assert_eq!(EventKind::parse(k.as_str()), k);
         }
+    }
+
+    #[test]
+    fn new_kinds_round_trip() {
+        use EventKind::*;
+        for k in [
+            ModelDelta,
+            AgentHeartbeat,
+            TurnInput,
+            TurnFinished,
+            ControlRequested,
+            ControlApplied,
+            BudgetExceeded,
+        ] {
+            assert_eq!(EventKind::parse(k.as_str()), k);
+        }
+        assert_eq!(EventKind::AgentHeartbeat.as_str(), "agent.heartbeat");
     }
 
     #[test]

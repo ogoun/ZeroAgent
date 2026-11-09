@@ -6,7 +6,8 @@
 //! в blobs по BLAKE3 (ARC-032), runs меняют статус по таблице переходов с проверкой
 //! `generation` (SWM-064), снимки состояния служат для resume (CORE-006).
 //! Эффекты записываются протоколом намерение → квитанция (CORE-002), прерывания
-//! открываются идемпотентно по детерминированному id (CORE-007).
+//! открываются идемпотентно по детерминированному id и решаются один раз (CORE-007),
+//! расход модели по вызовам хранится в `usage` (CORE-113).
 
 mod blobs;
 mod effects;
@@ -14,11 +15,13 @@ mod events;
 mod migrate;
 mod reader;
 mod runs;
+mod usage;
 mod writer;
 
 pub use blobs::BLOB_THRESHOLD;
 pub use effects::{EffectRow, InterruptRow};
 pub use runs::{NewRun, Run};
+pub use usage::{UsageRow, UsageTotals};
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
@@ -102,6 +105,9 @@ pub enum StoreError {
     /// Повторное намерение или повторная квитанция того же эффекта.
     #[error("эффект {} уже записан", .0.0)]
     EffectConflict(EffectKey),
+    /// Прерывания с таким идентификатором нет.
+    #[error("прерывание {0} не найдено")]
+    UnknownInterrupt(String),
 }
 
 impl From<rusqlite::Error> for StoreError {

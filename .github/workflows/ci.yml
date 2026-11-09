@@ -18,7 +18,8 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      # v7 (последняя на 2026-11-09) работает на Node 24; v4 — на устаревшем Node 20.
+      - uses: actions/checkout@v7
       # С rustup 1.28 `rustup show` больше не ставит тулчейн; без аргументов
       # `rustup toolchain install` читает канал и компоненты из rust-toolchain.toml.
       - name: Тулчейн Rust

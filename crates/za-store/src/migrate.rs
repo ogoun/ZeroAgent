@@ -6,7 +6,10 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Миграции по возрастанию версии.
-const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_usage.sql")),
+];
 
 /// Последняя известная версия схемы.
 pub(crate) fn latest() -> u32 {
@@ -55,6 +58,7 @@ mod tests {
             "interrupts",
             "snapshots",
             "blobs",
+            "usage",
         ] {
             let n: i64 = c
                 .query_row(

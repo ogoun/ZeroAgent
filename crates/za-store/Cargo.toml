@@ -22,4 +22,6 @@ blake3.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+# Тест миграции готовит журнал версии 1 прямо в SQLite.
+rusqlite.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -45,6 +45,20 @@ pub mod pause_reason {
     pub const PROVIDER: &str = "provider";
     /// Дневной бюджет облачной группы исчерпан (RES-004, `QueueError::BudgetExhausted`).
     pub const BUDGET: &str = "budget";
+    /// Пауза по команде пользователя (`RunControl::pause`, Ctrl+C).
+    pub const COMMAND: &str = "command";
+    /// Модель спросила пользователя (`ask_user`), ждём ответа.
+    pub const NEEDS_INPUT: &str = "needs_input";
+    /// Вызов инструмента ждёт одобрения человека.
+    pub const NEEDS_APPROVAL: &str = "needs_approval";
+    /// Ждём внешнего результата или таймера.
+    pub const WAITING: &str = "waiting";
+    /// Внутренняя ошибка рантайма или модели, не относящаяся к провайдеру.
+    pub const INTERNAL: &str = "internal";
+    /// Контекст модели переполнен.
+    pub const CONTEXT: &str = "context";
+    /// Модель отказалась отвечать (`finish = Refusal` или фильтр содержимого).
+    pub const REFUSAL: &str = "refusal";
 }
 
 impl RunStatus {

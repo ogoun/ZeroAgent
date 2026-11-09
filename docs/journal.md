@@ -2,6 +2,13 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-09. R1-B1, задача 1: протокол и журнал цикла
+
+- **Миграция 0002** (`crates/za-store/migrations/0002_usage.sql`, `user_version` 2): таблица `usage` части 01, 5.2 — строка на каждый вызов модели (`model`, `input` с кэшем, `cached`, `output`, `reasoning`, `gpu_ms`, `cost_eq` в долларах, `ts`) и `seq` события `model.usage`. `ProjectStore::record_usage(run, row, payload)` пишет событие (actor `model`, payload как передан) и строку в одной транзакции писателя; `usage_totals(run)` — суммы для бюджетов (CORE-113, D19), неизвестные `gpu_ms`/`cost_eq` считаются нулём, run без вызовов — нули. Журнал версии 1 (R0) открывается и доводится до версии 2, старые события читаются (тест). Новой зависимости нет: `rusqlite` стал ещё и dev-зависимостью `za-store` (тест готовит журнал версии 1 напрямую).
+- **Прерывания.** `InterruptRow.response`; `interrupt(id)`; `resolve_interrupt(id, response)` — `open` → `resolved` с событием `interrupt.resolved {id, kind, response}` один раз, повтор — `Ok(false)` без события, неизвестный id — `StoreError::UnknownInterrupt`. `step_has_effects(run, step)` — есть ли эффекты с ключом `{run}:{step}:*` (двоеточие после шага отделяет шаг 3 от 30).
+- **Протокол.** Виды событий цикла D8: `model.delta`, `agent.heartbeat`, `turn.input`, `turn.finished`, `control.requested`, `control.applied`, `budget.exceeded`. Причины паузы D12: `command`, `needs_input`, `needs_approval`, `waiting`, `internal`, `context`, `refusal`. `RunMode` (kebab-case, по умолчанию `ask`, D14), `Tier` с `for_context` по D20 (меньше 32768 — `small`, меньше 65536 — `standard`, иначе `full`), `Budget`/`BudgetKind` (D19).
+- **CI.** `actions/checkout@v4` (Node 20, предупреждение GitHub) → `@v7` (последний релиз v7.0.1 от 2026-07-20, `node24`). Изменения v5–v7 (учётные данные в отдельном файле, запрет checkout fork PR для `pull_request_target`/`workflow_run`) наших триггеров `push`/`pull_request` не касаются. `Swatinem/rust-cache@v2` уже на `node24`, `taiki-e/install-action@v2` — composite.
+
 ## 2026-11-09. R1-A, финальный fix-раунд (final-review.md)
 
 - **I1. Ключ на `/slots`.** `LlamaSlots::with_secret` — save/restore идут с тем же `Authorization: Bearer`, что зонд и запрос модели (`Gateway` передаёт ключ эндпоинта, текст ошибки очищается `redact`). 401/403 на `/slots` (`ErrorClass::Auth`) — «не поддержано»: `slot_save = Some(false)` и одно предупреждение с причиной «llama-server отклонил ключ на /slots». Поддельный сервер тестов умеет требовать ключ (`FakeServer::start_with_bearer`).

@@ -201,3 +201,96 @@ async fn open_interrupt_is_idempotent_and_logged_once() {
         json!({"id": "unk-x", "kind": "unknown_outcome", "payload": {"a": 1}})
     );
 }
+
+#[tokio::test]
+async fn resolve_interrupt_once() {
+    let (s, run) = setup("resolve").await;
+    s.open_interrupt("appr-k", run, "approval", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.resolve_interrupt("appr-k", json!({"approved": true}))
+            .await,
+        Ok(true)
+    );
+    assert_eq!(
+        s.resolve_interrupt("appr-k", json!({"approved": false}))
+            .await,
+        Ok(false)
+    );
+    let row = s.interrupt("appr-k").await.unwrap().unwrap();
+    assert_eq!(row.status, "resolved");
+    assert_eq!(row.response, Some(json!({"approved": true})));
+    assert_eq!(row.run, run);
+    assert_eq!(s.interrupts(run).await.unwrap()[0].response, row.response);
+
+    let resolved: Vec<_> = s
+        .read_run(run, Seq(0), 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::InterruptResolved)
+        .collect();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].payload,
+        json!({"id": "appr-k", "kind": "approval", "response": {"approved": true}})
+    );
+
+    assert_eq!(
+        s.resolve_interrupt("nope", json!({})).await,
+        Err(StoreError::UnknownInterrupt("nope".into()))
+    );
+    assert_eq!(s.interrupt("nope").await, Ok(None));
+}
+
+#[tokio::test]
+async fn open_interrupt_has_no_response() {
+    let (s, run) = setup("open-no-response").await;
+    s.open_interrupt("input-k", run, "input", json!({"q": 1}))
+        .await
+        .unwrap();
+    let row = s.interrupt("input-k").await.unwrap().unwrap();
+    assert_eq!((row.status.as_str(), row.response), ("open", None));
+}
+
+#[tokio::test]
+async fn step_has_effects_by_prefix() {
+    let (s, run) = setup("step-prefix").await;
+    s.record_intent(
+        run,
+        &EffectKey::derive(run, 3, 0),
+        EffectClass::ReadOnly,
+        "read",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.step_has_effects(run, 3).await, Ok(true));
+    assert_eq!(s.step_has_effects(run, 4).await, Ok(false));
+    assert_eq!(s.step_has_effects(run, 30).await, Ok(false));
+    assert_eq!(s.step_has_effects(RunId::new(), 3).await, Ok(false));
+
+    // Двоеточие после шага: эффект шага 30 не делает шаг 3 «с эффектами».
+    let other = RunId::new();
+    s.create_run(NewRun {
+        id: other,
+        project_id: "p".into(),
+        parent_id: None,
+        role: RunRole::Top,
+        model_profile: None,
+    })
+    .await
+    .unwrap();
+    s.record_intent(
+        other,
+        &EffectKey::derive(other, 30, 0),
+        EffectClass::ReadOnly,
+        "read",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.step_has_effects(other, 3).await, Ok(false));
+    assert_eq!(s.step_has_effects(other, 30).await, Ok(true));
+}

@@ -1,10 +1,10 @@
 //! Эффекты (намерение и квитанция, CORE-002) и прерывания.
 //!
 //! Журнал — источник истины: каждая запись в `effects` или `interrupts`
-//! сопровождается событием (`effect.intent`, `effect.receipt`, `interrupt.opened`)
-//! в той же транзакции. Намерение `NonIdempotent`-эффекта фиксируется с
-//! `synchronous=FULL` (CORE-005): после `Ok` оно переживает отключение питания, и
-//! необратимое действие не повторится вслепую.
+//! сопровождается событием (`effect.intent`, `effect.receipt`, `interrupt.opened`,
+//! `interrupt.resolved`) в той же транзакции. Намерение `NonIdempotent`-эффекта
+//! фиксируется с `synchronous=FULL` (CORE-005): после `Ok` оно переживает отключение
+//! питания, и необратимое действие не повторится вслепую.
 //!
 //! Результат хранится в событии квитанции `{key, result}`. Результат длиннее
 //! [`BLOB_THRESHOLD`] байт канонического JSON уходит в blob: в событии остаётся
@@ -24,6 +24,11 @@ const RESULT_MIME: &str = "application/json";
 
 /// Статус только что открытого прерывания.
 const INTERRUPT_OPEN: &str = "open";
+/// Статус решённого прерывания.
+const INTERRUPT_RESOLVED: &str = "resolved";
+
+/// Столбцы прерывания в порядке [`interrupt_from`].
+const INTERRUPT_COLS: &str = "SELECT id, run_id, kind, status, payload, response FROM interrupts";
 
 /// Эффект, как он записан в журнале.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,9 +55,11 @@ pub struct InterruptRow {
     pub run: RunId,
     /// Вид, например `unknown_outcome`.
     pub kind: String,
-    /// Состояние; при открытии `open`.
+    /// Состояние: `open`, после решения `resolved`.
     pub status: String,
     pub payload: Option<Value>,
+    /// Решение человека или внешний результат; `None`, пока прерывание открыто.
+    pub response: Option<Value>,
 }
 
 impl ProjectStore {
@@ -247,37 +254,125 @@ impl ProjectStore {
     /// Прерывания run в порядке открытия.
     pub async fn interrupts(&self, run: RunId) -> Result<Vec<InterruptRow>, StoreError> {
         self.read(move |c| {
-            let mut stmt = c.prepare(
-                "SELECT id, run_id, kind, status, payload FROM interrupts \
-                 WHERE run_id = ?1 ORDER BY rowid",
-            )?;
-            let rows = stmt.query_map([id_sql(run)], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                ))
-            })?;
-            rows.map(|r| {
-                let (id, run_id, kind, status, payload) = r?;
-                let payload = payload
-                    .map(|p| serde_json::from_str(&p))
-                    .transpose()
-                    .map_err(|e| corrupt(&format!("payload прерывания {id}: {e}")))?;
-                Ok(InterruptRow {
-                    run: RunId(uuid(&run_id)?),
-                    id,
-                    kind,
-                    status,
-                    payload,
-                })
-            })
-            .collect()
+            let mut stmt = c.prepare(&format!(
+                "{INTERRUPT_COLS} WHERE run_id = ?1 ORDER BY rowid"
+            ))?;
+            let rows = stmt.query_map([id_sql(run)], raw_interrupt)?;
+            rows.map(|r| interrupt_from(r?)).collect()
         })
         .await
     }
+
+    /// Прерывание по id; `None`, если его нет.
+    pub async fn interrupt(&self, id: &str) -> Result<Option<InterruptRow>, StoreError> {
+        let id = id.to_owned();
+        self.read(move |c| {
+            c.query_row(
+                &format!("{INTERRUPT_COLS} WHERE id = ?1"),
+                [id],
+                raw_interrupt,
+            )
+            .optional()?
+            .map(interrupt_from)
+            .transpose()
+        })
+        .await
+    }
+
+    /// Переводит прерывание `open` в `resolved`, сохраняет `response` и пишет событие
+    /// `interrupt.resolved {id, kind, response}`.
+    ///
+    /// Уже решённое прерывание не меняется: `Ok(false)` без события (решение
+    /// принимается один раз). Неизвестный id — [`StoreError::UnknownInterrupt`].
+    pub async fn resolve_interrupt(&self, id: &str, response: Value) -> Result<bool, StoreError> {
+        let dir = self.dir();
+        let id = id.to_owned();
+        self.write(move |c| {
+            let (run_id, kind) = c
+                .query_row(
+                    "SELECT run_id, kind FROM interrupts WHERE id = ?1",
+                    [&id],
+                    |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::UnknownInterrupt(id.clone()))?;
+            let n = c.execute(
+                "UPDATE interrupts SET status = ?1, response = ?2 \
+                 WHERE id = ?3 AND status = ?4",
+                params![
+                    INTERRUPT_RESOLVED,
+                    canonical_json(&response),
+                    id,
+                    INTERRUPT_OPEN
+                ],
+            )?;
+            if n == 0 {
+                return Ok(false);
+            }
+            let run = RunId(uuid(&run_id)?);
+            let ev = json!({"id": id, "kind": kind, "response": response});
+            events::insert(
+                c,
+                &dir,
+                &runtime_event(run, EventKind::InterruptResolved, ev),
+            )?;
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Есть ли у run эффекты шага `step`, то есть с ключом `{run}:{step}:*`.
+    pub async fn step_has_effects(&self, run: RunId, step: u64) -> Result<bool, StoreError> {
+        // Двоеточие после номера шага отделяет шаг 3 от шага 30. В ключе только
+        // UUID, цифры и двоеточия, поэтому `%` и `_` в шаблоне не встречаются.
+        let pattern = format!("{run}:{step}:%");
+        self.read(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM effects WHERE run_id = ?1 AND effect_key LIKE ?2)",
+                params![id_sql(run), pattern],
+                |r| r.get::<_, bool>(0),
+            )?)
+        })
+        .await
+    }
+}
+
+/// Строка `interrupts` в исходном виде: id, run_id, kind, status, payload, response.
+type RawInterrupt = (
+    String,
+    Vec<u8>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+fn raw_interrupt(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawInterrupt> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+    ))
+}
+
+fn interrupt_from(raw: RawInterrupt) -> Result<InterruptRow, StoreError> {
+    let (id, run_id, kind, status, payload, response) = raw;
+    let parse = |v: Option<String>, what: &str| {
+        v.map(|p| serde_json::from_str(&p))
+            .transpose()
+            .map_err(|e| corrupt(&format!("{what} прерывания {id}: {e}")))
+    };
+    Ok(InterruptRow {
+        run: RunId(uuid(&run_id)?),
+        payload: parse(payload, "payload")?,
+        response: parse(response, "response")?,
+        id,
+        kind,
+        status,
+    })
 }
 
 /// Строка `effects` без результата.
