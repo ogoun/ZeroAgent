@@ -1,0 +1,18 @@
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1762650000,"id":"chatcmpl-Lq1","model":"qwen3-8b","system_fingerprint":"b7123-d05706b4","object":"chat.completion.chunk","prompt_progress":{"total":3000,"cache":0,"processed":1024,"time_ms":410}}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1762650000,"id":"chatcmpl-Lq1","model":"qwen3-8b","system_fingerprint":"b7123-d05706b4","object":"chat.completion.chunk","prompt_progress":{"total":3000,"cache":0,"processed":2048,"time_ms":820}}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1762650000,"id":"chatcmpl-Lq1","model":"qwen3-8b","system_fingerprint":"b7123-d05706b4","object":"chat.completion.chunk","prompt_progress":{"total":3000,"cache":0,"processed":3000,"time_ms":1190}}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"Нужно "}}],"created":1762650000,"id":"chatcmpl-Lq1","model":"qwen3-8b","system_fingerprint":"b7123-d05706b4","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"подумать."}}],"created":1762650000,"id":"chatcmpl-Lq1","model":"qwen3-8b","system_fingerprint":"b7123-d05706b4","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"Готово."}}],"created":1762650000,"id":"chatcmpl-Lq1","model":"qwen3-8b","system_fingerprint":"b7123-d05706b4","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":"stop","index":0,"delta":{}}],"created":1762650000,"id":"chatcmpl-Lq1","model":"qwen3-8b","system_fingerprint":"b7123-d05706b4","object":"chat.completion.chunk"}
+
+data: {"choices":[],"created":1762650000,"id":"chatcmpl-Lq1","model":"qwen3-8b","system_fingerprint":"b7123-d05706b4","object":"chat.completion.chunk","usage":{"completion_tokens":9,"prompt_tokens":3000,"total_tokens":3009,"prompt_tokens_details":{"cached_tokens":0}},"timings":{"cache_n":0,"prompt_n":3000,"prompt_ms":1190.0,"predicted_n":9,"predicted_ms":120.0}}
+
+data: [DONE]
+

@@ -40,6 +40,10 @@ required-features = ["http"]
 name = "sse"
 required-features = ["http"]
 
+[[test]]
+name = "chat_wire"
+required-features = ["http"]
+
 [dev-dependencies]
 axum.workspace = true
 http-body.workspace = true

@@ -145,6 +145,7 @@ impl HttpTransport {
             pending: VecDeque::new(),
             idle: self.timeouts.idle,
             ended: false,
+            unterminated: None,
         })
     }
 
@@ -267,6 +268,8 @@ pub struct SseResponse {
     idle: Duration,
     /// Поток кончился или дал ошибку: дальше только `Ok(None)`.
     ended: bool,
+    /// Событие из строки без конца строки, на которой кончилось тело.
+    unterminated: Option<SseEvent>,
 }
 
 impl SseResponse {
@@ -308,7 +311,11 @@ impl SseResponse {
                 Ok(Ok(None)) if self.parser.has_partial_line() => {
                     // Соединение закрылось посреди строки (ответ без chunked и без
                     // `Content-Length`): обрезанная строка — обрыв, а не событие.
+                    // Коннектор может забрать её через `take_unterminated`: строка
+                    // `data: [DONE]` без перевода строки — штатный конец потока.
+                    let partial = self.parser.finish();
                     self.end();
+                    self.unterminated = partial;
                     return Err(ModelError::new(
                         ErrorClass::StreamCut,
                         "стрим закрыт посреди строки SSE",
@@ -320,6 +327,13 @@ impl SseResponse {
                 }
             }
         }
+    }
+
+    /// Событие из последней строки без конца строки, если тело кончилось на ней
+    /// (после `StreamCut` от [`Self::next_event`]). Была ли это законченная строка
+    /// (`data: [DONE]`, финальный чанк провайдера) или обрезок, решает коннектор.
+    pub fn take_unterminated(&mut self) -> Option<SseEvent> {
+        self.unterminated.take()
     }
 
     /// Конец потока после ошибки: разборщик больше не опрашивается.

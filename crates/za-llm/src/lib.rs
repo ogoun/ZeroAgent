@@ -4,7 +4,8 @@
 //! провайдера (`caps`), таксономия ошибок (`error`), трейт `ModelPort` и стрим (`port`),
 //! детерминированная `ScriptedModel` для тестов (`scripted`), стабильный префикс
 //! промпта (`prefix`). Функция `http` добавляет транспорт, SSE и секреты (`http`)
-//! и зонды (`probe`), `gateway` — очередь и `Gateway` (включена по умолчанию).
+//! и зонды (`probe`), коннекторы (`wire`, внутренние, D38), `gateway` — очередь
+//! и `Gateway` (включена по умолчанию).
 
 pub mod caps;
 pub mod error;
@@ -16,6 +17,16 @@ pub mod prefix;
 pub mod probe;
 pub mod scripted;
 pub mod types;
+#[cfg(feature = "http")]
+pub(crate) mod wire;
+
+/// Коннекторы для интеграционных тестов крейта (D38). Не API: рабочий код пользуется
+/// моделью только через `Gateway`.
+#[cfg(feature = "http")]
+#[doc(hidden)]
+pub mod __test {
+    pub use crate::wire::*;
+}
 
 pub use caps::{
     BackendKind, CachedTokensField, ContextSource, PoolKind, ProviderCapabilities, ReasoningField,
