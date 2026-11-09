@@ -4,14 +4,19 @@
 //! llama-server и провайдер облака — axum в процессе теста (многопоточный runtime,
 //! пока основной поток ждёт бинарник). Облачных ключей и сети наружу нет.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::{Command, Output};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::Router;
+use axum::body::{Body, Bytes, HttpBody};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use http_body::Frame;
 use serde_json::{Value, json};
 
 /// Ключ, который не должен появиться ни в одном выводе.
@@ -20,11 +25,13 @@ const KEY: &str = "sk-test-xyz";
 /// Поддельный сервер: runtime живёт, пока жив сервер.
 struct Fake {
     base: String,
-    hits: Arc<AtomicUsize>,
+    /// Запросы `"<метод> <путь>"` в порядке поступления.
+    log: Arc<Mutex<Vec<String>>>,
     _rt: tokio::runtime::Runtime,
 }
 
-type Handler = fn(&Method, &str, &HeaderMap) -> Response;
+/// Обработчик; последний аргумент — сколько таких же запросов (метод и путь) было раньше.
+type Handler = fn(&Method, &str, &HeaderMap, usize) -> Response;
 
 impl Fake {
     fn start(handler: Handler) -> Self {
@@ -33,13 +40,19 @@ impl Fake {
             .enable_all()
             .build()
             .unwrap();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let counter = hits.clone();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let shared = log.clone();
         let app = Router::new().fallback(move |m: Method, uri: Uri, h: HeaderMap| {
-            let counter = counter.clone();
+            let shared = shared.clone();
             async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                handler(&m, uri.path(), &h)
+                let key = format!("{m} {}", uri.path());
+                let prior = {
+                    let mut l = shared.lock().unwrap();
+                    let n = l.iter().filter(|k| **k == key).count();
+                    l.push(key);
+                    n
+                };
+                handler(&m, uri.path(), &h, prior)
             }
         });
         let listener = rt
@@ -51,13 +64,23 @@ impl Fake {
         });
         Self {
             base: format!("http://{addr}"),
-            hits,
+            log,
             _rt: rt,
         }
     }
 
     fn hits(&self) -> usize {
-        self.hits.load(Ordering::SeqCst)
+        self.log.lock().unwrap().len()
+    }
+
+    /// Число запросов `"<метод> <путь>"`.
+    fn count(&self, key: &str) -> usize {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| *k == key)
+            .count()
     }
 }
 
@@ -78,7 +101,7 @@ fn sse_chunk(delta: Value) -> String {
 }
 
 /// llama-server: `/props`, `/apply-template`, `/slots/*`, стрим «Привет, мир».
-fn llama(m: &Method, path: &str, _: &HeaderMap) -> Response {
+fn llama(m: &Method, path: &str, _: &HeaderMap, _: usize) -> Response {
     match (m.as_str(), path) {
         ("GET", "/props") => json_reply(
             StatusCode::OK,
@@ -108,8 +131,50 @@ fn llama(m: &Method, path: &str, _: &HeaderMap) -> Response {
     }
 }
 
+/// Тело: один чанк, затем через 200 мс ошибка — сервер рвёт соединение посреди ответа.
+struct CutBody {
+    first: Option<Bytes>,
+    pause: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl HttpBody for CutBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        if let Some(b) = self.first.take() {
+            return Poll::Ready(Some(Ok(Frame::data(b))));
+        }
+        match self.pause.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(()) => Poll::Ready(Some(Err(std::io::Error::other("обрыв")))),
+        }
+    }
+}
+
+/// llama-server, у которого первый стрим обрывается после «Привет», второй — полный.
+fn llama_cut(m: &Method, path: &str, h: &HeaderMap, prior: usize) -> Response {
+    if (m.as_str(), path, prior) == ("POST", "/v1/chat/completions", 0) {
+        let mut body = sse_chunk(json!({"role": "assistant", "content": null}));
+        body.push_str(&sse_chunk(json!({"content": "Привет"})));
+        let body = CutBody {
+            first: Some(Bytes::from(body)),
+            pause: Box::pin(tokio::time::sleep(Duration::from_millis(200))),
+        };
+        return (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            Body::new(body),
+        )
+            .into_response();
+    }
+    llama(m, path, h, prior)
+}
+
 /// Провайдер, который возвращает ключ эхом в теле 401.
-fn echo_key(_: &Method, _: &str, h: &HeaderMap) -> Response {
+fn echo_key(_: &Method, _: &str, h: &HeaderMap, _: usize) -> Response {
     let key = h
         .get("x-api-key")
         .or_else(|| h.get(header::AUTHORIZATION))
@@ -426,4 +491,63 @@ fn config_syntax_error_does_not_leak_key() {
     assert_eq!(o.status.code(), Some(1), "{o:?}");
     let all = format!("{}{}", stdout(&o), stderr(&o));
     assert!(!all.contains(KEY) && all.contains("api_key"), "{all}");
+}
+
+/// Обрыв стрима после части текста (D20): вне терминала stdout — только итог последней
+/// попытки, без обрывка первой; в stderr — пометка повтора.
+#[test]
+fn ask_after_restart_prints_answer_once() {
+    let srv = Fake::start(llama_cut);
+    let e = env("ask_restart", &llama_config(&srv.base));
+    let o = e.run(&["ask", "--model", "local", "Поздоровайся"]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(stdout(&o), "Привет, мир", "{o:?}");
+    assert!(stderr(&o).contains("повтор"), "{o:?}");
+    assert_eq!(srv.count("POST /v1/chat/completions"), 2);
+}
+
+/// `LLAMA_URL` с учётными данными и параметром запроса: ни логина, ни пароля, ни
+/// параметра в выводе `doctor`.
+#[test]
+fn doctor_hides_llama_url_credentials() {
+    let srv = Fake::start(llama);
+    let url =
+        srv.base.replace("http://", &format!("http://user:{KEY}@")) + &format!("/?token={KEY}");
+    let e = env("doctor_url", "");
+    for args in [&["doctor"][..], &["doctor", "--json"]] {
+        let o = e.run_with(args, &[("LLAMA_URL", &url)]);
+        let all = format!("{}{}", stdout(&o), stderr(&o));
+        assert!(
+            !all.contains(KEY) && !all.contains("user"),
+            "{args:?}: {all}"
+        );
+    }
+}
+
+/// `doctor` с `LLAMA_URL` без `[models]` зондирует сервер один раз — как модель `local`.
+#[test]
+fn doctor_probes_llama_url_once() {
+    let srv = Fake::start(llama);
+    let e = env("doctor_once", "");
+    let o = e.run_with(&["doctor", "--json"], &[("LLAMA_URL", &srv.base)]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    let v = json_out(&o);
+    assert_eq!(v["llama"]["status"], "ok", "{v}");
+    assert_eq!(v["models"][0][0], "local", "{v}");
+    assert_eq!(srv.count("GET /props"), 1);
+}
+
+/// `resources` не ждёт зондов: у `probing` нет ложного срока. Сервер принимает
+/// соединение (очередь ОС) и не отвечает — зонд ещё идёт, когда вывод готов.
+#[test]
+fn resources_probing_has_no_deadline_text() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", silent.local_addr().unwrap());
+    let e = env("resources_probing", &llama_config(&base));
+    let o = e.run(&["resources"]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    let out = stdout(&o);
+    assert!(out.contains("probing: зонд идёт"), "{out}");
+    assert!(!out.contains("не завершён за"), "{out}");
+    drop(silent);
 }

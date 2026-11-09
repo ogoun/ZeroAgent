@@ -1086,7 +1086,7 @@ impl Inner {
                 .secrets
                 .get(k)
                 .map(Some)
-                .ok_or_else(|| inactive(&ep.cfg.id, &format!("ключ {k} не настроен"))),
+                .ok_or_else(|| inactive(&ep.cfg.id, &crate::http::missing_key_reason(k))),
         }
     }
 

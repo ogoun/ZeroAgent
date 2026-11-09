@@ -195,7 +195,7 @@ pub fn render(v: &ResourcesView) -> String {
         }
     }
     out.push_str("Модели\n");
-    for line in render_endpoints(&v.endpoints, &v.warnings).lines() {
+    for line in render_endpoints(&v.endpoints, &v.warnings, None).lines() {
         out.push_str(&format!("  {line}\n"));
     }
     out

@@ -31,3 +31,5 @@ tracing-subscriber.workspace = true
 # Поддельный llama-server в процессе теста `r1a_models` (axum на многопоточном runtime).
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "net", "time"] }
 axum.workspace = true
+# Тело ответа с обрывом посреди стрима (`Frame`) в тесте повтора `ask`.
+http-body.workspace = true

@@ -13,7 +13,7 @@ use serde::Serialize;
 use za_llm::EndpointView;
 use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query_nvidia_smi};
 
-use crate::config::load_config;
+use crate::config::{AgentConfig, AppConfigError, LLAMA_URL_ENDPOINT, load_config};
 use crate::models::{PROBE_WAIT, start_gateway, state_text};
 
 /// Переменная окружения с адресом `llama-server`.
@@ -102,8 +102,35 @@ impl DoctorReport {
 
 /// Собирает отчёт; `llama_url` — значение `LLAMA_URL`, `home` — `ZA_HOME` (`None` — не
 /// определён: GPU и модели не проверяются, `Warn`). Проверки идут параллельно.
+///
+/// Если эндпоинт `local` создан из `LLAMA_URL` (нет раздела `[models]`), сервер
+/// зондируется один раз — как модель, и строка `llama` повторяет её итог.
 pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
-    let (llama, (gpu, models)) = tokio::join!(check_llama(llama_url), check_home(home));
+    let cfg = home.map(load_config);
+    let covered = matches!(&cfg, Some(Ok(c)) if c.llama_url_fallback);
+    let llama = async {
+        if covered {
+            None
+        } else {
+            Some(check_llama(llama_url).await)
+        }
+    };
+    let (llama, (gpu, models)) = tokio::join!(llama, check_home(home, cfg));
+    let llama = llama.unwrap_or_else(|| {
+        let shown = llama_url.map(display_url).unwrap_or_default();
+        match models.iter().find(|(id, _)| id == LLAMA_URL_ENDPOINT) {
+            Some((_, Check::Ok(d))) => {
+                Check::Ok(format!("{shown}: модель {LLAMA_URL_ENDPOINT}, {d}"))
+            }
+            Some((_, Check::Warn(d))) => {
+                Check::Warn(format!("{shown}: модель {LLAMA_URL_ENDPOINT}, {d}"))
+            }
+            Some((_, Check::Fail(d))) => {
+                Check::Fail(format!("{shown}: модель {LLAMA_URL_ENDPOINT}, {d}"))
+            }
+            None => Check::Warn(format!("{shown}: модель {LLAMA_URL_ENDPOINT} не проверена")),
+        }
+    });
     DoctorReport {
         sqlite: check_sqlite(za_store::sqlite_library_version(), za_store::MIN_SQLITE),
         llama,
@@ -114,12 +141,15 @@ pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
 }
 
 /// GPU и модели по конфигурации `home`.
-async fn check_home(home: Option<&Path>) -> (Check, Vec<(String, Check)>) {
-    let Some(home) = home else {
+async fn check_home(
+    home: Option<&Path>,
+    cfg: Option<Result<AgentConfig, AppConfigError>>,
+) -> (Check, Vec<(String, Check)>) {
+    let (Some(home), Some(cfg)) = (home, cfg) else {
         let w = || Check::Warn("каталог данных не определён (ZA_HOME)".to_owned());
         return (w(), vec![("config".to_owned(), w())]);
     };
-    let cfg = match load_config(home) {
+    let cfg = match cfg {
         Ok(c) => c,
         Err(e) => {
             // Конфигурация не прочитана: GPU — по `nvidia-smi` из PATH.
@@ -185,7 +215,7 @@ pub fn check_endpoint(v: &EndpointView) -> Check {
         let model = v.model.as_deref().unwrap_or("модель не названа");
         Check::Ok(format!("ready: {model}{ctx}{slots}"))
     } else {
-        Check::Warn(state_text(v))
+        Check::Warn(state_text(v, Some(PROBE_WAIT)))
     }
 }
 
@@ -216,10 +246,20 @@ fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
 }
 
 /// Зонд `llama-server`: адрес не задан или сервер недоступен — `Warn`, не `Fail`.
+///
+/// Адрес печатается без учётных данных, параметров запроса и фрагмента
+/// ([`display_url`]); адрес с ними не зондируется: текст ошибки HTTP-клиента содержит
+/// адрес целиком.
 pub async fn check_llama(url: Option<&str>) -> Check {
     let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) else {
         return Check::Warn(format!("{LLAMA_URL_ENV} не задан, llama.cpp не проверялся"));
     };
+    let shown = display_url(url);
+    if shown != url {
+        return Check::Warn(format!(
+            "{shown}: {LLAMA_URL_ENV} с учётными данными или параметрами запроса не проверяется"
+        ));
+    }
     match za_llm::probe_llama(url).await {
         Ok(p) => {
             let model = if p.model.is_empty() {
@@ -237,9 +277,50 @@ pub async fn check_llama(url: Option<&str>) -> Check {
     }
 }
 
+/// Адрес для вывода: схема, хост, порт и путь — без `user:password@`, `?query` и
+/// `#fragment`.
+pub fn display_url(url: &str) -> String {
+    let url = url.trim();
+    let url = url.split(['?', '#']).next().unwrap_or("");
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (Some(s), r),
+        None => (None, url),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    match scheme {
+        Some(s) => format!("{s}://{host}{path}"),
+        None => format!("{host}{path}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_url_hides_credentials_and_query() {
+        assert_eq!(
+            display_url("http://u:sk-test-xyz@127.0.0.1:9/v1?key=sk-q#f"),
+            "http://127.0.0.1:9/v1"
+        );
+        assert_eq!(
+            display_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(display_url("sk-a@host:1/p"), "host:1/p");
+    }
+
+    #[tokio::test]
+    async fn llama_url_with_credentials_is_not_printed() {
+        let c = check_llama(Some("http://u:sk-test-xyz@127.0.0.1:9/?t=sk-q")).await;
+        assert!(matches!(c, Check::Warn(_)), "{c:?}");
+        assert!(!c.detail().contains("sk-"), "{c:?}");
+        assert!(c.detail().contains("http://127.0.0.1:9/"), "{c:?}");
+    }
 
     #[test]
     fn sqlite_minimum_is_inclusive() {

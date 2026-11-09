@@ -65,6 +65,15 @@ impl SecretSource for EnvSecrets {
     }
 }
 
+/// Причина «ключ не настроен» с именем переменной окружения (D4): имя переменной —
+/// не секрет, а пользователю сразу видно, что задать.
+pub fn missing_key_reason(key_ref: &str) -> String {
+    format!(
+        "ключ {key_ref} не настроен: задайте переменную {}",
+        secret_env_name(key_ref)
+    )
+}
+
 /// Имя переменной окружения ключа: `ZA_SECRET_` и `key_ref` в верхнем регистре,
 /// где `-` и любой другой символ вне `[A-Za-z0-9_]` заменён на `_`.
 /// `"open-router"` → `"ZA_SECRET_OPEN_ROUTER"`.

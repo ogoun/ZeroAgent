@@ -212,7 +212,7 @@ fn endpoint_secret(
         Some(k) => secrets
             .get(k)
             .map(Some)
-            .ok_or_else(|| format!("ключ {k} не настроен")),
+            .ok_or_else(|| crate::http::missing_key_reason(k)),
         None if ep.pool() == PoolKind::Cloud => Err(format!(
             "ключ не настроен: у облачного эндпоинта {} нет key_ref",
             ep.id

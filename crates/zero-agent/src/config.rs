@@ -28,6 +28,9 @@ pub struct AgentConfig {
     pub models: Option<ModelsConfig>,
     #[serde(default)]
     pub resources: ResourcesConfig,
+    /// `models` — запасной эндпоинт `local` из `LLAMA_URL`, а не раздел файла.
+    #[serde(skip)]
+    pub llama_url_fallback: bool,
 }
 
 /// Ошибка чтения конфигурации. Текст не содержит фрагментов исходника.
@@ -67,6 +70,7 @@ pub fn load_config_with(
         && let Some(url) = llama_url.map(str::trim).filter(|u| !u.is_empty())
     {
         cfg.models = Some(llama_url_models(url));
+        cfg.llama_url_fallback = true;
     }
     validate(&cfg)?;
     Ok(cfg)

@@ -15,6 +15,12 @@
 - **Живые тесты** `crates/za-llm/tests/live.rs` (`#[ignore]`, функция `gateway`): по тесту на llama.cpp, vLLM, OpenRouter, Anthropic, OpenAI Responses; вопрос с инструментом `echo`, проверка вызова (нативного или извлечённого `normalize`), `usage.input > 0`, у llama.cpp второй такой же запрос — `usage.cached > 0` (MDL-011). Без переменных тест печатает «пропущен».
 - **Ручная проверка на рабочей станции (2026-11-09).** `resources`: RTX 3090 — `всего 24576 МиБ, занято 5442 МиБ`, 9 томов с типом (`ssd`/`hdd`), категории `za_home`, `uv_cache`, `cargo_cache`; 1,4 с. `doctor`: `gpu ok`, без `LLAMA_URL` — `warn`, код 0; с `LLAMA_URL=http://127.0.0.1:8080` без сервера — `llama warn`, `local warn unreachable`, 2 с. `ask` к недоступному — код 1 с причиной. **llama-server на машине не запущен** (порт 8080 не отвечает, процесса нет), поэтому `models probe local` и `ask` на живой модели, `cargo test -p za-llm --test live -- --ignored` с `LLAMA_TEST_URL` и замеры (`n_ctx`, время до первого токена, доля кэша) не выполнены — остаются открытым пунктом приёмки R1-A; облачных ключей нет. Тесты `live` в режиме пропуска — 5 passed.
 - **ADR.** `docs/adr/0001-resources-crate-and-model-queue.md` (D1), `0002-gpu-metrics-via-nvidia-smi.md` (D6), `0003-own-json-schema-subset.md` (D5).
+- **Исправления после ревью (раунд 1).**
+  - M2: строка `llama` в `doctor` печатает `LLAMA_URL` без `user:password@`, `?query` и `#fragment` (`doctor::display_url`); адрес с учётными данными или параметрами не зондируется, потому что текст ошибки HTTP-клиента содержит адрес целиком.
+  - M3: если `local` создан из `LLAMA_URL` (`AgentConfig::llama_url_fallback`), сервер зондируется один раз — как модель, строка `llama` повторяет её итог.
+  - M7: `ask` вне терминала печатает в stdout только текст из `Finished` последней попытки. На терминале — по мере стрима, при `Restart` — перевод строки, пометка в stderr и ответ заново.
+  - M1: `resources` зондов не ждёт, поэтому `probing` там — «зонд идёт», без срока. Срок пишут только `models`, `ask` и `doctor`.
+  - M5: причина `inactive` без ключа называет переменную: «ключ anthropic не настроен: задайте переменную ZA_SECRET_ANTHROPIC» (`za_llm::http::missing_key_reason`, зонд и `Gateway`).
 
 ## 2026-11-09. R1-A, задача 15: `Gateway` — единственный путь к модели
 

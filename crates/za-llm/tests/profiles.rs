@@ -387,7 +387,7 @@ async fn cloud_without_key_is_inactive_and_silent() {
     assert_eq!(
         st,
         EndpointState::Inactive {
-            reason: "ключ anthropic не настроен".into()
+            reason: "ключ anthropic не настроен: задайте переменную ZA_SECRET_ANTHROPIC".into()
         }
     );
     assert_eq!(srv.total_requests(), 0);

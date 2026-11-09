@@ -7,9 +7,11 @@
 //!
 //! Коды выхода: `0` — успех; `1` — ошибка, в том числе ошибка модели, неготовая модель
 //! (`ask`, `models probe`) и ошибка конфигурации. Список `models` — успех при любом
-//! состоянии эндпоинтов. `ask` журнал не пишет: это проверочная команда.
+//! состоянии эндпоинтов. `ask` журнал не пишет: это проверочная команда. Вывод `ask`:
+//! на терминале — текст по мере стрима, при повторе (D20) — пометка в stderr и ответ
+//! заново с новой строки; вне терминала — только итог последней попытки.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -118,9 +120,14 @@ pub async fn wait_endpoint(g: &Gateway, id: &EndpointId, limit: Duration) -> Opt
 }
 
 /// Состояние эндпоинта одной строкой: `ready`, `inactive: <причина>`, `probing: …`.
-pub fn state_text(v: &EndpointView) -> String {
+/// `waited` — сколько команда ждала зонда; `None` — не ждала (`resources`), и у
+/// `probing` нет срока.
+pub fn state_text(v: &EndpointView, waited: Option<Duration>) -> String {
     match (v.state.as_str(), &v.reason) {
-        ("probing", _) => format!("probing: зонд не завершён за {} с", PROBE_WAIT.as_secs()),
+        ("probing", _) => match waited {
+            Some(w) => format!("probing: зонд не завершён за {} с", w.as_secs()),
+            None => "probing: зонд идёт".to_owned(),
+        },
         ("open", _) => "open: предохранитель открыт после серии отказов (MDL-016)".to_owned(),
         (s, Some(r)) => format!("{s}: {r}"),
         (s, None) => s.to_owned(),
@@ -145,8 +152,12 @@ fn pool_name(v: &EndpointView) -> String {
         .unwrap_or_default()
 }
 
-/// Таблица эндпоинтов для человека.
-pub fn render_endpoints(views: &[EndpointView], warnings: &[String]) -> String {
+/// Таблица эндпоинтов для человека; `waited` — как у [`state_text`].
+pub fn render_endpoints(
+    views: &[EndpointView],
+    warnings: &[String],
+    waited: Option<Duration>,
+) -> String {
     let mut out = String::new();
     if views.is_empty() {
         out.push_str(&format!("{}\n", CommandError::NoModels));
@@ -160,7 +171,7 @@ pub fn render_endpoints(views: &[EndpointView], warnings: &[String]) -> String {
             opt(v.context_tokens),
             opt(v.slots),
             opt(v.model.as_deref()),
-            state_text(v),
+            state_text(v, waited),
         ));
     }
     for w in warnings {
@@ -189,7 +200,7 @@ pub async fn cmd_models(home: &Path, json: bool) -> Result<ExitCode, CommandErro
         let v = json!({"endpoints": views, "warnings": warnings});
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
-        print!("{}", render_endpoints(&views, &warnings));
+        print!("{}", render_endpoints(&views, &warnings, Some(PROBE_WAIT)));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -301,7 +312,10 @@ pub async fn cmd_ask(home: &Path, args: AskArgs) -> Result<ExitCode, CommandErro
         return Err(SelectError::Unknown(id).into());
     };
     if !matches!(view.state.as_str(), "ready" | "open") {
-        eprintln!("zero-agent: модель {id} не готова: {}", state_text(&view));
+        eprintln!(
+            "zero-agent: модель {id} не готова: {}",
+            state_text(&view, Some(PROBE_WAIT))
+        );
         return Ok(ExitCode::FAILURE);
     }
     let call = ModelCall {
@@ -327,10 +341,14 @@ pub async fn cmd_ask(home: &Path, args: AskArgs) -> Result<ExitCode, CommandErro
         }
     };
     let mut out = std::io::stdout();
+    // На терминале текст идёт по мере стрима; при повторе (D20) — пометка и ответ
+    // заново с новой строки. Вне терминала (конвейер, файл) stdout получает только
+    // итог последней попытки — текст из `Finished`, без обрывков.
+    let live = out.is_terminal();
     let mut last_wait: Option<WaitState> = None;
     while let Some(ev) = stream.next().await {
         match ev {
-            Ok(StreamEvent::TextDelta(t)) => {
+            Ok(StreamEvent::TextDelta(t)) if live => {
                 let _ = out.write_all(t.as_bytes());
                 let _ = out.flush();
             }
@@ -348,9 +366,31 @@ pub async fn cmd_ask(home: &Path, args: AskArgs) -> Result<ExitCode, CommandErro
                 last_wait = Some(q.state);
             }
             Ok(StreamEvent::Restart { attempt, reason }) => {
-                eprintln!("\nzero-agent: повтор, попытка {attempt}: {reason}");
+                if live {
+                    let _ = out.write_all(b"\n");
+                    let _ = out.flush();
+                }
+                eprintln!(
+                    "zero-agent: повтор, попытка {attempt}: {reason}; ответ печатается заново"
+                );
             }
-            Ok(StreamEvent::Finished { finish, usage, .. }) => {
+            Ok(StreamEvent::Finished {
+                message,
+                finish,
+                usage,
+            }) => {
+                if !live {
+                    let text: String = message
+                        .parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            Part::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let _ = out.write_all(text.as_bytes());
+                    let _ = out.flush();
+                }
                 eprintln!(
                     "\nfinish: {}\nusage: {}",
                     serde_json::to_string(&finish)?,

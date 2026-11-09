@@ -1847,6 +1847,7 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "http-body",
  "serde",
  "serde_json",
  "thiserror",
