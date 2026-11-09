@@ -264,6 +264,73 @@ fn strict_only_for_compatible_schema() {
     assert_eq!(strict_of(bad), None);
     // Корень не объект.
     assert_eq!(strict_of(json!({"type": "string"})), None);
+    // Белый список ключей strict-режима (Structured Outputs).
+    let with_prop = |p: Value| {
+        json!({"type": "object", "properties": {"v": p}, "required": ["v"],
+               "additionalProperties": false})
+    };
+    let ok_sub = json!({"type": "object", "properties": {}, "additionalProperties": false});
+    assert_eq!(
+        strict_of(with_prop(
+            json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
+        )),
+        Some(json!(true))
+    );
+    assert_eq!(
+        strict_of(with_prop(
+            json!({"oneOf": [ok_sub.clone(), ok_sub.clone()]})
+        )),
+        None
+    );
+    assert_eq!(strict_of(with_prop(json!({"allOf": [ok_sub]}))), None);
+    assert_eq!(
+        strict_of(with_prop(json!({"type": "string", "not": {"const": "x"}}))),
+        None
+    );
+    assert_eq!(
+        strict_of(with_prop(
+            json!({"type": "string", "if": {"const": "a"}, "then": {"const": "a"}})
+        )),
+        None
+    );
+    assert_eq!(
+        strict_of(with_prop(
+            json!({"type": "object", "patternProperties": {"^x": {"type": "string"}},
+                                   "additionalProperties": false})
+        )),
+        None
+    );
+    // Кортежные `items` и подсхема без `type`/`$ref`/`anyOf`/`enum`/`const`.
+    assert_eq!(
+        strict_of(with_prop(
+            json!({"type": "array", "items": [{"type": "string"}]})
+        )),
+        None
+    );
+    assert_eq!(
+        strict_of(with_prop(json!({"description": "что угодно"}))),
+        None
+    );
+    assert_eq!(strict_of(with_prop(json!({}))), None);
+    // Корень `anyOf` и внешний `$ref`.
+    let mut root_any = with_prop(json!({"type": "string"}));
+    root_any["anyOf"] = json!([{"type": "object"}]);
+    assert_eq!(strict_of(root_any), None);
+    assert_eq!(
+        strict_of(with_prop(json!({"$ref": "https://example.com/s.json"}))),
+        None
+    );
+    // Вложенность объектов больше 10.
+    let mut deep = json!({"type": "string"});
+    for _ in 0..11 {
+        deep = with_prop(deep);
+    }
+    assert_eq!(strict_of(deep), None);
+    let mut deep = json!({"type": "string"});
+    for _ in 0..10 {
+        deep = with_prop(deep);
+    }
+    assert_eq!(strict_of(deep), Some(json!(true)));
 }
 
 #[test]
@@ -921,6 +988,42 @@ fn same_index_with_new_id_is_new_call() {
             ("f".to_owned(), json!({"x": 1})),
             ("g".to_owned(), json!({"y": 2})),
             ("h".to_owned(), json!({})),
+        ]
+    );
+}
+
+#[test]
+fn late_id_continues_the_same_call() {
+    let mut d = ChatDecoder::new(ChatDialect::Generic);
+    let mut evs = Vec::new();
+    for data in [
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"{\"x\":"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"real","function":{"arguments":"1}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"real","function":{"arguments":""}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"other","function":{"name":"g","arguments":"{}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ] {
+        evs.extend(d.on_event(&sse(data)).unwrap());
+    }
+    let starts = evs
+        .iter()
+        .filter(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+        .count();
+    assert_eq!(starts, 2, "{evs:?}");
+    let calls: Vec<(String, Value)> = final_message(&evs)
+        .parts
+        .into_iter()
+        .filter_map(|p| match p {
+            Part::ToolCall(c) => Some((c.name, c.arguments)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("f".to_owned(), json!({"x": 1})),
+            ("g".to_owned(), json!({})),
         ]
     );
 }

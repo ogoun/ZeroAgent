@@ -339,12 +339,48 @@ fn tools(req: &ChatRequest, strict: bool) -> Result<Value, ModelError> {
     Ok(Value::Array(out))
 }
 
-/// Схема совместима со strict-режимом OpenAI: корень — объект, и у каждого объекта
-/// (в `properties`, `items`, `$defs`, `definitions`, `anyOf`, `oneOf`, `allOf`)
-/// `additionalProperties: false`, а `required` перечисляет все ключи `properties`.
-/// Схема не переписывается: несовместимая уходит без `strict`.
+/// Ключи подсхемы, допустимые в strict-режиме OpenAI (Structured Outputs, «Supported
+/// schemas»): белый список. Любой другой ключ (`oneOf`, `allOf`, `not`, `if`/`then`/
+/// `else`, `patternProperties`, `dependent*`, `minLength` и т. п.) — схема несовместима.
+const STRICT_KEYS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "enum",
+    "const",
+    "anyOf",
+    "$defs",
+    "definitions",
+    "$ref",
+    "description",
+    "title",
+    "default",
+    "pattern",
+    "format",
+    "multipleOf",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minItems",
+    "maxItems",
+];
+
+/// Предел вложенности объектов в strict-режиме OpenAI.
+const STRICT_MAX_DEPTH: usize = 10;
+
+/// Схема совместима со strict-режимом OpenAI. Корень — объект (не `anyOf`). Во всех
+/// подсхемах только ключи [`STRICT_KEYS`]; у каждой есть `type`, `$ref` (локальный),
+/// `anyOf`, `enum` или `const`; у каждого объекта `additionalProperties: false`, а
+/// `required` перечисляет все ключи `properties`; `items` — одна схема, не кортеж;
+/// вложенность объектов не больше 10. Проверка консервативна: лишний отказ безопасен,
+/// схема просто уходит без `strict`. Схема не переписывается.
 fn strict_compatible_root(s: &Value) -> bool {
-    s.as_object().is_some_and(is_object_schema) && strict_compatible(s)
+    s.as_object()
+        .is_some_and(|m| is_object_schema(m) && !m.contains_key("anyOf"))
+        && strict_compatible(s, 1)
 }
 
 fn is_object_schema(m: &Map<String, Value>) -> bool {
@@ -356,19 +392,36 @@ fn is_object_schema(m: &Map<String, Value>) -> bool {
     typed || m.contains_key("properties")
 }
 
-fn strict_compatible(s: &Value) -> bool {
+/// `depth` — число объектов на пути от корня, включая этот.
+fn strict_compatible(s: &Value, depth: usize) -> bool {
     let Value::Object(m) = s else {
         return false;
     };
-    if is_object_schema(m) {
-        if m.get("additionalProperties") != Some(&Value::Bool(false)) {
+    if !m.keys().all(|k| STRICT_KEYS.contains(&k.as_str())) {
+        return false;
+    }
+    if !["type", "$ref", "anyOf", "enum", "const"]
+        .iter()
+        .any(|k| m.contains_key(*k))
+    {
+        return false;
+    }
+    if let Some(r) = m.get("$ref")
+        && !r.as_str().is_some_and(|r| r.starts_with('#'))
+    {
+        return false;
+    }
+    let object = is_object_schema(m);
+    if object {
+        if depth > STRICT_MAX_DEPTH || m.get("additionalProperties") != Some(&Value::Bool(false)) {
             return false;
         }
         let empty = Map::new();
-        let props = m
-            .get("properties")
-            .and_then(Value::as_object)
-            .unwrap_or(&empty);
+        let props = match m.get("properties") {
+            None => &empty,
+            Some(Value::Object(p)) => p,
+            Some(_) => return false,
+        };
         let required: HashSet<&str> = m
             .get("required")
             .and_then(Value::as_array)
@@ -379,30 +432,35 @@ fn strict_compatible(s: &Value) -> bool {
         if !props.keys().all(|k| required.contains(k.as_str())) {
             return false;
         }
-        if !props.values().all(strict_compatible) {
+        if !props.values().all(|p| strict_compatible(p, depth + 1)) {
             return false;
         }
     }
-    let nested_ok = |v: &Value| match v {
-        Value::Array(xs) => xs.iter().all(strict_compatible),
-        other => strict_compatible(other),
-    };
+    // Подсхемы `items` и `anyOf` — на том же уровне вложенности объектов.
     if let Some(items) = m.get("items")
-        && !nested_ok(items)
+        && !strict_compatible(items, depth)
     {
         return false;
     }
-    for k in ["$defs", "definitions"] {
-        if let Some(defs) = m.get(k).and_then(Value::as_object)
-            && !defs.values().all(strict_compatible)
-        {
+    if let Some(any) = m.get("anyOf") {
+        let Value::Array(xs) = any else {
+            return false;
+        };
+        if !xs.iter().all(|x| strict_compatible(x, depth)) {
             return false;
         }
     }
-    ["anyOf", "oneOf", "allOf"]
-        .into_iter()
-        .filter_map(|k| m.get(k))
-        .all(nested_ok)
+    for k in ["$defs", "definitions"] {
+        if let Some(defs) = m.get(k) {
+            let Value::Object(d) = defs else {
+                return false;
+            };
+            if !d.values().all(|x| strict_compatible(x, 1)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn tool_choice(req: &ChatRequest) -> Result<Value, ModelError> {
@@ -491,6 +549,17 @@ async fn pump(
     }
 }
 
+/// Начатый вызов инструмента в декодере.
+#[derive(Debug)]
+struct StartedCall {
+    /// `index` в событиях стрима.
+    index: u32,
+    /// Последний `id` провайдера (или запасной).
+    id: String,
+    /// `id` запасной: провайдер его ещё не прислал.
+    fallback: bool,
+}
+
 /// Декодер стрима Chat Completions: переводит чанки в [`StreamEvent`] и собирает
 /// итог. `Finished` — на `[DONE]` или по концу стрима после `finish_reason`.
 #[derive(Debug)]
@@ -501,8 +570,8 @@ pub struct ChatDecoder {
     /// Модель запроса: для `ReplayBlob` (`reasoning_details` OpenRouter).
     model: String,
     asm: MessageAssembler,
-    /// Начатые вызовы: `index` провайдера → (`index` события, `id`).
-    calls: BTreeMap<u32, (u32, String)>,
+    /// Начатые вызовы по `index` провайдера.
+    calls: BTreeMap<u32, StartedCall>,
     /// Индексы событий, уже занятые вызовами.
     used: BTreeSet<u32>,
     usage: Usage,
@@ -679,10 +748,21 @@ impl ChatDecoder {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
             // Новый `id` на уже начатом `index` — другой вызов: часть совместимых
-            // серверов шлёт все вызовы с `index: 0`.
-            let fresh = match self.calls.get(&provider_index) {
+            // серверов шлёт все вызовы с `index: 0`. Но если у вызова пока запасной
+            // `id`, первый пришедший `id` — его собственный, это продолжение.
+            let fresh = match self.calls.get_mut(&provider_index) {
                 None => true,
-                Some((_, cur)) => new_id.is_some_and(|i| i != cur),
+                Some(c) => match new_id {
+                    Some(i) if c.fallback => {
+                        // `ToolCallStart` уже ушёл с запасным `id`: он и остаётся
+                        // в сообщении, пришедший запоминается для сравнения дальше.
+                        c.id = i.to_owned();
+                        c.fallback = false;
+                        false
+                    }
+                    Some(i) => i != c.id,
+                    None => false,
+                },
             };
             let index = if fresh {
                 let index = if self.used.contains(&provider_index) {
@@ -692,7 +772,14 @@ impl ChatDecoder {
                 };
                 self.used.insert(index);
                 let id = new_id.map_or_else(|| fallback_id(index), str::to_owned);
-                self.calls.insert(provider_index, (index, id.clone()));
+                self.calls.insert(
+                    provider_index,
+                    StartedCall {
+                        index,
+                        id: id.clone(),
+                        fallback: new_id.is_none(),
+                    },
+                );
                 let name = f
                     .and_then(|f| f.get("name"))
                     .and_then(Value::as_str)
@@ -703,7 +790,7 @@ impl ChatDecoder {
             } else {
                 self.calls
                     .get(&provider_index)
-                    .map_or(provider_index, |c| c.0)
+                    .map_or(provider_index, |c| c.index)
             };
             if let Some(a) = f.and_then(|f| f.get("arguments")).and_then(Value::as_str)
                 && !a.is_empty()
