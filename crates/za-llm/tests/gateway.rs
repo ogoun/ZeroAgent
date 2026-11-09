@@ -1,7 +1,8 @@
 //! `Gateway` (задача 15): единственный путь к модели — зонды, очередь, слоты, повторы,
 //! предохранитель, защита от повтора после ошибки разбора, стоимость, выбор модели.
 //! Поддельный axum-сервер, реальное время с короткими параметрами `GatewayOptions` (D41),
-//! облачных ключей нет.
+//! облачных ключей нет. Все длительности теста умножаются на `ZA_TEST_TIME_SCALE`
+//! (по умолчанию 1, в CI 4): запас для медленного раннера без изменения соотношений.
 
 mod support;
 
@@ -51,8 +52,14 @@ fn secrets(pairs: &[(&str, &str)]) -> Arc<dyn SecretSource> {
     ))
 }
 
+/// Миллисекунды с множителем `ZA_TEST_TIME_SCALE` ([`support::time_scale`]).
 fn ms(n: u64) -> Duration {
-    Duration::from_millis(n)
+    support::scaled(Duration::from_millis(n))
+}
+
+/// Секунды с множителем `ZA_TEST_TIME_SCALE`.
+fn secs(n: u64) -> Duration {
+    support::scaled(Duration::from_secs(n))
 }
 
 /// D41: повторы 1–5 мс, таймауты 500 мс, пауза предохранителя 50 мс.
@@ -74,7 +81,7 @@ fn opts() -> GatewayOptions {
             cooldown: ms(50),
             ..BreakerOptions::default()
         },
-        probe_deadline: Duration::from_secs(2),
+        probe_deadline: secs(2),
         reprobe_min: DEFAULT_REPROBE_MIN,
         reprobe_max: DEFAULT_REPROBE_MAX,
     }
@@ -90,7 +97,7 @@ fn opts_no_retry() -> GatewayOptions {
 /// Долгий idle: зависший стрим держит место, пока тест его не отпустит.
 fn opts_long_idle() -> GatewayOptions {
     let mut o = opts();
-    o.timeouts_local.idle = Duration::from_secs(30);
+    o.timeouts_local.idle = secs(30);
     o
 }
 
@@ -134,7 +141,7 @@ fn hang_after_first() -> Reply {
     chunks.extend(ev[2..].iter().cloned());
     Reply::Sse {
         chunks,
-        delay: Duration::from_secs(10),
+        delay: secs(10),
         cut_after: None,
         then_hang: false,
     }
@@ -164,10 +171,7 @@ async fn started(
     o: GatewayOptions,
 ) -> Result<Gateway, ConfigError> {
     let g = Gateway::start(cfg, secrets, admission, store, o).await?;
-    assert!(
-        g.wait_probed(Duration::from_secs(5)).await,
-        "зонды не завершены"
-    );
+    assert!(g.wait_probed(secs(5)).await, "зонды не завершены");
     Ok(g)
 }
 
@@ -204,10 +208,10 @@ fn call_on(ep: &str, run: RunId, text: &str) -> ModelCall {
     }
 }
 
-/// Все события стрима до закрытия канала (не дольше 10 с).
+/// Все события стрима до закрытия канала (не дольше 10 с × множитель).
 async fn drain(mut s: ModelStream) -> Vec<Ev> {
     let mut out = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(secs(10), async {
         while let Some(ev) = s.next().await {
             out.push(ev);
         }
@@ -690,7 +694,7 @@ async fn drop_stream_releases_slot_and_cancels_http_body(name: &str) {
     }
     drop(s);
     assert!(
-        eventually(Duration::from_secs(2), || srv.disconnects(CHAT) == 1).await,
+        eventually(secs(2), || srv.disconnects(CHAT) == 1).await,
         "соединение не закрыто"
     );
     let evs = drain(
@@ -763,7 +767,7 @@ async fn cancel_run_drops_waiting_requests_body(name: &str) {
             .all(|gr| gr.waiting.iter().all(|w| w.run_id != run))
     );
     // `Started` уходит до отправки запроса: на многопоточном runtime он доходит позже.
-    assert!(eventually(Duration::from_secs(2), || srv.requests(CHAT).len() == 1).await);
+    assert!(eventually(secs(2), || srv.requests(CHAT).len() == 1).await);
     tokio::time::sleep(ms(50)).await;
     assert_eq!(srv.requests(CHAT).len(), 1);
     drop(holder);
@@ -796,7 +800,7 @@ async fn cancel_run_stops_running_request() {
     let err = s.collect().await.unwrap_err();
     assert_eq!(err.class, ErrorClass::Cancelled);
     assert!(
-        eventually(Duration::from_secs(2), || srv.disconnects(CHAT) == 1
+        eventually(secs(2), || srv.disconnects(CHAT) == 1
             && g.view().queue.groups[0].active == 0)
         .await
     );
@@ -839,9 +843,7 @@ async fn reprobe_after_stream_cut_picks_new_bundle() {
         .unwrap_err();
     assert_eq!(err.class, ErrorClass::StreamCut);
     assert!(
-        eventually(Duration::from_secs(2), || view_of(&g, "local")
-            .model
-            .as_deref()
+        eventually(secs(2), || view_of(&g, "local").model.as_deref()
             == Some(MODEL_B))
         .await,
         "профиль не обновлён повторным зондом"
@@ -852,10 +854,7 @@ async fn reprobe_after_stream_cut_picks_new_bundle() {
             .and_then(|f| st.load(&f.bundle_key))
             .is_some_and(|p| p.bundle.model == MODEL_B)
     };
-    assert!(
-        eventually(Duration::from_secs(2), stored_b).await,
-        "профиль B не сохранён"
-    );
+    assert!(eventually(secs(2), stored_b).await, "профиль B не сохранён");
     assert_eq!(srv.requests(PROPS).len(), 2);
 }
 
@@ -1127,7 +1126,7 @@ async fn slot_save_unsupported_is_recorded() {
     assert_eq!(srv.total_requests() - before, 2);
     assert_eq!(srv.requests(CHAT).len(), 1);
     assert!(
-        eventually(Duration::from_secs(2), || st
+        eventually(secs(2), || st
             .load_endpoint(&id("local"))
             .is_some_and(|f| f.slot_save == Some(false)))
         .await,
@@ -1203,11 +1202,13 @@ async fn until_started(s: &mut ModelStream) -> Option<u32> {
 
 #[tokio::test]
 async fn start_returns_without_waiting_for_probes() {
-    // I3: облако не отвечает вовсе, локальный сервер отвечает через 1,5 с.
+    // I3: облако не отвечает вовсе, локальный сервер отвечает через 3 с. Длительности
+    // здесь без множителя: каждый запрос зонда ограничен 5 с (`probe::TOTAL_TIMEOUT`,
+    // константа кода), задержка сервера должна оставаться под этим пределом.
     let cloud = FakeServer::start(vec![("GET /models", vec![Reply::Hang])]).await;
     let local = llama_server(
         vec![Reply::Delayed(
-            ms(1500),
+            Duration::from_millis(3000),
             Box::new(props("probe/llama_props.json")),
         )],
         vec![llama_text()],
@@ -1222,7 +1223,7 @@ async fn start_returns_without_waiting_for_probes() {
         ]
     }));
     let mut o = opts();
-    o.probe_deadline = ms(2500);
+    o.probe_deadline = Duration::from_millis(4500);
     let t0 = Instant::now();
     let g = Gateway::start(
         cfg,
@@ -1234,7 +1235,7 @@ async fn start_returns_without_waiting_for_probes() {
     .await
     .unwrap();
     assert!(
-        t0.elapsed() < ms(1000),
+        t0.elapsed() < Duration::from_millis(2000),
         "start ждал зонды: {:?}",
         t0.elapsed()
     );
@@ -1255,11 +1256,7 @@ async fn start_returns_without_waiting_for_probes() {
     assert!(matches!(evs.last(), Some(Ok(StreamEvent::Finished { .. }))));
     assert_eq!(local.requests(PROPS).len(), 1);
     // Общий предел зонда облака → Unreachable.
-    assert!(
-        eventually(Duration::from_secs(5), || view_of(&g, "cloud").state
-            == "unreachable")
-        .await
-    );
+    assert!(eventually(secs(10), || view_of(&g, "cloud").state == "unreachable").await);
     assert!(g.wait_probed(ms(100)).await);
 }
 
@@ -1283,7 +1280,7 @@ async fn reprobe_without_changes_keeps_slot_map() {
         started_slot(&drain(g.stream(session_call(Some("b"), "два")).await.unwrap()).await);
     assert!(slot_a.is_some() && slot_b.is_some() && slot_a != slot_b);
     assert!(
-        eventually(Duration::from_secs(2), || st
+        eventually(secs(2), || st
             .load_endpoint(&id("local"))
             .is_some_and(|f| f.slot_save == Some(false)))
         .await
@@ -1484,7 +1481,7 @@ async fn slot_auth_failure_disables_slot_save() {
     c.meta.session = Some("sess-1".into());
     g.stream(c.clone()).await.unwrap().collect().await.unwrap();
     assert!(
-        eventually(Duration::from_secs(2), || st
+        eventually(secs(2), || st
             .load_endpoint(&id("local"))
             .is_some_and(|f| f.slot_save == Some(false)))
         .await,
@@ -1622,7 +1619,7 @@ async fn drain_timed(s: ModelStream) -> (Option<Instant>, Vec<Ev>) {
     let mut s = s;
     let mut started = None;
     let mut out = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(secs(10), async {
         while let Some(ev) = s.next().await {
             if started.is_none() && matches!(ev, Ok(StreamEvent::Started { .. })) {
                 started = Some(Instant::now());
@@ -1697,7 +1694,10 @@ async fn probe_wait_keeps_priority_and_aging() {
         })
         .max()
         .unwrap_or(0);
-    assert!(waited >= 500, "waited_ms Job: {waited}");
+    assert!(
+        u128::from(waited) >= ms(500).as_millis(),
+        "waited_ms Job: {waited}"
+    );
 }
 
 #[tokio::test]

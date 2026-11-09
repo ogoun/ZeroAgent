@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -22,6 +22,27 @@ use axum::response::Response;
 use http_body::Frame;
 use serde_json::Value;
 use tokio::sync::mpsc;
+
+/// Множитель времени тестов в реальном времени: `ZA_TEST_TIME_SCALE` (целое 1–8,
+/// по умолчанию 1; в CI — 4). Умножаются все длительности теста — пределы ожидания,
+/// таймауты, паузы сервера и окна проверок, — поэтому их соотношения не меняются, а
+/// запас на медленной машине растёт. Предел 8: задержки поддельного сервера при зонде
+/// (до 600 мс) должны оставаться под пределом запроса зонда в коде (5 с), который
+/// множитель не меняет.
+pub fn time_scale() -> u32 {
+    static SCALE: OnceLock<u32> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("ZA_TEST_TIME_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(1, |n| n.clamp(1, 8))
+    })
+}
+
+/// Длительность с множителем [`time_scale`].
+pub fn scaled(d: Duration) -> Duration {
+    d * time_scale()
+}
 
 /// Ответ поддельного сервера.
 #[derive(Debug, Clone)]

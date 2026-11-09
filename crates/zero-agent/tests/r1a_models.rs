@@ -211,10 +211,16 @@ impl Env {
     }
 
     /// Запуск бинарника; `LLAMA_URL`, `ZA_LOG`, `RUST_LOG` и ключи окружения тестов не
-    /// наследуются.
+    /// наследуются. Кэши cargo и uv (категории данных монитора) — пустые каталоги
+    /// внутри теста: время первого замера не зависит от размера кэшей машины или CI.
     fn run_with(&self, args: &[&str], vars: &[(&str, &str)]) -> Output {
+        let caches = self.home.with_extension("caches");
+        let _ = std::fs::create_dir_all(caches.join("cargo"));
+        let _ = std::fs::create_dir_all(caches.join("uv"));
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_zero-agent"));
         cmd.args(args)
+            .env("CARGO_HOME", caches.join("cargo"))
+            .env("UV_CACHE_DIR", caches.join("uv"))
             .env("ZA_HOME", &self.home)
             .env_remove("LLAMA_URL")
             .env_remove("ZA_LOG")
