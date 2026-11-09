@@ -1,7 +1,8 @@
 //! Проверка политики зависимостей и архитектуры: `cargo xtask policy`.
 //!
 //! Правила: только crates.io в `Cargo.lock`, запрет перечисленных
-//! агентных фреймворков, направление зависимостей между `za-*`,
+//! агентных фреймворков, направление зависимостей между `za-*`
+//! (`za-res` — только от `za-protocol`, `za-core` — `za-llm` без функций по умолчанию),
 //! лимит размера `za-core` (ARC-011).
 
 use std::fmt;
@@ -16,6 +17,8 @@ const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const FORBIDDEN_PACKAGES: &[&str] = &["rig-core", "adk-rust", "autoagents"];
 /// Крейты, от которых `za-core` зависеть не должен.
 const CORE_FORBIDDEN_DEPS: &[&str] = &["za-server", "za-peer", "za-browser"];
+/// Единственный крейт `za-*`, от которого может зависеть `za-res` (D1).
+const RES_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol"];
 
 /// Нарушение политики.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +45,16 @@ pub struct Package {
 #[derive(Debug, Deserialize)]
 pub struct Dependency {
     pub name: String,
+    /// `default-features` зависимости; в `cargo metadata` поле есть всегда.
+    #[serde(default = "default_true")]
+    pub uses_default_features: bool,
+    /// `None` — обычная зависимость, иначе `"dev"` или `"build"`.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Проверяет источники и имена пакетов в тексте `Cargo.lock`.
@@ -88,6 +101,27 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     "za-core не должен зависеть от {}",
                     dep.name
                 )));
+            }
+            // Все виды, включая dev: `za-llm` сам зависит от `za-res` (D1).
+            if pkg.name == "za-res"
+                && dep.name.starts_with("za-")
+                && !RES_ALLOWED_ZA_DEPS.contains(&dep.name.as_str())
+            {
+                out.push(Violation(format!(
+                    "za-res не должен зависеть от {} (допустим только za-protocol)",
+                    dep.name
+                )));
+            }
+            // Только то, что попадает в сборку ядра: dev-зависимости тестов не в счёт.
+            if pkg.name == "za-core"
+                && dep.name == "za-llm"
+                && dep.kind.as_deref() != Some("dev")
+                && dep.uses_default_features
+            {
+                out.push(Violation(
+                    "za-core подключает za-llm с функциями по умолчанию (нужно default-features = false)"
+                        .into(),
+                ));
             }
             if pkg.name == "za-protocol" && dep.name.starts_with("za-") {
                 out.push(Violation(format!(
@@ -216,13 +250,61 @@ version = \"0.0.1\"
             .is_empty()
         );
     }
-    fn meta(name: &str, dep: &str) -> Metadata {
+    fn dep(name: &str) -> Dependency {
+        Dependency {
+            name: name.into(),
+            uses_default_features: true,
+            kind: None,
+        }
+    }
+    fn meta_with(name: &str, dep: Dependency) -> Metadata {
         Metadata {
             packages: vec![Package {
                 name: name.into(),
-                dependencies: vec![Dependency { name: dep.into() }],
+                dependencies: vec![dep],
             }],
         }
+    }
+    fn meta(name: &str, d: &str) -> Metadata {
+        meta_with(name, dep(d))
+    }
+    #[test]
+    fn res_must_not_depend_on_llm() {
+        assert_eq!(check_direction(&meta("za-res", "za-llm")).len(), 1);
+        assert_eq!(check_direction(&meta("za-res", "za-store")).len(), 1);
+        let dev = Dependency {
+            kind: Some("dev".into()),
+            ..dep("za-llm")
+        };
+        assert_eq!(check_direction(&meta_with("za-res", dev)).len(), 1);
+        assert!(check_direction(&meta("za-res", "za-protocol")).is_empty());
+        assert!(check_direction(&meta("za-res", "sysinfo")).is_empty());
+    }
+    #[test]
+    fn core_uses_llm_without_defaults() {
+        assert_eq!(check_direction(&meta("za-core", "za-llm")).len(), 1);
+        let no_defaults = Dependency {
+            uses_default_features: false,
+            ..dep("za-llm")
+        };
+        assert!(check_direction(&meta_with("za-core", no_defaults)).is_empty());
+        let dev = Dependency {
+            kind: Some("dev".into()),
+            ..dep("za-llm")
+        };
+        assert!(check_direction(&meta_with("za-core", dev)).is_empty());
+    }
+    #[test]
+    fn metadata_dependency_fields_are_parsed() {
+        let json = r#"{"packages":[{"name":"za-core","dependencies":[
+            {"name":"za-llm","uses_default_features":false,"kind":null},
+            {"name":"tokio","uses_default_features":true,"kind":"dev"}]}]}"#;
+        let m: Metadata = serde_json::from_str(json).unwrap();
+        let deps = &m.packages[0].dependencies;
+        assert!(!deps[0].uses_default_features);
+        assert_eq!(deps[0].kind, None);
+        assert_eq!(deps[1].kind.as_deref(), Some("dev"));
+        assert!(check_direction(&m).is_empty());
     }
     #[test]
     fn core_must_not_depend_on_server() {

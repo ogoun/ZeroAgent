@@ -6,3 +6,5 @@ crates/za-llm/tests/golden/*.hash -text
 crates/zero-agent/tests/golden/*.hash -text
 # Записанные ответы провайдеров (SSE с CRLF и т. п.): байты не трогать.
 crates/za-llm/tests/fixtures/** -text
+# Вывод nvidia-smi (CRLF под Windows): байты не трогать.
+crates/za-res/tests/fixtures/** -text
