@@ -49,7 +49,7 @@ pub use control::{ControlRx, InputMode, RunControl, control_channel, submit_inpu
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted, cut_points, split_tail};
 pub use detect::{
     CYCLE_NUDGE, Degenerate, DetectorState, REPEAT_MARK, REPEAT_NUDGE, REPEAT_REJECT, Reaction,
-    StreamWatch, THINKING_TIMEOUT, call_fingerprint, retry_params,
+    StreamWatch, THINKING_TIMEOUT, call_fingerprint, retry_params, thinking_timeout,
 };
 pub use driver::{CrashHook, CrashPoint, LoopDeps, LoopError, LoopOutcome, RunSpec, start_run};
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};

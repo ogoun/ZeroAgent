@@ -43,7 +43,7 @@ use za_core::{
 };
 use za_llm::{
     BoxFuture, EndpointId, ErrorClass, FinishReason, ModelCall, ModelPort, Part, ReasoningMode,
-    RequestMeta, Sampling, ToolChoice,
+    RequestMeta, ToolChoice,
 };
 use za_protocol::{
     Actor, BlobHash, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId,
@@ -54,13 +54,14 @@ use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 use crate::budget::{Spent, budget_number, check_budget};
 use crate::context::{
     CompactInput, ContextBudget, ContextConfig, Estimate, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES,
-    SpillCfg, UserInput, compact, output_plan, prune, recite_task, rubric_tokens,
+    SpillCfg, UserInput, compact, output_plan, prune, recite_task, rubric_tokens, thinking_budget,
     truncation_suspected,
 };
 use crate::control::ControlRx;
 use crate::conversation::{Conversation, HistoryError};
 use crate::detect::{
     CYCLE_NUDGE, DetectorState, REPEAT_MARK, REPEAT_REJECT, Reaction, StreamWatch, retry_params,
+    thinking_timeout,
 };
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
@@ -76,7 +77,7 @@ use crate::state::{AtBoundary, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools};
 use crate::turn::{
     CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed, Signal,
-    TurnError, TurnOutput, model_turn_with, report_parse_errors, review,
+    TurnError, TurnOutput, model_turn_with, output_tps, report_parse_errors, review,
 };
 
 /// Точки «сбоя» для тестов и --crash-at (D33).
@@ -1554,28 +1555,29 @@ async fn context_alert(j: &Journal, run: RunId, payload: Value) -> Result<Seq, S
 
 // ---- Узел model ----
 
-/// Узел `model`: ход модели. `ContextOverflow` первой попытки (D49) — исход
-/// `overflow`, аварийная компакция и один повтор хода в том же шаге (тот же `turn`,
-/// `turn_attempt = 1`, `steps += 1` — D67, D69). Снимка после компакции нет: сбой до
-/// конца шага реплеит его со снимка `Model` по квитанциям к той же истории.
+/// Узел `model`: ход модели. `ContextOverflow` (D49), если аварийной компакции на этом
+/// шаге ещё не было, — исход `overflow`, аварийная компакция и повтор хода в том же шаге
+/// (тот же `turn`, `turn_attempt` и `steps` растут — D67, D69). Снимка после компакции
+/// нет: сбой до конца шага реплеит его со снимка `Model` по квитанциям к той же истории.
 ///
 /// Детекторы стрима (D58, D59): обрыв (`TurnError::Degenerate`) — исход `degenerate` с
 /// полем `detector`, `loop.detected {action: "retry"}` и повтор хода в том же шаге с
-/// параметрами [`retry_params`] (история та же, `turn` тот же, `turn_attempt` и
-/// `steps` растут, D69); второе срабатывание в шаге — `loop.detected {action: "pause"}`
-/// и пауза `model_loop`. Реплей получает обрыв из квитанции и повторяет то же решение.
+/// реакцией [`Reaction::RetryTurn`] из [`retry_params`] (история и `turn` те же); второе
+/// срабатывание в шаге — `loop.detected {action: "pause"}` и пауза `model_loop`. Реплей
+/// получает обрыв из квитанции и повторяет то же решение. Любой повтор хода сначала
+/// проверяет бюджет шагов: исчерпан — `blocked_on_budget` вместо повтора (Ruling minor
+/// ревью задачи 7).
 async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopError> {
     let deps = &sh.deps;
     let mut attempt = 0;
-    // Параметры повтора после обрыва детектором (D58, D59): выборка и мышление.
-    let mut retry: Option<(Sampling, Option<ReasoningMode>)> = None;
+    // Аварийная компакция уже была на этом шаге (D49: одна на шаг).
+    let mut emergency_done = false;
+    // Повтор после обрыва детектором (D58, D59): `Reaction::RetryTurn`.
+    let mut retry: Option<Reaction> = None;
     loop {
         let mut opts = turn_options(st);
-        if let Some((sampling, reasoning)) = &retry {
-            opts.sampling = sampling.clone();
-            if let Some(r) = reasoning {
-                opts.reasoning = Some(r.clone());
-            }
+        if let Some(r) = &retry {
+            apply_retry(st, &mut opts, r);
         }
         let call = ModelCall {
             endpoint: st.setup.endpoint.clone(),
@@ -1593,7 +1595,7 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             prefix: st.frozen.prefix_hash.clone(),
             prompt_version: st.frozen.prompt_version.clone(),
         };
-        let mut watch = StreamWatch::new(&call.request.reasoning);
+        let mut watch = stream_watch(st, &call.request.reasoning);
         let r = model_turn_with(
             &mut st.ctx,
             &deps.journal,
@@ -1623,8 +1625,9 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         }
         match r {
             Err(TurnError::Model { error, .. })
-                if error.class == ErrorClass::ContextOverflow && attempt == 0 =>
+                if error.class == ErrorClass::ContextOverflow && !emergency_done =>
             {
+                emergency_done = true;
                 tracing::warn!(run = %st.run, turn = st.turn, error = %error,
                     "запрос хода не поместился в окно: аварийная компакция и повтор");
                 turn_finished(deps, st, "overflow", None).await?;
@@ -1641,6 +1644,9 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
                 // повтора нет (D43).
                 st.meter.last_estimate = None;
                 st.meter.last_floor = None;
+                if let Some(t) = retry_over_budget(deps, st).await? {
+                    return Ok(t);
+                }
                 st.counters.steps += 1;
                 attempt += 1;
             }
@@ -1653,16 +1659,73 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
                     loop_detected(deps, st, name, "pause").await?;
                     return clean_pause(deps, st, LoopExit::Paused(pause_reason::MODEL_LOOP)).await;
                 }
+                if let Some(t) = retry_over_budget(deps, st).await? {
+                    return Ok(t);
+                }
                 tracing::warn!(run = %st.run, turn = st.turn, detector = name,
                     "стрим хода оборван детектором: повтор хода");
                 loop_detected(deps, st, name, "retry").await?;
-                retry = Some(retry_params(d, &opts.sampling));
+                let (sampling, reasoning) = retry_params(d, &opts.sampling);
+                retry = Some(Reaction::RetryTurn {
+                    sampling,
+                    reasoning,
+                });
                 // Повтор — тот же ход: `empty_turns` не меняется, шаг бюджета — новый (D69).
                 st.counters.steps += 1;
                 attempt += 1;
             }
             r => return model_result(sh, st, r, &call).await,
         }
+    }
+}
+
+/// Наблюдатель стрима хода (D58, D59). Дедлайн рассуждения — [`thinking_timeout`] от
+/// бюджета мышления хода (у `Off` — `output_reserve`, Ruling I-2 ревью задачи 7) и
+/// последней скорости вывода run (`Counters.output_tps`; профиль эндпоинта скорости не
+/// несёт, поэтому без неё — 10 ток/с).
+fn stream_watch(st: &LoopState, reasoning: &ReasoningMode) -> StreamWatch {
+    let budget = match thinking_budget(reasoning) {
+        0 => ContextBudget::for_context(st.setup.n_ctx).output_reserve,
+        n => n,
+    };
+    StreamWatch::new(reasoning).with_timeout(thinking_timeout(budget, st.counters.output_tps))
+}
+
+/// Параметры повтора хода (`Reaction::RetryTurn`, D58, D59). Повтор без мышления берёт
+/// лимит вывода `Off` по D40 (`output_reserve`), а не прежний `think + 1024`.
+fn apply_retry(st: &LoopState, opts: &mut TurnOptions, r: &Reaction) {
+    let Reaction::RetryTurn {
+        sampling,
+        reasoning,
+    } = r
+    else {
+        tracing::error!(run = %st.run, reaction = ?r, "реакция не повтор хода");
+        return;
+    };
+    opts.sampling = sampling.clone();
+    if let Some(mode) = reasoning {
+        opts.reasoning = Some(mode.clone());
+        if !st.legacy_step {
+            let plan = output_plan(&ContextBudget::for_context(st.setup.n_ctx), mode);
+            opts.max_output_tokens = Some(plan.max_output_tokens);
+        }
+    }
+}
+
+/// Повтор хода в том же шаге — ещё один эффект `model`, шаг бюджета (D69): при
+/// исчерпанном бюджете шагов — `blocked_on_budget` вместо повтора.
+async fn retry_over_budget(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+) -> Result<Option<Transition>, LoopError> {
+    match st.budget.steps {
+        Some(limit) if st.counters.steps >= limit => {
+            let used = f64::from(st.counters.steps);
+            budget_exceeded(deps, st, BudgetKind::Steps, used, f64::from(limit))
+                .await
+                .map(Some)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1735,6 +1798,11 @@ async fn model_output(
         // Частичный текст — только в `model.delta`, история без него (D13).
         turn_finished(deps, st, "refusal", None).await?;
         return clean_pause(deps, st, LoopExit::Paused(pause_reason::REFUSAL)).await;
+    }
+    // Скорость вывода хода (`model.usage.output_tps`) — для дедлайна рассуждения
+    // следующих ходов (Ruling I-2 ревью задачи 7); из квитанции, как при реплее.
+    if let Some(tps) = output_tps(out.usage.output, out.ttft_ms, out.duration_ms) {
+        st.counters.output_tps = Some(tps);
     }
     let rev = review(&out, &st.tools, &st.classes, st.turn);
     report_parse_errors(deps.model.as_ref(), st.run, call, rev.parse_errors);

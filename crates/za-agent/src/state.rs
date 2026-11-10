@@ -95,6 +95,10 @@ pub struct Counters {
     /// D19: активное время run, мс; last_boundary_ms — now_ms прошлой границы в этом процессе (resume обнуляет).
     pub active_ms: u64,
     pub last_boundary_ms: Option<u64>,
+    /// Скорость вывода последнего принятого хода, ток/с (`model.usage.output_tps`): дедлайн
+    /// рассуждения D59 (Ruling I-2 ревью задачи 7). Снимок без поля — `None`.
+    #[serde(default)]
+    pub output_tps: Option<f64>,
 }
 
 impl Counters {

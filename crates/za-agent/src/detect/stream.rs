@@ -1,21 +1,29 @@
 //! Детекторы стрима (R1-B2 D58, D59): повтор текста и бесконечное рассуждение.
 //!
-//! [`StreamWatch`] смотрит дельты одной попытки хода. Повтор текста (D58) проверяется,
-//! когда с прошлой проверки накоплено [`CHECK_BYTES`] байт текста или дельта содержит
-//! `\n` и текст попытки не короче [`CHECK_MIN_CHARS`] символов: срабатывание —
-//! строка от [`MIN_LINE_CHARS`] символов повторена [`REPEATS`] раза подряд в конце
-//! текста или [`NGRAM_WORDS`]-словная n-грамма встречается [`REPEATS`] раза в
-//! последних [`NGRAM_WINDOW`] словах. Бесконечное рассуждение (D59): байты рассуждения
-//! / 4 больше бюджета × 1,5 или рассуждение дольше [`THINKING_TIMEOUT`] без текста и
-//! вызовов. Тайм-аут — дедлайн [`StreamWatch::deadline`] в `select!` стрима (`turn.rs`):
-//! замолчавший стрим тоже обрывается. Время передаётся явно (`tokio::time::Instant`,
-//! как у `DeltaBuffer`), поэтому детектор детерминирован.
+//! [`StreamWatch`] смотрит дельты одной попытки хода. Повтор текста (D58, Ruling I-1
+//! ревью задачи 7) проверяется, когда с прошлой проверки накоплено [`CHECK_BYTES`] байт
+//! текста или дельта содержит `\n` и текст попытки не короче [`CHECK_MIN_CHARS`]
+//! символов. Вырождение — только когда хвост текста непрерывно состоит из повторов одной
+//! единицы: единица содержит не меньше [`MIN_UNIT_WORDS`] разных слов (буквенно-цифровых
+//! токенов с буквой) и [`MIN_UNIT_CHARS`] непробельных символов, повторена не меньше
+//! [`MIN_COPIES`] раз подряд без перекрытия, а повторённая часть — не меньше
+//! [`MIN_REPEAT_BYTES`] байт. Строка из одних пробелов, пунктуации и цифр (матрица нулей,
+//! рамка, разделитель, пустая строка таблицы) единицей не считается. Второе правило —
+//! [`NGRAM_WORDS`]-словная n-грамма с теми же требованиями к единице встречается не меньше
+//! [`MIN_COPIES`] раз без перекрытия в последних [`NGRAM_WINDOW`] словах, и от первого
+//! вхождения до конца текста не меньше [`MIN_REPEAT_BYTES`] байт: петля с вариациями.
+//!
+//! Бесконечное рассуждение (D59, Ruling I-2): байты рассуждения / 4 больше бюджета × 1,5
+//! (основной предел) или рассуждение дольше дедлайна без текста и вызовов. Дедлайн —
+//! [`thinking_timeout`]: `max(300 с, бюджет / max(tps, 10) × 1,5)`. Он стоит в `select!`
+//! стрима (`turn.rs`), поэтому замолчавший стрим тоже обрывается. Время передаётся явно
+//! (`tokio::time::Instant`, как у `DeltaBuffer`), детектор детерминирован.
 //!
 //! Реакция — обрыв стрима с квитанцией `interrupted:repetition|thinking` и повтор хода
 //! в том же шаге с параметрами [`retry_params`]; второе срабатывание в шаге — пауза
 //! `model_loop` (решает драйвер).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -53,25 +61,44 @@ impl Degenerate {
     }
 }
 
-/// Рассуждение дольше этого без текста и вызовов — обрыв (D59).
+/// Нижняя граница дедлайна рассуждения без текста и вызовов (D59).
 pub const THINKING_TIMEOUT: Duration = Duration::from_secs(300);
+/// Скорость вывода, если наблюдённой нет и она ниже этой, ток/с (Ruling I-2).
+pub const MIN_TPS: f64 = 10.0;
+/// Запас дедлайна над временем вывода бюджета (Ruling I-2).
+const TIMEOUT_SLACK: f64 = 1.5;
 /// Проверка повтора — после стольких байт текста с прошлой проверки (D58).
 pub const CHECK_BYTES: usize = 512;
-/// Проверка по `\n` — когда текст попытки не короче стольких символов (4 × 20, D58).
+/// Проверка по `\n` — когда текст попытки не короче стольких символов (D58).
 pub const CHECK_MIN_CHARS: usize = 80;
-/// Минимальная длина повторённой строки, символы (D58).
-pub const MIN_LINE_CHARS: usize = 20;
-/// Сколько раз подряд (строка) или в окне (n-грамма) — срабатывание (D58).
-pub const REPEATS: usize = 4;
+/// Разных слов в единице повтора, не меньше (Ruling I-1).
+pub const MIN_UNIT_WORDS: usize = 3;
+/// Непробельных символов в единице повтора, не меньше (Ruling I-1).
+pub const MIN_UNIT_CHARS: usize = 20;
+/// Копий единицы подряд (или вхождений n-граммы) без перекрытия, не меньше (Ruling I-1).
+pub const MIN_COPIES: usize = 8;
+/// Повторённая часть текста, байты, не меньше (Ruling I-1).
+pub const MIN_REPEAT_BYTES: usize = 2048;
 /// Длина n-граммы, слова (D58).
 pub const NGRAM_WORDS: usize = 12;
 /// Окно n-грамм — последние слова текста (D58).
 pub const NGRAM_WINDOW: usize = 600;
-/// Самая длинная строка, повтор которой ищется в конце текста, символы: предел
-/// работы одной проверки. Длиннее — повтор ловит n-грамма.
-const MAX_LINE_CHARS: usize = 2048;
+/// Самая длинная единица повтора, символы: предел работы одной проверки. Длиннее —
+/// повтор ловит n-грамма.
+const MAX_UNIT_CHARS: usize = 2048;
 /// Хвост текста попытки, который хранит детектор, байты: больше обоих окон проверки.
 const KEEP_BYTES: usize = 64 * 1024;
+
+/// D59, Ruling I-2: дедлайн рассуждения `max(300 с, budget_tokens / max(tps, 10) × 1,5)`.
+/// `tps` — наблюдённая скорость вывода run (`None` или не число — 10 ток/с).
+pub fn thinking_timeout(budget_tokens: u32, tps: Option<f64>) -> Duration {
+    let tps = tps
+        .filter(|t| t.is_finite())
+        .unwrap_or(MIN_TPS)
+        .max(MIN_TPS);
+    let secs = f64::from(budget_tokens) / tps * TIMEOUT_SLACK;
+    THINKING_TIMEOUT.max(Duration::from_secs_f64(secs))
+}
 
 /// Наблюдатель стрима одной попытки хода (D58, D59).
 #[derive(Debug, Clone)]
@@ -90,12 +117,15 @@ pub struct StreamWatch {
     acted: bool,
     /// Предел байт рассуждения: бюджет × 1,5 × 4 (D59); 0 — без предела.
     reasoning_limit: u64,
+    /// Дедлайн рассуждения от его начала (D59).
+    timeout: Duration,
 }
 
 impl StreamWatch {
     /// Бюджет рассуждения — [`thinking_budget`] режима хода (D40, D59). У режима без
     /// бюджета (`Off`) предела байт нет, остаётся тайм-аут: модель, которая не умеет
-    /// выключать мышление, иначе обрывалась бы на первой дельте и в повторе.
+    /// выключать мышление, иначе обрывалась бы на первой дельте и в повторе. Дедлайн —
+    /// [`THINKING_TIMEOUT`]; по бюджету и скорости — [`StreamWatch::with_timeout`].
     pub fn new(reasoning: &ReasoningMode) -> StreamWatch {
         StreamWatch {
             text: String::new(),
@@ -105,7 +135,14 @@ impl StreamWatch {
             reasoning_since: None,
             acted: false,
             reasoning_limit: u64::from(thinking_budget(reasoning)) * 6,
+            timeout: THINKING_TIMEOUT,
         }
+    }
+
+    /// Дедлайн рассуждения от его начала ([`thinking_timeout`]).
+    pub fn with_timeout(mut self, timeout: Duration) -> StreamWatch {
+        self.timeout = timeout;
+        self
     }
 
     /// Дельта текста (D58): снимает тайм-аут рассуждения; проверка повтора — после
@@ -122,11 +159,11 @@ impl StreamWatch {
         self.trim();
         let due = self.since_check >= CHECK_BYTES
             || (delta.contains('\n') && self.text_chars >= CHECK_MIN_CHARS);
-        if !due {
+        if !due || self.text.len() < MIN_REPEAT_BYTES {
             return None;
         }
         self.since_check = 0;
-        (line_repeated(&self.text) || ngram_repeated(&self.text)).then_some(Degenerate::Repetition)
+        (tail_repeated(&self.text) || ngram_repeated(&self.text)).then_some(Degenerate::Repetition)
     }
 
     /// Дельта рассуждения в момент `now` (D59): предел байт или тайм-аут без текста и
@@ -151,26 +188,22 @@ impl StreamWatch {
         self.acted = true;
     }
 
-    /// Начало рассуждения + [`THINKING_TIMEOUT`], пока нет текста и вызовов; иначе None.
+    /// Начало рассуждения + дедлайн, пока нет текста и вызовов; иначе None.
     pub fn deadline(&self) -> Option<Instant> {
         if self.acted {
             return None;
         }
-        self.reasoning_since.map(|t| t + THINKING_TIMEOUT)
+        self.reasoning_since.map(|t| t + self.timeout)
     }
 
     /// Перезапуск стрима (MDL-018): накопленное прежней попыткой отбрасывается.
     pub fn on_restart(&mut self) {
-        let limit = self.reasoning_limit;
-        *self = StreamWatch {
-            text: String::new(),
-            text_chars: 0,
-            since_check: 0,
-            reasoning_bytes: 0,
-            reasoning_since: None,
-            acted: false,
-            reasoning_limit: limit,
-        };
+        self.text.clear();
+        self.text_chars = 0;
+        self.since_check = 0;
+        self.reasoning_bytes = 0;
+        self.reasoning_since = None;
+        self.acted = false;
     }
 
     /// Хвост текста не растёт без предела: окна проверки много меньше `KEEP_BYTES`.
@@ -186,39 +219,117 @@ impl StreamWatch {
     }
 }
 
-/// D58: текст кончается [`REPEATS`] копиями строки от [`MIN_LINE_CHARS`] символов.
-/// Строка — неделимая: строка из повторов более короткой (`====`, `|---`) повтором
-/// длинной строки не считается.
-fn line_repeated(text: &str) -> bool {
-    let mut tail: Vec<char> = text.chars().rev().take(REPEATS * MAX_LINE_CHARS).collect();
+/// Единица повтора годится (Ruling I-1): не меньше [`MIN_UNIT_WORDS`] разных слов и
+/// [`MIN_UNIT_CHARS`] непробельных символов. Слово — буквенно-цифровой токен с буквой:
+/// строка из пробелов, пунктуации и цифр слов не содержит.
+fn good_unit<'a>(parts: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut words: HashSet<&str> = HashSet::new();
+    let mut chars = 0usize;
+    for part in parts {
+        chars += part.chars().filter(|c| !c.is_whitespace()).count();
+        words.extend(
+            part.split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.chars().any(char::is_alphabetic)),
+        );
+    }
+    words.len() >= MIN_UNIT_WORDS && chars >= MIN_UNIT_CHARS
+}
+
+/// D58, Ruling I-1: хвост текста — не меньше [`MIN_COPIES`] копий одной годной
+/// единицы подряд, повторённая часть не меньше [`MIN_REPEAT_BYTES`] байт.
+fn tail_repeated(text: &str) -> bool {
+    let mut tail: Vec<char> = text
+        .chars()
+        .rev()
+        .take(MIN_COPIES * MAX_UNIT_CHARS)
+        .collect();
     tail.reverse();
     let n = tail.len();
-    let max = (n / REPEATS).min(MAX_LINE_CHARS);
-    (MIN_LINE_CHARS..=max).any(|p| {
-        let periodic = (0..p * (REPEATS - 1)).all(|k| tail[n - 1 - k] == tail[n - 1 - k - p]);
-        periodic && root_len(&tail[n - p..]) >= MIN_LINE_CHARS
+    // suffix_bytes[l] — байты последних l символов.
+    let mut suffix_bytes = Vec::with_capacity(n + 1);
+    suffix_bytes.push(0usize);
+    for c in tail.iter().rev() {
+        let last = suffix_bytes.last().copied().unwrap_or(0);
+        suffix_bytes.push(last + c.len_utf8());
+    }
+    // suffix_letters[l] — букв среди последних l символов: дешёвый отсев единиц без слов.
+    let mut suffix_letters = Vec::with_capacity(n + 1);
+    suffix_letters.push(0usize);
+    for c in tail.iter().rev() {
+        let last = suffix_letters.last().copied().unwrap_or(0);
+        suffix_letters.push(last + usize::from(c.is_alphabetic()));
+    }
+    let max = (n / MIN_COPIES).min(MAX_UNIT_CHARS);
+    (1..=max).any(|p| {
+        if suffix_letters[p] < MIN_UNIT_WORDS {
+            return false;
+        }
+        // Нужная длина повторённой части: кратна p, не меньше 8 копий и 2 КиБ.
+        let mut need = MIN_COPIES * p;
+        while need <= n && suffix_bytes[need] < MIN_REPEAT_BYTES {
+            need += p;
+        }
+        if need > n {
+            return false;
+        }
+        let periodic = (0..need - p).all(|k| tail[n - 1 - k] == tail[n - 1 - k - p]);
+        periodic && good_cyclic_unit(&tail[n - p..])
     })
 }
 
-/// Длина наименьшего корня строки: `u = r^k` с наибольшим `k`.
-fn root_len(u: &[char]) -> usize {
-    let p = u.len();
-    (1..p)
-        .filter(|d| p.is_multiple_of(*d))
-        .find(|&d| (d..p).all(|i| u[i] == u[i - d]))
-        .unwrap_or(p)
+/// [`good_unit`] для единицы периода: конец текста режет её в произвольном месте
+/// (`ln!("--");\n    print`), поэтому слова считаются по кругу — в двух копиях подряд без
+/// обрезков слов на краях. Иначе обрезки дают лишние «слова» (`ln`, `print`).
+fn good_cyclic_unit(unit: &[char]) -> bool {
+    let doubled: String = unit.iter().chain(unit).collect();
+    let mut words: Vec<&str> = doubled
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if unit.last().is_some_and(|c| c.is_alphanumeric()) {
+        words.pop();
+    }
+    if unit.first().is_some_and(|c| c.is_alphanumeric()) && !words.is_empty() {
+        words.remove(0);
+    }
+    let distinct: HashSet<&str> = words
+        .into_iter()
+        .filter(|w| w.chars().any(char::is_alphabetic))
+        .collect();
+    let chars = unit.iter().filter(|c| !c.is_whitespace()).count();
+    distinct.len() >= MIN_UNIT_WORDS && chars >= MIN_UNIT_CHARS
 }
 
-/// D58: [`NGRAM_WORDS`]-словная n-грамма встречается [`REPEATS`] раза в последних
-/// [`NGRAM_WINDOW`] словах (вхождения могут перекрываться).
+/// D58, Ruling I-1: годная [`NGRAM_WORDS`]-словная n-грамма встречается не меньше
+/// [`MIN_COPIES`] раз без перекрытия в последних [`NGRAM_WINDOW`] словах, от первого
+/// вхождения до конца текста — не меньше [`MIN_REPEAT_BYTES`] байт.
 fn ngram_repeated(text: &str) -> bool {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let window = &words[words.len().saturating_sub(NGRAM_WINDOW)..];
-    let mut counts: HashMap<&[&str], usize> = HashMap::new();
-    for g in window.windows(NGRAM_WORDS) {
-        let c = counts.entry(g).or_insert(0);
-        *c += 1;
-        if *c >= REPEATS {
+    let mut words: Vec<&str> = text.split_whitespace().rev().take(NGRAM_WINDOW).collect();
+    words.reverse();
+    // Начало слова в байтах текста: слово — подстрока `text`.
+    let base = text.as_ptr() as usize;
+    let start = |w: &str| w.as_ptr() as usize - base;
+    struct Seen {
+        good: bool,
+        count: usize,
+        /// Первый индекс слова, с которого вхождение не перекрывает прошлое.
+        free: usize,
+        first: usize,
+    }
+    let mut seen: HashMap<&[&str], Seen> = HashMap::new();
+    for (i, g) in words.windows(NGRAM_WORDS).enumerate() {
+        let s = seen.entry(g).or_insert_with(|| Seen {
+            good: good_unit(g.iter().copied()),
+            count: 0,
+            free: 0,
+            first: start(g[0]),
+        });
+        if !s.good || i < s.free {
+            continue;
+        }
+        s.count += 1;
+        s.free = i + NGRAM_WORDS;
+        if s.count >= MIN_COPIES && text.len() - s.first >= MIN_REPEAT_BYTES {
             return true;
         }
     }
@@ -249,26 +360,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn line_repeated_needs_primitive_long_line() {
-        let line = "abcdefghij0123456789\n";
-        assert!(line_repeated(&line.repeat(4)));
-        assert!(!line_repeated(&line.repeat(3)));
-        // Разделители из коротких повторов — не строка от 20 символов.
-        assert!(!line_repeated(&"=".repeat(400)));
-        assert!(!line_repeated(&"|---".repeat(100)));
-        assert_eq!(root_len(&"abab".chars().collect::<Vec<_>>()), 2);
-        assert_eq!(root_len(&"abc".chars().collect::<Vec<_>>()), 3);
+    fn unit_needs_words_and_chars() {
+        assert!(good_unit(["Проверяю файл config.toml ещё раз\n"]));
+        assert!(!good_unit(["    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],\n"]));
+        assert!(!good_unit(["|                              |\n"]));
+        assert!(!good_unit(["    println!(\"--------\");\n"]), "одно слово");
+        assert!(!good_unit(["a b c"]), "меньше 20 непробельных символов");
+        // Единица периода, разрезанная концом текста: слова по кругу.
+        let cut: Vec<char> = "ln!(\"--------\");\n    print".chars().collect();
+        assert!(!good_cyclic_unit(&cut), "обрезки слова — не слова");
+        let rotated: Vec<char> = "config.toml ещё раз\nПроверяю файл ".chars().collect();
+        assert!(good_cyclic_unit(&rotated));
+    }
+
+    #[test]
+    fn tail_needs_copies_and_bytes() {
+        let line = "Проверяю файл config.toml ещё раз\n"; // 52 байта
+        assert!(!tail_repeated(&line.repeat(39)), "39 × 52 < 2048");
+        assert!(tail_repeated(&line.repeat(40)));
+        // 8 копий длинной строки: 8 × 300 > 2048.
+        let long = format!("{}\n", "word другое слово ".repeat(12));
+        assert!(!tail_repeated(&long.repeat(7)));
+        assert!(tail_repeated(&long.repeat(8)));
+        assert!(!tail_repeated(&"=".repeat(10_000)));
+    }
+
+    #[test]
+    fn timeout_by_budget_and_speed() {
+        assert_eq!(thinking_timeout(1024, None), THINKING_TIMEOUT);
+        // 2048 / 10 × 1,5 = 307,2 с: больше нижней границы.
+        assert_eq!(thinking_timeout(2048, None), Duration::from_secs_f64(307.2));
+        // 16384 / 10 × 1,5 = 2457,6 с.
+        assert_eq!(
+            thinking_timeout(16_384, None),
+            Duration::from_secs_f64(2457.6)
+        );
+        // 16384 / 32 × 1,5 = 768 с; скорость ниже 10 считается как 10.
+        assert_eq!(
+            thinking_timeout(16_384, Some(32.0)),
+            Duration::from_secs(768)
+        );
+        assert_eq!(
+            thinking_timeout(16_384, Some(2.0)),
+            thinking_timeout(16_384, None)
+        );
+        assert_eq!(
+            thinking_timeout(16_384, Some(f64::NAN)),
+            thinking_timeout(16_384, None)
+        );
+        assert_eq!(thinking_timeout(16_384, Some(1000.0)), THINKING_TIMEOUT);
     }
 
     #[test]
     fn restart_drops_attempt() {
-        let mut w = StreamWatch::new(&ReasoningMode::Default);
         let t0 = Instant::now();
+        let mut w =
+            StreamWatch::new(&ReasoningMode::Default).with_timeout(Duration::from_secs(900));
         assert_eq!(w.on_reasoning("x", t0), None);
-        assert!(w.deadline().is_some());
+        assert_eq!(w.deadline(), Some(t0 + Duration::from_secs(900)));
         w.on_restart();
         assert_eq!(w.deadline(), None);
         assert_eq!(w.reasoning_limit, 16_384 * 6);
+        assert_eq!(
+            w.timeout,
+            Duration::from_secs(900),
+            "дедлайн попытки сохраняется"
+        );
     }
 
     #[test]

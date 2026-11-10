@@ -685,7 +685,7 @@ async fn decode_failure_degenerate() {
         (
             "degenerate-repetition",
             ReasoningMode::Default,
-            vec![delta(line), delta(line), delta(line), delta(line)],
+            (0..60).map(|_| delta(line)).collect(),
             Degenerate::Repetition,
             "interrupted:repetition",
         ),

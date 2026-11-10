@@ -23,7 +23,7 @@ use za_llm::{ReasoningMode, Sampling};
 use za_protocol::{BlobHash, EffectClass, canonical_json};
 
 use repeat::RepeatState;
-pub use stream::{Degenerate, StreamWatch, THINKING_TIMEOUT, retry_params};
+pub use stream::{Degenerate, StreamWatch, THINKING_TIMEOUT, retry_params, thinking_timeout};
 
 /// Пометка результата, повторно показанного без исполнения (D54); после неё — `\n` и
 /// прошлый результат.
@@ -58,7 +58,8 @@ pub enum Reaction {
     Pause(&'static str),
     /// Пауза перед следующим вызовом модели.
     Sleep(Duration),
-    /// Повтор хода с другими параметрами.
+    /// Повтор хода с другими параметрами: обрыв стрима детектором (D58, D59), применяет
+    /// `model_node` драйвера.
     RetryTurn {
         sampling: Sampling,
         reasoning: Option<ReasoningMode>,
