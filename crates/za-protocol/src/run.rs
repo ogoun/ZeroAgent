@@ -63,6 +63,9 @@ pub mod pause_reason {
     pub const TOOL_ERRORS: &str = "tool_errors";
     /// Модель зациклилась: повтор текста или бесконечное рассуждение (R1-B2 D58, D59, D61).
     pub const MODEL_LOOP: &str = "model_loop";
+    /// Разовый сбой журнала посреди шага (R1-C1 D72): пауза только статусом, без
+    /// снимка; resume реплеит шаг с последнего снимка.
+    pub const STORE: &str = "store";
 }
 
 /// Детекторы зацикливания: поле `detector` события `loop.detected` (R1-B2 D63) и

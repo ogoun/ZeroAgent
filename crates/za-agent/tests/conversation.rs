@@ -1,7 +1,10 @@
 //! История диалога: атомарная фиксация хода (D10), пары вызов-результат, CORE-105,
 //! хранение сообщений блобами (D4).
 
+mod support;
+
 use std::path::PathBuf;
+use support::*;
 
 use serde_json::json;
 use za_agent::{Conversation, HistoryError, LoadError};
@@ -9,14 +12,9 @@ use za_llm::{Message, Part, Role, ToolCall};
 use za_protocol::BlobHash;
 use za_store::ProjectStore;
 
-/// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
+/// Свой каталог теста: `CARGO_TARGET_TMPDIR/conversation/<name>-<pid>-<n>`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("conversation")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("conversation", name)
 }
 
 fn text(role: Role, t: &str) -> Message {

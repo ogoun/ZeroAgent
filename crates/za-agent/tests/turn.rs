@@ -1,10 +1,13 @@
 //! Ход модели (задача 10): эффект `model` (D7), события журнала (D8), сигналы цикла
 //! (D9, D26), отображение ошибок в состояние run (D11, D13), разбор ответа (D27).
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
+use support::*;
 
 use serde_json::{Value, json};
 use za_agent::{
@@ -24,14 +27,9 @@ use za_store::{NewRun, ProjectStore, UsageTotals};
 
 // ---- Общие помощники ----
 
-/// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
+/// Свой каталог теста: `CARGO_TARGET_TMPDIR/turn/<name>-<pid>-<n>`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("turn")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("turn", name)
 }
 
 /// Хранилище, журнал с шиной и созданный в нём run.
@@ -540,31 +538,9 @@ async fn refusal_is_reported_not_committed() {
     assert_eq!(out.message, text_msg(Role::Assistant, "частич"));
 }
 
-/// Предел любого ожидания в тестах: зависание становится понятной паникой.
-const WAIT: Duration = Duration::from_secs(10);
-
-/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
-fn time_scale() -> u32 {
-    static SCALE: OnceLock<u32> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("ZA_TEST_TIME_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(1, |n| n.clamp(1, 6))
-    })
-}
-
 /// NFR-03: обрыв стрима не позже 200 мс (× `ZA_TEST_TIME_SCALE`, как в `control.rs`).
 fn nfr03() -> Duration {
-    Duration::from_millis(200) * time_scale()
-}
-
-/// Ожидание с пределом [`WAIT`]; по истечении — паника с описанием `what`.
-async fn within<F: std::future::Future>(what: &str, fut: F) -> F::Output {
-    match tokio::time::timeout(WAIT, fut).await {
-        Ok(v) => v,
-        Err(_) => panic!("не дождались за {WAIT:?}: {what}"),
-    }
+    Duration::from_millis(200) * scale()
 }
 
 /// Обрыв хода сигналом (D7, NFR-03): drop стрима не позже 200 мс после сигнала,

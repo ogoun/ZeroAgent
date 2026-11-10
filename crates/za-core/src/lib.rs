@@ -37,7 +37,7 @@ pub use interrupt::{Interrupt, InterruptKind, InterruptState, pause_reason_for};
 pub use recovery::{
     NOT_DONE_MESSAGE, Recovery, UNKNOWN_OUTCOME, UnknownDecision, recover, resolve_unknown,
 };
-pub use runtime::{EffectError, EffectSlot, EffectSource, EffectSpec, RunCtx};
+pub use runtime::{EffectError, EffectFailure, EffectSlot, EffectSource, EffectSpec, RunCtx};
 pub use tool::{
     Approval, DuplicateTool, Gate, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
 };

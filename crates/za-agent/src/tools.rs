@@ -41,6 +41,7 @@ use za_protocol::{
 use za_store::StoreError;
 
 use crate::context::{SPILL_NOT_SAVED, SpillCfg, spill, spill_cut, spill_limit_bytes, spill_name};
+use crate::driver::{FaultHook, FaultPoint, INJECTED_FAULT};
 use crate::prompt::escape_untrusted;
 use crate::turn::{CallVerdict, PlannedCall, Signal, Signals};
 
@@ -135,6 +136,8 @@ struct Job {
     action: Action,
     journal: Journal,
     run: RunId,
+    /// Шаг пакета и хук разового сбоя `tool.finished` (тест, R1-C1 D72).
+    fault: Option<(u64, FaultHook)>,
 }
 
 /// Итог запуска слота.
@@ -179,6 +182,22 @@ pub async fn run_tools(
     calls: &[PlannedCall],
     sig: &mut Signals,
 ) -> Result<ToolsOutcome, EffectError> {
+    run_tools_with(ctx, j, reg, env, calls, sig, None).await
+}
+
+/// [`run_tools`] с хуком разового сбоя журнала `LoopDeps.fault` (D72): точка
+/// [`FaultPoint::BeforeToolFinished`] даёт ошибку записи `tool.finished`, как настоящая.
+pub(crate) async fn run_tools_with(
+    ctx: &mut RunCtx,
+    j: &Journal,
+    reg: &ToolRegistry,
+    env: &ToolEnv,
+    calls: &[PlannedCall],
+    sig: &mut Signals,
+    fault: Option<FaultHook>,
+) -> Result<ToolsOutcome, EffectError> {
+    let fault = fault.map(|h| (ctx.step(), h));
+    let fault = fault.as_ref();
     // D15: ключи на все вызовы по порядку, до любых исходов.
     let mut slots = Vec::with_capacity(calls.len());
     for _ in calls {
@@ -206,7 +225,7 @@ pub async fn run_tools(
                 };
                 let slot = take(&mut slots, k)?;
                 let action = tool_action(tool, &calls[k].call, env, slot.key());
-                jobs.push((k, job(slot, &calls[k].call, action, j, env)));
+                jobs.push((k, job(slot, &calls[k].call, action, j, env, fault)));
             }
             let done = run_group(jobs, sig, &mut out).await;
             for (k, ex) in done {
@@ -281,7 +300,7 @@ pub async fn run_tools(
             }
             Plan::Finish(_) => Action::Finish,
         };
-        let jb = job(take(&mut slots, i)?, call, action, j, env);
+        let jb = job(take(&mut slots, i)?, call, action, j, env, fault);
         let Some(ex) = run_one(jb, sig, &mut out).await else {
             return Ok(out);
         };
@@ -462,7 +481,14 @@ fn tool_action(
     }
 }
 
-fn job(slot: EffectSlot, call: &ToolCall, action: Action, j: &Journal, env: &ToolEnv) -> Job {
+fn job(
+    slot: EffectSlot,
+    call: &ToolCall,
+    action: Action,
+    j: &Journal,
+    env: &ToolEnv,
+    fault: Option<&(u64, FaultHook)>,
+) -> Job {
     let class = match &action {
         Action::Tool { tool, .. } => tool.spec().class,
         Action::Answer(_) | Action::Finish => EffectClass::Pure,
@@ -478,6 +504,7 @@ fn job(slot: EffectSlot, call: &ToolCall, action: Action, j: &Journal, env: &Too
         action,
         journal: j.clone(),
         run: env.run,
+        fault: fault.cloned(),
     }
 }
 
@@ -625,6 +652,7 @@ async fn execute(jb: Job) -> Executed {
         action,
         journal,
         run,
+        fault,
     } = jb;
     let key = slot.key().0.clone();
     let name = spec.name.clone();
@@ -657,14 +685,22 @@ async fn execute(jb: Job) -> Executed {
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             // Инструмент уже отработал: квитанция фиксирует его итог, а ошибка
             // журнала отравляет контекст.
-            if let Err(e) = journal
-                .append(ev(
-                    EventKind::ToolFinished,
-                    Actor::Tool,
-                    json!({ "call_id": call_id, "is_error": out.is_error, "duration_ms": duration_ms }),
-                ))
-                .await
-            {
+            let finished = match &fault {
+                // Тест (D72): ошибка записи `tool.finished`, как настоящая.
+                Some((step, h)) if h(FaultPoint::BeforeToolFinished { step: *step }) => {
+                    Err(StoreError::Io(INJECTED_FAULT.into()))
+                }
+                _ => {
+                    journal
+                        .append(ev(
+                            EventKind::ToolFinished,
+                            Actor::Tool,
+                            json!({ "call_id": call_id, "is_error": out.is_error, "duration_ms": duration_ms }),
+                        ))
+                        .await
+                }
+            };
+            if let Err(e) = finished {
                 tracing::error!(key = %key, error = %e, "tool.finished не записано");
                 *fref = Some(e);
             }

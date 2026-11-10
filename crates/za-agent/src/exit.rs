@@ -59,11 +59,13 @@ pub fn exit_for_model_error(e: &ModelError, last_wait: Option<&WaitState>) -> Lo
 }
 
 /// D11, как в демо R0: ReplayMismatch → Paused("replay_mismatch"); Unknown{interrupt_id} →
-/// Suspended{reason: "needs_decision", interrupt: interrupt_id}; прочие (Store, Failed, Poisoned) — None,
-/// драйвер превращает их в LoopError.
+/// Suspended{reason: "needs_decision", interrupt: interrupt_id}; Transient → Paused("store") без снимка
+/// (R1-C1 D72); прочие (Store, Failed, Poisoned) — None, драйвер превращает их в LoopError
+/// (ошибка журнала — тоже в паузу `store` статусом).
 pub fn exit_for_effect_error(e: &EffectError) -> Option<LoopExit> {
     match e {
         EffectError::ReplayMismatch { .. } => Some(LoopExit::Paused(pause_reason::REPLAY_MISMATCH)),
+        EffectError::Transient(_) => Some(LoopExit::Paused(pause_reason::STORE)),
         EffectError::Unknown { interrupt_id } => Some(LoopExit::Suspended {
             reason: pause_reason::NEEDS_DECISION,
             interrupt: interrupt_id.clone(),

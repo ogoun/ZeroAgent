@@ -2,10 +2,13 @@
 //! голова и хвост по строкам и по границе символа, лимит после экранирования, файл
 //! выгрузки и `.gitignore`, реплей без повторного вызова, новая эпоха истории по порогу.
 
+mod support;
+
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use support::*;
 
 use serde_json::{Value, json};
 use za_agent::{
@@ -28,29 +31,14 @@ use za_store::{NewRun, ProjectStore};
 
 // ---- Помощники ----
 
-/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
-fn time_scale() -> u32 {
-    static SCALE: OnceLock<u32> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("ZA_TEST_TIME_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(1, |n| n.clamp(1, 6))
-    })
-}
-
 /// Предел ожиданий, которые при регрессии повисли бы.
 fn limit() -> Duration {
-    Duration::from_secs(30) * time_scale()
+    Duration::from_secs(30) * scale()
 }
 
+/// Свой каталог теста: `CARGO_TARGET_TMPDIR/spill/<name>-<pid>-<n>`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("spill")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("spill", name)
 }
 
 fn spill_file(project: &Path, name: &str) -> PathBuf {
@@ -643,6 +631,7 @@ async fn threshold_run(
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
+        fault: None,
     };
     // Ходы 1–5 без расхода (базы нет, оценка всего запроса мала); ход 6 сообщает
     // input 2400: на границе 7 оценка = 2400 + 4000 / 100 + 4 = 2444.

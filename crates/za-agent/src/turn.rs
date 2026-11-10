@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
-use za_core::{EffectError, EffectSource, EffectSpec, Journal, RunCtx};
+use za_core::{EffectError, EffectFailure, EffectSource, EffectSpec, Journal, RunCtx};
 use za_llm::normalize::{
     CallRejection, CallSource, NormalizedCall, extracted_mutation_blocked, normalize,
 };
@@ -303,9 +303,6 @@ pub(crate) const COMPACT_KIND: &str = "compact";
 pub(crate) const MODEL_ERROR: &str = "model_error:";
 /// Префикс квитанции обрыва сигналом (D7).
 const INTERRUPTED: &str = "interrupted:";
-/// Префикс квитанции-отказа, записанной после ошибки журнала внутри хода: реплей
-/// отдаёт её как [`EffectError::Failed`], драйвер — `LoopError` (D11).
-const STORE_ERROR: &str = "store_error:";
 
 /// Итог хода модели — значение квитанции эффекта `model` (D7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -516,31 +513,42 @@ pub(crate) async fn model_call(
     };
     let mut store_failure: Option<StoreError> = None;
     let failure = &mut store_failure;
+    // Ошибка журнала и несериализуемый итог — разовый сбой (R1-C1 D72): квитанции нет,
+    // resume повторяет ход (класс `Idempotent`), а не отдаёт вечный отказ.
     let (r, source) = slot
-        .run_traced(spec, move || async move {
+        .run_fallible(spec, move || async move {
             match live.run(model, call, sig, watch).await {
-                Ok(out) => serde_json::to_value(&out)
-                    .map_err(|e| format!("{STORE_ERROR} итог хода не сериализуется: {e}")),
+                Ok(out) => serde_json::to_value(&out).map_err(|e| {
+                    EffectFailure::Transient(format!("итог хода не сериализуется: {e}"))
+                }),
                 Err(Live::Model { error, last_wait }) => {
                     let body = ModelFailure { error, last_wait };
-                    Err(match serde_json::to_string(&body) {
-                        Ok(s) => format!("{MODEL_ERROR}{s}"),
-                        Err(e) => format!("{STORE_ERROR} ошибка модели не сериализуется: {e}"),
-                    })
+                    match serde_json::to_string(&body) {
+                        Ok(s) => Err(EffectFailure::Recorded(format!("{MODEL_ERROR}{s}"))),
+                        Err(e) => Err(EffectFailure::Transient(format!(
+                            "ошибка модели не сериализуется: {e}"
+                        ))),
+                    }
                 }
-                Err(Live::Signal(s)) => Err(format!("{INTERRUPTED}{}", s.as_str())),
-                Err(Live::Degenerate(d)) => Err(format!("{INTERRUPTED}{}", d.as_str())),
+                Err(Live::Signal(s)) => Err(EffectFailure::Recorded(format!(
+                    "{INTERRUPTED}{}",
+                    s.as_str()
+                ))),
+                Err(Live::Degenerate(d)) => Err(EffectFailure::Recorded(format!(
+                    "{INTERRUPTED}{}",
+                    d.as_str()
+                ))),
                 Err(Live::Store(e)) => {
-                    let msg = format!("{STORE_ERROR} {e}");
+                    let msg = e.to_string();
                     *failure = Some(e);
-                    Err(msg)
+                    Err(EffectFailure::Transient(msg))
                 }
             }
         })
         .await;
     ctx.observe(&r);
-    // Ошибка журнала посреди хода: квитанция-отказ (если записалась) лишь фиксирует
-    // факт, сам ход — ошибка журнала, контекст отравлен.
+    // Ошибка журнала посреди хода: квитанции нет, контекст отравлен; драйвер ставит
+    // run на паузу `store` статусом.
     if let Some(e) = store_failure {
         let err = EffectError::Store(e);
         ctx.observe::<()>(&Err(err.clone()));
@@ -1459,7 +1467,8 @@ mod tests {
         }
         let other = decode_failure("boom".into(), EffectSource::Live);
         assert!(matches!(other, TurnError::Effect(EffectError::Failed(m)) if m == "boom"));
-        let store = decode_failure(format!("{STORE_ERROR} x"), EffectSource::Journal);
+        // Квитанция `store_error:` журналов R1-B (D72: новые не пишутся) — по-прежнему отказ.
+        let store = decode_failure("store_error: x".into(), EffectSource::Journal);
         assert!(matches!(store, TurnError::Effect(EffectError::Failed(_))));
     }
 

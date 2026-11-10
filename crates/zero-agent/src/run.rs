@@ -511,6 +511,7 @@ fn deps(
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
+        fault: None,
     };
     (deps, bus)
 }

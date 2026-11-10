@@ -43,8 +43,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use za_core::{
-    Capability, EffectError, EffectSpec, Exit, Graph, GraphError, Journal, Node, NodeId, RunCtx,
-    ToolKind, ToolRegistry, Transition, pause_reason_for,
+    Capability, EffectError, EffectFailure, EffectSpec, Exit, Graph, GraphError, Journal, Node,
+    NodeId, RunCtx, ToolKind, ToolRegistry, Transition, pause_reason_for,
 };
 use za_llm::{
     BoxFuture, CachedTokensField, EndpointId, ErrorClass, FinishReason, ModelCall, ModelPort, Part,
@@ -80,7 +80,7 @@ use crate::request::{
 };
 use crate::resume::state_block;
 use crate::state::{AtBoundary, Counters, LoopState, Next, PendingExit};
-use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools};
+use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools_with};
 use crate::turn::{
     CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed, Signal,
     TurnError, TurnOutput, model_turn_with, output_tps, report_parse_errors, review,
@@ -106,6 +106,20 @@ pub enum CrashPoint {
 /// true — драйвер немедленно возвращает Err(LoopError::Halted) без единой записи.
 pub type CrashHook = Arc<dyn Fn(CrashPoint) -> bool + Send + Sync>;
 
+/// Точки разового сбоя журнала для тестов (R1-C1 D72), по образцу [`CrashPoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultPoint {
+    /// внутри замыкания эффекта `boundary` шага, до чтения ввода
+    BeforeReadBoundary { step: u64 },
+    /// внутри замыкания слота вызова инструмента шага: вызов исполнен, `tool.finished` ещё нет
+    BeforeToolFinished { step: u64 },
+}
+
+/// true — в точке случается сбой журнала: замыкание `boundary` возвращает
+/// `EffectFailure::Transient`, слот инструмента — ошибку записи `tool.finished`, как
+/// настоящая (D72).
+pub type FaultHook = Arc<dyn Fn(FaultPoint) -> bool + Send + Sync>;
+
 /// Зависимости цикла.
 #[derive(Clone)]
 pub struct LoopDeps {
@@ -117,6 +131,8 @@ pub struct LoopDeps {
     pub capabilities: Vec<Capability>,
     pub memory: Arc<dyn MemoryPort>,
     pub crash: Option<CrashHook>,
+    /// Разовые сбои журнала в тестах (D72); в продукте `None`.
+    pub fault: Option<FaultHook>,
 }
 
 /// Параметры нового run.
@@ -190,11 +206,24 @@ pub enum LoopError {
 }
 
 impl LoopError {
+    /// Сбой журнала после старта цикла: `LoopError::Store`, `EffectError::Store` и
+    /// `EffectError::Transient` дают паузу `store` статусом, а не `failed` (R1-C1 D72).
+    fn is_store_fault(&self) -> bool {
+        matches!(
+            self,
+            LoopError::Store(_)
+                | LoopError::Effect(EffectError::Store(_) | EffectError::Transient(_))
+        )
+    }
+
     /// Причина в `run.status` при переходе в `failed`.
     /// `None` — у `Halted`: точка сбоя ничего не пишет (D33).
     fn code(&self) -> Option<&'static str> {
         Some(match self {
-            LoopError::Store(_) | LoopError::Effect(EffectError::Store(_)) => fail_reason::STORE,
+            LoopError::Store(_)
+            | LoopError::Effect(EffectError::Store(_) | EffectError::Transient(_)) => {
+                fail_reason::STORE
+            }
             LoopError::Effect(EffectError::Poisoned) => fail_reason::POISONED,
             LoopError::Effect(_) => fail_reason::EFFECT,
             LoopError::History(_) => fail_reason::HISTORY,
@@ -234,8 +263,8 @@ const MEMORY_EFFECT: &str = "memory.snapshot";
 const CONTEXT_EFFECT: &str = "context";
 /// Имя эффекта повторного чтения ввода после компакции на границе (R1-B2, Ruling I-2).
 const INBOX_EFFECT: &str = "inbox";
-/// Префикс квитанции-отказа эффекта, у которого внутри не прочитался журнал.
-const STORE_ERROR: &str = "store_error:";
+/// Текст разового сбоя, вызванного [`FaultHook`] (тест, D72).
+pub(crate) const INJECTED_FAULT: &str = "сбой журнала (FaultHook)";
 /// `n_ctx`, если эндпоинт не сообщает размер контекста (D37).
 pub(crate) const DEFAULT_N_CTX: u32 = 8192;
 /// Пустых ходов подряд до `blocked` (D18).
@@ -514,7 +543,50 @@ pub(crate) async fn run_graph(
 ) -> Result<LoopOutcome, LoopError> {
     match drive(deps, st, at).await {
         Ok(o) => Ok(o),
+        Err(e) if e.is_store_fault() => store_pause(deps, st, e).await,
         Err(e) => Err(fail(deps, st.run, st.generation, e).await),
+    }
+}
+
+/// Сбой журнала посреди шага (R1-C1 D72): пауза `store` **только статусом** — без
+/// `persist` и снимка, ведь история могла остаться посреди шага (пары вызов–результат).
+/// Resume реплеит шаг с последнего снимка: квитанций разовых сбоев нет, безопасные
+/// классы повторяются (CORE-003). Не записался и статус — ошибка возвращается как есть,
+/// статус остаётся (`running`) для resume.
+async fn store_pause(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    e: LoopError,
+) -> Result<LoopOutcome, LoopError> {
+    let run = st.run;
+    match deps
+        .journal
+        .set_status(
+            run,
+            RunStatus::Paused,
+            st.generation,
+            Some(pause_reason::STORE),
+        )
+        .await
+    {
+        Ok(g) => {
+            st.generation = g;
+            if st.stopping == Some(RunStatus::Pausing) {
+                // Пауза по команде поглощена паузой `store`, как в `apply_exit`.
+                st.sig.clear_pause();
+            }
+            st.stopping = None;
+            tracing::warn!(run = %run, error = %e, "сбой журнала: run на паузе store, resume повторит шаг");
+            Ok(LoopOutcome::Paused {
+                reason: pause_reason::STORE.into(),
+                interrupt: None,
+            })
+        }
+        Err(se) => {
+            tracing::error!(run = %run, error = %e, status_error = %se,
+                "сбой журнала, пауза store не записана: run остаётся для resume");
+            Err(e)
+        }
     }
 }
 
@@ -716,6 +788,14 @@ struct BoundaryValue {
     usage: UsageTotals,
 }
 
+/// Итог чтения входа в значение квитанции. Ошибка журнала и несериализуемое значение —
+/// разовый сбой (D72): квитанции нет, resume прочитает вход заново.
+fn read_value(r: Result<BoundaryValue, StoreError>, what: &str) -> Result<Value, EffectFailure> {
+    let v = r.map_err(|e| EffectFailure::Transient(e.to_string()))?;
+    serde_json::to_value(&v)
+        .map_err(|e| EffectFailure::Transient(format!("{what} не сериализуется: {e}")))
+}
+
 /// Чтение входа границы внутри эффекта: ввод и поправки после `after`, время, расход.
 async fn read_boundary(
     store: &ProjectStore,
@@ -796,35 +876,26 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     let step = st.ctx.step();
     let store = deps.journal.store().clone();
     let (run, after) = (st.run, st.inbox_after);
-    let mut failure: Option<StoreError> = None;
-    let fref = &mut failure;
+    let fault = deps.fault.clone();
     // Источник нужен активному времени (4): реплей квитанции несёт `now_ms` прошлого процесса.
     let slot = st.ctx.reserve().map_err(effect_err)?;
+    // Сбой журнала внутри замыкания — разовый (D72): квитанции нет, resume читает заново.
     let (r, source) = slot
-        .run_traced(
+        .run_fallible(
             EffectSpec {
                 class: EffectClass::ReadOnly,
                 name: BOUNDARY_EFFECT.into(),
                 args: json!({ "step": step }),
             },
             move || async move {
-                match read_boundary(&store, run, after).await {
-                    Ok(v) => serde_json::to_value(&v)
-                        .map_err(|e| format!("{STORE_ERROR} граница не сериализуется: {e}")),
-                    Err(e) => {
-                        let msg = format!("{STORE_ERROR} {e}");
-                        *fref = Some(e);
-                        Err(msg)
-                    }
+                if fault.is_some_and(|h| h(FaultPoint::BeforeReadBoundary { step })) {
+                    return Err(EffectFailure::Transient(INJECTED_FAULT.into()));
                 }
+                read_value(read_boundary(&store, run, after).await, "граница")
             },
         )
         .await;
     st.ctx.observe(&r);
-    if let Some(e) = failure {
-        st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
-        return Err(LoopError::Store(e));
-    }
     let v = r.map_err(effect_err)?;
     let b: BoundaryValue = serde_json::from_value(v).map_err(|e| {
         let e = StoreError::Corrupt(format!("квитанция границы шага {step}: {e}"));
@@ -920,33 +991,17 @@ async fn reread_inbox(deps: &LoopDeps, st: &mut LoopState, step: u64) -> Result<
     st.sig.discard_input();
     let store = store_of(deps);
     let (run, after) = (st.run, st.inbox_after);
-    let mut failure: Option<StoreError> = None;
-    let fref = &mut failure;
     let r = st
         .ctx
-        .effect(
+        .effect_fallible(
             EffectSpec {
                 class: EffectClass::ReadOnly,
                 name: INBOX_EFFECT.into(),
                 args: json!({ "step": step }),
             },
-            move || async move {
-                match read_boundary(&store, run, after).await {
-                    Ok(v) => serde_json::to_value(&v)
-                        .map_err(|e| format!("{STORE_ERROR} ввод не сериализуется: {e}")),
-                    Err(e) => {
-                        let msg = format!("{STORE_ERROR} {e}");
-                        *fref = Some(e);
-                        Err(msg)
-                    }
-                }
-            },
+            move || async move { read_value(read_boundary(&store, run, after).await, "ввод") },
         )
         .await;
-    if let Some(e) = failure {
-        st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
-        return Err(LoopError::Store(e));
-    }
     let v = r.map_err(effect_err)?;
     let b: BoundaryValue = serde_json::from_value(v).map_err(|e| {
         let e = StoreError::Corrupt(format!("квитанция inbox шага {step}: {e}"));
@@ -1009,32 +1064,22 @@ async fn boundary_tail(
 async fn state_effect(deps: &LoopDeps, st: &mut LoopState) -> Result<String, LoopError> {
     let store = store_of(deps);
     let run = st.run;
-    let mut failure: Option<StoreError> = None;
-    let fref = &mut failure;
     let r = st
         .ctx
-        .effect(
+        .effect_fallible(
             EffectSpec {
                 class: EffectClass::ReadOnly,
                 name: STATE_EFFECT.into(),
                 args: json!({}),
             },
             move || async move {
-                match state_block(&store, run).await {
-                    Ok(text) => Ok(json!({ "text": text })),
-                    Err(e) => {
-                        let msg = format!("{STORE_ERROR} {e}");
-                        *fref = Some(e);
-                        Err(msg)
-                    }
-                }
+                state_block(&store, run)
+                    .await
+                    .map(|text| json!({ "text": text }))
+                    .map_err(|e| EffectFailure::Transient(e.to_string()))
             },
         )
         .await;
-    if let Some(e) = failure {
-        st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
-        return Err(LoopError::Store(e));
-    }
     let v = r.map_err(effect_err)?;
     v.get("text")
         .and_then(Value::as_str)
@@ -1426,20 +1471,25 @@ async fn run_compaction(
 /// удалять — история, эпоха и оценка прежние, события нет. Файлы выгрузки пишутся вне
 /// эффекта (исключение D30: имя и содержимое детерминированы историей); ошибка записи
 /// — `warn`, событие `context.alert {kind: "prune_failed", step, error}` и удаление
-/// на этой границе пропускается: run продолжается с полной историей.
+/// на этой границе пропускается: run продолжается с полной историей. Запись файлов —
+/// блокирующий ввод-вывод, поэтому `prune` идёт в `spawn_blocking` (Defer m6 R1-B2).
 async fn prune_results(
     deps: &LoopDeps,
     st: &mut LoopState,
     step: u64,
     before: Estimate,
 ) -> Result<Estimate, LoopError> {
-    let pruned = prune(
-        &st.conv,
-        st.run,
-        &st.setup.project_dir,
-        PRUNE_KEEP_TURNS,
-        PRUNE_MIN_BYTES,
-    );
+    let (conv, run, dir) = (st.conv.clone(), st.run, st.setup.project_dir.clone());
+    let pruned = match tokio::task::spawn_blocking(move || {
+        prune(&conv, run, &dir, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // Рантайм останавливается: удаление на этой границе не сделано.
+        Err(e) => Err(std::io::Error::other(e.to_string())),
+    };
     let (conv, count) = match pruned {
         Ok(r) => r,
         Err(e) => {
@@ -1979,13 +2029,14 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
     // не дожидаясь конца идущего инструмента. На сигналы пакет реагирует сам.
     let mut flags = st.sig.flags();
     let r = {
-        let batch = run_tools(
+        let batch = run_tools_with(
             &mut st.ctx,
             &deps.journal,
             &sh.registry,
             &env,
             &rev.calls,
             &mut st.sig,
+            deps.fault.clone(),
         );
         tokio::pin!(batch);
         let mut watching = true;
@@ -2881,8 +2932,21 @@ mod tests {
         assert_eq!(serde_json::from_value::<BoundaryValue>(j).unwrap(), v);
     }
 
+    /// Свой каталог на процесс и вызов `.tmp/za-agent-unit/<name>-<pid>-<n>` (R1-C1,
+    /// Global Constraints): параллельные прогоны тестов не делят журнал.
+    fn unit_dir(name: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.tmp/za-agent-unit")
+            .join(format!("{name}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// Модульная обвязка `apply_exit`: run после шага 0 на `ScriptedModel`, канал
-    /// управления и состояние цикла. Каталог — `.tmp/za-agent-unit/<name>`.
+    /// управления и состояние цикла. Каталог — [`unit_dir`].
     async fn unit_state(
         name: &str,
     ) -> (
@@ -2898,11 +2962,7 @@ mod tests {
         use za_core::EventBus;
         use za_llm::{BackendKind, ScriptedModel, default_caps};
 
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.tmp/za-agent-unit")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unit_dir(name);
         let store = ProjectStore::open(&dir).unwrap();
         let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
         let deps = LoopDeps {
@@ -2912,6 +2972,7 @@ mod tests {
             capabilities: Vec::new(),
             memory: Arc::new(NoMemory),
             crash: None,
+            fault: None,
         };
         let run = RunId::new();
         let spec = RunSpec {

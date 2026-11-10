@@ -4,10 +4,12 @@
 //!
 //! Run идут на `ScriptedModel`; журнал метрик собран вручную, чтобы цифры были точными.
 
+mod support;
+
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
+use support::*;
 
 use serde_json::{Value, json};
 use za_agent::{
@@ -30,30 +32,9 @@ use za_store::{NewRun, ProjectStore, UsageRow};
 
 // ---- Помощники ----
 
-/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
-fn time_scale() -> u32 {
-    static SCALE: OnceLock<u32> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("ZA_TEST_TIME_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(1, |n| n.clamp(1, 6))
-    })
-}
-
-async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(10) * time_scale(), f)
-        .await
-        .unwrap_or_else(|_| panic!("не дождались в срок: {what}"))
-}
-
+/// Свой каталог теста: `CARGO_TARGET_TMPDIR/inspect/<name>-<pid>-<n>`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("inspect")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("inspect", name)
 }
 
 /// Чтение с постоянным результатом `out`.
@@ -125,6 +106,7 @@ fn fx(name: &str, model: ScriptedModel) -> Fx {
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
+        fault: None,
     };
     Fx {
         store,

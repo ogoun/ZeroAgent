@@ -1291,13 +1291,15 @@ async fn until_started(s: &mut ModelStream) -> Option<u32> {
 
 #[tokio::test]
 async fn start_returns_without_waiting_for_probes() {
-    // I3: облако не отвечает вовсе, локальный сервер отвечает через 3 с. Длительности
-    // здесь без множителя: каждый запрос зонда ограничен 5 с (`probe::TOTAL_TIMEOUT`,
-    // константа кода), задержка сервера должна оставаться под этим пределом.
+    // I3: облако не отвечает вовсе, локальный сервер отвечает на зонд только по сигналу
+    // теста (R1-C1 D72): «зонд не завершён» проверяется событием, а не порогом времени.
+    // Сигнал подаётся сразу после проверок — задолго до предела запроса зонда (5 с,
+    // `probe::TOTAL_TIMEOUT`) и `probe_deadline`.
+    let gate = Arc::new(tokio::sync::Notify::new());
     let cloud = FakeServer::start(vec![("GET /models", vec![Reply::Hang])]).await;
     let local = llama_server(
-        vec![Reply::Delayed(
-            Duration::from_millis(3000),
+        vec![Reply::Gated(
+            Arc::clone(&gate),
             Box::new(props("probe/llama_props.json")),
         )],
         vec![llama_text()],
@@ -1313,30 +1315,41 @@ async fn start_returns_without_waiting_for_probes() {
     }));
     let mut o = opts();
     o.probe_deadline = Duration::from_millis(4500);
-    let t0 = Instant::now();
-    let g = Gateway::start(
-        cfg,
-        secrets(&[("openrouter", "sk-or-test-key")]),
-        None,
-        store("start_no_wait"),
-        o,
+    // `start` возвращается, пока зонд локального сервера ждёт сигнала: он не ждал зонды.
+    let g = tokio::time::timeout(
+        patience(),
+        Gateway::start(
+            cfg,
+            secrets(&[("openrouter", "sk-or-test-key")]),
+            None,
+            store("start_no_wait"),
+            o,
+        ),
     )
     .await
+    .expect("start ждал зонды")
     .unwrap();
-    assert!(
-        t0.elapsed() < Duration::from_millis(2000),
-        "start ждал зонды: {:?}",
-        t0.elapsed()
-    );
     assert_eq!(view_of(&g, "local").state, "probing");
     assert_eq!(view_of(&g, "cloud").state, "probing");
     // Заявка к зондируемому эндпоинту ждёт итога зонда и проходит.
-    let evs = drain(
-        g.stream(call_on("local", RunId::new(), "Привет"))
+    let g = Arc::new(g);
+    let req = {
+        let g = Arc::clone(&g);
+        tokio::spawn(async move {
+            drain(
+                g.stream(call_on("local", RunId::new(), "Привет"))
+                    .await
+                    .unwrap(),
+            )
             .await
-            .unwrap(),
-    )
-    .await;
+        })
+    };
+    gate.notify_one();
+    assert!(eventually(|| view_of(&g, "local").state == "ready").await);
+    let evs = tokio::time::timeout(patience(), req)
+        .await
+        .expect("заявка не завершилась в срок")
+        .unwrap();
     assert!(
         matches!(evs.first(), Some(Ok(StreamEvent::Queued(_)))),
         "{evs:?}"

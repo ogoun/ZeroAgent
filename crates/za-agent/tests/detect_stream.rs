@@ -3,10 +3,13 @@
 //! драйвером — обрыв стрима, повтор хода в том же шаге, пауза `model_loop`, реплей
 //! обрыва по квитанции после сбоя (`CrashPoint`).
 
+mod support;
+
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use support::*;
 
 use serde_json::{Value, json};
 use tokio::time::Instant;
@@ -26,23 +29,6 @@ use za_protocol::{
 use za_store::ProjectStore;
 
 // ---- Помощники ----
-
-/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
-fn time_scale() -> u32 {
-    static SCALE: OnceLock<u32> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("ZA_TEST_TIME_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(1, |n| n.clamp(1, 6))
-    })
-}
-
-async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(10) * time_scale(), f)
-        .await
-        .unwrap_or_else(|_| panic!("не дождались в срок: {what}"))
-}
 
 /// Строка повтора брифа: 52 байта, 34 символа.
 const LINE: &str = "Проверяю файл config.toml ещё раз\n";
@@ -357,6 +343,7 @@ fn fx(name: &str) -> Fx {
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
+        fault: None,
     };
     Fx {
         store,

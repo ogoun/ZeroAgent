@@ -18,6 +18,14 @@
 //! [`EffectSlot`] (D3): слоты одного шага можно запускать одновременно, ключи
 //! при реплее от этого не меняются. [`RunCtx::effect`] — резервирование,
 //! выполнение и учёт результата одним вызовом.
+//!
+//! Отказ замыкания бывает двух видов ([`EffectFailure`], R1-C1 D72). Записанный
+//! (`Recorded`) — квитанция-отказ, при повторе эффект не выполняется. Разовый
+//! (`Transient`, например сбой журнала внутри замыкания) — квитанции нет, результат
+//! [`EffectError::Transient`], контекст отравлен; повтор из нового контекста
+//! исполняет безопасный класс заново (CORE-003). [`EffectSlot::run`] и
+//! [`RunCtx::effect`] знают только записанный отказ, [`EffectSlot::run_fallible`] и
+//! [`RunCtx::effect_fallible`] — оба.
 
 use std::future::Future;
 
@@ -60,6 +68,22 @@ pub enum EffectError {
     /// после восстановления.
     #[error("контекст run отравлен прежней ошибкой, нужен новый контекст")]
     Poisoned,
+    /// Разовый сбой внутри замыкания (R1-C1 D72), например ошибка журнала: квитанция
+    /// не записана, намерение осталось без неё. Контекст отравлен; повтор из нового
+    /// контекста исполняет безопасный класс заново, а `NonIdempotent` открывает
+    /// `unknown_outcome` (CORE-003).
+    #[error("разовый сбой эффекта, квитанция не записана: {0}")]
+    Transient(String),
+}
+
+/// Отказ замыкания эффекта (R1-C1 D72).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectFailure {
+    /// Отказ — исход эффекта: пишется квитанция-отказ, при повторе эффект не
+    /// выполняется, результат — [`EffectError::Failed`].
+    Recorded(String),
+    /// Разовый сбой: квитанция не пишется, результат — [`EffectError::Transient`].
+    Transient(String),
 }
 
 /// Откуда взят результат слота (D7, pre-flight 5.2).
@@ -116,14 +140,38 @@ impl EffectSlot {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Value, String>>,
     {
+        self.run_fallible(spec, move || async move {
+            f().await.map_err(EffectFailure::Recorded)
+        })
+        .await
+    }
+
+    /// Как [`Self::run_traced`], но замыкание различает записанный и разовый отказ
+    /// ([`EffectFailure`], R1-C1 D72): `Transient` квитанцию не пишет и даёт
+    /// [`EffectError::Transient`].
+    pub async fn run_fallible<F, Fut>(
+        self,
+        spec: EffectSpec,
+        f: F,
+    ) -> (Result<Value, EffectError>, EffectSource)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Value, EffectFailure>>,
+    {
         let out = match self.prepare(spec).await {
             Ok(Prepared::Recorded(r)) => (r, EffectSource::Journal),
             Ok(Prepared::Execute) => (self.execute(f).await, EffectSource::Live),
             Err(e) => (Err(e), EffectSource::Live),
         };
         // `observe` ключа не знает: ошибки, отравляющие контекст, логируются здесь.
-        if let Err(e @ (EffectError::Store(_) | EffectError::ReplayMismatch { .. })) = &out.0 {
-            tracing::error!(key = %self.key.0, error = %e, "ошибка эффекта");
+        match &out.0 {
+            Err(e @ (EffectError::Store(_) | EffectError::ReplayMismatch { .. })) => {
+                tracing::error!(key = %self.key.0, error = %e, "ошибка эффекта");
+            }
+            Err(e @ EffectError::Transient(_)) => {
+                tracing::warn!(key = %self.key.0, error = %e, "разовый сбой эффекта");
+            }
+            _ => {}
         }
         out
     }
@@ -183,11 +231,12 @@ impl EffectSlot {
         Ok(Prepared::Execute)
     }
 
-    /// Выполняет замыкание и записывает квитанцию с конвертом исхода.
+    /// Выполняет замыкание и записывает квитанцию с конвертом исхода; разовый сбой
+    /// квитанцию не пишет (D72).
     async fn execute<F, Fut>(&self, f: F) -> Result<Value, EffectError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Value, String>>,
+        Fut: Future<Output = Result<Value, EffectFailure>>,
     {
         match f().await {
             Ok(v) => {
@@ -196,12 +245,13 @@ impl EffectSlot {
                     .await?;
                 Ok(v)
             }
-            Err(msg) => {
+            Err(EffectFailure::Recorded(msg)) => {
                 self.store
                     .record_receipt(self.run, &self.key, error_envelope(&msg))
                     .await?;
                 Err(EffectError::Failed(msg))
             }
+            Err(EffectFailure::Transient(msg)) => Err(EffectError::Transient(msg)),
         }
     }
 }
@@ -219,7 +269,8 @@ enum Prepared {
 /// После любой [`EffectError::Store`] контекст отравлен: неизвестно, зафиксирована
 /// ли запись, поэтому ни занять следующий ключ, ни повторить текущий нельзя —
 /// иначе после перезапуска `NonIdempotent`-действие выполнится повторно или ключи
-/// шага сдвинутся. Так же отравляют [`EffectError::Unknown`] (run ждёт решения
+/// шага сдвинутся. Так же отравляют [`EffectError::Transient`] (намерение без
+/// квитанции, как после сбоя журнала), [`EffectError::Unknown`] (run ждёт решения
 /// человека, следующий эффект не должен занять ключ `seq+1`) и
 /// [`EffectError::ReplayMismatch`] (дальнейшие ключи уже не соответствуют
 /// журналу). Все дальнейшие вызовы [`RunCtx::effect`] и [`RunCtx::reserve`] дают
@@ -303,11 +354,13 @@ impl RunCtx {
         })
     }
 
-    /// Учитывает результат слота: [`EffectError::Store`], [`EffectError::Unknown`]
-    /// и [`EffectError::ReplayMismatch`] отравляют контекст (правила R0).
+    /// Учитывает результат слота: [`EffectError::Store`], [`EffectError::Transient`],
+    /// [`EffectError::Unknown`] и [`EffectError::ReplayMismatch`] отравляют контекст
+    /// (правила R0, D72).
     pub fn observe<T>(&mut self, r: &Result<T, EffectError>) {
         if let Err(
             e @ (EffectError::Store(_)
+            | EffectError::Transient(_)
             | EffectError::Unknown { .. }
             | EffectError::ReplayMismatch { .. }),
         ) = r
@@ -331,6 +384,23 @@ impl RunCtx {
     {
         let slot = self.reserve()?;
         let r = slot.run(spec, f).await;
+        self.observe(&r);
+        r
+    }
+
+    /// Как [`Self::effect`], но замыкание различает записанный и разовый отказ
+    /// ([`EffectFailure`], D72); разовый отказ отравляет контекст.
+    pub async fn effect_fallible<F, Fut>(
+        &mut self,
+        spec: EffectSpec,
+        f: F,
+    ) -> Result<Value, EffectError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Value, EffectFailure>>,
+    {
+        let slot = self.reserve()?;
+        let r = slot.run_fallible(spec, f).await.0;
         self.observe(&r);
         r
     }

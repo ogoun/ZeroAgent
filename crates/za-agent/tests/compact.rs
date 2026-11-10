@@ -8,10 +8,13 @@
 //! длины промптов. На окне 8192 тир small, `Effort(Low)`: резерв 3072 (D40), порог
 //! компакции — оценка ≥ 0,75 × 8192 − 3072 = 3072, окно — оценка > 8192 − 3072 = 5120.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use support::*;
 
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, broadcast};
@@ -38,35 +41,9 @@ use za_store::{NewRun, ProjectStore};
 
 // ---- Помощники ----
 
-/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
-fn time_scale() -> u32 {
-    static SCALE: OnceLock<u32> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("ZA_TEST_TIME_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(1, |n| n.clamp(1, 6))
-    })
-}
-
-/// Предел ожиданий, которые при регрессии повисли бы.
-fn limit() -> Duration {
-    Duration::from_secs(10) * time_scale()
-}
-
-async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(limit(), f)
-        .await
-        .unwrap_or_else(|_| panic!("не дождались в срок: {what}"))
-}
-
+/// Свой каталог теста: `CARGO_TARGET_TMPDIR/compact/<name>-<pid>-<n>`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("compact")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("compact", name)
 }
 
 /// Порог компакции на окне 8192 (тир small): оценка ≥ 3072.
@@ -195,6 +172,7 @@ fn fx_in(d: &Path, model: ScriptedModel, memory: Arc<dyn MemoryPort>) -> Fx {
         capabilities: Vec::new(),
         memory,
         crash: None,
+        fault: None,
     };
     Fx {
         store,
@@ -1044,7 +1022,7 @@ async fn compaction_pause_is_interrupted() {
     .await;
     let took = t0.elapsed();
     assert!(
-        took <= Duration::from_millis(200) * time_scale(),
+        took <= Duration::from_millis(200) * scale(),
         "стрим компакции оборван за {took:?}"
     );
     let out = within("run", h).await.unwrap().unwrap();

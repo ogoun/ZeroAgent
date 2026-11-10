@@ -1,4 +1,5 @@
-//! Запуск бинарника `zero-agent` из теста: чистые `ZA_HOME` и каталог проекта внутри
+//! Запуск бинарника `zero-agent` из теста: чистые `ZA_HOME` и каталог проекта (свой у
+//! каждого теста и процесса, [`unique_dir`]) внутри
 //! `CARGO_TARGET_TMPDIR`, предел жизни процесса 60 с × `ZA_TEST_TIME_SCALE` (по
 //! истечении процесс убивается, тест падает с понятной паникой), чтение журнала run.
 
@@ -6,6 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -35,13 +37,24 @@ pub struct Env {
     pub project: PathBuf,
 }
 
-/// Чистые `ZA_HOME` и каталог проекта `<CARGO_TARGET_TMPDIR>/<group>/<name>`; `config` —
-/// текст `config.toml` (пустой — без файла).
-pub fn env_in(group: &str, name: &str, config: &str) -> Env {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+/// Чистый каталог теста `<CARGO_TARGET_TMPDIR>/<group>/<name>-<pid>-<n>`: свой у каждого
+/// вызова и процесса, поэтому одновременные прогоны одного бинарника не делят каталог
+/// (R1-C1, гигиена тестов).
+pub fn unique_dir(group: &str, name: &str) -> PathBuf {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(group)
-        .join(name);
-    let _ = std::fs::remove_dir_all(&root);
+        .join(format!("{name}-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Чистые `ZA_HOME` и каталог проекта в [`unique_dir`]; `config` — текст `config.toml`
+/// (пустой — без файла).
+pub fn env_in(group: &str, name: &str, config: &str) -> Env {
+    let root = unique_dir(group, name);
     let e = Env {
         home: root.join("home"),
         project: root.join("project"),

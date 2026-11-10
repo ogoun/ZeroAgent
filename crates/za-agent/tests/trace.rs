@@ -16,10 +16,13 @@
 //! `ZA_UPDATE_GOLDEN=1` и коммитится; без файла тест падает. Меняется только вместе с
 //! намеренной правкой промптов, запроса или правил контекста.
 
+mod support;
+
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use support::*;
 
 use serde_json::{Value, json};
 use za_agent::{
@@ -41,22 +44,8 @@ use za_store::ProjectStore;
 
 // ---- Помощники ----
 
-/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
-fn time_scale() -> u32 {
-    static SCALE: OnceLock<u32> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("ZA_TEST_TIME_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(1, |n| n.clamp(1, 6))
-    })
-}
-
-async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(30) * time_scale(), f)
-        .await
-        .unwrap_or_else(|_| panic!("не дождались в срок: {what}"))
-}
+/// Предел ожиданий длинного run трассы (× `ZA_TEST_TIME_SCALE`).
+const TRACE_LIMIT: Duration = Duration::from_secs(30);
 
 /// Фиксированный id run (UUIDv7 с нулевым временем): трасса не зависит от прогона.
 const RUN: &str = "00000000-0000-7000-8000-000000000009";
@@ -81,12 +70,10 @@ fn golden_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/trace_prefixes.json")
 }
 
-/// Каталог теста: журнал и проект (выгрузка удалённых результатов).
+/// Свой каталог теста `CARGO_TARGET_TMPDIR/trace/<name>-<pid>-<n>`: журнал и проект
+/// (выгрузка удалённых результатов).
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("trace")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
+    let d = unique_dir("trace", name);
     std::fs::create_dir_all(d.join("project")).unwrap();
     d
 }
@@ -172,6 +159,7 @@ fn fx(name: &str) -> Fx {
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
+        fault: None,
     };
     Fx {
         store,
@@ -356,12 +344,18 @@ fn done() -> LoopOutcome {
 
 async fn start(f: &Fx) -> Result<LoopOutcome, LoopError> {
     let (_ctl, rx) = control_channel(f.store.clone(), f.run);
-    within("start_run", start_run(&f.deps, f.run, spec(&f.project), rx)).await
+    within_for(
+        TRACE_LIMIT,
+        "start_run",
+        start_run(&f.deps, f.run, spec(&f.project), rx),
+    )
+    .await
 }
 
 async fn resume(f: &Fx) -> LoopOutcome {
     let (_ctl, rx) = control_channel(f.store.clone(), f.run);
-    within(
+    within_for(
+        TRACE_LIMIT,
         "resume_run",
         resume_run(&f.deps, f.run, ResumeChange::default(), rx),
     )

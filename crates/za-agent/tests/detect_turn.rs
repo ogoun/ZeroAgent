@@ -3,9 +3,12 @@
 //! применение драйвером. Для каждого детектора — проверка, что нормальный ход его не
 //! включает: ложное срабатывание ставит run на паузу или тратит ход.
 
+mod support;
+
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use support::*;
 
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -32,26 +35,9 @@ use za_store::ProjectStore;
 
 // ---- Помощники ----
 
-/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
-fn time_scale() -> u32 {
-    static SCALE: OnceLock<u32> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("ZA_TEST_TIME_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(1, |n| n.clamp(1, 6))
-    })
-}
-
-async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(10) * time_scale(), f)
-        .await
-        .unwrap_or_else(|_| panic!("не дождались в срок: {what}"))
-}
-
 /// NFR-03: эффект сигнала не позже 200 мс (× `ZA_TEST_TIME_SCALE`).
 fn nfr03() -> Duration {
-    Duration::from_millis(200) * time_scale()
+    Duration::from_millis(200) * scale()
 }
 
 fn h(s: &str) -> BlobHash {
@@ -590,6 +576,7 @@ fn fx_with(name: &str, model: ScriptedModel) -> Fx {
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
+        fault: None,
     };
     Fx {
         store,

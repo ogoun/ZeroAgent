@@ -63,6 +63,9 @@ pub enum Reply {
     Hang,
     /// Тот же ответ после паузы (заголовки приходят не сразу).
     Delayed(Duration, Box<Reply>),
+    /// Тот же ответ после сигнала теста (`Notify::notify_one`): ответ ждёт события, а
+    /// не таймера.
+    Gated(Arc<tokio::sync::Notify>, Box<Reply>),
 }
 
 impl Reply {
@@ -254,16 +257,25 @@ async fn handle(state: Arc<Mutex<State>>, req: Request) -> Response {
         return respond(404, &[], Body::from(r#"{"error":"нет маршрута"}"#));
     };
     let mut reply = reply;
-    while let Reply::Delayed(d, inner) = reply {
-        tokio::time::sleep(d).await;
-        reply = *inner;
-    }
+    let reply = loop {
+        reply = match reply {
+            Reply::Delayed(d, inner) => {
+                tokio::time::sleep(d).await;
+                *inner
+            }
+            Reply::Gated(gate, inner) => {
+                gate.notified().await;
+                *inner
+            }
+            other => break other,
+        };
+    };
     match reply {
         Reply::Json(status, v) => json(status, &[], &v),
         Reply::JsonWithHeaders(status, h, v) => json(status, &h, &v),
         Reply::Raw(status, h, bytes) => respond(status, &h, Body::from(bytes)),
         Reply::Hang => std::future::pending::<Response>().await,
-        Reply::Delayed(..) => unreachable!("пауза снята выше"),
+        Reply::Delayed(..) | Reply::Gated(..) => unreachable!("пауза снята выше"),
         Reply::Sse {
             chunks,
             delay,

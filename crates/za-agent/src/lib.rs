@@ -54,7 +54,10 @@ pub use detect::{
     REPEAT_REJECT, Reaction, StreamWatch, THINKING_TIMEOUT, call_fingerprint,
     promise_without_action, retry_params, thinking_timeout,
 };
-pub use driver::{CrashHook, CrashPoint, LoopDeps, LoopError, LoopOutcome, RunSpec, start_run};
+pub use driver::{
+    CrashHook, CrashPoint, FaultHook, FaultPoint, LoopDeps, LoopError, LoopOutcome, RunSpec,
+    start_run,
+};
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 pub use inspect::{BlockCost, InspectError, Inspection, RunMetrics, inspect, run_metrics};
 pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};

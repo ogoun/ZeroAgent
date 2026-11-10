@@ -1,15 +1,18 @@
 //! Драйвер цикла (задача 12): граница шага, ходы, завершение (D18), чистая пауза
 //! (D5), снимки (D4), ошибки цикла (D11), управление (D26).
 
+mod support;
+
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
+use support::*;
 
 use serde_json::{Value, json};
 use za_agent::{
-    ControlRx, Conversation, CrashPoint, EnvInfo, HistoryError, LoopDeps, LoopError, LoopOutcome,
-    Next, NoMemory, PendingExit, RunSpec, Signal, Snapshot, builtin_tools, control_channel,
-    start_run,
+    ControlRx, Conversation, CrashPoint, EnvInfo, FaultHook, FaultPoint, HistoryError, LoopDeps,
+    LoopError, LoopOutcome, Next, NoMemory, PendingExit, ResumeChange, RunSpec, Signal, Snapshot,
+    builtin_tools, control_channel, resume_run, start_run,
 };
 use za_core::{
     Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
@@ -19,36 +22,16 @@ use za_llm::{
     ScriptedModel, StreamEvent, ToolCall, ToolChoice, ToolSchema, Usage, default_caps,
 };
 use za_protocol::{
-    Actor, Budget, EffectClass, Event, EventKind, NewEvent, Priority, RunId, RunMode, RunRole,
-    RunStatus, Seq, Tier,
+    Actor, Budget, EffectClass, EffectKey, Event, EventKind, NewEvent, Priority, RunId, RunMode,
+    RunRole, RunStatus, Seq, Tier, pause_reason,
 };
 use za_store::{ProjectStore, StoreError, StoreOptions};
 
 // ---- Помощники ----
 
-/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
-fn time_scale() -> u32 {
-    static SCALE: OnceLock<u32> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("ZA_TEST_TIME_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(1, |n| n.clamp(1, 6))
-    })
-}
-
-/// Предел ожиданий, которые при регрессии повисли бы.
-fn limit() -> Duration {
-    Duration::from_secs(10) * time_scale()
-}
-
+/// Свой каталог теста: `CARGO_TARGET_TMPDIR/driver/<name>-<pid>-<n>`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("driver")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("driver", name)
 }
 
 /// Инструмент чтения `echo`: результат — канонический JSON аргументов.
@@ -172,6 +155,7 @@ fn fx_on(store: ProjectStore, model: ScriptedModel, extra: Vec<Arc<dyn Tool>>) -
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
+        fault: None,
     };
     let run = RunId::new();
     let (ctl, rx) = control_channel(store.clone(), run);
@@ -935,4 +919,135 @@ async fn finish_wins_over_pause_during_finish() {
     let h = history(&f.store, &snap).await;
     assert_eq!(h.validate(), Ok(()));
     assert!(h.pending_calls().is_empty());
+}
+
+// ---- Разовый сбой журнала: пауза store статусом (R1-C1 D72) ----
+
+/// Хук, срабатывающий один раз в точке `at`.
+fn fault_once(at: FaultPoint) -> FaultHook {
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    Arc::new(move |p| p == at && armed.swap(false, std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Resume run фикстуры без хука сбоя.
+async fn resume_clean(f: &Fx) -> Result<LoopOutcome, LoopError> {
+    let mut deps = f.deps.clone();
+    deps.fault = None;
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    within(
+        "resume_run",
+        resume_run(&deps, f.run, ResumeChange::default(), rx),
+    )
+    .await
+}
+
+/// Последний `reason` перехода `run.status` в `paused`.
+fn pause_reason_of(evs: &[Event]) -> Option<String> {
+    of_kind(evs, EventKind::RunStatus)
+        .into_iter()
+        .rev()
+        .find(|e| e.payload["to"] == "paused")
+        .and_then(|e| e.payload["reason"].as_str().map(str::to_owned))
+}
+
+fn store_paused() -> LoopOutcome {
+    LoopOutcome::Paused {
+        reason: pause_reason::STORE.into(),
+        interrupt: None,
+    }
+}
+
+#[tokio::test]
+async fn boundary_fault_pauses_with_store_then_resumes() {
+    let mut f = fx("boundary_fault", scripted());
+    f.deps.fault = Some(fault_once(FaultPoint::BeforeReadBoundary { step: 2 }));
+    f.model
+        .push(vec![calls(vec![call_part("c1", "echo", json!({"x": 1}))])]);
+    f.model.push(answer("готово"));
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert_eq!(out, store_paused());
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
+    let evs = events(&f.store, f.run).await;
+    assert_eq!(pause_reason_of(&evs).as_deref(), Some(pause_reason::STORE));
+    // Снимка паузы нет: последний — снимок `Model` шага 1, записанный до шага 2.
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!((snap.step, snap.next, &snap.exit), (1, Next::Model, &None));
+    // Намерение `boundary` шага 2 без квитанции: resume прочитает ввод заново.
+    let row = f
+        .store
+        .effect(f.run, &EffectKey::derive(f.run, 2, 0))
+        .await
+        .unwrap()
+        .expect("намерение boundary шага 2");
+    assert!(row.receipt_seq.is_none(), "квитанции разового сбоя нет");
+    assert_eq!(f.model.calls().len(), 1);
+
+    let out = resume_clean(&f).await.unwrap();
+    assert!(
+        matches!(
+            out,
+            LoopOutcome::Finished {
+                status: RunStatus::Done,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    let row = f
+        .store
+        .effect(f.run, &EffectKey::derive(f.run, 2, 0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.receipt_seq.is_some(), "граница шага 2 прочитана вживую");
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let h = history(&f.store, &snap).await;
+    h.validate().unwrap();
+    assert_eq!(
+        roles(&h),
+        [Role::User, Role::Assistant, Role::Tool, Role::Assistant]
+    );
+    // Ход шага 1 взят из квитанции: модель вызвана ещё раз только для шага 2.
+    assert_eq!(f.model.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn tool_finished_fault_keeps_history_valid() {
+    let mut f = fx("tool_finished_fault", scripted());
+    f.deps.fault = Some(fault_once(FaultPoint::BeforeToolFinished { step: 1 }));
+    f.model
+        .push(vec![calls(vec![call_part("c1", "echo", json!({"x": 1}))])]);
+    f.model.push(answer("готово"));
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert_eq!(out, store_paused());
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
+    let evs = events(&f.store, f.run).await;
+    assert_eq!(pause_reason_of(&evs).as_deref(), Some(pause_reason::STORE));
+    assert!(of_kind(&evs, EventKind::ToolFinished).is_empty());
+    // Пауза без снимка: последний снимок — `Model` шага 1, до вызова.
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!((snap.step, snap.next, &snap.exit), (1, Next::Model, &None));
+    history(&f.store, &snap).await.validate().unwrap();
+
+    let out = resume_clean(&f).await.unwrap();
+    assert!(
+        matches!(
+            out,
+            LoopOutcome::Finished {
+                status: RunStatus::Done,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let h = history(&f.store, &snap).await;
+    h.validate().unwrap();
+    assert_eq!(
+        roles(&h),
+        [Role::User, Role::Assistant, Role::Tool, Role::Assistant]
+    );
+    // Квитанция инструмента записана до сбоя: реплей не вызывает его снова.
+    let evs = events(&f.store, f.run).await;
+    assert_eq!(of_kind(&evs, EventKind::ToolStarted).len(), 1);
 }

@@ -55,10 +55,14 @@ fn ready(state: EndpointState) -> ProbedEndpoint {
     }
 }
 
+/// Свой каталог хранилища `CARGO_TARGET_TMPDIR/profiles/<name>-<pid>-<n>`: два
+/// одновременных прогона бинарника (R1-C1, гигиена тестов) не делят каталог.
 fn store_dir(name: &str) -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("profiles")
-        .join(name);
+        .join(format!("{name}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }

@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use za_core::{
-    EffectError, EffectSource, EffectSpec, Recovery, RunCtx, UnknownDecision, recover,
-    resolve_unknown,
+    EffectError, EffectFailure, EffectSource, EffectSpec, Recovery, RunCtx, UnknownDecision,
+    recover, resolve_unknown,
 };
 use za_protocol::{EffectClass, EffectKey, EventKind, RunId, RunRole, Seq};
 use za_store::{BLOB_THRESHOLD, NewRun, ProjectStore};
@@ -1121,4 +1121,109 @@ async fn resolve_unknown_rejects_foreign_ids() {
         za_store::StoreError::UnknownInterrupt(id.clone())
     );
     assert_eq!(s.interrupt(&id).await.unwrap().unwrap().status, "open");
+}
+
+// ---- Разовый сбой без квитанции (R1-C1 D72) ----
+
+#[tokio::test]
+async fn transient_failure_writes_no_receipt_and_retries() {
+    let (s, run) = setup("transient-retry").await;
+    let key = first_key(run);
+    let slot = RunCtx::new(s.clone(), run).reserve().unwrap();
+    let (r, src) = slot
+        .run_fallible(spec(EffectClass::ReadOnly), || async {
+            Err(EffectFailure::Transient("busy".into()))
+        })
+        .await;
+    assert_eq!(r, Err(EffectError::Transient("busy".into())));
+    assert_eq!(src, EffectSource::Live);
+    let row = s.effect(run, &key).await.unwrap().unwrap();
+    assert!(row.receipt_seq.is_none(), "квитанции разового сбоя нет");
+    assert!(row.result.is_none());
+
+    // Новый контекст с того же шага повторяет безопасный эффект вживую.
+    let slot2 = RunCtx::new(s.clone(), run).reserve().unwrap();
+    let (r2, src) = slot2
+        .run_fallible(spec(EffectClass::ReadOnly), || async { Ok(json!(1)) })
+        .await;
+    assert_eq!((r2.unwrap(), src), (json!(1), EffectSource::Live));
+    assert!(
+        s.effect(run, &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .receipt_seq
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn recorded_failure_through_fallible_is_a_receipt() {
+    let (s, run) = setup("transient-recorded").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut a = RunCtx::new(s.clone(), run);
+    let err = a
+        .effect_fallible(spec(EffectClass::Idempotent), || async {
+            Err(EffectFailure::Recorded("нет доступа".into()))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Failed("нет доступа".into()));
+    assert!(!a.is_poisoned(), "записанный отказ контекст не отравляет");
+    let mut b = RunCtx::new(s.clone(), run);
+    let err = b
+        .effect(spec(EffectClass::Idempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Failed("нет доступа".into()));
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "отказ не повторяется");
+}
+
+#[tokio::test]
+async fn transient_non_idempotent_opens_unknown_on_retry() {
+    let (s, run) = setup("transient-unknown").await;
+    let mut a = RunCtx::new(s.clone(), run);
+    let err = a
+        .effect_fallible(spec(EffectClass::NonIdempotent), || async {
+            Err(EffectFailure::Transient("busy".into()))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Transient("busy".into()));
+    // Повтор с того же шага: намерение без квитанции, класс `NonIdempotent`.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut b = RunCtx::new(s.clone(), run);
+    let err = b
+        .effect(spec(EffectClass::NonIdempotent), counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EffectError::Unknown { .. }), "{err:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn transient_poisons_context() {
+    let (s, run) = setup("transient-poison").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let err = ctx
+        .effect_fallible(spec(EffectClass::ReadOnly), || async {
+            Err(EffectFailure::Transient("busy".into()))
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EffectError::Transient(_)));
+    assert!(ctx.is_poisoned());
+    let err = ctx
+        .effect(spec(EffectClass::ReadOnly), counted(&calls, json!(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EffectError::Poisoned);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // То же через слот и `observe`.
+    let mut ctx2 = RunCtx::new(s.clone(), run);
+    ctx2.next_step();
+    ctx2.observe(&Err::<Value, _>(EffectError::Transient("busy".into())));
+    assert_eq!(ctx2.reserve().unwrap_err(), EffectError::Poisoned);
 }
