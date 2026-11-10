@@ -56,8 +56,8 @@ use crate::request::{
 use crate::state::{Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools};
 use crate::turn::{
-    CallVerdict, ControlFlags, RequestRefs, Reviewed, Signal, TurnError, TurnOutput, model_turn,
-    report_parse_errors, review,
+    CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, RequestRefs, Reviewed, Signal, TurnError,
+    TurnOutput, model_turn, report_parse_errors, review,
 };
 
 /// Точки «сбоя» для тестов и --crash-at (D33).
@@ -957,14 +957,19 @@ async fn model_output(
         tracing::warn!(run = %st.run, "пустые ходы подряд: run blocked");
         return finish_with(st, RunStatus::Blocked);
     }
+    // Обрезанный вызов в тексте уже получил `LENGTH_CUT_NUDGE` от разбора: он точнее
+    // (вызов не выполнен из-за обрезки), второй nudge про обрезку не нужен.
+    let cut_call = rev.nudges.iter().any(|n| n == LENGTH_CUT_NUDGE);
     let nudge = if truncated {
-        TRUNCATED_NUDGE
+        (!cut_call).then_some(TRUNCATED_NUDGE)
     } else if st.setup.role == RunRole::Top {
-        EMPTY_NUDGE_TOP
+        Some(EMPTY_NUDGE_TOP)
     } else {
-        EMPTY_NUDGE_SUBAGENT
+        Some(EMPTY_NUDGE_SUBAGENT)
     };
-    push_nudges(st, &[nudge.to_owned()])?;
+    if let Some(nudge) = nudge {
+        push_nudges(st, &[nudge.to_owned()])?;
+    }
     if !truncated && st.counters.empty_turns == EMPTY_TURNS_LIMIT - 1 {
         st.counters.forced_required = true;
     }

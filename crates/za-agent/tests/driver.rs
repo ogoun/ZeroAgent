@@ -484,6 +484,50 @@ async fn truncated_reply_nudges_to_continue() {
     assert_eq!(f.model.calls().len(), 3);
 }
 
+/// Решение контроллера (ревью задачи 12): при `Length` с прозой и обрезанным вызовом
+/// в тексте модель получает один nudge — про обрезанный вызов, без nudge обрезанного
+/// ответа: он точнее (вызов не выполнен из-за обрезки).
+#[tokio::test]
+async fn length_cut_call_gets_single_nudge() {
+    let mut f = fx("length_cut_single", scripted());
+    let t = "Читаю файл.
+<tool_call>
+{\"name\": \"echo\", \"arguments\": {\"pa
+</tool_call>";
+    f.model.push(truncated(t));
+    f.model.push(answer("ок"));
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert!(
+        matches!(
+            out,
+            LoopOutcome::Finished {
+                status: RunStatus::Done,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    let calls = f.model.calls();
+    assert_eq!(calls.len(), 2);
+    let msgs = &calls[1].request.messages;
+    let at = msgs
+        .iter()
+        .rposition(|m| m.role == Role::Assistant)
+        .expect("ответа ассистента нет");
+    let nudges: Vec<String> = msgs[at + 1..]
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(text_of)
+        .collect();
+    assert_eq!(nudges.len(), 1, "{nudges:?}");
+    assert!(nudges[0].contains("finish_reason=length"), "{}", nudges[0]);
+    assert!(
+        !nudges[0].contains("Continue more briefly"),
+        "{}",
+        nudges[0]
+    );
+}
+
 /// I1: конечный снимок пишется после конечного статуса. Сбой между статусом и
 /// снимком оставляет run `done` (не resumable) с последним снимком `Model`; сбой до
 /// статуса оставляет `running` и снимок `Model` — resume реплеит шаг по квитанциям.
