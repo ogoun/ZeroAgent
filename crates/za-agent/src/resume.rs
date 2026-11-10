@@ -396,13 +396,16 @@ async fn inputs_of(store: &ProjectStore, msgs: &[Message]) -> Result<Vec<UserInp
     Ok(out)
 }
 
+/// Исходы `turn.finished`, после которых ход повторяется в том же шаге (D69).
+const RETRIED_OUTCOMES: [&str; 2] = ["overflow", "degenerate"];
+
 /// Текст <state>: шаги, последняя причина паузы, решённые неизвестные исходы, мутирующие вызовы
 /// (имя и аргументы до 120 символов) — эффект ReadOnly "state".
 ///
-/// Шаги — число `turn.finished` с конечным исходом (без `overflow`, R1-B2 D69); пауза —
-/// причина последнего перехода в `paused` (`blocked_on_budget` — так и пишется);
-/// мутирующие вызовы — намерения классов `Idempotent` и `NonIdempotent`, кроме вызовов
-/// модели (ход, сводка компакции) и хука памяти, с квитанцией-успехом без `is_error`.
+/// Шаги — число `turn.finished` с конечным исходом (без `overflow` и `degenerate`, R1-B2
+/// D69); пауза — причина последнего перехода в `paused` (`blocked_on_budget` — так и
+/// пишется); мутирующие вызовы — намерения классов `Idempotent` и `NonIdempotent`, кроме
+/// вызовов модели (ход, сводка компакции) и хука памяти, с квитанцией-успехом без `is_error`.
 /// Имена и аргументы экранируются [`escape_untrusted`].
 pub async fn state_block(store: &ProjectStore, run: RunId) -> Result<String, StoreError> {
     let mut steps = 0u64;
@@ -415,8 +418,13 @@ pub async fn state_block(store: &ProjectStore, run: RunId) -> Result<String, Sto
         for e in page {
             cursor = e.seq;
             match e.kind {
-                // Исход `overflow` — не конец хода: ход повторяется в том же шаге (D69).
-                EventKind::TurnFinished if e.payload["outcome"] != "overflow" => steps += 1,
+                // Исходы `overflow` и `degenerate` — не конец хода: ход повторяется в
+                // том же шаге (D69).
+                EventKind::TurnFinished
+                    if !RETRIED_OUTCOMES.contains(&e.payload["outcome"].as_str().unwrap_or("")) =>
+                {
+                    steps += 1
+                }
                 EventKind::RunStatus => {
                     let to = serde_json::from_value::<RunStatus>(e.payload["to"].clone()).ok();
                     match to {

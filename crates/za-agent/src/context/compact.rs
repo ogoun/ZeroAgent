@@ -315,7 +315,19 @@ pub async fn compact(
             prefix: input.frozen.prefix_hash.clone(),
             prompt_version: input.frozen.prompt_version.clone(),
         };
-        match model_call(ctx, j, model, call, &refs, turn, sig, CallKind::Compact).await {
+        match model_call(
+            ctx,
+            j,
+            model,
+            call,
+            &refs,
+            turn,
+            sig,
+            CallKind::Compact,
+            None,
+        )
+        .await
+        {
             Ok(out) => {
                 let text = text_of(&out.message);
                 if next_step_of(&text).is_some() {

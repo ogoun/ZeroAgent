@@ -7,9 +7,12 @@
 //!
 //! Детектор отвечает [`Reaction`]; применяет её драйвер: до пакета вызовов (повтор
 //! A,A,A — повторное использование прошлого результата, отказ, блокировка) и после
-//! результатов хода (цикл ABAB, застой). Повтор, цикл и застой — [`repeat`].
+//! результатов хода (цикл ABAB, застой). Повтор, цикл и застой — [`repeat`]. Повтор
+//! текста и бесконечное рассуждение в стриме хода (D58, D59) — [`stream`]: их состояние
+//! живёт одну попытку хода и в снимок не входит.
 
 mod repeat;
+mod stream;
 
 use std::time::Duration;
 
@@ -20,6 +23,7 @@ use za_llm::{ReasoningMode, Sampling};
 use za_protocol::{BlobHash, EffectClass, canonical_json};
 
 use repeat::RepeatState;
+pub use stream::{Degenerate, StreamWatch, THINKING_TIMEOUT, retry_params};
 
 /// Пометка результата, повторно показанного без исполнения (D54); после неё — `\n` и
 /// прошлый результат.

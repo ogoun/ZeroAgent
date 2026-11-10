@@ -42,8 +42,8 @@ use za_core::{
     ToolKind, ToolRegistry, Transition, pause_reason_for,
 };
 use za_llm::{
-    BoxFuture, EndpointId, ErrorClass, FinishReason, ModelCall, ModelPort, Part, RequestMeta,
-    ToolChoice,
+    BoxFuture, EndpointId, ErrorClass, FinishReason, ModelCall, ModelPort, Part, ReasoningMode,
+    RequestMeta, Sampling, ToolChoice,
 };
 use za_protocol::{
     Actor, BlobHash, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId,
@@ -59,7 +59,9 @@ use crate::context::{
 };
 use crate::control::ControlRx;
 use crate::conversation::{Conversation, HistoryError};
-use crate::detect::{CYCLE_NUDGE, DetectorState, REPEAT_MARK, REPEAT_REJECT, Reaction};
+use crate::detect::{
+    CYCLE_NUDGE, DetectorState, REPEAT_MARK, REPEAT_REJECT, Reaction, StreamWatch, retry_params,
+};
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
 use crate::prompt::{
@@ -73,8 +75,8 @@ use crate::resume::state_block;
 use crate::state::{AtBoundary, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools};
 use crate::turn::{
-    CallKind, CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed,
-    Signal, TurnError, TurnOutput, model_call, report_parse_errors, review,
+    CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed, Signal,
+    TurnError, TurnOutput, model_turn_with, report_parse_errors, review,
 };
 
 /// Точки «сбоя» для тестов и --crash-at (D33).
@@ -1375,6 +1377,14 @@ async fn run_compaction(
             st.exit = Some(effect_exit(e)?);
             Ok(CompactStep::Exit(Transition::Done))
         }
+        // У компакции детекторов стрима нет: такая квитанция — чужая запись.
+        Err(TurnError::Degenerate(d)) => {
+            st.exit = Some(effect_exit(EffectError::Failed(format!(
+                "обрыв детектором {} у компакции",
+                d.as_str()
+            )))?);
+            Ok(CompactStep::Exit(Transition::Done))
+        }
         Err(TurnError::Aborted { signal, source }) => match (signal, source) {
             (Signal::Pause, za_core::EffectSource::Live) => {
                 Ok(CompactStep::Exit(command_pause(sh, st).await?))
@@ -1548,11 +1558,25 @@ async fn context_alert(j: &Journal, run: RunId, payload: Value) -> Result<Seq, S
 /// `overflow`, аварийная компакция и один повтор хода в том же шаге (тот же `turn`,
 /// `turn_attempt = 1`, `steps += 1` — D67, D69). Снимка после компакции нет: сбой до
 /// конца шага реплеит его со снимка `Model` по квитанциям к той же истории.
+///
+/// Детекторы стрима (D58, D59): обрыв (`TurnError::Degenerate`) — исход `degenerate` с
+/// полем `detector`, `loop.detected {action: "retry"}` и повтор хода в том же шаге с
+/// параметрами [`retry_params`] (история та же, `turn` тот же, `turn_attempt` и
+/// `steps` растут, D69); второе срабатывание в шаге — `loop.detected {action: "pause"}`
+/// и пауза `model_loop`. Реплей получает обрыв из квитанции и повторяет то же решение.
 async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopError> {
     let deps = &sh.deps;
     let mut attempt = 0;
+    // Параметры повтора после обрыва детектором (D58, D59): выборка и мышление.
+    let mut retry: Option<(Sampling, Option<ReasoningMode>)> = None;
     loop {
-        let opts = turn_options(st);
+        let mut opts = turn_options(st);
+        if let Some((sampling, reasoning)) = &retry {
+            opts.sampling = sampling.clone();
+            if let Some(r) = reasoning {
+                opts.reasoning = Some(r.clone());
+            }
+        }
         let call = ModelCall {
             endpoint: st.setup.endpoint.clone(),
             meta: RequestMeta {
@@ -1569,7 +1593,8 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             prefix: st.frozen.prefix_hash.clone(),
             prompt_version: st.frozen.prompt_version.clone(),
         };
-        let r = model_call(
+        let mut watch = StreamWatch::new(&call.request.reasoning);
+        let r = model_turn_with(
             &mut st.ctx,
             &deps.journal,
             deps.model.as_ref(),
@@ -1577,13 +1602,17 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             &refs,
             st.turn,
             &mut st.sig,
-            CallKind::Turn { attempt },
+            Some(&mut watch),
+            attempt,
         )
         .await;
         // Квитанция эффекта записана (успех, ошибка модели или обрыв) — точка сбоя D33.
         if matches!(
             r,
-            Ok(_) | Err(TurnError::Model { .. } | TurnError::Aborted { .. })
+            Ok(_)
+                | Err(TurnError::Model { .. }
+                    | TurnError::Aborted { .. }
+                    | TurnError::Degenerate(_))
         ) && crashed(
             deps,
             CrashPoint::AfterModelEffect {
@@ -1613,7 +1642,24 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
                 st.meter.last_estimate = None;
                 st.meter.last_floor = None;
                 st.counters.steps += 1;
-                attempt = 1;
+                attempt += 1;
+            }
+            Err(TurnError::Degenerate(d)) => {
+                let name = d.as_str();
+                turn_finished_with(deps, st, "degenerate", None, Some(name)).await?;
+                if retry.is_some() {
+                    tracing::warn!(run = %st.run, turn = st.turn, detector = name,
+                        "повтор хода снова оборван детектором: пауза model_loop");
+                    loop_detected(deps, st, name, "pause").await?;
+                    return clean_pause(deps, st, LoopExit::Paused(pause_reason::MODEL_LOOP)).await;
+                }
+                tracing::warn!(run = %st.run, turn = st.turn, detector = name,
+                    "стрим хода оборван детектором: повтор хода");
+                loop_detected(deps, st, name, "retry").await?;
+                retry = Some(retry_params(d, &opts.sampling));
+                // Повтор — тот же ход: `empty_turns` не меняется, шаг бюджета — новый (D69).
+                st.counters.steps += 1;
+                attempt += 1;
             }
             r => return model_result(sh, st, r, &call).await,
         }
@@ -1637,6 +1683,16 @@ async fn model_result(
         }
         Err(TurnError::Effect(e)) => {
             let exit = effect_exit(e)?;
+            turn_finished(deps, st, "error", None).await?;
+            st.exit = Some(exit);
+            Ok(Transition::Done)
+        }
+        // Обрыв детектором разбирает `model_node` (повтор или пауза) и сюда не передаёт.
+        Err(TurnError::Degenerate(d)) => {
+            let exit = effect_exit(EffectError::Failed(format!(
+                "обрыв детектором {} вне узла model",
+                d.as_str()
+            )))?;
             turn_finished(deps, st, "error", None).await?;
             st.exit = Some(exit);
             Ok(Transition::Done)
@@ -2320,20 +2376,35 @@ async fn turn_finished(
     outcome: &str,
     rev: Option<&Reviewed>,
 ) -> Result<(), StoreError> {
+    turn_finished_with(deps, st, outcome, rev, None).await
+}
+
+/// [`turn_finished`] с полем `detector` у исхода `degenerate` (R1-B2 D69).
+async fn turn_finished_with(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    outcome: &str,
+    rev: Option<&Reviewed>,
+    detector: Option<&str>,
+) -> Result<(), StoreError> {
     let (calls, repairs, rejected) =
         rev.map_or((0, 0, 0), |r| (r.calls.len(), r.repairs, r.rejected));
+    let mut payload = json!({
+        "turn": st.turn,
+        "outcome": outcome,
+        "calls": calls,
+        "repairs": repairs,
+        "rejected": rejected,
+    });
+    if let Some(d) = detector {
+        payload["detector"] = Value::String(d.to_owned());
+    }
     st.last_seq = append(
         &deps.journal,
         st.run,
         Actor::Runtime,
         EventKind::TurnFinished,
-        json!({
-            "turn": st.turn,
-            "outcome": outcome,
-            "calls": calls,
-            "repairs": repairs,
-            "rejected": rejected,
-        }),
+        payload,
     )
     .await?;
     Ok(())

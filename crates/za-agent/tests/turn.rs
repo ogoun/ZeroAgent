@@ -8,15 +8,16 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use za_agent::{
-    CallVerdict, LoopExit, RequestRefs, Signal, TurnError, exit_for_effect_error,
-    exit_for_model_error, model_turn, report_parse_errors, review, signal_channel,
+    CallVerdict, Degenerate, LoopExit, RequestRefs, Signal, StreamWatch, TurnError,
+    exit_for_effect_error, exit_for_model_error, model_turn, model_turn_with, report_parse_errors,
+    review, signal_channel,
 };
 use za_core::{EffectError, EffectSource, EventBus, Journal, RunCtx};
 use za_llm::normalize::CallSource;
 use za_llm::{
-    BackendKind, ChatRequest, EndpointId, ErrorClass, FinishReason, Message, ModelCall, ModelError,
-    Part, QueueStatus, ReasoningMode, RequestMeta, Role, Sampling, ScriptedModel, StreamEvent,
-    ToolCall, ToolChoice, ToolSchema, Usage, WaitState, default_caps,
+    BackendKind, ChatRequest, Effort, EndpointId, ErrorClass, FinishReason, Message, ModelCall,
+    ModelError, Part, QueueStatus, ReasoningMode, RequestMeta, Role, Sampling, ScriptedModel,
+    StreamEvent, ToolCall, ToolChoice, ToolSchema, Usage, WaitState, default_caps,
 };
 use za_protocol::{BlobHash, EffectClass, EffectKey, EventKind, Priority, RunId, RunRole, Seq};
 use za_store::{NewRun, ProjectStore, UsageTotals};
@@ -671,6 +672,80 @@ async fn cancel_aborts_turn() {
 #[tokio::test]
 async fn input_aborts_turn() {
     abort_with("abort-input", Signal::Input).await;
+}
+
+/// R1-B2 Ruling 1.9: квитанции `interrupted:repetition|thinking` разбираются в
+/// `TurnError::Degenerate` до `Signal::parse` — вживую и при реплее (иначе
+/// `TurnError::Effect` и `fail_reason::EFFECT`); `interrupted:pause` — как в R1-B1.
+#[tokio::test]
+async fn decode_failure_degenerate() {
+    let line = "Проверяю файл config.toml ещё раз
+";
+    let cases = [
+        (
+            "degenerate-repetition",
+            ReasoningMode::Default,
+            vec![delta(line), delta(line), delta(line), delta(line)],
+            Degenerate::Repetition,
+            "interrupted:repetition",
+        ),
+        (
+            "degenerate-thinking",
+            ReasoningMode::Effort(Effort::Low),
+            vec![Ok(StreamEvent::ReasoningDelta("r".repeat(2048 * 6 + 4)))],
+            Degenerate::Thinking,
+            "interrupted:thinking",
+        ),
+    ];
+    for (name, reasoning, events, want, receipt) in cases {
+        let (s, j, run) = setup(name).await;
+        let m = model();
+        m.push_open(events);
+        let mut ctx = RunCtx::new(s.clone(), run);
+        ctx.next_step();
+        let key = EffectKey::derive(run, 1, 0);
+        let (_tx, mut sig) = signal_channel();
+        let mut watch = StreamWatch::new(&reasoning);
+        let err = within(
+            "обрыв по детектору",
+            model_turn_with(
+                &mut ctx,
+                &j,
+                &m,
+                call(run),
+                &refs(),
+                1,
+                &mut sig,
+                Some(&mut watch),
+                0,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, TurnError::Degenerate(d) if d == want),
+            "{err:?}"
+        );
+        assert_eq!(m.open_streams(), 0, "стрим брошен");
+        assert_eq!(receipt_error(&s, run, &key).await, receipt);
+
+        // Реплей: тот же обрыв из квитанции, стрим не открывается, наблюдателя нет.
+        let mut ctx = RunCtx::resume_at(s.clone(), run, 1, 0);
+        let (_tx2, mut sig2) = signal_channel();
+        let again = within(
+            "реплей обрыва по детектору",
+            model_turn(&mut ctx, &j, &m, call(run), &refs(), 1, &mut sig2),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(again, TurnError::Degenerate(d) if d == want),
+            "{again:?}"
+        );
+        assert_eq!(m.calls().len(), 1);
+    }
+    // `interrupted:pause` — обрыв сигналом, как в R1-B1 (abort_with).
+    abort_with("degenerate-pause", Signal::Pause).await;
 }
 
 #[tokio::test]

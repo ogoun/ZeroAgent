@@ -6,7 +6,8 @@
 //! `model.request` (с `options` хода и `turn_attempt`, R1-B2 D67), читает стрим, склеивает дельты ([`DeltaBuffer`]) в `model.delta`,
 //! пишет `agent.heartbeat` и, на `Finished`, `model.usage` вместе со строкой `usage`.
 //! Итог хода — квитанция-успех с [`TurnOutput`]; ошибка модели — квитанция-отказ
-//! `model_error:{json}`; обрыв сигналом — `interrupted:pause|cancel|input`. Реплей
+//! `model_error:{json}`; обрыв сигналом — `interrupted:pause|cancel|input`, обрыв
+//! детектором стрима ([`StreamWatch`], R1-B2 D58, D59) — `interrupted:repetition|thinking`. Реплей
 //! получает тот же итог из журнала без вызова модели и без событий хода. Тот же путь
 //! (`model_call`) у запроса сводки компакции (R1-B2 D46): эффект `compact` с
 //! аргументами `{request}`, `model.request` и `model.usage` с `kind: "compact"`.
@@ -35,6 +36,7 @@ use za_llm::{
 use za_protocol::{Actor, BlobHash, EffectClass, EventKind, NewEvent, RunId};
 use za_store::{StoreError, UsageRow};
 
+use crate::detect::{Degenerate, StreamWatch};
 use crate::prompt::escape_untrusted;
 use crate::request::request_hash;
 
@@ -333,6 +335,9 @@ pub enum TurnError {
         signal: Signal,
         source: EffectSource,
     },
+    /// Обрыв детектором стрима (R1-B2 D58, D59): квитанция `interrupted:repetition` или
+    /// `interrupted:thinking`; вживую и при реплее одинаково.
+    Degenerate(Degenerate),
     /// Ошибка протокола эффектов (журнал, неизвестный исход, расхождение с журналом).
     Effect(EffectError),
     /// Запрос хода не сериализуется для `request_hash`: ключ эффекта не занят,
@@ -347,6 +352,9 @@ impl fmt::Display for TurnError {
             TurnError::Aborted { signal, source } => {
                 write!(f, "ход прерван сигналом {signal:?} ({source:?})")
             }
+            TurnError::Degenerate(d) => {
+                write!(f, "стрим хода оборван детектором {}", d.as_str())
+            }
             TurnError::Effect(e) => write!(f, "{e}"),
             TurnError::Request(e) => write!(f, "запрос хода не сериализуется: {e}"),
         }
@@ -359,7 +367,7 @@ impl std::error::Error for TurnError {
             TurnError::Model { error, .. } => Some(error),
             TurnError::Effect(e) => Some(e),
             TurnError::Request(e) => Some(e),
-            TurnError::Aborted { .. } => None,
+            TurnError::Aborted { .. } | TurnError::Degenerate(_) => None,
         }
     }
 }
@@ -392,6 +400,7 @@ struct ModelFailure {
 
 /// Эффект `model` (D7): стрим, события D8 (дельты, restart, heartbeat, usage — только вживую), итог.
 /// `sig` — сигналы цикла; первый пришедший обрывает стрим (drop) и записывает `interrupted:*`.
+/// Первая попытка хода без детекторов стрима; с ними — [`model_turn_with`].
 pub async fn model_turn(
     ctx: &mut RunCtx,
     j: &Journal,
@@ -401,6 +410,29 @@ pub async fn model_turn(
     turn: u32,
     sig: &mut Signals,
 ) -> Result<TurnOutput, TurnError> {
+    model_turn_with(ctx, j, model, call, refs, turn, sig, None, 0).await
+}
+
+/// [`model_turn`] с детекторами стрима и номером попытки хода (R1-B2 D58, D59, D67).
+///
+/// `watch` смотрит дельты живого стрима: срабатывание обрывает стрим (drop), буферы
+/// дельт записываются, квитанция — `interrupted:repetition|thinking`, итог —
+/// [`TurnError::Degenerate`]. Дедлайн рассуждения ([`StreamWatch::deadline`]) — ветка
+/// того же `select!`, что сигналы и сброс дельт. Реплей отдаёт тот же обрыв из
+/// квитанции без модели. `turn_attempt` — поле `model.request` (0 — первая попытка,
+/// повторы D49, D58, D59 — с 1).
+#[allow(clippy::too_many_arguments)]
+pub async fn model_turn_with(
+    ctx: &mut RunCtx,
+    j: &Journal,
+    model: &dyn ModelPort,
+    call: ModelCall,
+    refs: &RequestRefs,
+    turn: u32,
+    sig: &mut Signals,
+    watch: Option<&mut StreamWatch>,
+    turn_attempt: u32,
+) -> Result<TurnOutput, TurnError> {
     model_call(
         ctx,
         j,
@@ -409,7 +441,10 @@ pub async fn model_turn(
         refs,
         turn,
         sig,
-        CallKind::Turn { attempt: 0 },
+        CallKind::Turn {
+            attempt: turn_attempt,
+        },
+        watch,
     )
     .await
 }
@@ -426,7 +461,8 @@ pub(crate) enum CallKind {
     Compact,
 }
 
-/// Вызов модели как эффект `Idempotent`: ход ([`model_turn`]) или компакция (D46).
+/// Вызов модели как эффект `Idempotent`: ход ([`model_turn_with`]) или компакция (D46).
+/// `watch` — детекторы стрима живого хода (D58, D59); у компакции их нет.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn model_call(
     ctx: &mut RunCtx,
@@ -437,6 +473,7 @@ pub(crate) async fn model_call(
     turn: u32,
     sig: &mut Signals,
     kind: CallKind,
+    watch: Option<&mut StreamWatch>,
 ) -> Result<TurnOutput, TurnError> {
     // До резервирования: ошибка хэша не занимает ключ эффекта.
     let request = request_hash(&call.request).map_err(TurnError::Request)?;
@@ -481,7 +518,7 @@ pub(crate) async fn model_call(
     let failure = &mut store_failure;
     let (r, source) = slot
         .run_traced(spec, move || async move {
-            match live.run(model, call, sig).await {
+            match live.run(model, call, sig, watch).await {
                 Ok(out) => serde_json::to_value(&out)
                     .map_err(|e| format!("{STORE_ERROR} итог хода не сериализуется: {e}")),
                 Err(Live::Model { error, last_wait }) => {
@@ -492,6 +529,7 @@ pub(crate) async fn model_call(
                     })
                 }
                 Err(Live::Signal(s)) => Err(format!("{INTERRUPTED}{}", s.as_str())),
+                Err(Live::Degenerate(d)) => Err(format!("{INTERRUPTED}{}", d.as_str())),
                 Err(Live::Store(e)) => {
                     let msg = format!("{STORE_ERROR} {e}");
                     *failure = Some(e);
@@ -521,7 +559,8 @@ pub(crate) async fn model_call(
     }
 }
 
-/// Квитанция-отказ эффекта `model` обратно в ошибку хода (D7).
+/// Квитанция-отказ эффекта `model` обратно в ошибку хода (D7). Обрыв детектором
+/// (`interrupted:repetition|thinking`, R1-B2 Ruling 1.9) разбирается до сигналов.
 fn decode_failure(msg: String, source: EffectSource) -> TurnError {
     if let Some(body) = msg.strip_prefix(MODEL_ERROR) {
         match serde_json::from_str::<ModelFailure>(body) {
@@ -533,8 +572,13 @@ fn decode_failure(msg: String, source: EffectSource) -> TurnError {
             }
             Err(e) => tracing::warn!(error = %e, "квитанция model_error не разбирается"),
         }
-    } else if let Some(signal) = msg.strip_prefix(INTERRUPTED).and_then(Signal::parse) {
-        return TurnError::Aborted { signal, source };
+    } else if let Some(tag) = msg.strip_prefix(INTERRUPTED) {
+        if let Some(d) = Degenerate::parse(tag) {
+            return TurnError::Degenerate(d);
+        }
+        if let Some(signal) = Signal::parse(tag) {
+            return TurnError::Aborted { signal, source };
+        }
     }
     TurnError::Effect(EffectError::Failed(msg))
 }
@@ -546,6 +590,8 @@ enum Live {
         last_wait: Option<WaitState>,
     },
     Signal(Signal),
+    /// Обрыв детектором стрима (D58, D59).
+    Degenerate(Degenerate),
     Store(StoreError),
 }
 
@@ -560,6 +606,8 @@ enum Step {
     Signal(Signal),
     Event(Option<Result<StreamEvent, ModelError>>),
     Timer,
+    /// Дедлайн рассуждения [`StreamWatch::deadline`] (D59).
+    ThinkingDeadline,
 }
 
 /// Последний записанный heartbeat.
@@ -585,7 +633,7 @@ struct LiveTurn<'a> {
 }
 
 /// Состояние стрима одного хода.
-struct StreamState {
+struct StreamState<'w> {
     attempt: u32,
     text: DeltaBuffer,
     reasoning: DeltaBuffer,
@@ -593,6 +641,10 @@ struct StreamState {
     last_wait: Option<WaitState>,
     beat: Option<Beat>,
     ttft_ms: Option<u64>,
+    /// Детекторы стрима (D58, D59); `None` — без них (компакция, [`model_turn`]).
+    watch: Option<&'w mut StreamWatch>,
+    /// Срабатывание детектора на последнем шаге цикла стрима: стрим обрывается.
+    degenerate: Option<Degenerate>,
 }
 
 impl LiveTurn<'_> {
@@ -622,11 +674,12 @@ impl LiveTurn<'_> {
         model: &dyn ModelPort,
         call: ModelCall,
         sig: &mut Signals,
+        watch: Option<&mut StreamWatch>,
     ) -> Result<TurnOutput, Live> {
         // Ввод во время компакции откладывается после её конца: внутри стрима
         // отложенный сигнал отдавался бы тому же `recv` снова и снова.
         let mut input_seen = false;
-        let r = self.stream(model, call, sig, &mut input_seen).await;
+        let r = self.stream(model, call, sig, &mut input_seen, watch).await;
         if input_seen {
             sig.defer_input();
         }
@@ -639,6 +692,7 @@ impl LiveTurn<'_> {
         call: ModelCall,
         sig: &mut Signals,
         input_seen: &mut bool,
+        watch: Option<&mut StreamWatch>,
     ) -> Result<TurnOutput, Live> {
         let endpoint = call.endpoint.0.clone();
         // D67: параметры хода вне истории — по ним инспектор восстанавливает запрос точно.
@@ -673,6 +727,8 @@ impl LiveTurn<'_> {
             last_wait: None,
             beat: None,
             ttft_ms: None,
+            watch,
+            degenerate: None,
         };
         let mut stream = match model.stream(call).await {
             Ok(s) => s,
@@ -685,6 +741,9 @@ impl LiveTurn<'_> {
         };
         loop {
             let deadline = min_deadline(st.text.deadline(), st.reasoning.deadline());
+            // D59: замолчавший стрим рассуждения обрывается по дедлайну, а не только по
+            // приходу следующей дельты.
+            let thinking = st.watch.as_ref().and_then(|w| w.deadline());
             let step = tokio::select! {
                 // Сигналы первыми: поток событий стрима не задерживает обрыв (NFR-03).
                 biased;
@@ -692,6 +751,8 @@ impl LiveTurn<'_> {
                 ev = stream.next() => Step::Event(ev),
                 _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)),
                     if deadline.is_some() => Step::Timer,
+                _ = tokio::time::sleep_until(thinking.unwrap_or_else(Instant::now)),
+                    if thinking.is_some() => Step::ThinkingDeadline,
             };
             match step {
                 // Компакцию ввод не обрывает, но сигнал не теряется (Ruling I-2): граница
@@ -705,6 +766,7 @@ impl LiveTurn<'_> {
                     return Err(Live::Signal(s));
                 }
                 Step::Timer => self.flush_due(&mut st, Instant::now()).await?,
+                Step::ThinkingDeadline => st.degenerate = Some(Degenerate::Thinking),
                 Step::Event(None) => {
                     self.flush(&mut st).await?;
                     return Err(Live::Model {
@@ -728,13 +790,21 @@ impl LiveTurn<'_> {
                     }
                 }
             }
+            if let Some(d) = st.degenerate {
+                // Как у сигнала: drop закрывает соединение до записи квитанции.
+                drop(stream);
+                tracing::warn!(run = %self.run, turn = self.turn, detector = d.as_str(),
+                    "стрим хода оборван детектором");
+                self.flush(&mut st).await?;
+                return Err(Live::Degenerate(d));
+            }
         }
     }
 
     /// Одно событие стрима; `Some` — итог хода.
     async fn on_event(
         &self,
-        st: &mut StreamState,
+        st: &mut StreamState<'_>,
         ev: StreamEvent,
         endpoint: &str,
         started: Instant,
@@ -758,22 +828,33 @@ impl LiveTurn<'_> {
                 st.attempt = attempt;
                 st.service.clear();
                 st.ttft_ms = None;
+                if let Some(w) = st.watch.as_deref_mut() {
+                    w.on_restart();
+                }
             }
             StreamEvent::Progress { .. } => {}
             StreamEvent::TextDelta(t) => {
                 mark_ttft(st, started, now);
+                st.degenerate = st.watch.as_deref_mut().and_then(|w| w.on_text(&t));
                 if let Some(chunk) = st.text.push(&t, now) {
                     self.write_delta(st.attempt, "text", chunk).await?;
                 }
             }
             StreamEvent::ReasoningDelta(t) => {
                 mark_ttft(st, started, now);
+                st.degenerate = st
+                    .watch
+                    .as_deref_mut()
+                    .and_then(|w| w.on_reasoning(&t, now));
                 if let Some(chunk) = st.reasoning.push(&t, now) {
                     self.write_delta(st.attempt, "reasoning", chunk).await?;
                 }
             }
             StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallArgs { .. } => {
                 mark_ttft(st, started, now);
+                if let Some(w) = st.watch.as_deref_mut() {
+                    w.on_calls();
+                }
             }
             StreamEvent::ServiceMessage(m) => st.service.push(m),
             StreamEvent::Finished {
@@ -826,7 +907,7 @@ impl LiveTurn<'_> {
     }
 
     /// Сброс обоих буферов: рассуждение, затем текст.
-    async fn flush(&self, st: &mut StreamState) -> Result<(), Live> {
+    async fn flush(&self, st: &mut StreamState<'_>) -> Result<(), Live> {
         if let Some(chunk) = st.reasoning.take() {
             self.write_delta(st.attempt, "reasoning", chunk).await?;
         }
@@ -837,7 +918,7 @@ impl LiveTurn<'_> {
     }
 
     /// Сброс буферов, чей срок истёк к `now`.
-    async fn flush_due(&self, st: &mut StreamState, now: Instant) -> Result<(), Live> {
+    async fn flush_due(&self, st: &mut StreamState<'_>, now: Instant) -> Result<(), Live> {
         if st.reasoning.deadline().is_some_and(|d| d <= now)
             && let Some(chunk) = st.reasoning.take()
         {
@@ -853,7 +934,7 @@ impl LiveTurn<'_> {
 
     async fn heartbeat_queued(
         &self,
-        st: &mut StreamState,
+        st: &mut StreamState<'_>,
         q: &QueueStatus,
         now: Instant,
     ) -> Result<(), Live> {
@@ -873,7 +954,11 @@ impl LiveTurn<'_> {
             .await
     }
 
-    async fn heartbeat_generating(&self, st: &mut StreamState, now: Instant) -> Result<(), Live> {
+    async fn heartbeat_generating(
+        &self,
+        st: &mut StreamState<'_>,
+        now: Instant,
+    ) -> Result<(), Live> {
         let payload = json!({
             "turn": self.turn,
             "state": GENERATING,
@@ -887,7 +972,7 @@ impl LiveTurn<'_> {
     /// D8: смена `state` пишется сразу, смена только позиции — не чаще раза в секунду.
     async fn heartbeat(
         &self,
-        st: &mut StreamState,
+        st: &mut StreamState<'_>,
         state: &'static str,
         position: Option<u32>,
         payload: Value,
@@ -928,7 +1013,7 @@ fn wait_state_name(s: &WaitState) -> &'static str {
     }
 }
 
-fn mark_ttft(st: &mut StreamState, started: Instant, now: Instant) {
+fn mark_ttft(st: &mut StreamState<'_>, started: Instant, now: Instant) {
     if st.ttft_ms.is_none() {
         st.ttft_ms = Some(millis(now.saturating_duration_since(started)));
     }
@@ -1376,5 +1461,20 @@ mod tests {
         assert!(matches!(other, TurnError::Effect(EffectError::Failed(m)) if m == "boom"));
         let store = decode_failure(format!("{STORE_ERROR} x"), EffectSource::Journal);
         assert!(matches!(store, TurnError::Effect(EffectError::Failed(_))));
+    }
+
+    #[test]
+    fn decode_failure_parses_degenerate_before_signals() {
+        for (tag, d) in [
+            ("repetition", Degenerate::Repetition),
+            ("thinking", Degenerate::Thinking),
+        ] {
+            for source in [EffectSource::Live, EffectSource::Journal] {
+                let e = decode_failure(format!("{INTERRUPTED}{tag}"), source);
+                assert!(matches!(e, TurnError::Degenerate(x) if x == d), "{e:?}");
+            }
+        }
+        let unknown = decode_failure(format!("{INTERRUPTED}other"), EffectSource::Journal);
+        assert!(matches!(unknown, TurnError::Effect(EffectError::Failed(_))));
     }
 }

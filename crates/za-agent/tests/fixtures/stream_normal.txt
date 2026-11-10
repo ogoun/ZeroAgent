@@ -1,0 +1,390 @@
+# Release notes and working log
+
+This document is a deliberately mixed sample of what a coding agent might stream to a user
+during an ordinary session. It contains English prose, Russian prose, source code in several
+languages, a markdown table, shell commands with their output, and short lists. None of the
+fragments loop; the purpose of the file is to make sure that the repetition detector stays
+quiet on ordinary, healthy output.
+
+## 1. What changed in the storage layer
+
+The journal now writes every event through a single dedicated thread. Earlier builds opened a
+connection per request, which made lock contention visible under load: on a laptop with a slow
+disk we measured pauses of up to 1.4 seconds when three runs were active at once. The new
+design keeps one writer and many readers. Readers use WAL mode, so a long report query never
+blocks an append. Snapshots are still taken at step boundaries, and the replay logic did not
+need any change, because the order of events inside a run is preserved exactly.
+
+A second, smaller change concerns blobs. Large tool outputs used to be inlined in the event
+payload; now anything above sixteen kilobytes is stored once, addressed by its BLAKE3 hash, and
+the event keeps only the reference. Deduplication is a pleasant side effect: when the agent
+reads the same configuration file twice, the second read costs nothing on disk.
+
+Finally, the migration code learned to upgrade old journals in place. It is a forward-only
+migration with a single schema record. If the binary is older than the file, opening fails
+with a clear message instead of silently corrupting rows.
+
+## 2. Заметки по контексту
+
+Счётчик контекста теперь опирается на фактическое число входных токенов, которое сервер
+возвращает после каждого хода. Между ходами добавляется оценка по длине новых сообщений: четыре
+байта на токен для латиницы и примерно два с половиной для кириллицы. Такая оценка грубая, но
+она не бывает заниженной больше чем на десять процентов, а этого достаточно, чтобы вовремя
+запустить сжатие истории.
+
+Порог сжатия по умолчанию — три четверти окна. До него срабатывает более дешёвая мера: старые
+результаты инструментов заменяются короткой ссылкой на файл выгрузки. Если и после этого
+история не помещается, модель пишет сводку: цель, решения, изменённые файлы, ошибки и следующий
+шаг. Цель и сообщения пользователя рантайм вставляет сам, дословно, чтобы модель не могла их
+исказить или потерять при пересказе.
+
+Отдельно стоит сказать о подавлении бесполезной компакции. Бывает, что хвост истории огромен:
+например, последний результат занимает пятую часть окна. Тогда сводка почти ничего не даёт, и
+без защиты агент сжимал бы историю на каждой границе шага. Теперь после такой неудачной попытки
+порог временно отключается, а пределом становится само окно.
+
+## 3. A small Rust example
+
+The function below parses a key-value line and returns a typed pair. It shows the error style
+used across the workspace: `thiserror` for library errors, no `unwrap` outside tests.
+
+```rust
+use std::str::FromStr;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ParseError {
+    #[error("missing '=' in line {0:?}")]
+    NoSeparator(String),
+    #[error("empty key")]
+    EmptyKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pair {
+    pub key: String,
+    pub value: String,
+}
+
+impl FromStr for Pair {
+    type Err = ParseError;
+
+    fn from_str(line: &str) -> Result<Self, Self::Err> {
+        let (k, v) = line
+            .split_once('=')
+            .ok_or_else(|| ParseError::NoSeparator(line.to_owned()))?;
+        let key = k.trim();
+        if key.is_empty() {
+            return Err(ParseError::EmptyKey);
+        }
+        Ok(Pair {
+            key: key.to_owned(),
+            value: v.trim().trim_matches('"').to_owned(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_quoted_value() {
+        let p: Pair = "name = \"zero\"".parse().unwrap();
+        assert_eq!(p.key, "name");
+        assert_eq!(p.value, "zero");
+    }
+
+    #[test]
+    fn rejects_line_without_separator() {
+        assert!(matches!("oops".parse::<Pair>(), Err(ParseError::NoSeparator(_))));
+    }
+}
+```
+
+The tests cover the two interesting paths. A third case, an empty key such as `= 5`, is left as
+an exercise; it would be a one-line addition next to the others.
+
+## 4. Benchmarks on the workstation
+
+| Scenario                     | Model         | Context | TTFT, ms | Output tok/s | Notes                       |
+|------------------------------|---------------|---------|----------|--------------|-----------------------------|
+| cold start, empty history    | qwen-coder 32B| 32k     | 820      | 41.2         | prefix not cached yet       |
+| warm, same prefix            | qwen-coder 32B| 32k     | 95       | 43.8         | cache hit on system prompt  |
+| after compaction             | qwen-coder 32B| 32k     | 610      | 42.9         | new epoch, prefix reused    |
+| long tool output spilled     | qwen-coder 32B| 32k     | 120      | 44.1         | 18 KB moved to spill file   |
+| small tier, tight budget     | llama 8B      | 8k      | 70       | 96.5         | reasoning off               |
+| reasoning budget medium      | deepseek 14B  | 16k     | 1340     | 37.0         | thinking counted separately |
+
+Numbers are medians of five runs. Variance was below four percent except for the cold start,
+where the first run paid for loading weights into VRAM and was excluded.
+
+## 5. Commands used during the session
+
+```powershell
+PS H:\p> cargo build --release --locked
+   Compiling za-protocol v0.1.0 (H:\p\crates\za-protocol)
+   Compiling za-store v0.1.0 (H:\p\crates\za-store)
+   Compiling za-core v0.1.0 (H:\p\crates\za-core)
+   Compiling za-llm v0.1.0 (H:\p\crates\za-llm)
+   Compiling za-agent v0.1.0 (H:\p\crates\za-agent)
+   Compiling zero-agent v0.1.0 (H:\p\crates\zero-agent)
+    Finished `release` profile [optimized] target(s) in 1m 12s
+PS H:\p> .\target\release\zero-agent.exe inspect --run 01JF3 --turn 7
+turn 7, attempt 0, endpoint local
+  tools        3120 B   ~780 tok
+  core         2804 B   ~701 tok
+  overlay       412 B   ~103 tok
+  dialog      41890 B ~10472 tok
+  total input (usage): 12188
+PS H:\p> git status --short
+ M crates/za-agent/src/turn.rs
+?? crates/za-agent/src/detect/stream.rs
+```
+
+Each build line names a different crate, so even though they look alike, no two are identical.
+
+## 6. Python helper for log analysis
+
+```python
+import json
+import statistics
+from pathlib import Path
+
+
+def load_events(path: Path) -> list[dict]:
+    """Read a JSONL export and keep only model usage events."""
+    events = []
+    with path.open(encoding="utf-8") as fh:
+        for raw in fh:
+            item = json.loads(raw)
+            if item.get("kind") == "model.usage":
+                events.append(item["payload"])
+    return events
+
+
+def summarize(events: list[dict]) -> dict:
+    ttft = [e["ttft_ms"] for e in events if e.get("ttft_ms") is not None]
+    tps = [e["output_tps"] for e in events if e.get("output_tps")]
+    return {
+        "turns": len(events),
+        "ttft_p50": statistics.median(ttft) if ttft else None,
+        "tps_mean": round(statistics.fmean(tps), 1) if tps else None,
+    }
+
+
+if __name__ == "__main__":
+    data = load_events(Path("export.jsonl"))
+    print(json.dumps(summarize(data), indent=2))
+```
+
+## 7. Почему детекторы устроены именно так
+
+Повтор текста ловится двумя способами. Первый — короткий: в конце ответа одна и та же строка
+стоит четыре раза подряд. Так обычно выглядит модель, которая застряла и снова и снова сообщает,
+что проверяет один и тот же файл. Второй способ — более общий: фраза из двенадцати слов
+встречается четыре раза в последних шестистах словах. Он срабатывает, когда повтор растянут и
+перемешан с другим текстом, например когда модель пересказывает один и тот же план разными
+абзацами, но с одинаковой серединой.
+
+Почему именно двенадцать слов? Короткие фразы повторяются в нормальной речи постоянно: «в этом
+случае», «как показано выше», «для каждого элемента списка». Двенадцать слов подряд совпадают
+случайно крайне редко, а четыре таких совпадения в окне — уже почти наверняка петля. Порог
+выбран с запасом, чтобы технический текст с повторяющимися конструкциями не давал ложных
+срабатываний.
+
+Бесконечное рассуждение — отдельная беда. Модель с включённым мышлением иногда уходит в долгий
+внутренний спор и не выдаёт ни текста, ни вызова. Здесь два предела: объём рассуждения в полтора
+раза больше бюджета и пять минут без какого-либо видимого действия. Второй предел проверяется по
+таймеру, а не только по приходу очередной дельты, поэтому стрим, который замолчал посреди
+размышлений, тоже будет оборван.
+
+После обрыва ход повторяется в том же шаге. При повторе текста снижается температура и
+добавляется штраф за присутствие токенов; при бесконечном рассуждении мышление выключается.
+Если и вторая попытка вырождается, run встаёт на паузу с причиной model_loop: дальше решает
+человек, а не автоматика.
+
+## 8. Go snippet: a bounded worker pool
+
+```go
+package pool
+
+import (
+	"context"
+	"sync"
+)
+
+// Run executes fn for every item with at most n goroutines in flight.
+func Run[T any](ctx context.Context, n int, items []T, fn func(context.Context, T) error) error {
+	sem := make(chan struct{}, n)
+	errs := make(chan error, 1)
+	var wg sync.WaitGroup
+	for _, it := range items {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(v T) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := fn(ctx, v); err != nil {
+				select {
+				case errs <- err:
+				default:
+				}
+			}
+		}(it)
+	}
+	wg.Wait()
+	close(errs)
+	return <-errs
+}
+```
+
+Only the first error is kept; later failures are dropped on purpose, since the caller usually
+cancels the context after the first problem anyway.
+
+## 9. Checklist before a release
+
+1. Run the formatter and the linter with warnings treated as errors.
+2. Execute the whole test suite with the lock file enforced.
+3. Check the dependency policy: licenses, sources, duplicated versions.
+4. Count prompt tokens with both tokenizers and compare against role limits.
+5. Update the changelog section called "Unreleased" and the working journal.
+6. Tag the commit only after the CI pipeline turns green on every platform.
+7. Smoke-test the demo replay and compare its hash with the golden value.
+
+## 10. Разбор одного сбоя
+
+Во вторник ночью run завис на ходе номер девять. Журнал показал, что последняя дельта пришла за
+шесть минут до того, как человек заметил проблему. В стриме было только рассуждение: модель
+перебирала варианты структуры каталога и так и не вызвала ни одного инструмента. Сеть была в
+порядке, сервер отвечал на проверки здоровья, а очередь GPU была пуста.
+
+Причина нашлась быстро. Шаблон чата у этой модели закрывает блок мышления только после явного
+маркера, а маркер в ответе так и не появился. Прежняя версия агента ждала событие завершения и
+ничего не делала, пока соединение оставалось открытым. Теперь в том же месте стоит дедлайн:
+через пять минут после начала рассуждения без текста стрим закрывается, квитанция записывается
+в журнал, а повтор идёт уже без мышления. При восстановлении после сбоя реплей читает квитанцию
+и принимает то же решение, не вызывая модель заново.
+
+Из этого случая сделано ещё два вывода. Во-первых, тесты такого поведения не должны зависеть от
+настенных часов: время в них остановлено, и рантайм сам продвигает его до ближайшего таймера.
+Во-вторых, проверять нужно исход, а не длительность, потому что запись журнала идёт в отдельном
+потоке операционной системы и под нагрузкой может задерживаться.
+
+## 11. TypeScript client fragment
+
+```typescript
+export interface RunStatus {
+  id: string;
+  status: "running" | "paused" | "done" | "failed" | "blocked";
+  reason?: string;
+  turn: number;
+}
+
+export async function waitForStop(base: string, id: string, signal: AbortSignal): Promise<RunStatus> {
+  let delay = 250;
+  for (;;) {
+    const res = await fetch(`${base}/runs/${encodeURIComponent(id)}`, { signal });
+    if (!res.ok) throw new Error(`status ${res.status} while polling run ${id}`);
+    const body = (await res.json()) as RunStatus;
+    if (body.status !== "running") return body;
+    await new Promise((r) => setTimeout(r, delay));
+    delay = Math.min(delay * 2, 4000);
+  }
+}
+```
+
+Polling with exponential backoff is crude compared to the event stream, yet it is handy for
+scripts that only need the final status and do not want to hold a connection open.
+
+## 12. Glossary
+
+- **Boundary**: the point between steps where user input is read and snapshots are written.
+- **Epoch**: a counter that grows whenever history is rewritten by pruning or compaction.
+- **Spill file**: a text file holding a tool result too large to keep inline in history.
+- **Receipt**: the journal record that fixes the outcome of an effect for later replay.
+- **Nudge**: a short runtime message that steers the model after a detected problem.
+- **Tier**: small, standard or full; it chooses which prompt blocks and tools are shown.
+
+## 13. Closing remarks
+
+Most of the work in this iteration was invisible: tighter invariants, clearer error codes, a
+handful of tests that pin down behaviour which used to be implicit. The user-facing part is
+modest. Long sessions survive context pressure, runaway generations are stopped early, and the
+inspector can explain exactly what the model saw on any turn. The next milestone moves on to
+memory and to sub-agents, which will reuse the same journal and the same replay rules.
+
+Спасибо всем, кто гонял сборки на своих машинах и присылал журналы: без живых прогонов половина
+этих ошибок так и осталась бы незамеченной. Отдельная благодарность за терпение тем, у кого
+агент по ночам переписывал один и тот же абзац, пока мы не научились его останавливать.
+
+## 14. Appendix: configuration excerpt
+
+```toml
+[context]
+tier = "standard"
+compact_at = 0.75
+prune_at = 0.65
+spill_share = 0.15
+
+[endpoints.local]
+backend = "llama-cpp"
+url = "http://127.0.0.1:8080"
+n_ctx = 32768
+
+[endpoints.cloud]
+backend = "openai-compatible"
+url = "https://api.example.invalid/v1"
+model = "general-large"
+max_wait = "90s"
+```
+
+The cloud endpoint is a placeholder; real keys live in the operating system's credential store
+and never in this file. Values for the thresholds are the defaults, repeated here only so the
+example is self-contained.
+
+## 15. SQL used by the metrics report
+
+```sql
+SELECT r.id,
+       r.role,
+       COUNT(e.seq)                                   AS events,
+       SUM(CASE WHEN e.kind = 'tool.finished' THEN 1 END) AS tool_calls,
+       MAX(e.ts) - MIN(e.ts)                          AS wall_ms
+FROM runs AS r
+JOIN events AS e ON e.run_id = r.id
+WHERE r.project_id = :project
+GROUP BY r.id, r.role
+ORDER BY wall_ms DESC
+LIMIT 20;
+```
+
+The query is fast because events are indexed by run and sequence; even with a few million rows
+it returns in well under a second on the workstation's NVMe drive.
+
+## 16. Ещё немного о стиле ответов
+
+Хороший ответ агента короткий и проверяемый. Он называет изменённые файлы, говорит, какие тесты
+запущены и чем закончились, и честно перечисляет то, что осталось сомнительным. Плохой ответ
+длинный, обещает действия, которые так и не были выполнены, и повторяет одни и те же формулировки
+в каждом абзаце. Детектор обещаний без действия появится в следующей задаче, а детектор повторов
+уже сейчас не даёт такому ответу растянуться на тысячи токенов.
+
+Наконец, о языке. Сообщения, которые уходят модели, пишутся по-английски: так короче, и модели
+лучше следуют инструкциям на языке, на котором их в основном обучали. Пользователь при этом может
+писать на любом языке, а ответ агента следует языку пользователя.
+
+## 17. Open questions for the next review
+
+- Should spill files be garbage-collected when a run is archived, or kept for audits?
+- Is a single retry after a degenerate stream enough for weaker local models?
+- Could the inspector show a token-level diff between two consecutive requests?
+- What is the right default for the thinking timeout on very slow hardware?
+- Do we need a per-endpoint override for the presence penalty used on retries?
+
+Answers are welcome in the tracker. Please attach the run identifier and, if possible, the
+exported journal, so that the case can be replayed locally without guessing at the inputs.

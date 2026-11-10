@@ -66,7 +66,8 @@ pub mod pause_reason {
 }
 
 /// Детекторы зацикливания: поле `detector` события `loop.detected` (R1-B2 D63) и
-/// причина перехода run в `blocked` по детектору (D54–D56).
+/// причина перехода run в `blocked` по детектору (D54–D56); у исхода `degenerate`
+/// события `turn.finished` — поле `detector` (D69).
 ///
 /// Значения — часть протокола (их читают UI и инспектор), менять строки нельзя.
 pub mod detector {
@@ -76,6 +77,10 @@ pub mod detector {
     pub const CYCLE: &str = "cycle";
     /// Ходы подряд без прогресса (D56).
     pub const STALL: &str = "stall";
+    /// Повтор текста в стриме (D58); тот же хвост у квитанции `interrupted:repetition`.
+    pub const REPETITION: &str = "repetition";
+    /// Бесконечное рассуждение (D59); тот же хвост у квитанции `interrupted:thinking`.
+    pub const THINKING: &str = "thinking";
 }
 
 /// Причины ошибки run: поле `reason` события `run.status` при переходе в `failed`.
