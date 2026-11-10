@@ -64,6 +64,12 @@ pub trait ModelPort: Send + Sync {
     ) -> BoxFuture<'a, Option<u32>> {
         Box::pin(async { None })
     }
+    /// Тело запроса провайдеру без заголовков и ключей (R1-B2 D52, OPS-003): то, что
+    /// реализация отправила бы на `call` сейчас. `None` — не умеет (эндпоинт неизвестен,
+    /// не зондирован или реализация так не умеет). По умолчанию — `None`.
+    fn render_request(&self, _call: &ModelCall) -> Option<String> {
+        None
+    }
 }
 
 /// Guard фоновой задачи стрима: `Drop` вызывает `JoinHandle::abort()` (D2).

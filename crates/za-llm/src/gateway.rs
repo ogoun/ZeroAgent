@@ -103,7 +103,8 @@ use crate::slots::{
     LlamaSlots, SlotLease, SlotManager, SlotPlan, restore_unsupported, save_unsupported,
 };
 use crate::types::{
-    CostSource, EndpointId, QueueStatus, ReasoningMode, StreamEvent, ToolChoice, Usage, WaitState,
+    ChatRequest, CostSource, EndpointId, QueueStatus, ReasoningMode, StreamEvent, ToolChoice,
+    Usage, WaitState,
 };
 use crate::wire::{AnthropicWire, ChatDialect, ChatWire, Connector, ResponsesWire, WireCtx};
 
@@ -525,6 +526,28 @@ impl ModelPort for Gateway {
             }
             self.inner.tokenize(ep, text).await
         })
+    }
+
+    /// R1-B2 D52: тело тем же коннектором и профилем, что и [`ModelPort::stream`], по
+    /// последним известным фактам эндпоинта. Без ключа (заголовки не строятся) и без
+    /// `id_slot` llama.cpp: слот выбирается в момент отправки. Эндпоинт неизвестен или
+    /// ещё ни разу не зондирован, тело не строится — `None` (`debug`).
+    fn render_request(&self, call: &ModelCall) -> Option<String> {
+        let ep = self.inner.endpoints.get(&call.endpoint)?;
+        let probed = lock(&ep.live).known()?.clone();
+        let connector = connector(&ep.cfg, &probed);
+        let caps = probed.caps();
+        let ctx = WireCtx {
+            caps: &caps,
+            slot: None,
+            secret: None,
+            thinking: Some(&probed.profile.thinking),
+            max_output_tokens: probed.profile.max_output_tokens,
+        };
+        let req = endpoint_request(ep, &call.request);
+        body_text(&connector, &req, &ctx)
+            .inspect_err(|e| tracing::debug!(endpoint = %call.endpoint, error = %e, "тело запроса не построено"))
+            .ok()
     }
 }
 
@@ -1471,12 +1494,7 @@ impl CallTask {
             thinking: Some(&probed.profile.thinking),
             max_output_tokens: probed.profile.max_output_tokens,
         };
-        let mut req = self.call.request.clone();
-        if req.reasoning == ReasoningMode::Default
-            && let Some(r) = &ep.cfg.reasoning
-        {
-            req.reasoning = r.clone();
-        }
+        let req = endpoint_request(ep, &self.call.request);
         let price = ep.cfg.price.or(probed.profile.price);
         let hook = FinishHook {
             inner: self.inner.clone(),
@@ -1734,6 +1752,33 @@ fn inactive(id: &EndpointId, reason: &str) -> ModelError {
 }
 
 /// Коннектор эндпоинта (D35, D37). Модель — из конфигурации, иначе из профиля связки.
+/// Запрос, который уходит коннектору: `ReasoningMode::Default` заменяется на
+/// `reasoning` конфигурации эндпоинта, если он задан.
+fn endpoint_request(ep: &Endpoint, req: &ChatRequest) -> ChatRequest {
+    let mut req = req.clone();
+    if req.reasoning == ReasoningMode::Default
+        && let Some(r) = &ep.cfg.reasoning
+    {
+        req.reasoning = r.clone();
+    }
+    req
+}
+
+/// Тело запроса текстом, как его отправляет коннектор: у Anthropic —
+/// `AnthropicWire::body_text` (вход `tool_use` из `raw_arguments` без пересериализации),
+/// у прочих — компактный JSON `build_body` (так его сериализует `post_sse`).
+fn body_text(conn: &Connector, req: &ChatRequest, ctx: &WireCtx<'_>) -> Result<String, ModelError> {
+    match conn {
+        Connector::Anthropic(w) => Ok(w.body_text(req, ctx)?.get().to_owned()),
+        _ => {
+            let body = conn.build_body(req, ctx)?;
+            serde_json::to_string(&body).map_err(|e| {
+                ModelError::new(ErrorClass::BadRequest, format!("тело запроса не JSON: {e}"))
+            })
+        }
+    }
+}
+
 fn connector(cfg: &EndpointConfig, p: &ProbedEndpoint) -> Connector {
     let base_url = cfg.effective_base_url();
     let model = cfg

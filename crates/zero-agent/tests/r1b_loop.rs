@@ -679,3 +679,80 @@ fn ask_user_round_trip() {
     assert_eq!(tool_results.len(), 1, "{:?}", bodies[1]);
     assert_eq!(tool_results[0]["content"], "42", "{:?}", tool_results[0]);
 }
+
+#[test]
+fn inspect_and_stats_read_journal() {
+    // R1-B2 D52, D53: `inspect` и `stats` только читают журнал run.
+    let srv = Fake::start(paris);
+    let e = env("inspect", &llama_config(&srv.base));
+    let o = e.run_cmd(&["Ответь одним словом: столица Франции?"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let run = run_id(&o).to_string();
+    let p = e.project_arg();
+    let before = e.events(run_id(&o)).len();
+
+    let t = e.run(&["inspect", "--project", p, "--run", &run]);
+    assert_eq!(t.code(), Some(0), "{t:?}");
+    assert!(t.stdout.contains(", ход 1, модель local,"), "{t:?}");
+    assert!(t.stdout.contains("first_message"), "{t:?}");
+
+    let j = e.run(&[
+        "inspect",
+        "--project",
+        p,
+        "--run",
+        &run,
+        "--turn",
+        "1",
+        "--json",
+    ]);
+    assert_eq!(j.code(), Some(0), "{j:?}");
+    let v: Value = serde_json::from_str(&j.stdout).unwrap();
+    assert_eq!(v["turn"], 1);
+    assert_eq!(v["input"], 12);
+    assert_eq!(v["n_ctx"], 32768);
+    assert_eq!(v["blocks"].as_array().unwrap().len(), 8);
+
+    // Тело провайдеру — то же, что ушло серверу, кроме слота (выбирается при отправке).
+    let r = e.run(&["inspect", "--project", p, "--run", &run, "--raw"]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    let mut rendered: Value = serde_json::from_str(r.stdout.trim()).unwrap();
+    let mut sent = srv.bodies()[0].clone();
+    for b in [&mut rendered, &mut sent] {
+        b.as_object_mut().unwrap().remove("id_slot");
+    }
+    assert_eq!(rendered, sent);
+
+    let s = e.run(&["stats", "--project", p, "--run", &run, "--json"]);
+    assert_eq!(s.code(), Some(0), "{s:?}");
+    let m: Value = serde_json::from_str(&s.stdout).unwrap();
+    assert_eq!(
+        (m["turns"].clone(), m["steps"].clone()),
+        (json!(1), json!(1))
+    );
+    assert_eq!(
+        (m["input"].clone(), m["output"].clone()),
+        (json!(12), json!(3))
+    );
+    let s = e.run(&["stats", "--project", p, "--run", &run]);
+    assert_eq!(s.code(), Some(0), "{s:?}");
+    assert!(s.stdout.contains("ходов 1, шагов 1"), "{s:?}");
+
+    // Нет хода — код 1; журнал не изменился.
+    let n = e.run(&["inspect", "--project", p, "--run", &run, "--turn", "5"]);
+    assert_eq!(n.code(), Some(1), "{n:?}");
+    assert_eq!(e.events(run_id(&o)).len(), before);
+    // Неизвестный run — код 1.
+    let other = uuid::Uuid::now_v7().to_string();
+    let u = e.run(&["stats", "--project", p, "--run", &other]);
+    assert_eq!(u.code(), Some(1), "{u:?}");
+
+    // Проект без журнала: код 1, каталог журнала не создаётся.
+    let fresh = env("inspect_fresh", "");
+    for cmd in ["inspect", "stats"] {
+        let o = fresh.run(&[cmd, "--project", fresh.project_arg(), "--run", &other]);
+        assert_eq!(o.code(), Some(1), "{o:?}");
+        assert!(o.stderr.contains("не найден"), "{o:?}");
+        assert!(!journal_exists(&fresh));
+    }
+}

@@ -59,6 +59,35 @@ pub struct BlockHashes {
     pub agents_md: String,
 }
 
+/// Длина каждого блока system в байтах UTF-8, как он стоит в `system` (после замены
+/// CRLF на LF; блок из одних пробельных символов в `system` не входит — 0). Нужна
+/// инспектору (R1-B2 D52): `system` нельзя разрезать по `\n\n`, Core сам их содержит.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlockSizes {
+    pub core: usize,
+    pub adapter: usize,
+    pub overlay: usize,
+    pub agents_md: usize,
+}
+
+impl BlockSizes {
+    fn of(blocks: &PromptBlocks) -> BlockSizes {
+        let len = |b: &str| {
+            if b.trim().is_empty() {
+                0
+            } else {
+                b.replace("\r\n", "\n").len()
+            }
+        };
+        BlockSizes {
+            core: len(&blocks.core),
+            adapter: len(&blocks.adapter),
+            overlay: len(&blocks.overlay),
+            agents_md: len(&blocks.agents_md),
+        }
+    }
+}
+
 /// Неизменяемая на run часть (блоки 1–5, CTX-003, CTX-005).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FrozenPrefix {
@@ -69,6 +98,10 @@ pub struct FrozenPrefix {
     pub blocks: BlockHashes,
     pub prompt_version: String,
     pub texts_hash: String,
+    /// Размеры блоков system (R1-B2 D52); `None` — префикс run R1-B1. В `prefix_hash` не
+    /// входит: хэш считается от самих блоков.
+    #[serde(default)]
+    pub sizes: Option<BlockSizes>,
 }
 
 fn hex(s: &str) -> String {
@@ -226,6 +259,7 @@ pub fn freeze(
     };
     Ok(FrozenPrefix {
         system,
+        sizes: Some(BlockSizes::of(&blocks)),
         prefix_hash: prefix_hash(&blocks),
         tools: blocks.tools,
         blocks: block_hashes,

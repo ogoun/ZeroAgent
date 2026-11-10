@@ -16,7 +16,8 @@
 //! ([`resume_run`]: реплей после сбоя, выход из паузы и бюджета, блок [`state_block`],
 //! D4–D6, CORE-006, CORE-110), контекст модели ([`ContextBudget`], [`output_plan`],
 //! [`ContextMeter`], раздел [`ContextConfig`], выгрузка вывода [`spill`] и удаление
-//! старых результатов [`prune`], компакция [`compact`], R1-B2 D40–D50, D65, D66). Модель
+//! старых результатов [`prune`], компакция [`compact`], R1-B2 D40–D50, D65, D66),
+//! инспектор запроса хода [`inspect`] и метрики run [`run_metrics`] (D52, D53). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod budget;
@@ -25,6 +26,7 @@ mod control;
 mod conversation;
 mod driver;
 mod exit;
+mod inspect;
 mod memory;
 mod prompt;
 mod request;
@@ -44,6 +46,7 @@ pub use control::{ControlRx, InputMode, RunControl, control_channel, submit_inpu
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted, cut_points, split_tail};
 pub use driver::{CrashHook, CrashPoint, LoopDeps, LoopError, LoopOutcome, RunSpec, start_run};
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
+pub use inspect::{BlockCost, InspectError, Inspection, RunMetrics, inspect, run_metrics};
 pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};
 pub use prompt::{
     AGENTS_MD_LIMIT, BRANCH_MAX_CHARS, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo, LEFT_ANGLES,
@@ -53,8 +56,8 @@ pub use prompt::{
     role_limit, upper_tokens, utility_rules,
 };
 pub use request::{
-    BlockHashes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request,
-    first_message, freeze, request_hash,
+    BlockHashes, BlockSizes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions,
+    build_request, first_message, freeze, request_hash,
 };
 pub use resume::{ResumeChange, resume_run, state_block};
 pub use state::{AtBoundary, Counters, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};

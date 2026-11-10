@@ -1,5 +1,5 @@
 //! Бинарник `zero-agent`: `doctor`, `demo-run`, `replay` (R0), `models`, `ask`,
-//! `resources` (R1-A), `run`, `answer` (R1-B1).
+//! `resources` (R1-A), `run`, `answer` (R1-B1), `inspect`, `stats` (R1-B2).
 //!
 //! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы, ошибка
 //! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя;
@@ -26,6 +26,7 @@ use za_protocol::{Priority, RunId, RunMode, Tier};
 use za_store::{ProjectStore, StoreError};
 use zero_agent::doctor::{self, LLAMA_URL_ENV};
 use zero_agent::home::{self, NoHome};
+use zero_agent::inspect::{self as inspector, InspectArgs, InspectCmdError};
 use zero_agent::journal::open_retrying;
 use zero_agent::models::{self, AskArgs, CommandError};
 use zero_agent::resources;
@@ -45,7 +46,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[command(
     name = "zero-agent",
     version,
-    about = "zero-agent, этапы R0, R1-A и R1-B1: журнал, эффекты, модели, ресурсы, цикл агента"
+    about = "zero-agent, этапы R0, R1-A и R1-B: журнал, эффекты, модели, ресурсы, цикл агента, контекст"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -146,6 +147,42 @@ enum Cmd {
         #[arg(long)]
         not_done: bool,
     },
+    /// Запрос хода к модели по журналу: блоки с байтами, токенами и хэшем, расход,
+    /// предсказание следующего хода; `--raw` — тело запроса провайдеру.
+    Inspect(InspectCli),
+    /// Метрики run по журналу: токены и кэш, время до первого токена, скорость, ошибки,
+    /// ремонт вызовов, компакции, стоимость.
+    Stats {
+        /// Каталог проекта.
+        #[arg(long)]
+        project: PathBuf,
+        /// id run.
+        #[arg(long, value_parser = parse_run)]
+        run: RunId,
+        /// Вывод в JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Аргументы `inspect`.
+#[derive(Debug, clap::Args)]
+struct InspectCli {
+    /// Каталог проекта.
+    #[arg(long)]
+    project: PathBuf,
+    /// id run.
+    #[arg(long, value_parser = parse_run)]
+    run: RunId,
+    /// Номер хода (с 1); без него — последний ход.
+    #[arg(long)]
+    turn: Option<u32>,
+    /// Точное тело запроса провайдеру (без ключей) вместо таблицы блоков.
+    #[arg(long, conflicts_with = "json")]
+    raw: bool,
+    /// Вывод в JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Аргументы `run`.
@@ -346,6 +383,8 @@ enum AppError {
     Command(#[from] CommandError),
     #[error(transparent)]
     Run(#[from] RunError),
+    #[error(transparent)]
+    Inspect(#[from] InspectCmdError),
 }
 
 fn parse_run(s: &str) -> Result<RunId, String> {
@@ -489,6 +528,21 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
                 None => Answer::NotDone,
             };
             Ok(agent_run::cmd_answer(&home, &project, &interrupt, answer).await?)
+        }
+        Cmd::Inspect(i) => {
+            let home = home::za_home()?;
+            let args = InspectArgs {
+                project: i.project,
+                run: i.run,
+                turn: i.turn,
+                raw: i.raw,
+                json: i.json,
+            };
+            Ok(inspector::cmd_inspect(&home, args).await?)
+        }
+        Cmd::Stats { project, run, json } => {
+            let home = home::za_home()?;
+            Ok(inspector::cmd_stats(&home, &project, run, json).await?)
         }
     }
 }

@@ -278,7 +278,7 @@ fn journal_dir(home: &Path, project: &Path) -> Result<PathBuf, RunError> {
 /// Журнал существующего проекта: наличие `journal.db` проверяется до открытия, иначе
 /// `ProjectStore::open` создал бы пустой журнал. Открытие — с повтором на `Locked`
 /// (Windows снимает блокировку убитого процесса не сразу).
-fn open_existing(home: &Path, project: &Path) -> Result<ProjectStore, RunError> {
+pub(crate) fn open_existing(home: &Path, project: &Path) -> Result<ProjectStore, RunError> {
     Ok(open_retrying(&existing_journal(home, project)?)?)
 }
 

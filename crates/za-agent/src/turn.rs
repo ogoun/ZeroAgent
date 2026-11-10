@@ -296,9 +296,9 @@ pub const MODEL_EFFECT: &str = "model";
 /// Имя эффекта запроса сводки компакции (R1-B2 D46).
 pub const COMPACT_EFFECT: &str = "compact";
 /// Значение `kind` в `model.request` и `model.usage` запроса компакции (D46, D67).
-const COMPACT_KIND: &str = "compact";
+pub(crate) const COMPACT_KIND: &str = "compact";
 /// Префикс квитанции-отказа с ошибкой модели (D7).
-const MODEL_ERROR: &str = "model_error:";
+pub(crate) const MODEL_ERROR: &str = "model_error:";
 /// Префикс квитанции обрыва сигналом (D7).
 const INTERRUPTED: &str = "interrupted:";
 /// Префикс квитанции-отказа, записанной после ошибки журнала внутри хода: реплей

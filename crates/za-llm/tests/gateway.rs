@@ -2048,3 +2048,45 @@ async fn zero_max_wait_gives_only_error() {
     );
     assert_eq!(srv.requests(CHAT).len(), 0);
 }
+
+#[tokio::test]
+async fn render_request_has_no_secret() {
+    // R1-B2 D52 (OPS-003): тело провайдеру строится тем же кодом, что и запрос, но без
+    // заголовков и ключей.
+    let srv = FakeServer::start(vec![
+        (
+            "GET /models/claude-opus-5-5",
+            vec![props("probe/anthropic_model.json")],
+        ),
+        ("POST /messages", vec![Reply::sse(vec![anthropic_sse()])]),
+    ])
+    .await;
+    let cfg = models(json!({
+        "endpoints": [
+            {"id": "an", "backend": "anthropic", "base_url": srv.base_url,
+             "model": "claude-opus-5-5", "key_ref": "anthropic"}
+        ]
+    }));
+    const KEY: &str = "sk-ant-render-secret";
+    let g = started(
+        cfg,
+        secrets(&[("anthropic", KEY)]),
+        None,
+        store("render_request"),
+        opts(),
+    )
+    .await
+    .unwrap();
+    let call = call_on("an", RunId::new(), "Привет");
+    let body = g.render_request(&call).expect("тело запроса");
+    assert!(!body.contains(KEY), "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["messages"].is_array(), "{body}");
+    // То же тело уходит провайдеру.
+    g.stream(call).await.unwrap().collect().await.unwrap();
+    let sent = srv.requests("POST /messages");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(String::from_utf8(sent[0].body.clone()).unwrap(), body);
+    // Неизвестный эндпоинт — `None`.
+    assert_eq!(g.render_request(&call_on("nope", RunId::new(), "x")), None);
+}

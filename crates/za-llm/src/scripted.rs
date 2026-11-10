@@ -222,6 +222,13 @@ impl ModelPort for ScriptedModel {
         let n = self.tokens.map(|f| f(text));
         Box::pin(async move { n })
     }
+
+    /// Канонический JSON запроса: у тестовой модели нет провайдера и его тела (R1-B2 D52).
+    fn render_request(&self, call: &ModelCall) -> Option<String> {
+        serde_json::to_value(&call.request)
+            .ok()
+            .map(|v| za_protocol::canonical_json(&v))
+    }
 }
 
 #[cfg(test)]
