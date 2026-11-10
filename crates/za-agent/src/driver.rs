@@ -519,6 +519,13 @@ async fn apply_exit(
 ) -> Result<LoopOutcome, LoopError> {
     let j = &deps.journal;
     let run = st.run;
+    let ab = &st.at_boundary;
+    if ab.budget.is_some() || ab.run_mode.is_some() {
+        // Resume со снимка `Model` отложил их до границы, а run остановился раньше:
+        // изменения не применены и в снимок не попали (M1 ревью задачи 15).
+        tracing::warn!(run = %run, budget = ?ab.budget, run_mode = ?ab.run_mode,
+            "изменения resume не применены: run остановился до границы шага, их нужно передать снова");
+    }
     let exit = match (exit, st.stopping) {
         // `cancelling` уже записан: из него есть только `cancelled` (часть 01, 4.3).
         // Итог `finish`, исполненного до наблюдения отмены, остаётся в истории.
@@ -738,9 +745,10 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     let (run, after) = (st.run, st.inbox_after);
     let mut failure: Option<StoreError> = None;
     let fref = &mut failure;
-    let r = st
-        .ctx
-        .effect(
+    // Источник нужен активному времени (4): реплей квитанции несёт `now_ms` прошлого процесса.
+    let slot = st.ctx.reserve().map_err(effect_err)?;
+    let (r, source) = slot
+        .run_traced(
             EffectSpec {
                 class: EffectClass::ReadOnly,
                 name: BOUNDARY_EFFECT.into(),
@@ -759,6 +767,7 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
             },
         )
         .await;
+    st.ctx.observe(&r);
     if let Some(e) = failure {
         st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
         return Err(LoopError::Store(e));
@@ -772,8 +781,14 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     if crashed(deps, CrashPoint::AfterBoundary { step }) {
         return Err(LoopError::Halted);
     }
-    // (4) Активное время (D19).
-    st.counters.tick(b.now_ms);
+    // (4) Активное время (D19). Реплей границы из журнала (после resume) время не
+    // считает: `now_ms` квитанции записан до простоя между процессами, и `tick` с ним
+    // засчитал бы простой следующей живой границей. Теряется один интервал (решение
+    // контроллера, I1 ревью задачи 15).
+    match source {
+        za_core::EffectSource::Live => st.counters.tick(b.now_ms),
+        za_core::EffectSource::Journal => st.counters.last_boundary_ms = None,
+    }
     // (5) Проверка бюджета до приёма ввода (D32): ввод остаётся непрочитанным,
     // `inbox_after` не сдвигается, следующая граница прочитает его ровно один раз.
     let spent = Spent::from_totals(&b.usage, st.counters.steps, st.counters.active_ms);
@@ -1590,5 +1605,126 @@ mod tests {
         let j = serde_json::to_value(&v).unwrap();
         assert_eq!(j["inputs"][0]["kind"], "input");
         assert_eq!(serde_json::from_value::<BoundaryValue>(j).unwrap(), v);
+    }
+
+    /// M2 ревью задачи 14: `pausing` записан, а run встал в `paused` по другой
+    /// причине — флаг паузы поглощён, resume на том же канале не встаёт на паузу.
+    #[tokio::test]
+    async fn paused_after_pausing_clears_pause_flag() {
+        use crate::control::control_channel;
+        use crate::memory::NoMemory;
+        use crate::resume::{ResumeChange, resume_run};
+        use za_core::EventBus;
+        use za_llm::{
+            BackendKind, Message, Part, Role, ScriptedModel, StreamEvent, Usage, default_caps,
+        };
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.tmp/za-agent-unit/paused_after_pausing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ProjectStore::open(&dir).unwrap();
+        let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
+        let deps = LoopDeps {
+            journal: Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
+            model: model.clone(),
+            tools: Arc::new(ToolRegistry::default()),
+            capabilities: Vec::new(),
+            memory: Arc::new(NoMemory),
+            crash: None,
+        };
+        let run = RunId::new();
+        let spec = RunSpec {
+            project_id: "p".into(),
+            project_dir: PathBuf::from("H:/p"),
+            role: RunRole::Top,
+            parent: None,
+            endpoint: EndpointId("a".into()),
+            run_mode: RunMode::Ask,
+            work_mode: None,
+            tier: None,
+            budget: Budget::default(),
+            priority: Priority::Top,
+            max_wait: None,
+            task: "t".into(),
+            agents_md: None,
+            env: EnvInfo {
+                os: "windows".into(),
+                shell: "powershell".into(),
+                project_dir: "H:/p".into(),
+                date: "2026-11-10".into(),
+                tier: Tier::Full,
+                n_ctx: 1,
+                budget: "x".into(),
+                branch: "main".into(),
+            },
+        };
+        store
+            .create_run(NewRun {
+                id: run,
+                project_id: "p".into(),
+                parent_id: None,
+                role: RunRole::Top,
+                model_profile: None,
+            })
+            .await
+            .unwrap();
+        let g = deps
+            .journal
+            .set_status(run, RunStatus::Running, 0, None)
+            .await
+            .unwrap();
+        let (ctl, rx) = control_channel(store.clone(), run);
+        let mut st = step_zero(&deps, run, spec, rx, g).await.unwrap();
+        // Пауза наблюдена (`pausing`), но выход — пауза провайдера.
+        ctl.pause();
+        mark_stop(
+            &deps.journal,
+            run,
+            &mut st.generation,
+            &mut st.stopping,
+            RunStatus::Pausing,
+        )
+        .await
+        .unwrap();
+        let out = apply_exit(&deps, &mut st, LoopExit::Paused(pause_reason::PROVIDER))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            LoopOutcome::Paused {
+                reason: pause_reason::PROVIDER.into(),
+                interrupt: None,
+            }
+        );
+        assert!(!st.sig.flags().borrow().pause, "флаг паузы не снят");
+        // Тот же канал (тот же `RunControl`) — resume в том же процессе.
+        model.push(vec![Ok(StreamEvent::Finished {
+            message: Message {
+                role: Role::Assistant,
+                parts: vec![Part::Text("ок".into())],
+            },
+            finish: FinishReason::Stop,
+            usage: Usage::default(),
+        })]);
+        let LoopState { sig, .. } = st;
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            resume_run(&deps, run, ResumeChange::default(), ControlRx { sig }),
+        )
+        .await
+        .expect("resume не завершился в срок")
+        .unwrap();
+        assert!(
+            matches!(
+                out,
+                LoopOutcome::Finished {
+                    status: RunStatus::Done,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        drop(ctl);
     }
 }

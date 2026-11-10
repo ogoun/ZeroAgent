@@ -49,12 +49,13 @@ pub async fn resume_run(
     deps: &LoopDeps,
     run: RunId,
     change: ResumeChange,
-    mut ctl: ControlRx,
+    ctl: ControlRx,
 ) -> Result<LoopOutcome, LoopError> {
     let j = &deps.journal;
     let store = j.store().clone();
-    // Флаг паузы канала, поднятый до resume, уже поглощён прежним выходом в `paused`.
-    ctl.clear_pause();
+    // Флаг паузы канала не снимается: `ControlRx` одноразовый (его забирает цикл), и
+    // пауза на канале, переданном сюда, — новая команда пользователя (решение
+    // контроллера, I2 ревью задачи 15). Её применит первая граница.
 
     // (1) Статус run.
     let r = store
@@ -108,15 +109,22 @@ pub async fn resume_run(
     // (3) Последний снимок.
     let Some((seq, v)) = store.latest_snapshot(run).await? else {
         let e = LoopError::Snapshot("нет снимка".into());
-        return Err(fail(deps, run, generation, e).await);
+        return Err(fail_broken(deps, run, status, generation, e).await);
     };
     let ver = v.get("v").and_then(Value::as_u64);
     if ver != Some(u64::from(SNAPSHOT_V)) {
         let shown = ver.map_or_else(|| "?".to_owned(), |n| n.to_string());
         return Err(LoopError::Snapshot(format!("версия снимка {shown}")));
     }
-    let snap: Snapshot =
-        serde_json::from_value(v).map_err(|e| LoopError::Snapshot(e.to_string()))?;
+    // Снимок своей версии, который не разбирается, — нарушенный инвариант (решение
+    // контроллера, M2 ревью задачи 15): `failed` с причиной `snapshot`.
+    let snap: Snapshot = match serde_json::from_value(v) {
+        Ok(s) => s,
+        Err(e) => {
+            let e = LoopError::Snapshot(format!("снимок не разбирается: {e}"));
+            return Err(fail_broken(deps, run, status, generation, e).await);
+        }
+    };
 
     // (4) D5: процесс упал между снимком чистой паузы и её статусом.
     if status == RunStatus::Running
@@ -145,7 +153,13 @@ pub async fn resume_run(
     if next == Next::Model && change.endpoint.is_some() {
         return Err(LoopError::ChangeMidStep);
     }
-    let mut st = restore(deps, run, seq, snap, ctl).await?;
+    let mut st = match restore(deps, run, seq, snap, ctl).await {
+        Ok(st) => st,
+        Err(e @ LoopError::Snapshot(_)) => {
+            return Err(fail_broken(deps, run, status, generation, e).await);
+        }
+        Err(e) => return Err(e),
+    };
     // D19: простой между процессами и время в паузе — не активное время.
     st.counters.last_boundary_ms = None;
     let at = match next {
@@ -194,6 +208,33 @@ pub async fn resume_run(
     run_graph(deps, &mut st, at).await
 }
 
+/// Снимка нет или он испорчен: `failed` с причиной `snapshot` (D4, D11). Из `paused` и
+/// `blocked_on_budget` перехода в `failed` нет (часть 01, 4.3): run сначала переводится
+/// в `running` — resume начат и не удался.
+async fn fail_broken(
+    deps: &LoopDeps,
+    run: RunId,
+    status: RunStatus,
+    mut generation: u64,
+    e: LoopError,
+) -> LoopError {
+    if !status.can_transition(RunStatus::Failed) && status.can_transition(RunStatus::Running) {
+        match deps
+            .journal
+            .set_status(run, RunStatus::Running, generation, None)
+            .await
+        {
+            Ok(g) => generation = g,
+            Err(se) => {
+                tracing::error!(run = %run, error = %e, status_error = %se,
+                    "снимок run испорчен, статус failed не записан");
+                return e;
+            }
+        }
+    }
+    fail(deps, run, generation, e).await
+}
+
 /// [`LoopState`] из снимка на `seq`.
 async fn restore(
     deps: &LoopDeps,
@@ -203,11 +244,17 @@ async fn restore(
     ctl: ControlRx,
 ) -> Result<LoopState, LoopError> {
     let store = deps.journal.store().clone();
+    // Испорченная история снимка (нет блоба, блоб не разбирается, нарушен инвариант) —
+    // `LoopError::Snapshot`: вызывающий переводит run в `failed`. Прочие ошибки журнала
+    // (ввод-вывод) статус не меняют: resume можно повторить.
     let conv = Conversation::load(&store, &snap.messages)
         .await
         .map_err(|e| match e {
+            LoadError::Store(e @ StoreError::Corrupt(_)) => {
+                LoopError::Snapshot(format!("история снимка: {e}"))
+            }
             LoadError::Store(e) => LoopError::Store(e),
-            LoadError::History(e) => LoopError::History(e),
+            LoadError::History(e) => LoopError::Snapshot(format!("история снимка: {e}")),
         })?;
     let registry = run_registry(deps)?;
     let (_, classes) = run_tools_of(&registry, snap.setup.role, snap.setup.tier);

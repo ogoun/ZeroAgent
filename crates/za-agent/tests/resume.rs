@@ -964,24 +964,143 @@ async fn resume_with_input_continues_paused_run() {
 
 // ---- Дополнительно ----
 
-/// Ревью задачи 14, M2: флаг паузы, поглощённый прежним выходом, не ставит resume на паузу.
+/// I2 ревью задачи 15: пауза, посланная на канал до `resume_run`, — новая команда:
+/// первая граница ставит run в `paused (command)`.
 #[tokio::test]
-async fn consumed_pause_flag_does_not_repause() {
-    let f = fx("consumed_pause");
+async fn pause_before_resume_pauses() {
+    let f = fx("pause_before_resume");
     f.model.push(server_error());
     assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
     let before = statuses(&f.store, f.run).await.len();
     let (ctl, rx) = control_channel(f.store.clone(), f.run);
-    // Флаг поднят до resume (команда уже исполнена выходом в `paused`).
     ctl.pause();
-    f.model.push(answer("ок"));
     let out = within(
         "resume_run",
         resume_run(&f.deps, f.run, ResumeChange::default(), rx),
     )
     .await
     .unwrap();
-    assert_eq!(out, done("ок"));
+    assert_eq!(out, paused("command"));
     let st = statuses(&f.store, f.run).await;
-    assert_eq!(st[before..], [RunStatus::Running, RunStatus::Done]);
+    assert_eq!(
+        st[before..],
+        [RunStatus::Running, RunStatus::Pausing, RunStatus::Paused]
+    );
+    assert_eq!(f.model.calls().len(), 1, "модель вызвана после паузы");
+}
+
+/// I1 ревью задачи 15: реплей границы из журнала не берёт `now_ms` прошлого процесса.
+#[tokio::test]
+async fn replayed_boundary_does_not_count_idle_time() {
+    let mut f = fx("replayed_boundary");
+    f.model.push(calls(&[("c1", "echo")]));
+    let plain = f.deps.clone();
+    f.deps.crash = crash_at(CrashPoint::AfterBoundary { step: 2 });
+    let err = start(&f, ask()).await.unwrap_err();
+    assert!(matches!(err, LoopError::Halted), "{err:?}");
+    assert!(f.store.step_has_effects(f.run, 2).await.unwrap());
+    f.model.push(answer("ок"));
+    let out = resume_with(&f, &plain, ResumeChange::default())
+        .await
+        .unwrap();
+    assert_eq!(out, done("ок"));
+    let snaps = f.store.snapshots(f.run).await.unwrap();
+    let model2: Snapshot = snaps
+        .into_iter()
+        .map(|(_, v)| serde_json::from_value::<Snapshot>(v).unwrap())
+        .find(|s| s.step == 2 && s.next == Next::Model)
+        .expect("нет снимка Model шага 2");
+    assert_eq!(model2.counters.last_boundary_ms, None);
+    assert_eq!(model2.counters.active_ms, 0);
+}
+
+/// M6 ревью задачи 15: resume со снимка `Model` обнуляет `last_boundary_ms` — время
+/// между процессами не идёт в бюджет `duration_ms`.
+#[tokio::test]
+async fn resume_mid_step_resets_last_boundary() {
+    let f = fx("reset_last_boundary");
+    f.model.push_open(Vec::new());
+    let mut bus = f.bus.subscribe();
+    let (h, _ctl) = spawn_start(&f, ask());
+    nth_of(&mut bus, EventKind::ModelRequest, 1, |_| true).await;
+    crash(h).await;
+    let (seq, mut snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.next, Next::Model);
+    // Граница «в далёком прошлом»: без обнуления следующая граница засчитала бы всё
+    // время с 1 мс эпохи.
+    snap.counters.last_boundary_ms = Some(1);
+    snap.counters.active_ms = 0;
+    snap.budget = Budget {
+        duration_ms: Some(60_000),
+        ..Budget::default()
+    };
+    let last = events(&f.store, f.run).await.last().unwrap().seq;
+    assert!(last > seq);
+    f.store
+        .save_snapshot(f.run, last, serde_json::to_value(&snap).unwrap())
+        .await
+        .unwrap();
+    f.model.push(calls(&[("c1", "echo")]));
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert!(snap.counters.active_ms < 60_000, "{:?}", snap.counters);
+}
+
+/// M2 ревью задачи 15: испорченный снимок или его история — `failed (snapshot)`;
+/// снимок другой версии статус не меняет.
+#[tokio::test]
+async fn broken_snapshot_fails_other_version_does_not() {
+    async fn paused_run(name: &str) -> (Fx, Seq, Snapshot) {
+        let f = fx(name);
+        f.model.push(server_error());
+        assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+        let (seq, snap) = last_snapshot(&f.store, f.run).await;
+        let last = events(&f.store, f.run).await.last().unwrap().seq;
+        assert!(last > seq);
+        (f, last, snap)
+    }
+    async fn last_reason(f: &Fx) -> Value {
+        let evs = events(&f.store, f.run).await;
+        of_kind(&evs, EventKind::RunStatus).last().unwrap().payload["reason"].clone()
+    }
+
+    // Снимок версии 1, который не разбирается.
+    let (f, last, _) = paused_run("broken_snapshot").await;
+    f.store
+        .save_snapshot(f.run, last, json!({"v": 1, "step": "x"}))
+        .await
+        .unwrap();
+    let err = resume(&f, ResumeChange::default()).await.unwrap_err();
+    assert!(matches!(err, LoopError::Snapshot(_)), "{err:?}");
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Failed);
+    assert_eq!(last_reason(&f).await, json!("snapshot"));
+
+    // История ссылается на блоб, которого нет.
+    let (f, last, mut snap) = paused_run("missing_blob").await;
+    snap.messages.push(za_protocol::BlobHash("0".repeat(64)));
+    f.store
+        .save_snapshot(f.run, last, serde_json::to_value(&snap).unwrap())
+        .await
+        .unwrap();
+    let err = resume(&f, ResumeChange::default()).await.unwrap_err();
+    assert!(matches!(err, LoopError::Snapshot(_)), "{err:?}");
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Failed);
+    assert_eq!(last_reason(&f).await, json!("snapshot"));
+
+    // Снимок другой версии: статус не меняется, его может прочитать новая версия.
+    let (f, last, _) = paused_run("other_version").await;
+    f.store
+        .save_snapshot(f.run, last, json!({"v": 2}))
+        .await
+        .unwrap();
+    let err = resume(&f, ResumeChange::default()).await.unwrap_err();
+    assert!(
+        matches!(&err, LoopError::Snapshot(s) if s == "версия снимка 2"),
+        "{err:?}"
+    );
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
 }
