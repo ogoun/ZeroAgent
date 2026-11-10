@@ -31,7 +31,8 @@ use za_core::{
 };
 use za_llm::{EndpointId, SelectError, Selection};
 use za_protocol::{
-    Budget, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Seq, Tier, pause_reason,
+    Budget, BudgetKind, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Seq, Tier,
+    pause_reason,
 };
 use za_store::{INTERRUPT_OPEN, ProjectStore, StoreError};
 
@@ -134,9 +135,60 @@ pub enum RunAction {
 pub struct RunArgs {
     pub project: PathBuf,
     pub action: RunAction,
-    pub max_steps: Option<u32>,
-    pub max_tokens: Option<u64>,
+    pub budget: BudgetFlags,
     pub crash: Option<RunCrash>,
+}
+
+/// Флаги бюджета `run`: каждый задаёт своё поле поверх базового бюджета.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BudgetFlags {
+    /// `--max-steps`.
+    pub steps: Option<u32>,
+    /// `--max-tokens`.
+    pub tokens: Option<u64>,
+    /// `--max-usd`.
+    pub usd: Option<f64>,
+    /// `--max-gpu-ms`.
+    pub gpu_ms: Option<u64>,
+    /// `--max-duration` в секундах; в бюджете — `duration_ms`.
+    pub duration_secs: Option<u64>,
+}
+
+impl BudgetFlags {
+    /// Задан хотя бы один флаг.
+    pub fn any(&self) -> bool {
+        self.steps.is_some()
+            || self.tokens.is_some()
+            || self.usd.is_some()
+            || self.gpu_ms.is_some()
+            || self.duration_secs.is_some()
+    }
+}
+
+/// Флаг `run`, меняющий предел вида `kind` (подсказка при `blocked_on_budget`).
+pub fn budget_flag(kind: BudgetKind) -> &'static str {
+    match kind {
+        BudgetKind::Steps => "--max-steps N",
+        BudgetKind::Tokens => "--max-tokens N",
+        BudgetKind::Usd => "--max-usd USD",
+        BudgetKind::GpuMs => "--max-gpu-ms МС",
+        BudgetKind::Duration => "--max-duration СЕК",
+    }
+}
+
+/// Разбор `--max-usd`: конечное неотрицательное число (NaN снял бы предел молча, как в
+/// проверке `[budgets.run]`).
+pub fn parse_usd(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("ожидается число долларов, получено {s:?}"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!(
+            "предел usd должен быть конечным и не отрицательным: {s:?}"
+        ));
+    }
+    Ok(v)
 }
 
 /// Ответ на прерывание (`answer`).
@@ -155,14 +207,23 @@ pub enum Answer {
 }
 
 /// Бюджет `base` (у нового run — `[budgets.run]`, у resume — текущий бюджет run), поверх
-/// него флаги `--max-steps`, `--max-tokens`.
-pub fn run_budget(base: &Budget, max_steps: Option<u32>, max_tokens: Option<u64>) -> Budget {
+/// него заданные флаги; незаданные поля остаются из `base`.
+pub fn run_budget(base: &Budget, f: &BudgetFlags) -> Budget {
     let mut b = base.clone();
-    if max_steps.is_some() {
-        b.steps = max_steps;
+    if f.steps.is_some() {
+        b.steps = f.steps;
     }
-    if max_tokens.is_some() {
-        b.tokens = max_tokens;
+    if f.tokens.is_some() {
+        b.tokens = f.tokens;
+    }
+    if f.usd.is_some() {
+        b.usd = f.usd;
+    }
+    if f.gpu_ms.is_some() {
+        b.gpu_ms = f.gpu_ms;
+    }
+    if let Some(s) = f.duration_secs {
+        b.duration_ms = Some(s.saturating_mul(1000));
     }
     b
 }
@@ -358,7 +419,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             let dir = journal_dir(home, &project)?;
             let store = ProjectStore::open(&dir)?;
             // Бюджет нового run: `[budgets.run]`, поверх него флаги.
-            let budget = run_budget(&cfg.budgets.run, args.max_steps, args.max_tokens);
+            let budget = run_budget(&cfg.budgets.run, &args.budget);
             let project_id = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -404,9 +465,9 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             // Бюджет resume: без флагов — бюджет run сохраняется; с флагами — флаги поверх
             // текущего бюджета run из последнего снимка. `[budgets.run]` применён при старте
             // и не перечитывается (решение контроллера, I2 ревью задачи 16).
-            let budget = if args.max_steps.is_some() || args.max_tokens.is_some() {
+            let budget = if args.budget.any() {
                 let current = current_budget(&store, r.run).await?;
-                Some(run_budget(&current, args.max_steps, args.max_tokens))
+                Some(run_budget(&current, &args.budget))
             } else {
                 None
             };
@@ -728,17 +789,18 @@ async fn report(
             }
         }
         LoopOutcome::BlockedOnBudget { kind } => {
-            let kind = serde_json::to_value(kind)
+            let name = serde_json::to_value(kind)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .unwrap_or_default();
             eprintln!(
-                "zero-agent: run на паузе: {}: исчерпан предел {kind}",
+                "zero-agent: run на паузе: {}: исчерпан предел {name}",
                 pause_reason::BUDGET
             );
             eprintln!(
-                "zero-agent: продолжить с новым бюджетом: zero-agent run --project {} --resume {run} --max-steps N | --max-tokens N",
-                quoted(project)
+                "zero-agent: продолжить с новым бюджетом: zero-agent run --project {} --resume {run} {}",
+                quoted(project),
+                budget_flag(kind)
             );
             EXIT_PAUSED
         }
@@ -748,6 +810,14 @@ async fn report(
         }
     };
     Ok(ExitCode::from(code))
+}
+
+/// Решение неизвестного исхода именем флага `answer`.
+fn decision_flag(d: UnknownDecision) -> &'static str {
+    match d {
+        UnknownDecision::Done => "--done",
+        UnknownDecision::NotDone => "--not-done",
+    }
 }
 
 /// `zero-agent answer`: решение прерывания; цикл не запускается.
@@ -795,7 +865,15 @@ pub async fn cmd_answer(
             };
             let was_open = row.status == INTERRUPT_OPEN;
             let recorded = resolve_unknown(&store, interrupt, d).await?;
-            was_open && recorded == d
+            if recorded != d {
+                // Действует уже записанное решение (квитанция эффекта или прежний ответ).
+                eprintln!(
+                    "zero-agent: прерывание {interrupt} уже решено: действует решение {}, ответ не изменён",
+                    decision_flag(recorded)
+                );
+                return Ok(ExitCode::from(EXIT_ERROR));
+            }
+            was_open
         }
     };
     if !applied {
@@ -832,12 +910,47 @@ mod tests {
             usd: Some(1.5),
             ..Budget::default()
         };
-        let b = run_budget(&base, Some(3), None);
+        let flags = |f: BudgetFlags| run_budget(&base, &f);
+        let b = flags(BudgetFlags {
+            steps: Some(3),
+            ..BudgetFlags::default()
+        });
         assert_eq!(b.steps, Some(3));
         assert_eq!(b.usd, Some(1.5));
         assert_eq!(b.tokens, None);
-        let b = run_budget(&base, None, Some(500));
+        let b = flags(BudgetFlags {
+            tokens: Some(500),
+            ..BudgetFlags::default()
+        });
         assert_eq!((b.steps, b.tokens), (Some(10), Some(500)));
+        let b = flags(BudgetFlags {
+            usd: Some(4.0),
+            gpu_ms: Some(7),
+            duration_secs: Some(600),
+            ..BudgetFlags::default()
+        });
+        assert_eq!(b.usd, Some(4.0));
+        assert_eq!((b.gpu_ms, b.duration_ms), (Some(7), Some(600_000)));
+        assert_eq!(b.steps, Some(10));
+        assert!(!BudgetFlags::default().any());
+    }
+
+    #[test]
+    fn budget_hint_names_flag_of_kind() {
+        assert_eq!(budget_flag(BudgetKind::Duration), "--max-duration СЕК");
+        assert_eq!(budget_flag(BudgetKind::Usd), "--max-usd USD");
+        assert_eq!(budget_flag(BudgetKind::GpuMs), "--max-gpu-ms МС");
+        assert_eq!(budget_flag(BudgetKind::Steps), "--max-steps N");
+        assert_eq!(budget_flag(BudgetKind::Tokens), "--max-tokens N");
+    }
+
+    #[test]
+    fn usd_flag_is_finite_and_non_negative() {
+        assert_eq!(parse_usd("2.5"), Ok(2.5));
+        assert_eq!(parse_usd("0"), Ok(0.0));
+        for bad in ["nan", "inf", "-1", "x"] {
+            assert!(parse_usd(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

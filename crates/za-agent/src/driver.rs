@@ -1607,20 +1607,26 @@ mod tests {
         assert_eq!(serde_json::from_value::<BoundaryValue>(j).unwrap(), v);
     }
 
-    /// M2 ревью задачи 14: `pausing` записан, а run встал в `paused` по другой
-    /// причине — флаг паузы поглощён, resume на том же канале не встаёт на паузу.
-    #[tokio::test]
-    async fn paused_after_pausing_clears_pause_flag() {
+    /// Модульная обвязка `apply_exit`: run после шага 0 на `ScriptedModel`, канал
+    /// управления и состояние цикла. Каталог — `.tmp/za-agent-unit/<name>`.
+    async fn unit_state(
+        name: &str,
+    ) -> (
+        LoopDeps,
+        ProjectStore,
+        Arc<za_llm::ScriptedModel>,
+        RunId,
+        crate::control::RunControl,
+        LoopState,
+    ) {
         use crate::control::control_channel;
         use crate::memory::NoMemory;
-        use crate::resume::{ResumeChange, resume_run};
         use za_core::EventBus;
-        use za_llm::{
-            BackendKind, Message, Part, Role, ScriptedModel, StreamEvent, Usage, default_caps,
-        };
+        use za_llm::{BackendKind, ScriptedModel, default_caps};
 
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.tmp/za-agent-unit/paused_after_pausing");
+            .join("../../.tmp/za-agent-unit")
+            .join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = ProjectStore::open(&dir).unwrap();
@@ -1675,7 +1681,94 @@ mod tests {
             .await
             .unwrap();
         let (ctl, rx) = control_channel(store.clone(), run);
-        let mut st = step_zero(&deps, run, spec, rx, g).await.unwrap();
+        let st = step_zero(&deps, run, spec, rx, g).await.unwrap();
+        (deps, store, model, run, ctl, st)
+    }
+
+    /// Статусы run по порядку из событий `run.status`.
+    async fn statuses(store: &ProjectStore, run: RunId) -> Vec<String> {
+        store
+            .read_run(run, Seq(0), usize::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == EventKind::RunStatus)
+            .filter_map(|e| e.payload["to"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// M3 ревью задачи 14, решение progress:145: `finish` после записанного
+    /// `cancelling` даёт `cancelled` (из `cancelling` переход только в `cancelled`).
+    #[tokio::test]
+    async fn finished_after_cancelling_is_cancelled() {
+        let (deps, store, _model, run, _ctl, mut st) =
+            unit_state("finished_after_cancelling").await;
+        mark_stop(
+            &deps.journal,
+            run,
+            &mut st.generation,
+            &mut st.stopping,
+            RunStatus::Cancelling,
+        )
+        .await
+        .unwrap();
+        let out = apply_exit(&deps, &mut st, LoopExit::Finished(RunStatus::Done))
+            .await
+            .unwrap();
+        assert_eq!(out, LoopOutcome::Cancelled);
+        let r = store.get_run(run).await.unwrap().unwrap();
+        assert_eq!(r.status, RunStatus::Cancelled);
+        assert_eq!(
+            statuses(&store, run).await,
+            ["running", "cancelling", "cancelled"]
+        );
+    }
+
+    /// M3 ревью задачи 14, решение к задаче 11: пауза, наблюдённая во время `finish`,
+    /// снимается — `pausing → running → done`.
+    #[tokio::test]
+    async fn finished_after_pausing_is_done() {
+        let (deps, store, _model, run, ctl, mut st) = unit_state("finished_after_pausing").await;
+        ctl.pause();
+        mark_stop(
+            &deps.journal,
+            run,
+            &mut st.generation,
+            &mut st.stopping,
+            RunStatus::Pausing,
+        )
+        .await
+        .unwrap();
+        st.answer = Some("ok".into());
+        let out = apply_exit(&deps, &mut st, LoopExit::Finished(RunStatus::Done))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out,
+                LoopOutcome::Finished {
+                    status: RunStatus::Done,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        let r = store.get_run(run).await.unwrap().unwrap();
+        assert_eq!(r.status, RunStatus::Done);
+        assert_eq!(
+            statuses(&store, run).await,
+            ["running", "pausing", "running", "done"]
+        );
+    }
+
+    /// M2 ревью задачи 14: `pausing` записан, а run встал в `paused` по другой
+    /// причине — флаг паузы поглощён, resume на том же канале не встаёт на паузу.
+    #[tokio::test]
+    async fn paused_after_pausing_clears_pause_flag() {
+        use crate::resume::{ResumeChange, resume_run};
+        use za_llm::{Message, Part, Role, StreamEvent, Usage};
+
+        let (deps, _store, model, run, ctl, mut st) = unit_state("paused_after_pausing").await;
         // Пауза наблюдена (`pausing`), но выход — пауза провайдера.
         ctl.pause();
         mark_stop(

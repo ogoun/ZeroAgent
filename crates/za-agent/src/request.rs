@@ -282,9 +282,9 @@ pub fn build_request(
 }
 
 /// Метка формата хэша запроса; смена формата не совпадёт со старыми квитанциями.
-const REQUEST_FORMAT_TAG: &[u8] = b"za-request-v1 ";
+const REQUEST_FORMAT_TAG: &[u8] = b"za-request-v1\0";
 
-/// BLAKE3 hex запроса (D7): метка `za-request-v1 `, затем канонический JSON
+/// BLAKE3 hex запроса (D7): метка `za-request-v1\0`, затем канонический JSON
 /// `ChatRequest` (`canonical_json`, как у блобов истории и `render_tools`).
 ///
 /// Хэш входит в аргументы эффекта модели и сверяется при реплее, поэтому зависит

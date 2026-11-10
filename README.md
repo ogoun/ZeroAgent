@@ -87,8 +87,9 @@ zero-agent run --project . "Ответь одним словом: столица
 #   stderr: run 019a…   stdout: Париж
 zero-agent run --project DIR [--model ID] [--mode read-only|plan|ask|accept-edits|auto]
                [--work-mode coder|researcher|operator|writer] [--tier small|standard|full]
-               [--max-wait СЕК] [--max-steps N] [--max-tokens N] [--agents-md] "<задача>"
-zero-agent run --project DIR --resume RUN [--model ID] [--input "<текст>"] [--max-steps N] [--max-tokens N]
+               [--max-wait СЕК] [--max-steps N] [--max-tokens N] [--max-usd USD] [--max-gpu-ms МС] [--max-duration СЕК] [--agents-md] "<задача>"
+zero-agent run --project DIR --resume RUN [--model ID] [--input "<текст>"]
+               [--max-steps N] [--max-tokens N] [--max-usd USD] [--max-gpu-ms МС] [--max-duration СЕК]
 zero-agent answer --project DIR --interrupt ID (--text "<ответ>" | --approve | --deny [--note "<текст>"] | --done | --not-done)
 ```
 
@@ -127,7 +128,7 @@ steps = 50             # ходов модели: 50-й ход последни�
 duration_ms = 1800000  # активное время run, мс: время в паузе не считается
 ```
 
-Флаги `run` `--max-steps` и `--max-tokens` задают `steps` и `tokens` поверх `[budgets.run]`. Бюджет фиксируется при старте run и хранится в его снимке. `run --resume` без флагов бюджета продолжает с тем же бюджетом; `[budgets.run]` при продолжении не перечитывается. С флагами они меняют `steps` или `tokens` поверх текущего бюджета run, остальные пределы сохраняются: так run в `blocked_on_budget` продолжают с новым пределом (`run --resume <id> --max-steps 100`).
+Флаги `run` задают пределы поверх `[budgets.run]`, по одному на поле: `--max-steps` — `steps`, `--max-tokens` — `tokens`, `--max-usd` — `usd` (конечное неотрицательное число), `--max-gpu-ms` — `gpu_ms`, `--max-duration СЕК` — `duration_ms` (в секундах). Бюджет фиксируется при старте run и хранится в его снимке. `run --resume` без флагов бюджета продолжает с тем же бюджетом; `[budgets.run]` при продолжении не перечитывается. С флагами они меняют свои поля поверх текущего бюджета run, остальные пределы сохраняются. Так run в `blocked_on_budget` продолжают с новым пределом исчерпанного вида: подсказка в stderr называет нужный флаг (`run --resume <id> --max-steps 100`, `--max-duration 3600`, `--max-usd 5`).
 
 Бюджет проверяется на границе шага, до начала следующего хода и до чтения нового ввода. `steps` ограничивает число ходов: при `steps = 2` третий ход не начинается. Остальные пределы срабатывают, когда расход их превысил; равенство пределу — ещё не превышение. Превышение записывается событием `budget.exceeded {kind, used, limit}` и переводит run в `blocked_on_budget`. Ввод, пришедший во время последнего хода, не теряется: его прочитает граница после продолжения run с новым бюджетом. Дневной бюджет облачной группы по-прежнему задаётся `daily_budget_usd` у эндпоинта в `[models]`.
 

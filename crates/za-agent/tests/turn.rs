@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -539,6 +539,22 @@ async fn refusal_is_reported_not_committed() {
 /// Предел любого ожидания в тестах: зависание становится понятной паникой.
 const WAIT: Duration = Duration::from_secs(10);
 
+/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
+fn time_scale() -> u32 {
+    static SCALE: OnceLock<u32> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("ZA_TEST_TIME_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(1, |n| n.clamp(1, 6))
+    })
+}
+
+/// NFR-03: обрыв стрима не позже 200 мс (× `ZA_TEST_TIME_SCALE`, как в `control.rs`).
+fn nfr03() -> Duration {
+    Duration::from_millis(200) * time_scale()
+}
+
 /// Ожидание с пределом [`WAIT`]; по истечении — паника с описанием `what`.
 async fn within<F: std::future::Future>(what: &str, fut: F) -> F::Output {
     match tokio::time::timeout(WAIT, fut).await {
@@ -600,7 +616,7 @@ async fn abort_with(name: &str, signal: Signal) {
         "{err:?}"
     );
     let lag = dropped.saturating_duration_since(at);
-    assert!(lag <= Duration::from_millis(200), "{lag:?}");
+    assert!(lag <= nfr03(), "{lag:?}");
     assert_eq!(m.open_streams(), 0);
     let tag = match signal {
         Signal::Pause => "pause",

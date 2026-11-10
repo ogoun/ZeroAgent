@@ -30,8 +30,8 @@ use zero_agent::journal::open_retrying;
 use zero_agent::models::{self, AskArgs, CommandError};
 use zero_agent::resources;
 use zero_agent::run::{
-    self as agent_run, Answer, EXIT_NEEDS_DECISION, JOURNAL_FILE, NewRunArgs, ResumeArgs,
-    RunAction, RunArgs, RunCrash, RunError, parse_run_crash,
+    self as agent_run, Answer, BudgetFlags, EXIT_NEEDS_DECISION, JOURNAL_FILE, NewRunArgs,
+    ResumeArgs, RunAction, RunArgs, RunCrash, RunError, parse_run_crash, parse_usd,
 };
 /// Переменная окружения с фильтром логов; без неё читается `RUST_LOG`.
 const LOG_ENV: &str = "ZA_LOG";
@@ -178,6 +178,15 @@ struct RunCli {
     /// Предел токенов поверх `[budgets.run]`.
     #[arg(long)]
     max_tokens: Option<u64>,
+    /// Предел стоимости, USD, поверх `[budgets.run]`.
+    #[arg(long, value_name = "USD", value_parser = parse_usd)]
+    max_usd: Option<f64>,
+    /// Предел времени GPU, мс, поверх `[budgets.run]`.
+    #[arg(long, value_name = "МС")]
+    max_gpu_ms: Option<u64>,
+    /// Предел активного времени run, с, поверх `[budgets.run]` (`duration_ms`).
+    #[arg(long, value_name = "СЕК")]
+    max_duration: Option<u64>,
     /// Добавить `AGENTS.md` проекта в промпт.
     #[arg(long, conflicts_with = "resume")]
     agents_md: bool,
@@ -272,8 +281,13 @@ fn run_args(r: RunCli) -> RunArgs {
     RunArgs {
         project: r.project,
         action,
-        max_steps: r.max_steps,
-        max_tokens: r.max_tokens,
+        budget: BudgetFlags {
+            steps: r.max_steps,
+            tokens: r.max_tokens,
+            usd: r.max_usd,
+            gpu_ms: r.max_gpu_ms,
+            duration_secs: r.max_duration,
+        },
         crash: r.crash_at,
     }
 }

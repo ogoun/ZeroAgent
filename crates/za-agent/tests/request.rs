@@ -459,7 +459,7 @@ fn request_hash_is_canonical_blake3() {
     let req = build_request(&f, &s, &c, &TurnOptions::default());
     let canon = za_protocol::canonical_json(&serde_json::to_value(&req).unwrap());
     let mut h = blake3::Hasher::new();
-    h.update(b"za-request-v1 ");
+    h.update(b"za-request-v1\0");
     h.update(canon.as_bytes());
     assert_eq!(
         request_hash(&req).unwrap(),

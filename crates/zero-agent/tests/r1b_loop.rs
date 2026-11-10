@@ -548,6 +548,40 @@ fn resume_reads_budget_from_flags() {
     assert_eq!(count(&e.events(run), EventKind::BudgetExceeded), 2);
 }
 
+/// Предел активного времени (`duration_ms`) из CLI продолжается флагом `--max-duration`
+/// (финальное ревью R1-B1, I1): подсказка называет флаг вида, исчерпавшего предел.
+#[test]
+fn resume_extends_duration_budget() {
+    let srv = Fake::start(empty_then_ok);
+    // Предел 0 мс: первая граница (активного времени ещё нет) пропускает ход, вторая —
+    // после хода модели — превышает предел.
+    let cfg = format!(
+        "{}\n[budgets.run]\nduration_ms = 0\n",
+        llama_config(&srv.base)
+    );
+    let e = env("duration", &cfg);
+    let o = e.run_cmd(&["Задача"]);
+    assert_eq!(o.code(), Some(4), "{o:?}");
+    assert!(o.stderr.contains("--max-duration"), "{o:?}");
+    let run = run_id(&o);
+    let exceeded: Vec<Value> = e
+        .events(run)
+        .into_iter()
+        .filter(|(k, _)| *k == EventKind::BudgetExceeded)
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(exceeded.len(), 1, "{exceeded:?}");
+    assert_eq!(exceeded[0]["kind"], "duration", "{exceeded:?}");
+    assert_eq!(exceeded[0]["limit"], 0, "{exceeded:?}");
+    let id = run.to_string();
+    // Без флага предел сохраняется.
+    let again = e.run_cmd(&["--resume", &id]);
+    assert_eq!(again.code(), Some(4), "{again:?}");
+    let r = e.run_cmd(&["--resume", &id, "--max-duration", "600"]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert_eq!(r.stdout, "ок\n", "{r:?}");
+}
+
 /// Первая строка stderr — `run <id>` раньше любых предупреждений (D28): `--agents-md`
 /// без файла предупреждает уже после неё.
 #[test]
