@@ -25,6 +25,13 @@ tracing.workspace = true
 # Сверка открытого дескриптора с каноническим путём (D98).
 same-file.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# Число жёстких ссылок у `paths::open_checked` (I3).
+winapi-util.workspace = true
+# Локальные тома: сетевой диск и `subst` отвергаются по типу диска до обращения к ним
+# (Ruling C1). Крейт уже в дереве у `za-res`.
+sysinfo.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 # `O_NOFOLLOW` у `paths::open_checked` (D98).
 libc.workspace = true

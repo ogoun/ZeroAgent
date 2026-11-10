@@ -95,12 +95,21 @@ fn file_link(link: &Path, target: &Path) -> Option<()> {
     match std::os::windows::fs::symlink_file(target, link) {
         Ok(()) => Some(()),
         Err(e) => {
-            eprintln!(
-                "ПРОПУСК: ссылка на файл не создана ({e}); нужен режим разработчика или права администратора"
-            );
+            skip(&format!(
+                "ссылка на файл не создана ({e}); нужен режим разработчика или права администратора"
+            ));
             None
         }
     }
+}
+
+/// Пропуск проверки, которой нужны права или свойство тома, — с сообщением. При
+/// `ZA_REQUIRE_LINK_TESTS=1` (CI с правами) пропуск — падение: доказательство обязательно.
+fn skip(why: &str) {
+    if std::env::var("ZA_REQUIRE_LINK_TESTS").as_deref() == Ok("1") {
+        panic!("ZA_REQUIRE_LINK_TESTS=1, а проверка пропущена: {why}");
+    }
+    eprintln!("ПРОПУСК: {why}");
 }
 
 // ---- Лексический этап: обе ОС через classify_with ----
@@ -134,7 +143,20 @@ fn windows_lexical_rejections() {
     assert!(matches!(w(r"\??\C:\x"), Err(PathError::Device(_))));
     assert!(matches!(w("sub/con.txt"), Err(PathError::Device(_))));
     for name in [
-        "NUL", "prn", "Aux.log", "com1", "LPT9.x", "COM¹", "conin$", "con .txt",
+        "NUL",
+        "prn",
+        "Aux.log",
+        "com1",
+        "LPT9.x",
+        "COM¹",
+        "conin$",
+        "con .txt",
+        "nul.txt",
+        "CON",
+        "COM1.log",
+        "com0",
+        "LPT0.a.b",
+        "sub/aux.tar.gz",
     ] {
         assert!(matches!(w(name), Err(PathError::Device(_))), "{name}");
     }
@@ -343,6 +365,11 @@ fn case_does_not_bypass_protection() {
     std::fs::create_dir_all(f.project.join(".git")).unwrap();
     assert!(res(&f, ".ZERO-AGENT/config.toml", Access::Write).protected);
     assert!(res(&f, ".GIT/config", Access::Write).protected);
+    // Исключение `work/` сравнивается ординально (I1): ещё не созданный `WORK` в другом
+    // регистре остаётся защищённым — ошибка в безопасную сторону; существующий
+    // `.zero-agent/work` канонизация приводит к настоящему регистру.
+    assert!(res(&f, ".ZERO-AGENT/WORK/x", Access::Write).protected);
+    std::fs::create_dir_all(f.project.join(".zero-agent/work")).unwrap();
     assert!(!res(&f, ".ZERO-AGENT/WORK/x", Access::Write).protected);
     let home = f.home.to_string_lossy().to_uppercase();
     assert!(res(&f, &format!(r"{home}\config.toml"), Access::Write).protected);
@@ -379,7 +406,7 @@ fn short_names_are_resolved() {
     std::fs::create_dir_all(f.project.join("averyverylongdirectoryname")).unwrap();
     dir_link(&f.project.join("averyverylonglinkname"), &f.outside);
     let Some(za) = short_name(&f.project, ".zero-agent") else {
-        eprintln!("ПРОПУСК: том не создаёт короткие имена 8.3 (fsutil 8dot3name)");
+        skip("том не создаёт короткие имена 8.3 (fsutil 8dot3name)");
         return;
     };
     let r = res(&f, &format!(r"{za}\config.toml"), Access::Write);
@@ -405,8 +432,10 @@ fn within_by_components() {
     assert!(!within(Path::new("/data/x"), Path::new("/data")));
     #[cfg(windows)]
     {
-        assert!(within(Path::new(r"C:\Data"), Path::new(r"c:\data\X")));
-        assert!(within(Path::new(r"\\?\C:\Data"), Path::new(r"C:\data\x")));
+        // Без учёта регистра — только буква диска (Ruling I1).
+        assert!(within(Path::new(r"C:\Data"), Path::new(r"c:\Data\X")));
+        assert!(within(Path::new(r"\\?\C:\Data"), Path::new(r"C:\Data\x")));
+        assert!(!within(Path::new(r"C:\Data"), Path::new(r"C:\data\x")));
         assert!(!within(Path::new(r"C:\data"), Path::new(r"D:\data\x")));
     }
 }
@@ -528,4 +557,258 @@ fn roots_are_canonical() {
     ));
     assert!(roots.za_home.ends_with("missing"));
     assert!(Roots::canonical(&f.project.join("absent"), &f.home).is_err());
+}
+
+// ---- Раунд исправлений 1 (ревью задачи 2): C1, I1–I4, M1, M5 ----
+
+/// Символическая ссылка на каталог (на Windows нужен режим разработчика или права).
+#[cfg(windows)]
+fn dir_symlink(link: &Path, target: &Path) -> Option<()> {
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => Some(()),
+        Err(e) => {
+            skip(&format!(
+                "символическая ссылка не создана ({e}); нужен режим разработчика или права администратора"
+            ));
+            None
+        }
+    }
+}
+
+/// C1: ссылка в проекте на `\\host\share` (и другие сетевые и device-цели) — отказ до
+/// любого обращения к цели: `canonicalize` в этом потоке не вызывался ни разу, цель
+/// проверена лексически по `read_link`. Создание ссылки цель не трогает.
+#[cfg(windows)]
+#[test]
+fn link_to_unc_refused_without_io() {
+    use za_core::paths::canonicalize_calls;
+    let f = fixture("link_unc");
+    for (i, target) in [
+        r"\\192.0.2.1\share",
+        r"\\?\UNC\192.0.2.1\share",
+        "//192.0.2.1/share",
+        r"\\.\pipe\x",
+        r"\\?\GLOBALROOT\Device\Mup\192.0.2.1\share",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let link = f.project.join(format!("l{i}"));
+        if dir_symlink(&link, Path::new(target)).is_none() {
+            return;
+        }
+        let lex = classify(&f.project, &format!("l{i}/x")).unwrap();
+        let before = canonicalize_calls();
+        let e = resolve(&f.roots, &lex, Access::Read).unwrap_err();
+        assert!(
+            matches!(e, PathError::Network(_) | PathError::Device(_)),
+            "{target}: {e}"
+        );
+        assert_eq!(
+            canonicalize_calls(),
+            before,
+            "{target}: canonicalize вызван"
+        );
+    }
+    // Цепочка: локальная ссылка на ссылку с UNC-целью — тоже отказ без канонизации.
+    dir_link(&f.project.join("chain"), &f.project.join("l0"));
+    let lex = classify(&f.project, "chain/x").unwrap();
+    let before = canonicalize_calls();
+    assert!(matches!(
+        resolve(&f.roots, &lex, Access::Read),
+        Err(PathError::Network(_))
+    ));
+    assert_eq!(canonicalize_calls(), before);
+}
+
+/// C1, M5: корень проекта за ссылкой на UNC — ошибка `Roots::canonical`, а не корень
+/// `\\?\UNC\…`.
+#[cfg(windows)]
+#[test]
+fn roots_behind_unc_link_are_refused() {
+    let base = unique_dir("roots_unc");
+    let link = base.join("p");
+    if dir_symlink(&link, Path::new(r"\\192.0.2.1\share")).is_none() {
+        return;
+    }
+    assert!(Roots::canonical(&link, &base.join("home")).is_err());
+}
+
+/// Буква, которой нет среди локальных томов (как у подключённого сетевого диска или
+/// `subst`), — `Network` по типу диска, без обращения к нему.
+#[cfg(windows)]
+#[test]
+fn non_local_drive_is_network() {
+    use za_core::paths::canonicalize_calls;
+    let f = fixture("drive");
+    // Буква без тома: `exists` у несуществующего диска — локальный отказ ОС.
+    let Some(letter) = ('D'..='Z')
+        .rev()
+        .find(|c| !Path::new(&format!(r"{c}:\")).exists())
+    else {
+        skip("все буквы дисков заняты");
+        return;
+    };
+    let arg = format!(r"{letter}:\share\x");
+    let before = canonicalize_calls();
+    let e = resolve(&f.roots, &classify(&f.project, &arg).unwrap(), Access::Read).unwrap_err();
+    assert!(matches!(e, PathError::Network(_)), "{e}");
+    assert_eq!(canonicalize_calls(), before);
+    // Junction на такую букву создать нельзя (цели нет); symlink — можно.
+    if dir_symlink(
+        &f.project.join("m"),
+        Path::new(&format!(r"{letter}:\share")),
+    )
+    .is_some()
+    {
+        let lex = classify(&f.project, "m/x").unwrap();
+        assert!(matches!(
+            resolve(&f.roots, &lex, Access::Read),
+            Err(PathError::Network(_))
+        ));
+        assert_eq!(canonicalize_calls(), before);
+    }
+    // Диск проекта локальный.
+    assert!(res(&f, "x", Access::Read).inside);
+}
+
+/// I1: знак Кельвина U+212A сворачивается `to_lowercase` в `k`, но для NTFS `Kproj` и
+/// `kproj` — разные имена. Путь с U+212A вместо `k` в корне проекта — снаружи.
+#[test]
+fn kelvin_sign_is_not_inside() {
+    let base = unique_dir("kproj");
+    let project = base.join("kproj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("a.txt"), "a").unwrap();
+    let roots = Roots::canonical(&project, &base.join("home")).unwrap();
+    let real = roots.project.to_string_lossy().into_owned();
+    let at = real.rfind("kproj").unwrap();
+    let fake = format!("{}\u{212A}proj{}", &real[..at], &real[at + "kproj".len()..]);
+    let r = resolve(
+        &roots,
+        &classify(&project, &format!("{fake}/a.txt")).unwrap(),
+        Access::Read,
+    )
+    .unwrap();
+    assert!(!r.inside, "{}", r.path.display());
+    // Ангстрем U+212B и `å` — тоже разные имена.
+    let p = Path::new("/data/å");
+    assert!(!within(p, Path::new("/data/\u{212B}/x")));
+}
+
+/// I2: имена с хвостовой точкой и зарезервированные имена устройств, созданные через
+/// `\\?\`, не достать и через цель ссылки: в Win32 они означали бы `.git` и `NUL`.
+#[cfg(windows)]
+#[test]
+fn link_to_win32_ambiguous_names_is_refused() {
+    use za_core::paths::canonicalize_calls;
+    let f = fixture("ambiguous");
+    let canon = f.roots.project.clone();
+    for (i, name) in [".git.", "nul.txt", "CON", "COM1.log", "dir "]
+        .into_iter()
+        .enumerate()
+    {
+        let verbatim = format!(r"\\?\{}\{name}", canon.display());
+        std::fs::create_dir(&verbatim).unwrap();
+        let link = f.project.join(format!("s{i}"));
+        if dir_symlink(&link, Path::new(&verbatim)).is_none() {
+            return;
+        }
+        let lex = classify(&f.project, &format!("s{i}/config")).unwrap();
+        let before = canonicalize_calls();
+        let e = resolve(&f.roots, &lex, Access::Write).unwrap_err();
+        assert!(e.to_string().contains("link target"), "{name}: {e}");
+        assert_eq!(canonicalize_calls(), before, "{name}");
+        // И сам аргумент с таким именем — отказ лексики.
+        assert!(
+            classify(&f.project, &format!("{name}/config")).is_err(),
+            "{name}"
+        );
+    }
+}
+
+/// I3: запись в жёсткую ссылку на файл вне проекта — отказ; файл снаружи не тронут.
+/// Чтение разрешено (D98, записанный риск 7.12).
+#[test]
+fn open_checked_refuses_write_to_hard_link() {
+    use std::io::Read;
+    let f = fixture("hardlink");
+    let victim = f.outside.join("victim.txt");
+    std::fs::write(&victim, "чужой файл").unwrap();
+    std::fs::hard_link(&victim, f.project.join("h.txt")).unwrap();
+    let r = res(&f, "h.txt", Access::Write);
+    assert!(r.inside && !r.protected);
+    let e = open_checked(&r, true).unwrap_err();
+    assert!(e.to_string().contains("several hard links"), "{e}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "чужой файл");
+    let mut s = String::new();
+    open_checked(&r, false)
+        .unwrap()
+        .read_to_string(&mut s)
+        .unwrap();
+    assert_eq!(s, "чужой файл");
+}
+
+/// Ожидание `f` в отдельном потоке не дольше 10 с × `ZA_TEST_TIME_SCALE`: зависание —
+/// понятная паника, а не повисший прогон.
+#[cfg(unix)]
+fn within_thread<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let scale = std::env::var("ZA_TEST_TIME_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(1, |n| n.clamp(1, 6));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10) * scale)
+        .unwrap_or_else(|_| panic!("не дождались в срок: {what}"))
+}
+
+/// I4: FIFO без писателя не блокирует открытие (`O_NONBLOCK`) и отвергается как не
+/// обычный файл.
+#[cfg(unix)]
+#[test]
+fn open_checked_refuses_fifo_without_blocking() {
+    let f = fixture("fifo");
+    let fifo = f.project.join("p");
+    let st = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo не запустился");
+    assert!(st.success());
+    let r = res(&f, "p", Access::Read);
+    for write in [false, true] {
+        let r = r.clone();
+        let e = within_thread("open_checked на FIFO", move || open_checked(&r, write)).unwrap_err();
+        let text = e.to_string();
+        // Чтение — не обычный файл; запись без читателя — ENXIO от O_NONBLOCK.
+        assert!(
+            text.contains("not a regular file") || e.raw_os_error() == Some(6),
+            "{write}: {e}"
+        );
+    }
+}
+
+/// Каталог — не обычный файл.
+#[test]
+fn open_checked_refuses_directory() {
+    let f = fixture("open_dir");
+    std::fs::create_dir_all(f.project.join("d")).unwrap();
+    let r = res(&f, "d", Access::Read);
+    assert!(open_checked(&r, false).is_err());
+}
+
+/// M1: новый файл при подмене родителя ссылкой наружу не остаётся снаружи: отказ, и
+/// созданный этим вызовом файл удалён.
+#[test]
+fn open_checked_swap_does_not_leave_created_file() {
+    let f = fixture("open_swap_new");
+    std::fs::create_dir_all(f.project.join("sub")).unwrap();
+    let r = res(&f, "sub/new.txt", Access::Write);
+    std::fs::rename(f.project.join("sub"), f.project.join("sub-old")).unwrap();
+    dir_link(&f.project.join("sub"), &f.outside);
+    let e = open_checked(&r, true).unwrap_err();
+    assert!(e.to_string().contains("path changed while opening"), "{e}");
+    assert!(!f.outside.join("new.txt").exists(), "файл остался снаружи");
 }

@@ -94,8 +94,19 @@ pub struct Roots {
 impl Roots {
     /// Канонизирует корни (блокирующая). Проект должен существовать; `ZA_HOME` — нет:
     /// канонизируется самый длинный существующий префикс.
+    ///
+    /// Корни разрешаются так же, как пути вызовов ([`resolve`]): проект на сетевом диске
+    /// или за ссылкой на UNC — ошибка, а не корень `\\?\UNC\…` (M5 ревью).
     pub fn canonical(project: &Path, za_home: &Path) -> io::Result<Roots> {
-        let project = strip_verbatim(std::fs::canonicalize(project)?);
+        let p = std::path::absolute(project)?;
+        let (_, missing) = walk(&p, &mut 0).map_err(io::Error::other)?;
+        if !missing.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("каталог проекта не найден: {}", p.display()),
+            ));
+        }
+        let project = canonical_prefix(&p).map_err(io::Error::other)?;
         let za_home = canonical_prefix(&std::path::absolute(za_home)?).map_err(io::Error::other)?;
         Ok(Roots { project, za_home })
     }
@@ -128,7 +139,7 @@ pub fn classify(root: &Path, arg: &str) -> Result<LexPath, PathError> {
 ///
 /// Windows (`/` и `\` — разделители): `\\host\share`, `//host/share`, `\\?\UNC\…` →
 /// [`PathError::Network`]; `\\.\…`, `\??\…`, `\\?\` не перед буквой диска,
-/// зарезервированные имена (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`,
+/// зарезервированные имена (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`,
 /// `CONIN$`, `CONOUT$`; с расширением, в любом регистре, в любом компоненте) →
 /// [`PathError::Device`]; `:` в компоненте → [`PathError::Stream`]; компонент с
 /// хвостовой точкой или пробелом → [`PathError::TrailingDot`]; `C:foo`, `C:` и `\foo`
@@ -258,7 +269,7 @@ fn is_reserved(stem: &str) -> bool {
     matches!(head, "COM" | "LPT")
         && matches!(
             num,
-            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
         )
 }
 
@@ -291,54 +302,222 @@ fn build(mut out: PathBuf, parts: &[&str]) -> PathBuf {
     out
 }
 
-/// Снимает `\\?\` у дисковых путей (Ruling 7.10); остальное без изменений.
-fn strip_verbatim(p: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    {
-        let s = p.to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\")
-            && drive_abs(rest)
-        {
-            return PathBuf::from(rest);
-        }
-    }
-    p
+/// Предел переходов по ссылкам при разрешении одного пути (как `MAXSYMLINKS` Linux).
+const MAX_LINKS: u32 = 40;
+
+thread_local! {
+    /// Счётчик вызовов `canonicalize` в этом потоке: тесты проверяют, что до проверки
+    /// цепочки ссылок к ФС за целью ссылки не обращались.
+    static CANONICALIZE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Канонический путь: самый длинный существующий префикс канонизирован, хвост дописан.
-/// Префикс — сетевой путь (подключённый диск) → `Network`; другой `\\?\` (том без
-/// буквы) → `Device`. Висячая ссылка в пути → `Invalid`: её цель не канонизировать,
-/// а запись через неё ушла бы туда, куда она указывает.
-fn canonical_prefix(path: &Path) -> Result<PathBuf, PathError> {
-    let shown = || path.display().to_string();
-    let mut existing = path.to_path_buf();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let canon = loop {
-        match std::fs::canonicalize(&existing) {
-            Ok(c) => break c,
-            Err(e) if is_missing(&e) => {
-                if std::fs::symlink_metadata(&existing).is_ok() {
-                    return Err(PathError::Invalid(format!("dangling link: {}", shown())));
+/// Сколько раз этот поток вызвал `canonicalize` внутри модуля (для тестов).
+#[doc(hidden)]
+pub fn canonicalize_calls() -> u64 {
+    CANONICALIZE_CALLS.with(std::cell::Cell::get)
+}
+
+/// `canonicalize` только для путей, вся цепочка ссылок которых проверена: локальный
+/// диск, цели ссылок не сетевые и не device.
+fn canonicalize_local(p: &Path) -> io::Result<PathBuf> {
+    CANONICALIZE_CALLS.with(|c| c.set(c.get() + 1));
+    std::fs::canonicalize(p)
+}
+
+/// Канонический путь без `\\?\` (Ruling 7.10, I2). Префикс — только диск с буквой:
+/// `\\?\UNC\…` → `Network`, другой `\\?\…` (том без буквы) → `Device`. На Windows
+/// каждый компонент проходит правила [`classify`] **до** снятия `\\?\`: имя вида
+/// `.git.` или `nul.txt`, созданное через `\\?\` и найденное по короткому имени 8.3, в
+/// Win32 означало бы другой объект (`.git`, устройство `NUL`). Снятие идёт по
+/// компонентам, без перевода в строку (имена с непарными суррогатами не портятся).
+fn strip_canonical(canon: PathBuf, shown: &dyn Fn() -> String) -> Result<PathBuf, PathError> {
+    #[cfg(windows)]
+    {
+        let mut out = PathBuf::new();
+        for c in canon.components() {
+            match c {
+                Component::Prefix(p) => match p.kind() {
+                    Prefix::VerbatimDisk(d) | Prefix::Disk(d) => {
+                        out.push(format!("{}:", char::from(d.to_ascii_uppercase())));
+                    }
+                    Prefix::VerbatimUNC(..) | Prefix::UNC(..) => {
+                        return Err(PathError::Network(shown()));
+                    }
+                    _ => return Err(PathError::Device(shown())),
+                },
+                Component::RootDir => out.push(r"\"),
+                Component::Normal(n) => {
+                    let Some(name) = n.to_str() else {
+                        return Err(PathError::Invalid(format!("non-Unicode name: {}", shown())));
+                    };
+                    check_windows_component(name, &shown())?;
+                    out.push(n);
                 }
-                let Some(name) = existing.file_name().map(ToOwned::to_owned) else {
-                    return Err(PathError::Invalid(format!("{}: {e}", shown())));
-                };
-                tail.push(name);
-                existing.pop();
+                Component::CurDir | Component::ParentDir => {
+                    return Err(PathError::Invalid(shown()));
+                }
             }
-            Err(e) => return Err(PathError::Invalid(format!("{}: {e}", shown()))),
+        }
+        check_drive(&out, shown)?;
+        Ok(out)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = shown;
+        Ok(canon)
+    }
+}
+
+/// Буквы локальных томов (фиксированных и съёмных) с корнем `X:\`; `None` — ещё не
+/// перечислены. Обновляется, если буквы нет в списке: новый локальный том виден.
+#[cfg(windows)]
+static LOCAL_DRIVES: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// Перечисляет локальные тома (`FindFirstVolumeW` и `GetDriveTypeW` внутри `sysinfo`,
+/// без `unsafe` у нас). Сетевые диски и `subst` томами не являются и в список не входят.
+#[cfg(windows)]
+fn list_local_drives() -> Vec<u8> {
+    let disks = match sysinfo::Disks::new_with_refreshed_list_specifics(
+        sysinfo::DiskRefreshKind::nothing(),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "локальные тома не перечислены");
+            return Vec::new();
         }
     };
-    let s = canon.to_string_lossy();
-    let network = s.starts_with(r"\\?\UNC\") || (s.starts_with(r"\\") && !s.starts_with(r"\\?\"));
-    if network {
-        return Err(PathError::Network(shown()));
+    (&disks)
+        .into_iter()
+        .filter_map(|d| {
+            let mut c = d.mount_point().components();
+            match (c.next(), c.next(), c.next()) {
+                (Some(Component::Prefix(p)), Some(Component::RootDir), None) => match p.kind() {
+                    Prefix::Disk(l) | Prefix::VerbatimDisk(l) => Some(l.to_ascii_uppercase()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Диск пути — локальный том (Ruling C1): подключённый сетевой диск и `subst` — отказ
+/// по типу диска, без обращения к нему (ни `canonicalize`, ни метаданных).
+#[cfg(windows)]
+fn check_drive(p: &Path, shown: &dyn Fn() -> String) -> Result<(), PathError> {
+    let letter = match p.components().next() {
+        Some(Component::Prefix(px)) => match px.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => d.to_ascii_uppercase(),
+            Prefix::UNC(..) | Prefix::VerbatimUNC(..) => return Err(PathError::Network(shown())),
+            _ => return Err(PathError::Device(shown())),
+        },
+        _ => return Err(PathError::Invalid(shown())),
+    };
+    let mut cache = LOCAL_DRIVES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.as_ref().is_some_and(|l| l.contains(&letter)) {
+        return Ok(());
     }
-    let mut out = strip_verbatim(canon);
-    if out.to_string_lossy().starts_with(r"\\") {
-        return Err(PathError::Device(shown()));
+    let fresh = list_local_drives();
+    let local = fresh.contains(&letter);
+    *cache = Some(fresh);
+    if local {
+        Ok(())
+    } else {
+        Err(PathError::Network(format!(
+            "drive {}: is not a local volume: {}",
+            char::from(letter),
+            shown()
+        )))
     }
-    for name in tail.into_iter().rev() {
+}
+
+/// Цель ссылки (`read_link`) по тем же правилам, что и аргумент модели ([`classify`]):
+/// UNC, `\\?\UNC\`, `\??\UNC\`, device-пути, ADS и прочее — отказ без обращения к цели.
+/// Относительная цель берётся от каталога ссылки `dir`.
+fn link_target(
+    dir: &Path,
+    target: &Path,
+    shown: &dyn Fn() -> String,
+) -> Result<PathBuf, PathError> {
+    let Some(t) = target.to_str() else {
+        return Err(PathError::Invalid(format!(
+            "non-Unicode link target: {}",
+            shown()
+        )));
+    };
+    let lex = classify(dir, t).map_err(|e| match e {
+        PathError::Network(_) => PathError::Network(format!("link target {t}: {}", shown())),
+        PathError::Device(_) => PathError::Device(format!("link target {t}: {}", shown())),
+        other => PathError::Invalid(format!("link target {t} ({other}): {}", shown())),
+    })?;
+    Ok(lex.0)
+}
+
+/// Разрешение по компонентам (Ruling C1). Каждый существующий компонент читается
+/// `symlink_metadata` — он не следует по ссылке; у ссылки и junction цель читается
+/// `read_link` (локальные метаданные самой ссылки) и проверяется [`link_target`] до любого
+/// обращения к ней; затем цель разрешается так же. Итог — `(существующий префикс без
+/// ссылок, несуществующий хвост)`. Ссылка на несуществующую цель — `dangling link`.
+fn walk(path: &Path, hops: &mut u32) -> Result<(PathBuf, Vec<std::ffi::OsString>), PathError> {
+    let shown = || path.display().to_string();
+    let mut cur = PathBuf::new();
+    let mut names = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => cur.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => names.push(std::ffi::OsString::from("..")),
+            Component::Normal(n) => names.push(n.to_owned()),
+        }
+    }
+    #[cfg(windows)]
+    check_drive(&cur, &shown)?;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    for name in names {
+        if !tail.is_empty() {
+            tail.push(name);
+            continue;
+        }
+        if name == ".." {
+            cur.pop();
+            continue;
+        }
+        let next = cur.join(&name);
+        match std::fs::symlink_metadata(&next) {
+            Ok(m) if m.file_type().is_symlink() => {
+                *hops += 1;
+                if *hops > MAX_LINKS {
+                    return Err(PathError::Invalid(format!("too many links: {}", shown())));
+                }
+                let target = std::fs::read_link(&next)
+                    .map_err(|e| PathError::Invalid(format!("{}: {e}", shown())))?;
+                let abs = link_target(&cur, &target, &shown)?;
+                let (real, rest) = walk(&abs, hops)?;
+                if !rest.is_empty() {
+                    return Err(PathError::Invalid(format!("dangling link: {}", shown())));
+                }
+                cur = real;
+            }
+            Ok(_) => cur = next,
+            Err(e) if is_missing(&e) => tail.push(name),
+            Err(e) => return Err(PathError::Invalid(format!("{}: {e}", shown()))),
+        }
+    }
+    Ok((cur, tail))
+}
+
+/// Канонический путь: цепочка ссылок проверена [`walk`], существующий префикс (уже без
+/// ссылок, на локальном диске) канонизирован — он приводит короткие имена 8.3 и регистр
+/// к настоящим именам; хвост дописан литерально.
+fn canonical_prefix(path: &Path) -> Result<PathBuf, PathError> {
+    let shown = || path.display().to_string();
+    let (existing, tail) = walk(path, &mut 0)?;
+    let canon = canonicalize_local(&existing)
+        .map_err(|e| PathError::Invalid(format!("{}: {e}", shown())))?;
+    let mut out = strip_canonical(canon, &shown)?;
+    for name in tail {
         out.push(name);
     }
     Ok(out)
@@ -351,17 +530,20 @@ fn is_missing(e: &io::Error) -> bool {
 
 /// Разрешение пути (D76, D79). Блокирующая: вызывать только в `spawn_blocking`.
 ///
-/// `inside` — путь внутри канонического корня проекта; `protected` — нативная запись
-/// (`Access::Write`) в `ZA_HOME`, `<project>/.zero-agent/` кроме `.zero-agent/work/` или
-/// `<project>/.git/`. Сверяются канонические пути, поэтому защита действует и через
-/// ссылку, junction, короткое имя 8.3 и другой регистр.
+/// `inside` — путь внутри канонического корня проекта, сравнение ординальное (I1);
+/// `protected` — нативная запись (`Access::Write`) в `ZA_HOME`, `<project>/.zero-agent/`
+/// кроме `.zero-agent/work/` или `<project>/.git/`. Защищённые места сравниваются на
+/// Windows без учёта регистра (ошибка такого сравнения — в безопасную сторону: ещё не
+/// созданный `.ZERO-AGENT` — тот же каталог NTFS). Сверяются канонические пути, поэтому
+/// защита действует и через ссылку, junction, короткое имя 8.3 и другой регистр.
 pub fn resolve(roots: &Roots, lex: &LexPath, access: Access) -> Result<ResolvedPath, PathError> {
     let path = canonical_prefix(lex.as_path())?;
     let inside = within(&roots.project, &path);
     let za = roots.project.join(ZA_DIR);
-    let protected_place = within(&roots.za_home, &path)
-        || (within(&za, &path) && !within(&za.join(WORK), &path))
-        || within(&roots.project.join(GIT_DIR), &path);
+    let fold = cfg!(windows);
+    let protected_place = within_with(&roots.za_home, &path, fold)
+        || (within_with(&za, &path, fold) && !within(&za.join(WORK), &path))
+        || within_with(&roots.project.join(GIT_DIR), &path, fold);
     Ok(ResolvedPath {
         path,
         inside,
@@ -369,29 +551,41 @@ pub fn resolve(roots: &Roots, lex: &LexPath, access: Access) -> Result<ResolvedP
     })
 }
 
-/// Ключ компонента для сравнения: `\\?\C:` и `C:` — один диск; на Windows без учёта
-/// регистра.
-fn comp_key(c: Component<'_>) -> String {
-    if let Component::Prefix(p) = c
-        && let Prefix::Disk(d) | Prefix::VerbatimDisk(d) = p.kind()
-    {
-        return format!("{}:", char::from(d.to_ascii_lowercase()));
+/// Компоненты равны: буква диска (`\\?\C:` ≡ `C:`) — без учёта ASCII-регистра, прочее —
+/// ординально, а при `fold` — после `to_lowercase` (шире равенства имён NTFS).
+fn comp_eq(a: Component<'_>, b: Component<'_>, fold: bool) -> bool {
+    let disk = |c: Component<'_>| match c {
+        Component::Prefix(p) => match p.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => Some(d.to_ascii_lowercase()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match (disk(a), disk(b)) {
+        (Some(x), Some(y)) => return x == y,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
     }
-    let s = c.as_os_str().to_string_lossy();
-    if cfg!(windows) {
-        s.to_lowercase()
+    if fold {
+        a.as_os_str().to_string_lossy().to_lowercase()
+            == b.as_os_str().to_string_lossy().to_lowercase()
     } else {
-        s.into_owned()
+        a.as_os_str() == b.as_os_str()
     }
 }
 
-/// `p` лежит в `root` или равен ему — по компонентам (`/data` не содержит `/data2`);
-/// на Windows без учёта регистра. Пути сравниваются как есть: оба должны быть
-/// каноническими.
-pub fn within(root: &Path, p: &Path) -> bool {
+fn within_with(root: &Path, p: &Path, fold: bool) -> bool {
     let mut pc = p.components();
     root.components()
-        .all(|rc| pc.next().is_some_and(|c| comp_key(c) == comp_key(rc)))
+        .all(|rc| pc.next().is_some_and(|c| comp_eq(c, rc, fold)))
+}
+
+/// `p` лежит в `root` или равен ему — по компонентам (`/data` не содержит `/data2`).
+/// Сравнение ординальное, без Unicode-свёртки регистра (Ruling I1: `K` (U+212A) и `k`
+/// — разные имена NTFS); без учёта регистра — только буква диска. Оба пути должны быть
+/// каноническими: регистр существующих компонентов берётся с диска.
+pub fn within(root: &Path, p: &Path) -> bool {
+    within_with(root, p, false)
 }
 
 /// Путь для человека и модели: внутри `root` — относительный через `/` (`.` для самого
@@ -527,69 +721,152 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     r
 }
 
+/// Текст отказа открыть не обычный файл (FIFO, устройство, сокет, каталог).
+const NOT_REGULAR: &str = "not a regular file";
+/// Текст отказа писать в файл с несколькими жёсткими ссылками.
+const HARD_LINKS: &str = "refusing to write a file with several hard links";
+
 /// Безопасное открытие файла (D98). Блокирующая.
 ///
-/// `write = false` — только чтение; `write = true` — чтение и запись, файл создаётся,
-/// если его нет, и **не** усекается (усечение — дело вызывающего).
+/// `write = false` — только чтение; `write = true` — чтение и запись, файл **не**
+/// усекается (усечение — дело вызывающего), а если его нет — создаётся (`create_new`).
 ///
 /// 1. Последний компонент — ссылка или junction → отказ `refusing to follow a link`.
 ///    Открытие тоже не следует по ней: Unix — `O_NOFOLLOW`, Windows —
 ///    `FILE_FLAG_OPEN_REPARSE_POINT`, и открытая ссылка — тот же отказ.
-/// 2. Затем путь канонизируется ещё раз и должен совпасть с `r.path`, а дескриптор —
-///    быть тем же файлом, что и `r.path` (`same_file::Handle`). Иначе (промежуточный
-///    каталог или файл подменили после [`resolve`]) — отказ `path changed while opening`.
+/// 2. Открыт должен быть обычный файл (по дескриптору): FIFO, устройство, сокет, каталог —
+///    отказ `not a regular file`. На Unix открытие идёт с `O_NONBLOCK`, поэтому FIFO без
+///    писателя не блокирует поток (I4).
+/// 3. Запись в файл с `nlink > 1` — отказ (I3): жёсткая ссылка внутри проекта может вести
+///    к файлу снаружи или к `ZA_HOME/config.toml`, а путь и дескриптор при этом честные.
+///    Чтение жёсткой ссылки разрешено (D98, записанный риск 7.12).
+/// 4. Путь канонизируется ещё раз и должен совпасть с `r.path`, а дескриптор — быть тем
+///    же файлом (`same_file::Handle`). Иначе (промежуточный каталог или файл подменили
+///    после [`resolve`]) — отказ `path changed while opening`; файл, созданный этим
+///    вызовом по подменённому пути, удаляется (M1 ревью).
 ///
-/// Записанные риски (D98): жёсткие ссылки на чтение; подмена между сверкой и
+/// Записанные риски: подмена промежуточного каталога ссылкой на UNC между [`resolve`] и
+/// открытием (открытие пойдёт по ней, Windows не даёт `openat`), подмена между сверкой и
 /// использованием процессом вне Job или группы — до SEC-100.
 pub fn open_checked(r: &ResolvedPath, write: bool) -> io::Result<File> {
     if std::fs::symlink_metadata(&r.path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(refuse_link(&r.path));
     }
-    let mut o = std::fs::OpenOptions::new();
-    o.read(true);
-    if write {
-        o.write(true).create(true).truncate(false);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        o.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let f = match o.open(&r.path) {
-        Ok(f) => f,
-        // `O_NOFOLLOW` на ссылке — `ELOOP`.
+    let open = |create: bool| {
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true);
+        if write {
+            o.write(true);
+            if create {
+                o.create_new(true);
+            }
+        }
         #[cfg(unix)]
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refuse_link(&r.path)),
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            o.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        match o.open(&r.path) {
+            // `O_NOFOLLOW` на ссылке — `ELOOP`.
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(refuse_link(&r.path)),
+            other => other,
+        }
+    };
+    let (f, created) = match open(false) {
+        Ok(f) => (f, false),
+        Err(e) if write && e.kind() == io::ErrorKind::NotFound => (open(true)?, true),
         Err(e) => return Err(e),
     };
-    if f.metadata()?.file_type().is_symlink() {
-        return Err(refuse_link(&r.path));
+    match verify_open(r, &f, write) {
+        Ok(()) => Ok(f),
+        Err((e, actual)) => {
+            if created && let Some(actual) = actual {
+                // Удаляется только тот файл, что создан этим вызовом.
+                let ours = same_file::Handle::from_file(f.try_clone()?)?;
+                if same_file::Handle::from_path(&actual).is_ok_and(|h| h == ours) {
+                    drop(f);
+                    if let Err(rm) = std::fs::remove_file(&actual) {
+                        tracing::warn!(path = %actual.display(), error = %rm, "созданный файл не удалён");
+                    }
+                }
+            }
+            Err(e)
+        }
     }
-    let changed = || {
+}
+
+/// Проверки открытого дескриптора (шаги 1–4 [`open_checked`]). При ошибке сверки пути
+/// возвращает и фактический канонический путь открытого файла.
+fn verify_open(
+    r: &ResolvedPath,
+    f: &File,
+    write: bool,
+) -> Result<(), (io::Error, Option<PathBuf>)> {
+    let plain = |e: io::Error| (e, None);
+    let meta = f.metadata().map_err(plain)?;
+    if meta.file_type().is_symlink() {
+        return Err(plain(refuse_link(&r.path)));
+    }
+    if !meta.is_file() {
+        return Err(plain(io::Error::other(format!(
+            "{NOT_REGULAR}: {}",
+            r.path.display()
+        ))));
+    }
+    if write && hard_links(f, &meta).map_err(plain)? > 1 {
+        return Err(plain(io::Error::other(format!(
+            "{HARD_LINKS}: {}",
+            r.path.display()
+        ))));
+    }
+    let changed = |actual: Option<PathBuf>| {
         tracing::error!(path = %r.path.display(), "путь подменён между разрешением и открытием");
-        io::Error::other(format!("{PATH_CHANGED}: {}", r.path.display()))
+        (
+            io::Error::other(format!("{PATH_CHANGED}: {}", r.path.display())),
+            actual,
+        )
     };
-    let now = strip_verbatim(std::fs::canonicalize(&r.path)?);
+    let shown = || r.path.display().to_string();
+    let canon = canonicalize_local(&r.path).map_err(plain)?;
+    let now = match strip_canonical(canon, &shown) {
+        Ok(p) => p,
+        Err(_) => return Err(changed(None)),
+    };
     if !same_path(&now, &r.path) {
-        return Err(changed());
+        return Err(changed(Some(now)));
     }
-    let opened = same_file::Handle::from_file(f.try_clone()?)?;
-    if opened != same_file::Handle::from_path(&now)? {
-        return Err(changed());
+    let opened = same_file::Handle::from_file(f.try_clone().map_err(plain)?).map_err(plain)?;
+    if opened != same_file::Handle::from_path(&now).map_err(plain)? {
+        return Err(changed(None));
     }
-    Ok(f)
+    Ok(())
+}
+
+/// Число жёстких ссылок открытого файла.
+#[cfg(unix)]
+fn hard_links(_f: &File, meta: &std::fs::Metadata) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(meta.nlink())
+}
+
+/// Число жёстких ссылок открытого файла (`GetFileInformationByHandle` через
+/// `winapi-util`, без `unsafe` у нас).
+#[cfg(windows)]
+fn hard_links(f: &File, _meta: &std::fs::Metadata) -> io::Result<u64> {
+    Ok(winapi_util::file::information(f)?.number_of_links())
 }
 
 fn refuse_link(p: &Path) -> io::Error {
     io::Error::other(format!("{REFUSE_LINK}: {}", p.display()))
 }
 
-/// Один и тот же путь по компонентам (на Windows без учёта регистра).
+/// Один и тот же путь по компонентам (ординально, кроме буквы диска).
 fn same_path(a: &Path, b: &Path) -> bool {
     a.components().count() == b.components().count() && within(a, b)
 }

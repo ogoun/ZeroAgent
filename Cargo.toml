@@ -68,3 +68,6 @@ same-file = "=1.0.6"
 # План называл `nix`; его нет ни в Cargo.lock, ни в локальном реестре, а для одной
 # константы хватает `libc`, через который `nix` и работает.
 libc = { version = "=0.2.191", default-features = false }
+# Число жёстких ссылок открытого файла на Windows (R1-C1 I3, `open_checked`): API
+# `file::information` без `unsafe` в нашем коде. Крейт уже в Cargo.lock через `same-file`.
+winapi-util = "=0.1.11"
