@@ -1,5 +1,6 @@
 //! Бинарник `zero-agent`: `doctor`, `demo-run`, `replay` (R0), `models`, `ask`,
-//! `resources` (R1-A), `run`, `answer` (R1-B1), `inspect`, `stats` (R1-B2).
+//! `resources` (R1-A), `run`, `answer` (R1-B1), `inspect`, `stats` (R1-B2), `audit`,
+//! `journal export` (R1-C1).
 //!
 //! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы, ошибка
 //! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя;
@@ -24,6 +25,7 @@ use za_agent::WorkMode;
 use za_core::{CrashPoint, DemoConfig, DemoOutcome, EffectError, replay_hash, run_demo};
 use za_protocol::{Priority, RunId, RunMode, Tier};
 use za_store::{ProjectStore, StoreError};
+use zero_agent::audit::{self as audit_cmd, AuditCmdError, KnownSecrets};
 use zero_agent::doctor::{self, LLAMA_URL_ENV};
 use zero_agent::home::{self, NoHome};
 use zero_agent::inspect::{self as inspector, InspectArgs, InspectCmdError};
@@ -115,7 +117,8 @@ enum Cmd {
     },
     /// Run агента: ответ — в stdout, первая строка stderr — `run <id>`; Ctrl+C — пауза.
     Run(RunCli),
-    /// Ответ на прерывание run: вопрос модели, одобрение вызова, неизвестный исход.
+    /// Ответ на прерывание run: вопрос модели, одобрение вызова, доверие к проекту,
+    /// неизвестный исход. Одобрение и доверие пишутся в журнал аудита.
     #[command(group(
         ArgGroup::new("reply")
             .required(true)
@@ -131,10 +134,10 @@ enum Cmd {
         /// Ответ на вопрос модели (`input-…`).
         #[arg(long)]
         text: Option<String>,
-        /// Одобрить вызов (`appr-…`).
+        /// Одобрить вызов (`appr-…`) или довериться проекту (`trust-…`).
         #[arg(long)]
         approve: bool,
-        /// Отказать в вызове (`appr-…`).
+        /// Отказать в вызове (`appr-…`) или в доверии к проекту (`trust-…`).
         #[arg(long)]
         deny: bool,
         /// Заметка к отказу.
@@ -146,6 +149,24 @@ enum Cmd {
         /// Действие не выполнено (`unk-…`).
         #[arg(long)]
         not_done: bool,
+    },
+    /// Журнал аудита проекта: одобрения, гранты, доверие; `--verify` — проверка
+    /// hash-цепочки (разрыв — код 1).
+    Audit {
+        /// Каталог проекта.
+        #[arg(long)]
+        project: PathBuf,
+        /// Только проверить цепочку.
+        #[arg(long)]
+        verify: bool,
+        /// Вывод в JSON (строка на запись).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Журнал проекта.
+    Journal {
+        #[command(subcommand)]
+        action: JournalCmd,
     },
     /// Запрос хода к модели по журналу: блоки с байтами, токенами и хэшем, расход,
     /// предсказание следующего хода; `--raw` — тело запроса провайдеру.
@@ -330,6 +351,19 @@ fn run_args(r: RunCli) -> RunArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum JournalCmd {
+    /// События run в JSONL по порядку `seq`, значения секретов `ZA_SECRET_*` замаскированы.
+    Export {
+        /// Каталог проекта.
+        #[arg(long)]
+        project: PathBuf,
+        /// id run.
+        #[arg(long, value_parser = parse_run)]
+        run: RunId,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ModelsCmd {
     /// Повторный зонд эндпоинта и сохранение профиля; код 0 — эндпоинт готов.
     Probe {
@@ -385,6 +419,8 @@ enum AppError {
     Run(#[from] RunError),
     #[error(transparent)]
     Inspect(#[from] InspectCmdError),
+    #[error(transparent)]
+    Audit(#[from] AuditCmdError),
 }
 
 fn parse_run(s: &str) -> Result<RunId, String> {
@@ -543,6 +579,22 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
         Cmd::Stats { project, run, json } => {
             let home = home::za_home()?;
             Ok(inspector::cmd_stats(&home, &project, run, json).await?)
+        }
+        Cmd::Audit {
+            project,
+            verify,
+            json,
+        } => {
+            let home = home::za_home()?;
+            let secrets = KnownSecrets::from_vars(std::env::vars_os());
+            Ok(audit_cmd::cmd_audit(&home, &project, verify, json, &secrets).await?)
+        }
+        Cmd::Journal {
+            action: JournalCmd::Export { project, run },
+        } => {
+            let home = home::za_home()?;
+            let secrets = KnownSecrets::from_vars(std::env::vars_os());
+            Ok(audit_cmd::cmd_journal_export(&home, &project, run, &secrets).await?)
         }
     }
 }

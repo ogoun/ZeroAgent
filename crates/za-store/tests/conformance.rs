@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use serde_json::json;
 use za_protocol::{Actor, BlobHash, EventKind, NewEvent, RunId, RunRole, RunStatus, Seq};
 use za_store::{
-    BLOB_THRESHOLD, Durability, NewRun, ProjectStore, StatusChange, StoreError, StoreOptions,
-    UsageRow, UsageTotals,
+    AUDIT_GENESIS, AuditBreak, AuditNew, BLOB_THRESHOLD, Durability, NewRun, ProjectStore,
+    StatusChange, StoreError, StoreOptions, UsageRow, UsageTotals,
 };
 
 #[path = "../../../test-support/unique_dir.rs"]
@@ -712,7 +712,7 @@ async fn usage_for_unknown_run_is_rejected() {
 }
 
 #[tokio::test]
-async fn migration_2_applies_to_v1_journal() {
+async fn migrations_apply_to_v1_journal() {
     let d = dir("migrate-v1");
     let (run, seq) = {
         let s = ProjectStore::open(&d).unwrap();
@@ -732,7 +732,7 @@ async fn migration_2_applies_to_v1_journal() {
         .unwrap()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let old = s.read_run(run, Seq(0), 100).await.unwrap();
     assert!(
         old.iter()
@@ -740,4 +740,301 @@ async fn migration_2_applies_to_v1_journal() {
     );
     s.record_usage(run, usage_row(), json!({})).await.unwrap();
     assert_eq!(s.usage_totals(run).await.unwrap().calls, 1);
+    // Журнал R0 и R1-A (схема 1) получает и аудит (миграция 3).
+    let a = s
+        .append_audit(n("user", "grant.added", "/x", json!({})))
+        .await
+        .unwrap();
+    assert_eq!((a.seq, a.prev_hash.as_str()), (1, AUDIT_GENESIS));
+    assert_eq!(s.verify_audit().await.unwrap(), Ok(()));
+}
+
+// --- Журнал аудита (R1-C1 D91) ---
+
+fn n(actor: &str, action: &str, target: &str, payload: serde_json::Value) -> AuditNew {
+    AuditNew {
+        actor: actor.into(),
+        action: action.into(),
+        target: target.into(),
+        payload,
+    }
+}
+
+fn user_version(d: &std::path::Path) -> u32 {
+    rusqlite::Connection::open(d.join("journal.db"))
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn audit_chain_links_and_verifies() {
+    let s = open("audit-chain");
+    let a = s
+        .append_audit(n("user", "trust.granted", "/p", json!({"files": {}})))
+        .await
+        .unwrap();
+    let b = s
+        .append_audit(n("user", "grant.added", "/x", json!({"mode": "ro"})))
+        .await
+        .unwrap();
+    assert_eq!(a.prev_hash, AUDIT_GENESIS);
+    assert_eq!(b.prev_hash, a.hash);
+    assert_eq!((a.seq, b.seq), (1, 2));
+    assert_eq!(a.hash.len(), 64);
+    assert_ne!(a.hash, b.hash);
+    assert_eq!(s.verify_audit().await.unwrap(), Ok(()));
+    // Записи читаются такими, какими их вернула запись.
+    assert_eq!(
+        s.audit_entries(0, 10).await.unwrap(),
+        vec![a.clone(), b.clone()]
+    );
+    assert_eq!(s.audit_entries(1, 10).await.unwrap(), vec![b.clone()]);
+    assert_eq!(s.audit_entries(0, 1).await.unwrap(), vec![a.clone()]);
+    assert_eq!(s.last_audit("trust.").await.unwrap(), Some(a));
+    assert_eq!(s.last_audit("grant.").await.unwrap(), Some(b));
+    assert_eq!(s.last_audit("approval.").await.unwrap(), None);
+}
+
+/// Хэш записи считается по формуле D91: BLAKE3 от `prev_hash`, нулевого байта и
+/// канонического JSON полей записи.
+#[tokio::test]
+async fn audit_hash_follows_formula() {
+    let s = open("audit-formula");
+    let a = s
+        .append_audit(n("user", "grant.added", "/x", json!({"b": 1, "a": 2})))
+        .await
+        .unwrap();
+    let body = json!({
+        "seq": a.seq, "actor": a.actor, "action": a.action, "target": a.target,
+        "payload": a.payload, "ts": a.ts,
+    });
+    let mut h = blake3::Hasher::new();
+    h.update(AUDIT_GENESIS.as_bytes());
+    h.update(&[0]);
+    h.update(za_protocol::canonical_json(&body).as_bytes());
+    assert_eq!(a.hash, h.finalize().to_hex().to_string());
+}
+
+/// Подделка после закрытия хранилища: изменённые payload, target, хэш, удалённая
+/// середина, не-JSON и `NULL` в поле.
+#[test]
+fn tampered_payload_breaks_chain() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let tamper = |name: &str, sql: &str, at: u64| {
+        let d = dir(name);
+        {
+            let s = ProjectStore::open(&d).unwrap();
+            rt.block_on(async {
+                for i in 0..3 {
+                    s.append_audit(n("user", "grant.added", "/x", json!({"i": i})))
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+        rusqlite::Connection::open(d.join("journal.db"))
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+        let s = ProjectStore::open(&d).unwrap();
+        assert_eq!(
+            rt.block_on(s.verify_audit()).unwrap(),
+            Err(AuditBreak { seq: at }),
+            "{sql}"
+        );
+        // Решения по аудиту (доверие) на разорванной цепочке не принимаются.
+        assert!(
+            matches!(
+                rt.block_on(s.last_audit("grant.")),
+                Err(StoreError::Corrupt(_))
+            ),
+            "{sql}"
+        );
+    };
+    tamper(
+        "audit-tamper-payload",
+        r#"UPDATE audit SET payload = '{"i":7}' WHERE seq = 1"#,
+        1,
+    );
+    tamper(
+        "audit-tamper-target",
+        "UPDATE audit SET target = '/y' WHERE seq = 2",
+        2,
+    );
+    tamper(
+        "audit-tamper-hash",
+        "UPDATE audit SET hash = prev_hash WHERE seq = 3",
+        3,
+    );
+    tamper("audit-tamper-gap", "DELETE FROM audit WHERE seq = 2", 3);
+    tamper(
+        "audit-tamper-json",
+        "UPDATE audit SET payload = 'not json' WHERE seq = 1",
+        1,
+    );
+    tamper(
+        "audit-tamper-null",
+        "UPDATE audit SET ts = NULL WHERE seq = 2",
+        2,
+    );
+}
+
+#[tokio::test]
+async fn parallel_appends_keep_one_chain() {
+    let s = open("audit-parallel");
+    let tasks: Vec<_> = (0..2)
+        .map(|t| {
+            let s = s.clone();
+            tokio::spawn(async move {
+                for i in 0..50 {
+                    s.append_audit(n("user", "grant.added", "/x", json!({"t": t, "i": i})))
+                        .await
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_eq!(s.verify_audit().await.unwrap(), Ok(()));
+    let all = s.audit_entries(0, 1000).await.unwrap();
+    let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (1..=100).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn resolve_with_audit_is_atomic() {
+    let s = open("audit-resolve");
+    let run = s.create_run(new_run(None)).await.unwrap().id;
+    s.open_interrupt("appr-1", run, "approval", json!({"tool": "bash"}))
+        .await
+        .unwrap();
+    let audit = || {
+        vec![n(
+            "user",
+            "approval.resolved",
+            "appr-1",
+            json!({"approved": true}),
+        )]
+    };
+    assert!(
+        s.resolve_with_audit("appr-1", json!({"approved": true}), audit())
+            .await
+            .unwrap()
+    );
+    let row = s.interrupt("appr-1").await.unwrap().unwrap();
+    assert_eq!(row.status, za_store::INTERRUPT_RESOLVED);
+    assert_eq!(row.response, Some(json!({"approved": true})));
+    let first = s.audit_entries(0, 10).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].target, "appr-1");
+    // Повтор: прерывание уже решено — `false`, новой записи аудита нет.
+    assert!(
+        !s.resolve_with_audit("appr-1", json!({"approved": false}), audit())
+            .await
+            .unwrap()
+    );
+    assert_eq!(s.audit_entries(0, 10).await.unwrap(), first);
+    assert_eq!(
+        s.interrupt("appr-1").await.unwrap().unwrap().response,
+        Some(json!({"approved": true}))
+    );
+    // Неизвестное прерывание — ошибка, аудит не пишется.
+    assert_eq!(
+        s.resolve_with_audit("appr-2", json!({}), audit()).await,
+        Err(StoreError::UnknownInterrupt("appr-2".into()))
+    );
+    assert_eq!(s.audit_entries(0, 10).await.unwrap(), first);
+    // Событие `interrupt.resolved` записано один раз, от имени пользователя.
+    let resolved: Vec<_> = s
+        .read_run(run, Seq(0), 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::InterruptResolved)
+        .collect();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].actor, Actor::User);
+    // Несколько записей одного ответа идут подряд одной цепочкой (доверие, D83).
+    s.open_interrupt("trust-1", run, "trust", json!({}))
+        .await
+        .unwrap();
+    let two = vec![
+        n(
+            "user",
+            "approval.resolved",
+            "trust-1",
+            json!({"approved": true}),
+        ),
+        n("user", "trust.granted", "/p", json!({"files": {}})),
+    ];
+    assert!(
+        s.resolve_with_audit("trust-1", json!({"trusted": true}), two)
+            .await
+            .unwrap()
+    );
+    let all = s.audit_entries(0, 10).await.unwrap();
+    assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(all[2].prev_hash, all[1].hash);
+    assert_eq!(s.verify_audit().await.unwrap(), Ok(()));
+}
+
+/// Пустой журнал: цепочка цела, записей нет.
+#[tokio::test]
+async fn empty_audit_verifies() {
+    let s = open("audit-empty");
+    assert_eq!(s.verify_audit().await.unwrap(), Ok(()));
+    assert_eq!(s.audit_entries(0, 10).await.unwrap(), vec![]);
+    assert_eq!(s.last_audit("").await.unwrap(), None);
+}
+
+/// Журналы R1-B1 (схема 2, golden `za-agent/tests/golden/r1b1_v1`) открываются: миграция 3
+/// применяется к копии один раз, run и прерывание на месте, аудит пишется; повторное
+/// открытие ничего не меняет.
+#[tokio::test]
+async fn migration_3_opens_golden_r1b1_journals() {
+    let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../za-agent/tests/golden/r1b1_v1");
+    for name in ["approval", "mid_step"] {
+        let src = golden.join(name);
+        let d = dir(&format!("golden-{name}"));
+        std::fs::copy(src.join("store/journal.db"), d.join("journal.db")).unwrap();
+        assert_eq!(user_version(&d), 2, "{name}: фикстура не схемы 2");
+        let run: RunId = serde_json::from_value(json!(
+            std::fs::read_to_string(src.join("run.txt")).unwrap().trim()
+        ))
+        .unwrap();
+        let events = {
+            let s = ProjectStore::open(&d).unwrap();
+            assert!(s.get_run(run).await.unwrap().is_some(), "{name}");
+            let events = s.read_run(run, Seq(0), usize::MAX).await.unwrap();
+            assert!(!events.is_empty(), "{name}");
+            if let Ok(id) = std::fs::read_to_string(src.join("interrupt.txt")) {
+                let audit = vec![n("user", "approval.resolved", id.trim(), json!({}))];
+                assert!(
+                    s.resolve_with_audit(id.trim(), json!({"approved": true}), audit)
+                        .await
+                        .unwrap()
+                );
+            } else {
+                s.append_audit(n("user", "grant.added", "/x", json!({})))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(s.verify_audit().await.unwrap(), Ok(()));
+            events
+        };
+        assert_eq!(user_version(&d), 3, "{name}");
+        // Повторное открытие: миграция не повторяется, данные и цепочка те же.
+        let s = ProjectStore::open(&d).unwrap();
+        assert_eq!(user_version(&d), 3, "{name}");
+        let again = s.read_run(run, Seq(0), usize::MAX).await.unwrap();
+        assert!(again.len() >= events.len(), "{name}: пропали события");
+        assert_eq!(again[..events.len()], events[..], "{name}");
+        assert_eq!(s.audit_entries(0, 10).await.unwrap().len(), 1, "{name}");
+        assert_eq!(s.verify_audit().await.unwrap(), Ok(()), "{name}");
+    }
 }

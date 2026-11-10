@@ -301,41 +301,8 @@ impl ProjectStore {
     ) -> Result<bool, StoreError> {
         let dir = self.dir();
         let id = id.to_owned();
-        self.write(move |c| {
-            let (run_id, kind) = c
-                .query_row(
-                    "SELECT run_id, kind FROM interrupts WHERE id = ?1",
-                    [&id],
-                    |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
-                )
-                .optional()?
-                .ok_or_else(|| StoreError::UnknownInterrupt(id.clone()))?;
-            let n = c.execute(
-                "UPDATE interrupts SET status = ?1, response = ?2 \
-                 WHERE id = ?3 AND status = ?4",
-                params![
-                    INTERRUPT_RESOLVED,
-                    canonical_json(&response),
-                    id,
-                    INTERRUPT_OPEN
-                ],
-            )?;
-            if n == 0 {
-                return Ok(false);
-            }
-            let run = RunId(uuid(&run_id)?);
-            let ev = NewEvent {
-                actor,
-                ..runtime_event(
-                    run,
-                    EventKind::InterruptResolved,
-                    json!({"id": id, "kind": kind, "response": response}),
-                )
-            };
-            events::insert(c, &dir, &ev)?;
-            Ok(true)
-        })
-        .await
+        self.write(move |c| resolve_in(c, &dir, &id, response, actor))
+            .await
     }
 
     /// Есть ли у run эффекты шага `step`, то есть с ключом `{run}:{step}:*`.
@@ -352,6 +319,51 @@ impl ProjectStore {
         })
         .await
     }
+}
+
+/// Решение прерывания в открытой транзакции писателя: `open` → `resolved`, `response` и
+/// событие `interrupt.resolved {id, kind, response}` от имени `actor`. `Ok(false)` —
+/// прерывание уже решено (ничего не пишется); неизвестный id —
+/// [`StoreError::UnknownInterrupt`]. Общая часть [`ProjectStore::resolve_interrupt_as`]
+/// и [`ProjectStore::resolve_with_audit`].
+pub(crate) fn resolve_in(
+    c: &Connection,
+    dir: &std::path::Path,
+    id: &str,
+    response: Value,
+    actor: Actor,
+) -> Result<bool, StoreError> {
+    let (run_id, kind) = c
+        .query_row(
+            "SELECT run_id, kind FROM interrupts WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::UnknownInterrupt(id.to_owned()))?;
+    let n = c.execute(
+        "UPDATE interrupts SET status = ?1, response = ?2          WHERE id = ?3 AND status = ?4",
+        params![
+            INTERRUPT_RESOLVED,
+            canonical_json(&response),
+            id,
+            INTERRUPT_OPEN
+        ],
+    )?;
+    if n == 0 {
+        return Ok(false);
+    }
+    let run = RunId(uuid(&run_id)?);
+    let ev = NewEvent {
+        actor,
+        ..runtime_event(
+            run,
+            EventKind::InterruptResolved,
+            json!({"id": id, "kind": kind, "response": response}),
+        )
+    };
+    events::insert(c, dir, &ev)?;
+    Ok(true)
 }
 
 /// Строка `interrupts` в исходном виде: id, run_id, kind, status, payload, response.

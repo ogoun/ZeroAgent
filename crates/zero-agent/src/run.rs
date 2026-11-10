@@ -12,7 +12,10 @@
 //! (`abort`) тоже даёт код 3: признак настоящего «нужно решение» — строка `ответьте:`.
 //!
 //! `answer` открывает журнал, записывает решение прерывания и выходит; цикл продолжает
-//! `run --resume`.
+//! `run --resume`. Ответ на одобрение (`appr-…`) и на доверие (`trust-…`) закрывает
+//! прерывание и пишет аудит одной транзакцией (`resolve_with_audit`, R1-C1 D91):
+//! `approval.resolved`, а при доверии ещё `trust.granted` с набором доверенных файлов на
+//! момент ответа (D83).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,9 +35,9 @@ use za_core::{
 use za_llm::{EndpointId, SelectError, Selection};
 use za_protocol::{
     Budget, BudgetKind, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Seq, Tier,
-    pause_reason,
+    audit_action, pause_reason,
 };
-use za_store::{INTERRUPT_OPEN, ProjectStore, StoreError};
+use za_store::{AuditNew, INTERRUPT_OPEN, InterruptRow, ProjectStore, StoreError};
 
 use crate::config::load_config;
 use crate::home;
@@ -55,6 +58,8 @@ pub const EXIT_BLOCKED: u8 = 5;
 pub const EXIT_CANCELLED: u8 = 6;
 /// Имя файла журнала в каталоге журнала проекта.
 pub const JOURNAL_FILE: &str = "journal.db";
+/// Actor записей аудита, которые пишет решение пользователя в `answer`.
+const AUDIT_ACTOR_USER: &str = "user";
 /// Файл инструкций проекта (блок 5, D22).
 const AGENTS_MD: &str = "AGENTS.md";
 
@@ -77,6 +82,11 @@ pub enum RunError {
     NoJournal(PathBuf),
     #[error("прерывание {0} не найдено")]
     UnknownInterrupt(String),
+    #[error("набор доверенных файлов проекта {}: {source}", path.display())]
+    TrustSet {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("прерывание {id} вида {kind}: {hint}")]
     WrongAnswer {
         id: String,
@@ -196,9 +206,9 @@ pub fn parse_usd(s: &str) -> Result<f64, String> {
 pub enum Answer {
     /// Ответ на `ask_user` (`input-…`).
     Text(String),
-    /// Одобрение вызова (`appr-…`).
+    /// Одобрение вызова (`appr-…`) или доверие к проекту (`trust-…`).
     Approve,
-    /// Отказ в вызове (`appr-…`) с необязательной заметкой.
+    /// Отказ в вызове (`appr-…`) или в доверии (`trust-…`) с необязательной заметкой.
     Deny(Option<String>),
     /// Неизвестный исход (`unk-…`): действие выполнено.
     Done,
@@ -256,7 +266,7 @@ pub fn display_path(p: &Path) -> String {
 
 /// Канонический путь проекта без префикса `\\?\` (`display_path`): им пользуются
 /// `<env>`, подсказки и `RunSpec.project_dir`; `project_id` канонизирует путь сам.
-fn canonical_project(p: &Path) -> Result<PathBuf, RunError> {
+pub(crate) fn canonical_project(p: &Path) -> Result<PathBuf, RunError> {
     std::fs::canonicalize(p)
         .map(|c| PathBuf::from(display_path(&c)))
         .map_err(|source| RunError::Io {
@@ -848,17 +858,25 @@ pub async fn cmd_answer(
         kind: row.kind.clone(),
         hint,
     };
+    let approval = InterruptKind::Approval.as_str();
+    let trust = InterruptKind::Trust.as_str();
     let response = match (&answer, row.kind.as_str()) {
         (Answer::Text(t), k) if k == InterruptKind::Input.as_str() => Some(json!({"answer": t})),
-        (Answer::Approve, k) if k == InterruptKind::Approval.as_str() => {
-            Some(json!({"approved": true, "note": ""}))
-        }
-        (Answer::Deny(note), k) if k == InterruptKind::Approval.as_str() => {
-            Some(json!({"approved": false, "note": note.clone().unwrap_or_default()}))
+        (Answer::Approve | Answer::Deny(_), k) if k == approval || k == trust => {
+            let audit = decision_audit(&row, &answer, &project).await?;
+            let response = match &answer {
+                a if k == trust => json!({"trusted": *a == Answer::Approve}),
+                Answer::Deny(note) => {
+                    json!({"approved": false, "note": note.clone().unwrap_or_default()})
+                }
+                _ => json!({"approved": true, "note": ""}),
+            };
+            let applied = store.resolve_with_audit(interrupt, response, audit).await?;
+            return Ok(answered(applied, interrupt, &project, row.run));
         }
         (Answer::Done | Answer::NotDone, k) if k == InterruptKind::UnknownOutcome.as_str() => None,
         (_, k) if k == InterruptKind::Input.as_str() => return Err(wrong("ответ — --text")),
-        (_, k) if k == InterruptKind::Approval.as_str() => {
+        (_, k) if k == approval || k == trust => {
             return Err(wrong("ответ — --approve или --deny"));
         }
         (_, k) if k == InterruptKind::UnknownOutcome.as_str() => {
@@ -887,16 +905,69 @@ pub async fn cmd_answer(
             was_open
         }
     };
+    Ok(answered(applied, interrupt, &project, row.run))
+}
+
+/// Итог `answer`: подсказка продолжения или «уже решено» (код 1).
+fn answered(applied: bool, interrupt: &str, project: &Path, run: RunId) -> ExitCode {
     if !applied {
         eprintln!("zero-agent: прерывание {interrupt} уже решено, ответ не изменён");
-        return Ok(ExitCode::from(EXIT_ERROR));
+        return ExitCode::from(EXIT_ERROR);
     }
     eprintln!(
         "zero-agent: ответ записан; продолжить: zero-agent run --project {} --resume {}",
-        quoted(&project),
-        row.run
+        quoted(project),
+        run
     );
-    Ok(ExitCode::from(EXIT_DONE))
+    ExitCode::from(EXIT_DONE)
+}
+
+/// Записи аудита решения пользователя (D91): `approval.resolved` с id прерывания, а при
+/// доверии (`trust-…`, `--approve`) ещё `trust.granted` с путём проекта и набором
+/// доверенных файлов, пересчитанным в момент ответа (D83).
+async fn decision_audit(
+    row: &InterruptRow,
+    answer: &Answer,
+    project: &Path,
+) -> Result<Vec<AuditNew>, RunError> {
+    let approved = *answer == Answer::Approve;
+    let note = match answer {
+        Answer::Deny(Some(n)) => n.clone(),
+        _ => String::new(),
+    };
+    let mut audit = vec![AuditNew {
+        actor: AUDIT_ACTOR_USER.to_owned(),
+        action: audit_action::APPROVAL_RESOLVED.to_owned(),
+        target: row.id.clone(),
+        payload: json!({
+            "run": row.run.to_string(),
+            "kind": row.kind,
+            "approved": approved,
+            "note": note,
+        }),
+    }];
+    if approved && row.kind == InterruptKind::Trust.as_str() {
+        let dir = project.to_path_buf();
+        let set = tokio::task::spawn_blocking(move || crate::trust::trust_set(&dir))
+            .await
+            .map_err(|e| RunError::TrustSet {
+                path: project.to_path_buf(),
+                source: std::io::Error::other(e.to_string()),
+            })?
+            .map_err(|source| RunError::TrustSet {
+                path: project.to_path_buf(),
+                source,
+            })?;
+        let payload = serde_json::to_value(&set)
+            .map_err(|e| StoreError::Serde(format!("набор доверенных файлов: {e}")))?;
+        audit.push(AuditNew {
+            actor: AUDIT_ACTOR_USER.to_owned(),
+            action: audit_action::TRUST_GRANTED.to_owned(),
+            target: display_path(project),
+            payload,
+        });
+    }
+    Ok(audit)
 }
 
 #[cfg(test)]

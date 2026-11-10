@@ -1,11 +1,12 @@
 //! Тестовый писатель для проверки устойчивости журнала к `kill -9`
 //! (`tests/crash.rs`). Не для использования вне тестов.
 //!
-//! `crash_writer <dir> [--durable]`: открывает журнал в `<dir>` и бесконечно
+//! `crash_writer <dir> [--durable | --audit]`: открывает журнал в `<dir>` и бесконечно
 //! пишет события из нескольких потоков (чтобы убийство попадало и в середину
 //! group commit). После подтверждения каждого события печатает его `seq`
 //! отдельной строкой и сразу сбрасывает stdout. С `--durable` пишет через
-//! `append_durable`.
+//! `append_durable`, с `--audit` — записи аудита (`append_audit`, R1-C1 D91) и печатает
+//! их `seq`.
 
 use std::future::Future;
 use std::io::Write;
@@ -18,18 +19,34 @@ use std::thread::{self, Thread};
 
 use serde_json::json;
 use za_protocol::{Actor, EventKind, NewEvent, RunId};
-use za_store::{ProjectStore, StoreError};
+use za_store::{AuditNew, ProjectStore, StoreError};
 
 /// Число параллельных потоков-клиентов.
 const CLIENTS: usize = 4;
 
+/// Что пишет клиент.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Events,
+    Durable,
+    Audit,
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     let Some(dir) = args.next().map(PathBuf::from) else {
-        eprintln!("использование: crash_writer <dir> [--durable]");
+        eprintln!("использование: crash_writer <dir> [--durable | --audit]");
         return ExitCode::from(2);
     };
-    let durable = args.next().is_some_and(|a| a == "--durable");
+    let mode = match args.next() {
+        None => Mode::Events,
+        Some(a) if a == "--durable" => Mode::Durable,
+        Some(a) if a == "--audit" => Mode::Audit,
+        Some(a) => {
+            eprintln!("crash_writer: неизвестный режим {a:?}");
+            return ExitCode::from(2);
+        }
+    };
     let store = match ProjectStore::open(&dir) {
         Ok(s) => s,
         Err(e) => {
@@ -40,7 +57,7 @@ fn main() -> ExitCode {
     let clients: Vec<_> = (0..CLIENTS)
         .map(|_| {
             let s = store.clone();
-            thread::spawn(move || client(&s, durable))
+            thread::spawn(move || client(&s, mode))
         })
         .collect();
     // Клиенты работают до убийства процесса; сюда попадаем только при ошибке.
@@ -54,10 +71,21 @@ fn main() -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// Пишет события по одному и печатает `seq` каждого подтверждённого.
-fn client(s: &ProjectStore, durable: bool) -> Result<(), StoreError> {
+/// Пишет события (или записи аудита) по одному и печатает `seq` каждого подтверждённого.
+fn client(s: &ProjectStore, mode: Mode) -> Result<(), StoreError> {
     let run = RunId::new();
     for i in 0u64.. {
+        if mode == Mode::Audit {
+            let a = AuditNew {
+                actor: "user".into(),
+                action: "grant.added".into(),
+                target: format!("/x/{i}"),
+                payload: json!({ "i": i }),
+            };
+            let seq = block_on(s.append_audit(a))?.seq;
+            print_seq(seq)?;
+            continue;
+        }
         let e = NewEvent {
             run_id: run,
             parent_seq: None,
@@ -66,18 +94,23 @@ fn client(s: &ProjectStore, durable: bool) -> Result<(), StoreError> {
             payload: json!({ "i": i }),
             tainted: false,
         };
-        let seq = if durable {
+        let seq = if mode == Mode::Durable {
             block_on(s.append_durable(e))?
         } else {
             block_on(s.append(e))?
         };
-        // Одна запись строки целиком и flush: тест читает построчно.
-        let mut out = std::io::stdout().lock();
-        writeln!(out, "{}", seq.0)
-            .and_then(|()| out.flush())
-            .map_err(StoreError::from)?;
+        print_seq(seq.0)?;
     }
     Ok(())
+}
+
+/// Печатает подтверждённый `seq`: одна запись строки целиком и flush, тест читает
+/// построчно.
+fn print_seq(seq: u64) -> Result<(), StoreError> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{seq}")
+        .and_then(|()| out.flush())
+        .map_err(StoreError::from)
 }
 
 /// Будит поток, ждущий в [`block_on`].

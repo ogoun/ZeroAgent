@@ -9,6 +9,7 @@ use crate::StoreError;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_usage.sql")),
+    (3, include_str!("../migrations/0003_audit.sql")),
 ];
 
 /// Последняя известная версия схемы.
@@ -59,6 +60,7 @@ mod tests {
             "snapshots",
             "blobs",
             "usage",
+            "audit",
         ] {
             let n: i64 = c
                 .query_row(
@@ -69,6 +71,26 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "нет таблицы {t}");
         }
+    }
+
+    /// Миграция 3 повторно применима (`IF NOT EXISTS`): журнал, где таблица уже есть,
+    /// а `user_version` не поднят, доводится без ошибки и без потери записей.
+    #[test]
+    fn migration_3_is_reapplicable() {
+        let mut c = Connection::open_in_memory().unwrap();
+        migrate(&mut c).unwrap();
+        c.execute(
+            "INSERT INTO audit (seq, prev_hash, hash) VALUES (1, 'a', 'b')",
+            [],
+        )
+        .unwrap();
+        c.pragma_update(None, "user_version", 2).unwrap();
+        migrate(&mut c).unwrap();
+        assert_eq!(version(&c), 3);
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

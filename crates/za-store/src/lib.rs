@@ -7,8 +7,10 @@
 //! `generation` (SWM-064), снимки состояния служат для resume (CORE-006).
 //! Эффекты записываются протоколом намерение → квитанция (CORE-002), прерывания
 //! открываются идемпотентно по детерминированному id и решаются один раз (CORE-007),
-//! расход модели по вызовам хранится в `usage` (CORE-113).
+//! расход модели по вызовам хранится в `usage` (CORE-113), решения человека — в журнале
+//! аудита `audit` с hash-цепочкой (SEC-090, R1-C1 D91).
 
+mod audit;
 mod blobs;
 mod effects;
 mod events;
@@ -18,6 +20,7 @@ mod runs;
 mod usage;
 mod writer;
 
+pub use audit::{AUDIT_GENESIS, AuditBreak, AuditEntry, AuditNew};
 pub use blobs::BLOB_THRESHOLD;
 pub use effects::{EffectRow, INTERRUPT_OPEN, INTERRUPT_RESOLVED, InterruptRow};
 pub use runs::{NewRun, Run, StatusChange, run_status_payload};

@@ -3,7 +3,10 @@
 //! Тестовый бинарник `crash_writer` пишет события и печатает `seq` каждого
 //! подтверждённого. Тест убивает его в случайный момент (`Child::kill`:
 //! SIGKILL на Linux, TerminateProcess на Windows), открывает журнал заново
-//! и проверяет, что все напечатанные `seq` на месте.
+//! и проверяет, что все напечатанные `seq` на месте. В режиме `--audit` писатель
+//! добавляет записи аудита (R1-C1 D91): после убийства цепочка цела, подтверждённые
+//! записи на месте; первый раунд идёт по копии журнала R1-B1 (схема 2), поэтому
+//! убийство может попасть и в миграцию 3.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
@@ -35,11 +38,25 @@ struct Writer {
     reader: Option<JoinHandle<()>>,
 }
 
-fn spawn_writer(d: &Path, durable: bool) -> Writer {
+/// Режим писателя: события, события через `append_durable`, записи аудита.
+#[derive(Clone, Copy)]
+enum Mode {
+    Events,
+    Durable,
+    Audit,
+}
+
+fn spawn_writer(d: &Path, mode: Mode) -> Writer {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_crash_writer"));
     cmd.arg(d);
-    if durable {
-        cmd.arg("--durable");
+    match mode {
+        Mode::Events => {}
+        Mode::Durable => {
+            cmd.arg("--durable");
+        }
+        Mode::Audit => {
+            cmd.arg("--audit");
+        }
     }
     let mut child = cmd
         .stdin(Stdio::null())
@@ -130,7 +147,8 @@ fn open_after_kill(d: &Path) -> ProjectStore {
 fn crash_rounds(name: &str, rounds: u64, durable: bool) {
     for round in 0..rounds {
         let d = dir(&format!("{name}{round}"));
-        let mut w = spawn_writer(&d, durable);
+        let mode = if durable { Mode::Durable } else { Mode::Events };
+        let mut w = spawn_writer(&d, mode);
         let mut acked = read_seqs_for(&mut w, Duration::from_millis(50 + round * 37));
         kill(&mut w, &mut acked);
         let s = open_after_kill(&d);
@@ -154,4 +172,59 @@ fn acknowledged_events_survive_kill() {
 #[test]
 fn acknowledged_durable_events_survive_kill() {
     crash_rounds("crash-durable", 5, true);
+}
+
+/// Записи аудита переживают `kill -9`: после каждого убийства цепочка цела (без
+/// разрыва), подтверждённые записи на месте, `seq` идут подряд с 1. Журнал общий для
+/// всех раундов, цепочка продолжается через сбои. Первый раунд начинается с журнала
+/// R1-B1 схемы 2 и убивается без ожидания подтверждений: сбой может прийтись на
+/// миграцию 3, которая идёт одной транзакцией.
+#[test]
+fn audit_chain_survives_kill() {
+    let d = dir("crash-audit");
+    let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../za-agent/tests/golden/r1b1_v1/approval/store/journal.db");
+    std::fs::copy(golden, d.join("journal.db")).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut acked_all: Vec<u64> = Vec::new();
+    for round in 0..12u64 {
+        let mut w = spawn_writer(&d, Mode::Audit);
+        let mut acked = if round < 2 {
+            // Сразу после запуска: открытие и миграция ещё идут.
+            std::thread::sleep(Duration::from_millis(5 + round * 20));
+            Vec::new()
+        } else {
+            read_seqs_for(&mut w, Duration::from_millis(30 + round * 23))
+        };
+        kill(&mut w, &mut acked);
+        acked_all.extend(acked.iter().map(|q| q.0));
+        let s = open_after_kill(&d);
+        assert_eq!(
+            rt.block_on(s.verify_audit()).unwrap(),
+            Ok(()),
+            "раунд {round}: цепочка аудита разорвана"
+        );
+        let got: Vec<u64> = rt
+            .block_on(s.audit_entries(0, usize::MAX))
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(
+            got,
+            (1..=got.len() as u64).collect::<Vec<_>>(),
+            "раунд {round}: seq не подряд"
+        );
+        let lost: Vec<_> = acked_all.iter().filter(|q| !got.contains(q)).collect();
+        assert!(
+            lost.is_empty(),
+            "раунд {round}: потеряны подтверждённые записи аудита {lost:?}"
+        );
+    }
+    assert!(
+        !acked_all.is_empty(),
+        "писатель не подтвердил ни одной записи"
+    );
 }
