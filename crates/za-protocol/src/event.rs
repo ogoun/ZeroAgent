@@ -57,6 +57,14 @@ pub enum EventKind {
     ContextCompacted,
     /// Сработал детектор зацикливания (R1-B2 D54–D61).
     LoopDetected,
+    /// Исполненный вызов обратился к путям вне проекта (R1-C1 D77).
+    BoundaryOutside,
+    /// Выдан грант доступа вне проекта (R1-C1 D78).
+    GrantAdded,
+    /// Перед вызовом `Edit` или `Exec` сделан чекпоинт (R1-C1 D89).
+    CheckpointCreated,
+    /// Инструмент изменил файл проекта.
+    FileChanged,
     Unknown(String),
 }
 
@@ -87,6 +95,10 @@ impl EventKind {
             Self::ContextPruned => "context.pruned",
             Self::ContextCompacted => "context.compacted",
             Self::LoopDetected => "loop.detected",
+            Self::BoundaryOutside => "boundary.outside",
+            Self::GrantAdded => "grant.added",
+            Self::CheckpointCreated => "checkpoint.created",
+            Self::FileChanged => "file.changed",
             Self::Unknown(s) => s,
         }
     }
@@ -117,6 +129,10 @@ impl EventKind {
             "context.pruned" => Self::ContextPruned,
             "context.compacted" => Self::ContextCompacted,
             "loop.detected" => Self::LoopDetected,
+            "boundary.outside" => Self::BoundaryOutside,
+            "grant.added" => Self::GrantAdded,
+            "checkpoint.created" => Self::CheckpointCreated,
+            "file.changed" => Self::FileChanged,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -217,6 +233,20 @@ mod tests {
         assert_eq!(EventKind::AgentHeartbeat.as_str(), "agent.heartbeat");
         assert_eq!(EventKind::ContextAlert.as_str(), "context.alert");
         assert_eq!(EventKind::LoopDetected.as_str(), "loop.detected");
+    }
+
+    #[test]
+    fn r1c1_kinds_round_trip() {
+        use EventKind::*;
+        for (k, name) in [
+            (BoundaryOutside, "boundary.outside"),
+            (GrantAdded, "grant.added"),
+            (CheckpointCreated, "checkpoint.created"),
+            (FileChanged, "file.changed"),
+        ] {
+            assert_eq!(k.as_str(), name);
+            assert_eq!(EventKind::parse(name), k);
+        }
     }
 
     #[test]

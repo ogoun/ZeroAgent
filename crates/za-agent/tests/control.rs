@@ -21,8 +21,8 @@ use za_agent::{
     Snapshot, builtin_tools, control_channel, start_run, submit_input,
 };
 use za_core::{
-    AgentEvent, Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
-    ToolSpec,
+    AgentEvent, Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput,
+    ToolRegistry, ToolSpec,
 };
 use za_llm::{
     BackendKind, BoxFuture, EndpointId, FinishReason, Message, ModelError, Part, Role,
@@ -65,10 +65,7 @@ impl Tool for Hold {
                 .expect("инструмент hold не получил разрешения в срок")
                 .expect("семафор закрыт");
             permit.forget();
-            ToolOutput {
-                content: format!("held {args}"),
-                is_error: false,
-            }
+            ToolOutput::ok(format!("held {args}"))
         })
     }
 }
@@ -83,6 +80,7 @@ fn tool_spec(name: &str) -> ToolSpec {
         class: EffectClass::ReadOnly,
         kind: ToolKind::Read,
         approval: Approval::Mode,
+        risk: RiskClass::Read,
         roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
         min_tier: Tier::Small,
         timeout: Duration::from_secs(60),

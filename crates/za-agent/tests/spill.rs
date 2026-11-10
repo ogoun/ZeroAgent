@@ -17,7 +17,8 @@ use za_agent::{
     escape_untrusted, prune, run_tools, signal_channel, spill, spill_limit_bytes, start_run,
 };
 use za_core::{
-    Approval, EventBus, Journal, RunCtx, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
+    Approval, EventBus, Journal, RiskClass, RunCtx, Tool, ToolCx, ToolKind, ToolOutput,
+    ToolRegistry, ToolSpec,
 };
 use za_llm::normalize::CallSource;
 use za_llm::{
@@ -181,12 +182,7 @@ impl Tool for Big {
     fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let content = self.out.clone();
-        Box::pin(async move {
-            ToolOutput {
-                content,
-                is_error: false,
-            }
-        })
+        Box::pin(async move { ToolOutput::ok(content) })
     }
 }
 
@@ -200,6 +196,7 @@ fn tool_spec(name: &str, output_limit: Option<usize>) -> ToolSpec {
         class: EffectClass::ReadOnly,
         kind: ToolKind::Read,
         approval: Approval::Mode,
+        risk: RiskClass::Read,
         roles: vec![RunRole::Top],
         min_tier: Tier::Small,
         timeout: Duration::from_secs(60),
@@ -508,12 +505,7 @@ impl Tool for Dump {
 
     fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         let n = args.get("n").and_then(Value::as_u64).unwrap_or(0) as usize;
-        Box::pin(async move {
-            ToolOutput {
-                content: "y".repeat(n),
-                is_error: false,
-            }
-        })
+        Box::pin(async move { ToolOutput::ok("y".repeat(n)) })
     }
 }
 

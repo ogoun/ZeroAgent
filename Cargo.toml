@@ -60,3 +60,11 @@ sysinfo = { version = "0.40", default-features = false, features = ["system", "d
 # словари cl100k и o200k встроены в крейт, сеть не нужна; `tokenizers` от HF тянет
 # десятки крейтов. Только у `xtask` (проверяется `cargo xtask policy`).
 tiktoken-rs = { version = "=0.12.1", default-features = false }
+# Сверка открытого файла с путём (R1-C1 D98, `za_core::paths::open_checked`): тот же ли
+# это файл, без `unsafe` в нашем коде (на Windows — `GetFileInformationByHandle` через
+# `winapi-util`). Лицензия Unlicense OR MIT. Позже его же тянет `ignore` у `za-tools`.
+same-file = "=1.0.6"
+# Только константа `O_NOFOLLOW` на Unix (D98): крейт уже в Cargo.lock, новых крейтов нет.
+# План называл `nix`; его нет ни в Cargo.lock, ни в локальном реестре, а для одной
+# константы хватает `libc`, через который `nix` и работает.
+libc = { version = "=0.2.191", default-features = false }

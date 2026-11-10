@@ -18,5 +18,6 @@ pub use ids::{BlobHash, EventId, RunId, Seq};
 pub use mode::{RunMode, Tier};
 pub use resource::Priority;
 pub use run::{
-    RunRole, RunStatus, alert_kind, detector, detector_action, fail_reason, pause_reason,
+    RunRole, RunStatus, alert_kind, approval_reason, audit_action, checkpoint_kind, deny_reason,
+    detector, detector_action, fail_reason, irreversible, pause_reason, taint_origin,
 };

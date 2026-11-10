@@ -17,20 +17,26 @@
 //! объединяет инструменты, инструкции и хуки границы шага. [`Journal`] пишет
 //! события и публикует их после COMMIT в [`EventBus`] (D34, D35).
 //!
+//! Для границы проекта (R1-C1) модуль [`paths`] разбирает и разрешает пути вызовов
+//! (D76, D98), [`Checkpointer`] — контракт чекпоинта рабочей копии (D89).
+//!
 //! [`run_demo`] — детерминированный демонстрационный run для сквозной проверки
 //! журнала и протокола эффектов, [`replay_hash`] — хэш его значимых событий.
 
 mod bus;
 mod capability;
+mod checkpoint;
 mod demo;
 mod graph;
 pub mod interrupt;
+pub mod paths;
 mod recovery;
 mod runtime;
 mod tool;
 
 pub use bus::{AgentEvent, EventBus, Journal};
 pub use capability::{BoundaryInfo, Capability, Hook};
+pub use checkpoint::{Checkpoint, CheckpointRequest, Checkpointer};
 pub use demo::{CrashPoint, DemoConfig, DemoOutcome, replay_hash, run_demo};
 pub use graph::{BoxFuture, Exit, Graph, GraphError, Node, NodeId, Transition};
 pub use interrupt::{Interrupt, InterruptKind, InterruptState, pause_reason_for};
@@ -39,7 +45,8 @@ pub use recovery::{
 };
 pub use runtime::{EffectError, EffectFailure, EffectSlot, EffectSource, EffectSpec, RunCtx};
 pub use tool::{
-    Approval, DuplicateTool, Gate, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
+    Access, Approval, DuplicateTool, Gate, Postcondition, RawPath, RiskClass, Subjects, Tool,
+    ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
 };
 /// Прежнее имя причины паузы; значение живёт в [`za_protocol::pause_reason`].
 pub use za_protocol::pause_reason::NEEDS_DECISION;

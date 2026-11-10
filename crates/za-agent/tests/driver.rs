@@ -15,7 +15,8 @@ use za_agent::{
     builtin_tools, control_channel, resume_run, start_run,
 };
 use za_core::{
-    Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
+    Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
+    ToolSpec,
 };
 use za_llm::{
     BackendKind, BoxFuture, EndpointId, ErrorClass, FinishReason, Message, ModelError, Part, Role,
@@ -45,12 +46,7 @@ impl Tool for Echo {
     }
 
     fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
-        Box::pin(async move {
-            ToolOutput {
-                content: format!("echo {args}"),
-                is_error: false,
-            }
-        })
+        Box::pin(async move { ToolOutput::ok(format!("echo {args}")) })
     }
 }
 
@@ -84,10 +80,7 @@ impl Tool for Filler {
                 .is_ok()
             {}
             while store.append(ev()).await.is_ok() {}
-            ToolOutput {
-                content: "filled".into(),
-                is_error: false,
-            }
+            ToolOutput::ok("filled")
         })
     }
 }
@@ -102,6 +95,11 @@ fn tool_spec(name: &str, kind: ToolKind, class: EffectClass) -> ToolSpec {
         class,
         kind,
         approval: Approval::Mode,
+        risk: match kind {
+            ToolKind::Edit => RiskClass::LocalWrite,
+            ToolKind::Exec => RiskClass::Exec,
+            _ => RiskClass::Read,
+        },
         roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
         min_tier: Tier::Small,
         timeout: Duration::from_secs(60),

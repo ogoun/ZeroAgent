@@ -14,7 +14,8 @@ use za_agent::{
     RunSpec, Snapshot, Spent, builtin_tools, check_budget, control_channel, start_run,
 };
 use za_core::{
-    Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
+    Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
+    ToolSpec,
 };
 use za_llm::{
     BackendKind, BoxFuture, EndpointId, FinishReason, Message, ModelError, Part, Role,
@@ -43,6 +44,7 @@ fn tool_spec(name: &str) -> ToolSpec {
         class: EffectClass::ReadOnly,
         kind: ToolKind::Read,
         approval: Approval::Mode,
+        risk: RiskClass::Read,
         roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
         min_tier: Tier::Small,
         timeout: Duration::from_secs(60),
@@ -62,12 +64,7 @@ impl Tool for Echo {
     }
 
     fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
-        Box::pin(async move {
-            ToolOutput {
-                content: format!("echo {args}"),
-                is_error: false,
-            }
-        })
+        Box::pin(async move { ToolOutput::ok(format!("echo {args}")) })
     }
 }
 
@@ -87,10 +84,7 @@ impl Tool for Nap {
     fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         Box::pin(async move {
             tokio::time::sleep(NAP).await;
-            ToolOutput {
-                content: "slept".into(),
-                is_error: false,
-            }
+            ToolOutput::ok("slept")
         })
     }
 }
@@ -121,10 +115,7 @@ impl Tool for Inject {
                 })
                 .await
                 .expect("turn.input не записан");
-            ToolOutput {
-                content: "injected".into(),
-                is_error: false,
-            }
+            ToolOutput::ok("injected")
         })
     }
 }

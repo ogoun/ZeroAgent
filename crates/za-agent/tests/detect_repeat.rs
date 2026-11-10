@@ -20,7 +20,8 @@ use za_agent::{
     RunSpec, Snapshot, builtin_tools, call_fingerprint, control_channel, resume_run, start_run,
 };
 use za_core::{
-    Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
+    Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
+    ToolSpec,
 };
 use za_llm::{
     BackendKind, BoxFuture, EndpointId, FinishReason, Message, ModelError, Part, Role,
@@ -491,7 +492,11 @@ fn reply(name: &str, args: &Value) -> ToolOutput {
         "fail" => (format!("no such file {}", args["p"]), true),
         _ => (format!("edited {}", args["p"]), false),
     };
-    ToolOutput { content, is_error }
+    ToolOutput {
+        content,
+        is_error,
+        ..ToolOutput::default()
+    }
 }
 
 impl Tool for Probe {
@@ -526,10 +531,7 @@ impl Tool for Hold {
                 .await
                 .expect("семафор закрыт")
                 .forget();
-            ToolOutput {
-                content: format!("held {args}"),
-                is_error: false,
-            }
+            ToolOutput::ok(format!("held {args}"))
         })
     }
 }
@@ -545,6 +547,11 @@ fn spec_of(name: &str, kind: ToolKind, class: EffectClass) -> ToolSpec {
         kind,
         // Правка без одобрения в режиме Ask.
         approval: Approval::Never,
+        risk: match kind {
+            ToolKind::Edit => RiskClass::LocalWrite,
+            ToolKind::Exec => RiskClass::Exec,
+            _ => RiskClass::Read,
+        },
         roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
         min_tier: Tier::Small,
         timeout: Duration::from_secs(60),

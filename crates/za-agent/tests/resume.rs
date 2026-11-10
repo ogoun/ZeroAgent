@@ -23,8 +23,8 @@ use za_agent::{
     start_run, state_block,
 };
 use za_core::{
-    AgentEvent, Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
-    ToolSpec, UnknownDecision, resolve_unknown,
+    AgentEvent, Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput,
+    ToolRegistry, ToolSpec, UnknownDecision, resolve_unknown,
 };
 use za_llm::{
     BackendKind, BoxFuture, EndpointId, ErrorClass, FinishReason, Message, ModelError, Part, Role,
@@ -54,12 +54,7 @@ impl Tool for Echo {
     }
 
     fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
-        Box::pin(async move {
-            ToolOutput {
-                content: format!("echo {args}"),
-                is_error: false,
-            }
-        })
+        Box::pin(async move { ToolOutput::ok(format!("echo {args}")) })
     }
 }
 
@@ -76,12 +71,7 @@ impl Tool for Incr {
 
     fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        Box::pin(async move {
-            ToolOutput {
-                content: format!("incr {n}"),
-                is_error: false,
-            }
-        })
+        Box::pin(async move { ToolOutput::ok(format!("incr {n}")) })
     }
 }
 
@@ -104,10 +94,7 @@ impl Tool for Hang {
                 .expect("инструмент hang не получил разрешения в срок")
                 .expect("семафор закрыт");
             permit.forget();
-            ToolOutput {
-                content: "hung".into(),
-                is_error: false,
-            }
+            ToolOutput::ok("hung")
         })
     }
 }
@@ -144,6 +131,11 @@ fn tool_spec(name: &str, kind: ToolKind, class: EffectClass) -> ToolSpec {
         class,
         kind,
         approval: Approval::Mode,
+        risk: match kind {
+            ToolKind::Edit => RiskClass::LocalWrite,
+            ToolKind::Exec => RiskClass::Exec,
+            _ => RiskClass::Read,
+        },
         roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
         min_tier: Tier::Small,
         timeout: Duration::from_secs(600),

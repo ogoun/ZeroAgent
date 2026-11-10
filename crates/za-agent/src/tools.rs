@@ -31,8 +31,8 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use za_core::interrupt::{self, InterruptState};
 use za_core::{
-    Approval, EffectError, EffectSlot, EffectSpec, Gate, Interrupt, InterruptKind, Journal, RunCtx,
-    Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
+    Approval, EffectError, EffectSlot, EffectSpec, Gate, Interrupt, InterruptKind, Journal,
+    RiskClass, RunCtx, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
 };
 use za_llm::{BoxFuture, Part, ToolCall, ToolSchema};
 use za_protocol::{
@@ -727,24 +727,15 @@ async fn call_action(action: Action) -> ToolOutput {
         } => {
             let out = match tokio::time::timeout(timeout, tool.call(args, cx)).await {
                 Ok(o) => o,
-                Err(_) => ToolOutput {
-                    content: timeout_text(timeout),
-                    is_error: true,
-                },
+                Err(_) => ToolOutput::error(timeout_text(timeout)),
             };
             match spill {
                 Some(job) => spill_output(out, job).await,
                 None => out,
             }
         }
-        Action::Answer(a) => ToolOutput {
-            content: a,
-            is_error: false,
-        },
-        Action::Finish => ToolOutput {
-            content: FINISH_OK.to_owned(),
-            is_error: false,
-        },
+        Action::Answer(a) => ToolOutput::ok(a),
+        Action::Finish => ToolOutput::ok(FINISH_OK),
     }
 }
 
@@ -754,7 +745,13 @@ async fn call_action(action: Action) -> ToolOutput {
 /// записался файл — `error!` и тот же разрез с пометкой `full output not saved`.
 /// Экранирование и запись (до десятков МиБ) — в `spawn_blocking`.
 async fn spill_output(out: ToolOutput, job: SpillJob) -> ToolOutput {
-    let ToolOutput { content, is_error } = out;
+    let ToolOutput {
+        content,
+        is_error,
+        taint,
+        digest,
+        post,
+    } = out;
     let work = tokio::task::spawn_blocking(move || {
         let escaped = escape_untrusted(&content);
         if escaped.len() <= job.limit {
@@ -769,15 +766,18 @@ async fn spill_output(out: ToolOutput, job: SpillJob) -> ToolOutput {
         }
     });
     match work.await {
-        Ok(content) => ToolOutput { content, is_error },
+        Ok(content) => ToolOutput {
+            content,
+            is_error,
+            taint,
+            digest,
+            post,
+        },
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         Err(e) => {
             // Рантайм останавливается: вывода нет, но квитанция должна быть.
             tracing::error!(error = %e, "выгрузка вывода прервана");
-            ToolOutput {
-                content: OUTPUT_LOST.to_owned(),
-                is_error: true,
-            }
+            ToolOutput::error(OUTPUT_LOST)
         }
     }
 }
@@ -804,12 +804,7 @@ impl Tool for Builtin {
     /// `finish` и `ask_user` исполняет сам [`run_tools`]; прямой вызов — ошибка.
     fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         let name = self.spec.schema.name.clone();
-        Box::pin(async move {
-            ToolOutput {
-                content: runtime_only_text(&name),
-                is_error: true,
-            }
-        })
+        Box::pin(async move { ToolOutput::error(runtime_only_text(&name)) })
     }
 }
 
@@ -820,6 +815,7 @@ fn builtin(schema: ToolSchema, roles: Vec<RunRole>, min_tier: Tier) -> Arc<dyn T
             class: EffectClass::Pure,
             kind: ToolKind::Control,
             approval: Approval::Mode,
+            risk: RiskClass::Read,
             roles,
             min_tier,
             timeout: BUILTIN_TIMEOUT,

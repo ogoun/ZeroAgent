@@ -22,6 +22,13 @@ impl EffectKey {
     pub fn derive(run: RunId, step: u64, effect_seq: u64) -> Self {
         Self(format!("{run}:{step}:{effect_seq}"))
     }
+
+    /// Основа имени файла по ключу (D76, Ruling 1.11): `:` → `-`. На Windows `:` в
+    /// имени файла — это альтернативный поток данных (ADS), поэтому маркеры, файлы
+    /// выгрузки, `procs` и id чекпоинтов строятся только от этой формы ключа.
+    pub fn file_stem(&self) -> String {
+        self.0.replace(':', "-")
+    }
 }
 
 #[cfg(test)]
@@ -38,6 +45,14 @@ mod tests {
             EffectKey::derive(r, 2, 3).0,
             "0190b6a0-0000-7000-8000-000000000001:2:3"
         );
+    }
+
+    #[test]
+    fn file_stem_has_no_colon() {
+        let r = RunId(Uuid::parse_str("0190b6a0-0000-7000-8000-000000000001").unwrap());
+        let stem = EffectKey::derive(r, 2, 3).file_stem();
+        assert!(!stem.contains(':'));
+        assert_eq!(stem, "0190b6a0-0000-7000-8000-000000000001-2-3");
     }
 
     #[test]

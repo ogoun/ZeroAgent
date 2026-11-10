@@ -66,6 +66,106 @@ pub mod pause_reason {
     /// Разовый сбой журнала посреди шага (R1-C1 D72): пауза только статусом, без
     /// снимка; resume реплеит шаг с последнего снимка.
     pub const STORE: &str = "store";
+    /// Первый вызов `Exec` в недоверенном проекте ждёт решения о доверии (R1-C1 D83).
+    pub const NEEDS_TRUST: &str = "needs_trust";
+}
+
+/// Причины `Ask` политики (R1-C1 D80): поле `reasons` payload прерывания одобрения.
+/// Порядок констант — порядок причин в payload (Ruling 1.5).
+///
+/// Значения — часть протокола (их читают CLI и UI), менять строки нельзя.
+pub mod approval_reason {
+    /// Режим run требует одобрения.
+    pub const MODE: &str = "mode";
+    /// Сработало правило `ask`.
+    pub const RULE: &str = "rule";
+    /// Путь вне проекта без гранта (D77).
+    pub const OUTSIDE_PROJECT: &str = "outside_project";
+    /// Контекст run помечен недоверенным содержимым (D82).
+    pub const TAINTED: &str = "tainted";
+    /// Необратимая команда (D81).
+    pub const IRREVERSIBLE: &str = "irreversible";
+    /// Запрос гранта (`request_grant`, D78).
+    pub const GRANT: &str = "grant";
+}
+
+/// Причины отказа политики (R1-C1 D79, D80, D83): текст результата `denied: <причина>`.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod deny_reason {
+    /// Нативная запись в защищённый путь (D79).
+    pub const PROTECTED_PATH: &str = "protected path";
+    /// Сработало правило `deny` (D80).
+    pub const POLICY_RULE: &str = "policy rule";
+    /// Пользователь отказал проекту в доверии (D83).
+    pub const UNTRUSTED_PROJECT: &str = "untrusted project";
+}
+
+/// Метки необратимых команд (R1-C1 D81): поле `irreversible` payload прерывания.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod irreversible {
+    /// Удаление файлов: `rm -r`/`-f`, `find -delete`, `Remove-Item -Recurse`.
+    pub const DELETE: &str = "delete";
+    /// Сброс рабочей копии git: `reset --hard`, `checkout .`, `clean -f`.
+    pub const GIT_RESET: &str = "git_reset";
+    /// Принудительный `git push`.
+    pub const GIT_FORCE_PUSH: &str = "git_force_push";
+    /// Публикация пакета или образа.
+    pub const PUBLISH: &str = "publish";
+    /// Изменение инфраструктуры: `terraform apply`, `kubectl delete`.
+    pub const INFRA: &str = "infra";
+    /// `DROP TABLE`, `TRUNCATE` в клиенте СУБД.
+    pub const SQL_DROP: &str = "sql_drop";
+    /// Перенаправление `>` в путь вне проекта: там нет чекпоинта.
+    pub const OVERWRITE: &str = "overwrite";
+    /// Команда не разобрана: неизвестное считается необратимым.
+    pub const UNPARSED: &str = "unparsed";
+}
+
+/// Происхождения недоверенного содержимого (R1-C1 D82): `LoopState.taint` и первая
+/// строка `[untrusted content: <origin>]` результата.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod taint_origin {
+    /// Прочитан путь вне проекта, в том числе по гранту.
+    pub const OUTSIDE_PROJECT: &str = "outside_project";
+    /// Проект не доверен (D83).
+    pub const UNTRUSTED_PROJECT: &str = "untrusted_project";
+    /// Вывод сетевой команды.
+    pub const NETWORK: &str = "network";
+    /// Инструмент сам пометил результат недоверенным.
+    pub const TOOL: &str = "tool";
+}
+
+/// Вид чекпоинта (R1-C1 D89): поле `kind` события `checkpoint.created`.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod checkpoint_kind {
+    /// Коммит git под `refs/zero-agent/checkpoints/…`.
+    pub const GIT: &str = "git";
+    /// Копия затронутых файлов с манифестом.
+    pub const FILES: &str = "files";
+    /// Чекпоинт не сделан; причина — в `reason`.
+    pub const SKIPPED: &str = "skipped";
+}
+
+/// Действия журнала аудита (R1-C1 D91): поле `action` записи `audit`.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod audit_action {
+    /// Решение о прерывании одобрения.
+    pub const APPROVAL_RESOLVED: &str = "approval.resolved";
+    /// Выдан грант доступа вне проекта.
+    pub const GRANT_ADDED: &str = "grant.added";
+    /// Проекту дано доверие.
+    pub const TRUST_GRANTED: &str = "trust.granted";
+    /// Доверие к проекту отозвано.
+    pub const TRUST_REVOKED: &str = "trust.revoked";
+    /// Загружена политика с новым хэшем.
+    pub const POLICY_LOADED: &str = "policy.loaded";
+    /// Рабочая копия восстановлена из чекпоинта.
+    pub const CHECKPOINT_RESTORED: &str = "checkpoint.restored";
 }
 
 /// Детекторы зацикливания: поле `detector` события `loop.detected` (R1-B2 D63) и

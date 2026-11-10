@@ -30,7 +30,8 @@ use za_agent::{
     RunSpec, builtin_tools, control_channel, resume_run, start_run,
 };
 use za_core::{
-    Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
+    Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
+    ToolSpec,
 };
 use za_llm::{
     BackendKind, BoxFuture, ChatRequest, EndpointId, FinishReason, Message, ModelCall, ModelError,
@@ -93,12 +94,7 @@ impl Tool for Echo {
             .as_u64()
             .and_then(|i| u32::try_from(i).ok())
             .unwrap_or(0);
-        Box::pin(async move {
-            ToolOutput {
-                content: echo_text(i),
-                is_error: false,
-            }
-        })
+        Box::pin(async move { ToolOutput::ok(echo_text(i)) })
     }
 }
 
@@ -127,6 +123,7 @@ fn registry() -> ToolRegistry {
             class: EffectClass::ReadOnly,
             kind: ToolKind::Read,
             approval: Approval::Mode,
+            risk: RiskClass::Read,
             roles: vec![RunRole::Top],
             min_tier: Tier::Small,
             timeout: Duration::from_secs(600),

@@ -3,6 +3,11 @@
 //! Инструмент описывает себя [`ToolSpec`] и выполняется через [`Tool::call`].
 //! Набор `tools[]` от режима не зависит (CTX-003): режим решает только, можно ли
 //! выполнить вызов ([`gate`]); запрещённый вызов получает результат `denied: <причина>`.
+//!
+//! Для политики R1-C1 инструмент сообщает класс риска ([`RiskClass`], D81) и предметы
+//! вызова ([`Tool::subjects`], D77) — сырые пути, рабочий каталог и команду, без
+//! ввода-вывода. Результат ([`ToolOutput`], D75) несёт происхождение недоверенного
+//! содержимого, сжатое представление и постусловия.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -39,6 +44,67 @@ pub enum Approval {
     Never,
 }
 
+/// Класс риска инструмента (R1-C1 D81): по нему политика решает, действует ли метка
+/// недоверенного содержимого (D82). Порядок вариантов — от безопасного к опасному.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskClass {
+    /// Только чтение.
+    Read,
+    /// Правка файлов проекта.
+    LocalWrite,
+    /// Запуск команд.
+    Exec,
+    /// Сетевой доступ.
+    Network,
+    /// Необратимое действие.
+    Irreversible,
+    /// Публикация наружу.
+    Publish,
+}
+
+/// Вид доступа к пути вызова (D77).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    Read,
+    Write,
+    Exec,
+}
+
+/// Путь из аргументов вызова как его дала модель, до разбора [`crate::paths::classify`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawPath {
+    pub arg: String,
+    pub access: Access,
+}
+
+/// Предметы вызова (D77): что вызов затронет. Строит [`Tool::subjects`] без ввода-вывода;
+/// пути разрешает пакет вызовов непосредственно перед решением (D98).
+// Поле `segments` (разобранная команда, `za_core::shell`) добавит задача 3 R1-C1.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Subjects {
+    pub paths: Vec<RawPath>,
+    /// Рабочий каталог команды, как в аргументах.
+    pub cwd: Option<String>,
+    /// Текст команды.
+    pub command: Option<String>,
+    /// Метки необратимости (`za_protocol::irreversible`).
+    pub irreversible: Vec<&'static str>,
+    /// Вызов обращается к сети.
+    pub network: bool,
+}
+
+/// Постусловие результата (TOOL-004, D75): что пакет проверяет после вызова.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Postcondition {
+    /// Файл существует и его BLAKE3 (hex) равен `blake3`.
+    FileHash { path: PathBuf, blake3: String },
+    /// Файла нет.
+    FileAbsent { path: PathBuf },
+}
+
 /// Описание инструмента.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
@@ -51,6 +117,8 @@ pub struct ToolSpec {
     pub class: EffectClass,
     pub kind: ToolKind,
     pub approval: Approval,
+    /// Класс риска (D81); у `bash` по вызову может повыситься до `Irreversible`.
+    pub risk: RiskClass,
     /// Роли run, которым инструмент доступен.
     pub roles: Vec<RunRole>,
     /// Наименьший тир модели, которому инструмент выдаётся.
@@ -64,10 +132,42 @@ pub struct ToolSpec {
 }
 
 /// Результат вызова инструмента; сериализуется в квитанцию эффекта.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Поля R1-C1 (D75) необязательны и не пишутся пустыми: квитанции R1-B
+/// `{"content", "is_error"}` читаются, а новые без признаков выглядят как прежде.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// Происхождение недоверенного содержимого (`za_protocol::taint_origin`), если
+    /// инструмент сам знает, что результат недоверенный.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<String>,
+    /// Сжатое представление вывода для контекста при выгрузке (D86).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Постусловия (TOOL-004).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post: Vec<Postcondition>,
+}
+
+impl ToolOutput {
+    /// Успешный результат без признаков.
+    pub fn ok(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Результат-ошибка без признаков.
+    pub fn error(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Контекст одного вызова инструмента.
@@ -87,6 +187,16 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
     /// Выполняет вызов. Ошибка инструмента — `ToolOutput { is_error: true, .. }`.
     fn call(&self, args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput>;
+
+    /// Предметы вызова (D77): без ввода-вывода. По умолчанию — пусто.
+    fn subjects(&self, _args: &Value) -> Subjects {
+        Subjects::default()
+    }
+
+    /// Тексты для модели, входящие в хэш промптов (D94): `(имя, текст)`.
+    fn texts(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
 }
 
 /// Решение гейта о вызове.
@@ -108,7 +218,8 @@ const DENY_PLAN: &str = "plan mode";
 ///
 /// `Read` и `Control` разрешены всегда; `Edit` — `Deny` в `read-only` и `plan`,
 /// `Ask` в `ask`, `Allow` в `accept-edits` и `auto`; `Exec` — `Deny` в `read-only`
-/// и `plan`, `Ask` в `ask` и `accept-edits`, `Allow` в `auto`. Затем
+/// и `plan`, `Ask` в `ask` и `accept-edits`, `Allow` в `auto`; в `bypass` (R1-C1 D80)
+/// `Edit` и `Exec` — `Allow`. Затем
 /// [`Approval::Always`] превращает `Allow` в `Ask`, [`Approval::Never`] — `Ask`
 /// в `Allow`; `Deny` не меняется. Класс эффекта (`spec.class`) не учитывается.
 pub fn gate(mode: RunMode, spec: &ToolSpec) -> Gate {
@@ -119,7 +230,7 @@ pub fn gate(mode: RunMode, spec: &ToolSpec) -> Gate {
         (ToolKind::Edit | ToolKind::Exec, RunMode::Ask) => Gate::Ask,
         (ToolKind::Edit, RunMode::AcceptEdits) => Gate::Allow,
         (ToolKind::Exec, RunMode::AcceptEdits) => Gate::Ask,
-        (ToolKind::Edit | ToolKind::Exec, RunMode::Auto) => Gate::Allow,
+        (ToolKind::Edit | ToolKind::Exec, RunMode::Auto | RunMode::Bypass) => Gate::Allow,
     };
     match (by_mode, spec.approval) {
         (Gate::Allow, Approval::Always) => Gate::Ask,

@@ -26,7 +26,7 @@ use za_agent::{
     state_block, submit_input, summary_block,
 };
 use za_core::{
-    AgentEvent, Approval, EventBus, Journal, RunCtx, Tool, ToolCx, ToolKind, ToolOutput,
+    AgentEvent, Approval, EventBus, Journal, RiskClass, RunCtx, Tool, ToolCx, ToolKind, ToolOutput,
     ToolRegistry, ToolSpec,
 };
 use za_llm::{
@@ -60,12 +60,7 @@ impl Tool for Note {
     }
 
     fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
-        Box::pin(async {
-            ToolOutput {
-                content: "ok".into(),
-                is_error: false,
-            }
-        })
+        Box::pin(async { ToolOutput::ok("ok") })
     }
 }
 
@@ -88,10 +83,7 @@ impl Tool for Hang {
                 .expect("инструмент hang не получил разрешения в срок")
                 .expect("семафор закрыт");
             permit.forget();
-            ToolOutput {
-                content: "hung".into(),
-                is_error: false,
-            }
+            ToolOutput::ok("hung")
         })
     }
 }
@@ -106,6 +98,7 @@ fn tool_spec(name: &str) -> ToolSpec {
         class: EffectClass::ReadOnly,
         kind: ToolKind::Read,
         approval: Approval::Mode,
+        risk: RiskClass::Read,
         roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
         min_tier: Tier::Small,
         timeout: Duration::from_secs(600),

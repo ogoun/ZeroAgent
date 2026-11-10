@@ -2,7 +2,7 @@
 //! результата или таймера.
 //!
 //! Id выводится из ключа эффекта, на котором run остановился:
-//! `{appr|input|ext|timer|unk}-{effect_key}`. Повтор после сбоя открывает то же
+//! `{appr|input|ext|timer|unk|trust}-{effect_key}`. Повтор после сбоя открывает то же
 //! прерывание, а не новое. Переход `open → resolved` необратим, поэтому
 //! [`state`] при реплее видит то же или более позднее решение.
 
@@ -23,6 +23,8 @@ pub enum InterruptKind {
     Timer,
     /// Исход `NonIdempotent`-эффекта неизвестен после сбоя (CORE-003).
     UnknownOutcome,
+    /// Первый `Exec` в недоверенном проекте ждёт решения о доверии (R1-C1 D83).
+    Trust,
 }
 
 impl InterruptKind {
@@ -34,6 +36,7 @@ impl InterruptKind {
             Self::External => "external",
             Self::Timer => "timer",
             Self::UnknownOutcome => "unknown_outcome",
+            Self::Trust => "trust",
         }
     }
 
@@ -45,6 +48,7 @@ impl InterruptKind {
             Self::External => "ext",
             Self::Timer => "timer",
             Self::UnknownOutcome => "unk",
+            Self::Trust => "trust",
         }
     }
 }
@@ -60,7 +64,7 @@ pub struct Interrupt {
 }
 
 impl Interrupt {
-    /// Прерывание на эффекте `key`: id `"{appr|input|ext|timer|unk}-{key}"` (D16).
+    /// Прерывание на эффекте `key`: id `"{appr|input|ext|timer|unk|trust}-{key}"` (D16).
     pub fn for_effect(kind: InterruptKind, key: &EffectKey, payload: Value) -> Self {
         Self {
             id: format!("{}-{}", kind.id_prefix(), key.0),
@@ -123,12 +127,13 @@ pub async fn state(store: &ProjectStore, id: &str) -> Result<Option<InterruptSta
 
 /// Причина паузы run, ждущего прерывания этого вида: `Approval` →
 /// `needs_approval`, `Input` → `needs_input`, `UnknownOutcome` →
-/// `needs_decision`, `External` и `Timer` → `waiting`.
+/// `needs_decision`, `Trust` → `needs_trust`, `External` и `Timer` → `waiting`.
 pub fn pause_reason_for(kind: InterruptKind) -> &'static str {
     match kind {
         InterruptKind::Approval => pause_reason::NEEDS_APPROVAL,
         InterruptKind::Input => pause_reason::NEEDS_INPUT,
         InterruptKind::UnknownOutcome => pause_reason::NEEDS_DECISION,
+        InterruptKind::Trust => pause_reason::NEEDS_TRUST,
         InterruptKind::External | InterruptKind::Timer => pause_reason::WAITING,
     }
 }

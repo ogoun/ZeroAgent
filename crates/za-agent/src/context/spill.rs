@@ -8,30 +8,29 @@
 //! **после** [`crate::escape_untrusted`]: экранирование растит `<` вчетверо, и лимит до
 //! него превышался бы до 4 раз. В файл пишется исходный вывод.
 //!
-//! Файлы лежат только в `<project>/.zero-agent/work/spill/`; каталог
-//! `.zero-agent/work/` получает `.gitignore` со строкой `*`. Запись — через временный
-//! файл и переименование: оборванная запись не оставляет полуфайла под именем spill.
+//! Файлы лежат только в `<project>/.zero-agent/work/spill/`. Каталог создаёт
+//! [`za_core::paths::work_dir`] (R1-C1 D76): по компонентам, без ссылок, внутри корня
+//! проекта, с `.zero-agent/work/.gitignore` = `*`. Запись — через временный файл и
+//! переименование: оборванная запись не оставляет полуфайла под именем spill.
 //!
 //! Запись не идёт через ссылки (SEC-004; m5 финального ревью R1-B2): ни один компонент
-//! пути под корнем проекта (`.zero-agent`, `work`, `spill`), ни `.gitignore`, ни файл
-//! выгрузки не могут быть символической ссылкой или junction, а каталог выгрузки после
-//! `canonicalize` лежит внутри корня проекта. Иначе — ошибка записи: вывод уходит в
+//! пути под корнем проекта (`.zero-agent`, `work`, `spill`), ни файл выгрузки не могут
+//! быть символической ссылкой или junction. Иначе — ошибка записи: вывод уходит в
 //! контекст с пометкой `full output not saved`, удаление на границе — `prune_failed`.
 //! Проверка и запись — не одна атомарная операция: подмена каталога между ними
-//! (TOCTOU) — принятый риск до песочницы файловых инструментов R1-C.
+//! (TOCTOU) — принятый риск до песочницы файловых инструментов (D98, SEC-100).
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use za_core::paths::work_dir;
 use za_protocol::{EffectKey, RunId};
 
 /// Каталог выгрузки относительно корня проекта (D44, SEC-004).
 pub const SPILL_DIR: &str = ".zero-agent/work/spill";
-/// Каталог рабочих файлов агента: в нём `.gitignore` (ARC-021).
-const WORK_DIR: &str = ".zero-agent/work";
-/// Содержимое `.zero-agent/work/.gitignore`.
-const WORK_GITIGNORE: &str = "*\n";
+/// Имя подкаталога выгрузки у [`za_core::paths::work_dir`].
+const SPILL_SUB: &str = "spill";
 /// Доля головы в лимите, проценты (D44); хвост — остаток.
 const HEAD_PERCENT: usize = 60;
 /// Начало строки-указателя пропуска.
@@ -76,9 +75,9 @@ pub fn spill_limit_bytes(n_ctx: u32, share: f32, tool_limit: Option<usize>) -> u
     tool_limit.map_or(bytes, |t| t.min(bytes))
 }
 
-/// Имя файла выгрузки вывода инструмента: ключ эффекта с `:` → `-` (D44).
+/// Имя файла выгрузки вывода инструмента: [`EffectKey::file_stem`] (`:` → `-`, D44, D76).
 pub fn spill_name(key: &EffectKey) -> String {
-    safe_name(&key.0.replace(':', "-"))
+    safe_name(&key.file_stem())
 }
 
 /// Hex-символов BLAKE3 в имени файла выгрузки при удалении.
@@ -206,13 +205,7 @@ pub(crate) fn write_spill(project_dir: &Path, name: &str, bytes: &[u8]) -> io::R
             format!("недопустимое имя файла выгрузки: {name}"),
         ));
     }
-    spill_dir(project_dir)?;
-    let ignore = project_dir.join(WORK_DIR).join(".gitignore");
-    not_link(&ignore)?;
-    if std::fs::read(&ignore).ok().as_deref() != Some(WORK_GITIGNORE.as_bytes()) {
-        atomic_write(&ignore, WORK_GITIGNORE.as_bytes())?;
-    }
-    let file = file_of(project_dir, name);
+    let file = work_dir(project_dir, SPILL_SUB)?.join(format!("{name}.txt"));
     not_link(&file)?;
     if std::fs::metadata(&file).is_ok_and(|m| m.len() == bytes.len() as u64)
         && std::fs::read(&file).is_ok_and(|b| b == bytes)
@@ -222,40 +215,6 @@ pub(crate) fn write_spill(project_dir: &Path, name: &str, bytes: &[u8]) -> io::R
     atomic_write(&file, bytes)?;
     tracing::debug!(file = %file.display(), bytes = bytes.len(), "вывод выгружен в файл");
     Ok(())
-}
-
-/// Каталог выгрузки `<project>/.zero-agent/work/spill`: создаётся по компонентам, ни
-/// один компонент не ссылка и не junction, канонический путь — внутри корня проекта.
-fn spill_dir(project_dir: &Path) -> io::Result<PathBuf> {
-    let mut dir = project_dir.to_path_buf();
-    for part in Path::new(SPILL_DIR).components() {
-        dir.push(part);
-        not_link(&dir)?;
-        match std::fs::create_dir(&dir) {
-            Ok(()) => {}
-            // Уже есть (или создан параллельной записью) — проверить ещё раз.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                not_link(&dir)?;
-                if !dir.is_dir() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("путь каталога выгрузки — не каталог: {}", dir.display()),
-                    ));
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    let root = std::fs::canonicalize(project_dir)?;
-    let real = std::fs::canonicalize(&dir)?;
-    if !real.starts_with(&root) {
-        return Err(io::Error::other(format!(
-            "каталог выгрузки {} вне проекта {}",
-            real.display(),
-            root.display()
-        )));
-    }
-    Ok(dir)
 }
 
 /// Путь — не символическая ссылка и не junction (на Windows junction — тоже ссылка у
@@ -270,10 +229,6 @@ fn not_link(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
-}
-
-fn file_of(project_dir: &Path, name: &str) -> PathBuf {
-    project_dir.join(SPILL_DIR).join(format!("{name}.txt"))
 }
 
 /// Порядковый номер временного файла в процессе: одновременные записи (первая

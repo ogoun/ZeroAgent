@@ -7,12 +7,15 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use za_core::{
-    AgentEvent, Approval, BoxFuture, DuplicateTool, EventBus, Gate, Journal, Tool, ToolCx,
-    ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
+    AgentEvent, Approval, BoxFuture, DuplicateTool, EventBus, Gate, Interrupt, InterruptKind,
+    Journal, Postcondition, RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
+    ToolSpec, gate, pause_reason_for,
 };
 use za_llm::ToolSchema;
 use za_protocol::{
-    Actor, EffectClass, EventKind, NewEvent, RunId, RunMode, RunRole, RunStatus, Seq, Tier,
+    Actor, EffectClass, EffectKey, EventKind, NewEvent, RunId, RunMode, RunRole, RunStatus, Seq,
+    Tier, approval_reason, audit_action, checkpoint_kind, deny_reason, irreversible, pause_reason,
+    taint_origin,
 };
 use za_store::{NewRun, ProjectStore, UsageRow};
 
@@ -42,6 +45,7 @@ fn spec_full(
         class: EffectClass::ReadOnly,
         kind,
         approval,
+        risk: RiskClass::Read,
         roles,
         min_tier,
         timeout: Duration::from_secs(5),
@@ -64,12 +68,7 @@ impl Tool for Echo {
 
     fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         let name = self.0.schema.name.clone();
-        Box::pin(async move {
-            ToolOutput {
-                content: format!("{name}:{args}"),
-                is_error: false,
-            }
-        })
+        Box::pin(async move { ToolOutput::ok(format!("{name}:{args}")) })
     }
 }
 
@@ -142,13 +141,175 @@ fn registry_filters_role_and_tier() {
 
 #[test]
 fn tool_output_round_trips() {
-    let o = ToolOutput {
-        content: "x".into(),
-        is_error: true,
-    };
+    let o = ToolOutput::error("x");
     let v = serde_json::to_value(&o).unwrap();
     assert_eq!(v, json!({"content": "x", "is_error": true}));
     assert_eq!(serde_json::from_value::<ToolOutput>(v).unwrap(), o);
+}
+
+#[test]
+fn bypass_allows_edit_and_exec() {
+    assert_eq!(
+        gate(RunMode::Bypass, &spec(ToolKind::Exec, Approval::Mode)),
+        Gate::Allow
+    );
+    assert_eq!(
+        gate(RunMode::Bypass, &spec(ToolKind::Edit, Approval::Mode)),
+        Gate::Allow
+    );
+    // Затем поправка инструмента, как прежде.
+    assert_eq!(
+        gate(RunMode::Bypass, &spec(ToolKind::Exec, Approval::Always)),
+        Gate::Ask
+    );
+}
+
+/// Квитанция R1-B (`{"content", "is_error"}`) читается; новый результат без признаков
+/// пишется так же (D75).
+#[test]
+fn tool_output_reads_r1b_receipt() {
+    let o: ToolOutput = serde_json::from_str(r#"{"content":"x","is_error":false}"#).unwrap();
+    assert_eq!(o, ToolOutput::ok("x"));
+    assert_eq!(
+        serde_json::to_string(&ToolOutput::ok("x")).unwrap(),
+        r#"{"content":"x","is_error":false}"#
+    );
+    let full = ToolOutput {
+        taint: Some(taint_origin::NETWORK.into()),
+        digest: Some("d".into()),
+        post: vec![
+            Postcondition::FileHash {
+                path: "a.txt".into(),
+                blake3: "ab".into(),
+            },
+            Postcondition::FileAbsent { path: "b".into() },
+        ],
+        ..ToolOutput::ok("x")
+    };
+    let v = serde_json::to_value(&full).unwrap();
+    assert_eq!(
+        v,
+        json!({"content": "x", "is_error": false, "taint": "network", "digest": "d",
+            "post": [{"kind": "file_hash", "path": "a.txt", "blake3": "ab"},
+                     {"kind": "file_absent", "path": "b"}]})
+    );
+    assert_eq!(serde_json::from_value::<ToolOutput>(v).unwrap(), full);
+}
+
+/// Умолчания трейта: предметов и текстов нет; классы риска упорядочены и в snake_case.
+#[test]
+fn tool_defaults_and_risk() {
+    let t = Echo(spec(ToolKind::Read, Approval::Mode));
+    assert_eq!(t.subjects(&json!({})), Subjects::default());
+    assert!(t.texts().is_empty());
+    assert!(
+        RiskClass::Read < RiskClass::LocalWrite && RiskClass::Irreversible < RiskClass::Publish
+    );
+    assert_eq!(
+        serde_json::to_value(RiskClass::LocalWrite).unwrap(),
+        json!("local_write")
+    );
+}
+
+#[test]
+fn protocol_strings_stable() {
+    assert_eq!(EventKind::BoundaryOutside.as_str(), "boundary.outside");
+    assert_eq!(EventKind::GrantAdded.as_str(), "grant.added");
+    assert_eq!(EventKind::CheckpointCreated.as_str(), "checkpoint.created");
+    assert_eq!(EventKind::FileChanged.as_str(), "file.changed");
+    assert_eq!(
+        serde_json::to_value(RunMode::Bypass).unwrap(),
+        json!("bypass")
+    );
+    assert_eq!(pause_reason_for(InterruptKind::Trust), "needs_trust");
+    assert_eq!(pause_reason::NEEDS_TRUST, "needs_trust");
+    assert_eq!(InterruptKind::Trust.as_str(), "trust");
+    let key = EffectKey::derive(RunId::new(), 1, 2);
+    let i = Interrupt::for_effect(InterruptKind::Trust, &key, json!({}));
+    assert_eq!(i.id, format!("trust-{}", key.0));
+    assert_eq!(
+        [
+            approval_reason::MODE,
+            approval_reason::RULE,
+            approval_reason::OUTSIDE_PROJECT,
+            approval_reason::TAINTED,
+            approval_reason::IRREVERSIBLE,
+            approval_reason::GRANT,
+        ],
+        [
+            "mode",
+            "rule",
+            "outside_project",
+            "tainted",
+            "irreversible",
+            "grant"
+        ]
+    );
+    assert_eq!(
+        [
+            deny_reason::PROTECTED_PATH,
+            deny_reason::POLICY_RULE,
+            deny_reason::UNTRUSTED_PROJECT
+        ],
+        ["protected path", "policy rule", "untrusted project"]
+    );
+    assert_eq!(
+        [
+            irreversible::DELETE,
+            irreversible::GIT_RESET,
+            irreversible::GIT_FORCE_PUSH,
+            irreversible::PUBLISH,
+            irreversible::INFRA,
+            irreversible::SQL_DROP,
+            irreversible::OVERWRITE,
+            irreversible::UNPARSED,
+        ],
+        [
+            "delete",
+            "git_reset",
+            "git_force_push",
+            "publish",
+            "infra",
+            "sql_drop",
+            "overwrite",
+            "unparsed"
+        ]
+    );
+    assert_eq!(
+        [
+            taint_origin::OUTSIDE_PROJECT,
+            taint_origin::UNTRUSTED_PROJECT,
+            taint_origin::NETWORK,
+            taint_origin::TOOL,
+        ],
+        ["outside_project", "untrusted_project", "network", "tool"]
+    );
+    assert_eq!(
+        [
+            checkpoint_kind::GIT,
+            checkpoint_kind::FILES,
+            checkpoint_kind::SKIPPED
+        ],
+        ["git", "files", "skipped"]
+    );
+    assert_eq!(
+        [
+            audit_action::APPROVAL_RESOLVED,
+            audit_action::GRANT_ADDED,
+            audit_action::TRUST_GRANTED,
+            audit_action::TRUST_REVOKED,
+            audit_action::POLICY_LOADED,
+            audit_action::CHECKPOINT_RESTORED,
+        ],
+        [
+            "approval.resolved",
+            "grant.added",
+            "trust.granted",
+            "trust.revoked",
+            "policy.loaded",
+            "checkpoint.restored",
+        ]
+    );
 }
 
 async fn store_with_run(name: &str) -> (ProjectStore, RunId) {

@@ -18,7 +18,8 @@ use za_agent::{
     run_metrics, start_run,
 };
 use za_core::{
-    Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
+    Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
+    ToolSpec,
 };
 use za_llm::{
     BackendKind, BoxFuture, ErrorClass, FinishReason, Message, ModelError, Part, Role,
@@ -50,12 +51,7 @@ impl Tool for Fixed {
 
     fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         let content = self.out.clone();
-        Box::pin(async move {
-            ToolOutput {
-                content,
-                is_error: false,
-            }
-        })
+        Box::pin(async move { ToolOutput::ok(content) })
     }
 }
 
@@ -70,6 +66,7 @@ fn tool(name: &str, out: &str) -> Arc<dyn Tool> {
             class: EffectClass::ReadOnly,
             kind: ToolKind::Read,
             approval: Approval::Mode,
+            risk: RiskClass::Read,
             roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
             min_tier: Tier::Small,
             timeout: Duration::from_secs(600),

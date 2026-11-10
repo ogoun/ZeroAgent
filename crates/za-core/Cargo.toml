@@ -22,6 +22,12 @@ thiserror.workspace = true
 # `sync`: `broadcast` шины событий run (`EventBus`, D35).
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
+# Сверка открытого дескриптора с каноническим путём (D98).
+same-file.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW` у `paths::open_checked` (D98).
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

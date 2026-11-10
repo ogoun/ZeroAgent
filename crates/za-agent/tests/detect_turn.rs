@@ -19,8 +19,8 @@ use za_agent::{
     control_channel, promise_without_action, resume_run, start_run,
 };
 use za_core::{
-    AgentEvent, Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
-    ToolSpec,
+    AgentEvent, Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput,
+    ToolRegistry, ToolSpec,
 };
 use za_llm::{
     BackendKind, BoxFuture, EndpointId, FinishReason, Message, ModelCall, ModelError, ModelPort,
@@ -490,18 +490,9 @@ impl Tool for Probe {
 
     fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         let out = match self.spec.schema.name.as_str() {
-            "bash" => ToolOutput {
-                content: format!("exit 1: {}", args["cmd"]),
-                is_error: true,
-            },
-            "fail" => ToolOutput {
-                content: format!("no such file {}", args["p"]),
-                is_error: true,
-            },
-            _ => ToolOutput {
-                content: format!("content of {}", args["p"]),
-                is_error: false,
-            },
+            "bash" => ToolOutput::error(format!("exit 1: {}", args["cmd"])),
+            "fail" => ToolOutput::error(format!("no such file {}", args["p"])),
+            _ => ToolOutput::ok(format!("content of {}", args["p"])),
         };
         Box::pin(async move { out })
     }
@@ -518,6 +509,11 @@ fn spec_of(name: &str, kind: ToolKind, class: EffectClass) -> ToolSpec {
         kind,
         // Запуск без одобрения в режиме Ask.
         approval: Approval::Never,
+        risk: match kind {
+            ToolKind::Edit => RiskClass::LocalWrite,
+            ToolKind::Exec => RiskClass::Exec,
+            _ => RiskClass::Read,
+        },
         roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
         min_tier: Tier::Small,
         timeout: Duration::from_secs(60),

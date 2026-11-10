@@ -17,6 +17,10 @@ pub enum RunMode {
     AcceptEdits,
     /// Без одобрений.
     Auto,
+    /// Без одобрений режима и меток недоверенного содержимого (R1-C1 D80): разрешён
+    /// только при `[policy] allow_bypass = true` глобального конфига. Защищённые пути,
+    /// правила `deny`, необратимые команды и доступ вне проекта он не снимает.
+    Bypass,
 }
 
 /// Тир модели: определяет бюджет промпта и уровень мышления.
@@ -71,6 +75,7 @@ mod tests {
             "read-only"
         );
         assert_eq!(RunMode::default(), RunMode::Ask);
+        assert_eq!(serde_json::to_value(RunMode::Bypass).unwrap(), "bypass");
     }
 
     #[test]
