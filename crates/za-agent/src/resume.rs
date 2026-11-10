@@ -328,6 +328,7 @@ async fn restore(
         user_inputs,
         epoch: snap.epoch,
         last_next_step: snap.last_next_step,
+        detectors: snap.detectors,
     })
 }
 

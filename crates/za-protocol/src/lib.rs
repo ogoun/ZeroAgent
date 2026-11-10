@@ -17,4 +17,4 @@ pub use event::{Actor, Event, EventKind, NewEvent, SCHEMA_V};
 pub use ids::{BlobHash, EventId, RunId, Seq};
 pub use mode::{RunMode, Tier};
 pub use resource::Priority;
-pub use run::{RunRole, RunStatus, fail_reason, pause_reason};
+pub use run::{RunRole, RunStatus, detector, fail_reason, pause_reason};

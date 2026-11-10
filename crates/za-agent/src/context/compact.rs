@@ -103,6 +103,17 @@ fn clip(text: &str, budget: u32) -> String {
     format!("{}{CLIPPED}", &text[..end])
 }
 
+/// Рецитация задачи run (R1-B2 D55: после nudge цикла): управляющее сообщение
+/// `reminder` с текстом `Current task: <задача>`, задача — в пределах 25 % окна.
+pub(crate) fn recite_task(task: &str, n_ctx: u32) -> String {
+    render_control(
+        ControlFrom::Runtime,
+        ControlAction::Reminder,
+        "",
+        &format!("{RECITATION}{}", clip(task, n_ctx / USER_MESSAGES_DIVISOR)),
+    )
+}
+
 /// Вводы для сводки в пределах `budget` токенов (байты / 4): с новых к старым, пока
 /// помещаются; выпавшие старые — строка `[N earlier user messages omitted]` в начале
 /// списка. Цель в бюджет не входит и всегда остаётся целиком.

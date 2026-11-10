@@ -17,13 +17,15 @@
 //! D4–D6, CORE-006, CORE-110), контекст модели ([`ContextBudget`], [`output_plan`],
 //! [`ContextMeter`], раздел [`ContextConfig`], выгрузка вывода [`spill`] и удаление
 //! старых результатов [`prune`], компакция [`compact`], R1-B2 D40–D50, D65, D66),
-//! инспектор запроса хода [`inspect`] и метрики run [`run_metrics`] (D52, D53). Модель
+//! инспектор запроса хода [`inspect`] и метрики run [`run_metrics`] (D52, D53), детекторы
+//! повтора, цикла и застоя [`DetectorState`] (D54–D56). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod budget;
 mod context;
 mod control;
 mod conversation;
+mod detect;
 mod driver;
 mod exit;
 mod inspect;
@@ -44,6 +46,10 @@ pub use context::{
 };
 pub use control::{ControlRx, InputMode, RunControl, control_channel, submit_input};
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted, cut_points, split_tail};
+pub use detect::{
+    CYCLE_NUDGE, DetectorState, REPEAT_MARK, REPEAT_NUDGE, REPEAT_REJECT, Reaction,
+    call_fingerprint,
+};
 pub use driver::{CrashHook, CrashPoint, LoopDeps, LoopError, LoopOutcome, RunSpec, start_run};
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 pub use inspect::{BlockCost, InspectError, Inspection, RunMetrics, inspect, run_metrics};

@@ -875,7 +875,7 @@ fn texts(m: &Message) -> Vec<String> {
 fn reject_text(v: &CallVerdict) -> &str {
     match v {
         CallVerdict::Reject(s) => s,
-        CallVerdict::Run => panic!("ожидался отказ"),
+        CallVerdict::Run | CallVerdict::Reuse(_) => panic!("ожидался отказ"),
     }
 }
 

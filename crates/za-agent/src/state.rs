@@ -13,6 +13,7 @@ use za_protocol::{BlobHash, Budget, BudgetKind, EffectClass, RunId, RunMode, Run
 
 use crate::context::{ContextMeter, UserInput};
 use crate::conversation::Conversation;
+use crate::detect::DetectorState;
 use crate::exit::LoopExit;
 use crate::request::{FrozenPrefix, RunSetup};
 use crate::tools::FinishArgs;
@@ -77,6 +78,9 @@ pub struct Snapshot {
     /// перед следующей компакцией.
     #[serde(default)]
     pub last_next_step: String,
+    /// Состояние детекторов повтора, цикла и застоя (D54–D56).
+    #[serde(default)]
+    pub detectors: DetectorState,
 }
 
 /// Счётчики цикла, переживающие resume.
@@ -168,6 +172,8 @@ pub struct LoopState {
     pub epoch: u32,
     /// Раздел `## Next step` последней сводки компакции (D50).
     pub last_next_step: String,
+    /// Состояние детекторов (D54–D56).
+    pub detectors: DetectorState,
 }
 
 impl LoopState {
@@ -193,6 +199,7 @@ impl LoopState {
             user_inputs: self.user_inputs.clone(),
             epoch: self.epoch,
             last_next_step: self.last_next_step.clone(),
+            detectors: self.detectors.clone(),
         }
     }
 }

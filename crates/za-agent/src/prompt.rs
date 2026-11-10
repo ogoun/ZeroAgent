@@ -111,6 +111,10 @@ const RUNTIME_TEXTS: &[(&str, &str)] = &[
         "runtime/conversation.interrupted",
         crate::conversation::INTERRUPTED,
     ),
+    ("runtime/detect.cycle_nudge", crate::detect::CYCLE_NUDGE),
+    ("runtime/detect.repeat_mark", crate::detect::REPEAT_MARK),
+    ("runtime/detect.repeat_nudge", crate::detect::REPEAT_NUDGE),
+    ("runtime/detect.repeat_reject", crate::detect::REPEAT_REJECT),
     (
         "runtime/driver.empty_nudge_subagent",
         crate::driver::EMPTY_NUDGE_SUBAGENT,

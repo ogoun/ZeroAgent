@@ -13,6 +13,8 @@
 //! D70), `persist`, `turn.started`, снимок `Model` на его `seq`. Ход получает лимит
 //! вывода из [`crate::output_plan`] (R1-B2 D40); после хода — проверка тихой обрезки
 //! (R1-B2 D43); `ContextOverflow` хода — аварийная компакция и один повтор (R1-B2 D49).
+//! Детекторы (R1-B2 D54–D56, [`crate::DetectorState`]): до пакета вызовов — повтор,
+//! отказ или `blocked`; после результатов хода — nudge цикла с рецитацией или `blocked`.
 //!
 //! Чистая пауза (D5): событие шага, снимок `{next: Boundary, exit: Some}` на `seq`
 //! этого события, затем статус. Конечные состояния после записи статуса вызывают
@@ -37,24 +39,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use za_core::{
     Capability, EffectError, EffectSpec, Exit, Graph, GraphError, Journal, Node, NodeId, RunCtx,
-    ToolRegistry, Transition, pause_reason_for,
+    ToolKind, ToolRegistry, Transition, pause_reason_for,
 };
 use za_llm::{
-    BoxFuture, EndpointId, ErrorClass, FinishReason, ModelCall, ModelPort, RequestMeta, ToolChoice,
+    BoxFuture, EndpointId, ErrorClass, FinishReason, ModelCall, ModelPort, Part, RequestMeta,
+    ToolChoice,
 };
 use za_protocol::{
-    Actor, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId, RunMode, RunRole,
-    RunStatus, Seq, Tier, canonical_json, fail_reason, pause_reason,
+    Actor, BlobHash, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId,
+    RunMode, RunRole, RunStatus, Seq, Tier, canonical_json, detector, fail_reason, pause_reason,
 };
 use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
 use crate::budget::{Spent, budget_number, check_budget};
 use crate::context::{
     CompactInput, ContextBudget, ContextConfig, Estimate, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES,
-    SpillCfg, UserInput, compact, output_plan, prune, rubric_tokens, truncation_suspected,
+    SpillCfg, UserInput, compact, output_plan, prune, recite_task, rubric_tokens,
+    truncation_suspected,
 };
 use crate::control::ControlRx;
 use crate::conversation::{Conversation, HistoryError};
+use crate::detect::{CYCLE_NUDGE, DetectorState, REPEAT_MARK, REPEAT_REJECT, Reaction};
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
 use crate::prompt::{
@@ -68,8 +73,8 @@ use crate::resume::state_block;
 use crate::state::{AtBoundary, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools};
 use crate::turn::{
-    CallKind, CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, RequestRefs, Reviewed, Signal,
-    TurnError, TurnOutput, model_call, report_parse_errors, review,
+    CallKind, CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed,
+    Signal, TurnError, TurnOutput, model_call, report_parse_errors, review,
 };
 
 /// Точки «сбоя» для тестов и --crash-at (D33).
@@ -398,6 +403,7 @@ async fn step_zero(
         user_inputs: Vec::new(),
         epoch: 0,
         last_next_step: String::new(),
+        detectors: DetectorState::default(),
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
@@ -1733,10 +1739,18 @@ async fn model_output(
 
 async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopError> {
     let deps = &sh.deps;
-    let rev = st
+    let mut rev = st
         .reviewed
         .take()
         .ok_or_else(|| LoopError::Graph("узел tools без ответа модели".into()))?;
+    // Детектор повтора до пакета (R1-B2 D54): повтор, отказ или блокировка run.
+    let screened = screen_calls(sh, st, &mut rev.calls).await?;
+    if let Some(d) = screened.block {
+        tracing::warn!(run = %st.run, turn = st.turn, detector = d, "детектор повтора: run blocked");
+        loop_detected(deps, st, d, "block").await?;
+        st.conv.close_interrupted();
+        return finish_with(st, RunStatus::Blocked);
+    }
     let env = ToolEnv {
         run: st.run,
         project_dir: st.setup.project_dir.clone(),
@@ -1809,7 +1823,18 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         finish,
         ..
     } = out;
+    // Детекторы после результатов хода (D55, D56) — когда ход доходит до границы.
+    let facts = match verdict {
+        ToolsVerdict::Next { .. } | ToolsVerdict::Pause => {
+            Some(results_facts(sh, &results, &screened.subjects).await?)
+        }
+        _ => None,
+    };
     st.conv.push_results(results)?;
+    let reaction = match facts {
+        Some(f) => st.detectors.on_results(st.turn, &f, false),
+        None => Reaction::None,
+    };
     match verdict {
         ToolsVerdict::Finish(status) => {
             // Синтетические результаты — только вызовам без результата (CORE-105).
@@ -1835,14 +1860,194 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             }
             // Nudge — отдельными сообщениями после результатов (D23).
             push_nudges(st, &rev.nudges)?;
+            if let Some(t) = apply_detected(deps, st, &screened.nudges, reaction).await? {
+                return Ok(t);
+            }
             Ok(Transition::Goto(BOUNDARY))
         }
         ToolsVerdict::Pause => {
             st.conv.close_interrupted();
             push_nudges(st, &rev.nudges)?;
+            if let Some(t) = apply_detected(deps, st, &screened.nudges, reaction).await? {
+                return Ok(t);
+            }
             command_pause(sh, st).await
         }
     }
+}
+
+// ---- Детекторы повтора, цикла и застоя (R1-B2 D54–D56) ----
+
+/// Итог детектора повтора до пакета.
+#[derive(Debug, Default)]
+struct Screened {
+    /// Исполняемые вызовы (класс по имени): их результаты — факты хода. Повтор и
+    /// отказ детектора новых фактов не дают и в `on_results` не идут.
+    subjects: BTreeMap<String, ToolKind>,
+    /// Nudge детектора повтора: после результатов хода.
+    nudges: Vec<String>,
+    /// Детектор, заблокировавший run.
+    block: Option<&'static str>,
+}
+
+/// D54: реакции детектора повтора на вызовы, допущенные разбором ответа.
+///
+/// `ReusePrevious` — `CallVerdict::Reuse` с прошлым результатом из блоба. Блоб
+/// адресован содержимым и не меняется, поэтому его чтение при реплее даёт тот же
+/// текст (как чтение истории при resume), а не новое внешнее значение (D30). Блоба
+/// нет — отказ `REPEAT_REJECT`.
+async fn screen_calls(
+    sh: &Shared,
+    st: &mut LoopState,
+    calls: &mut [PlannedCall],
+) -> Result<Screened, LoopError> {
+    let mut out = Screened::default();
+    let idx: Vec<usize> = (0..calls.len())
+        .filter(|&i| calls[i].verdict == CallVerdict::Run)
+        .collect();
+    if idx.is_empty() {
+        return Ok(out);
+    }
+    let input: Vec<(String, String, Value)> = idx
+        .iter()
+        .map(|&i| {
+            let c = &calls[i].call;
+            (c.id.clone(), c.name.clone(), c.arguments.clone())
+        })
+        .collect();
+    let reactions = st.detectors.on_calls(st.turn, &input);
+    let store = store_of(&sh.deps);
+    for (k, r) in reactions.into_iter().enumerate() {
+        match (r, idx.get(k).copied()) {
+            (Reaction::None, _) => {}
+            (Reaction::ReusePrevious { result, .. }, Some(i)) => {
+                let (verdict, action) = match store.get_blob(&result).await? {
+                    Some(raw) => (
+                        CallVerdict::Reuse(format!(
+                            "{REPEAT_MARK}\n{}",
+                            String::from_utf8_lossy(&raw)
+                        )),
+                        "reuse",
+                    ),
+                    None => {
+                        tracing::warn!(run = %st.run, blob = %result.0,
+                            "прошлого результата повтора нет: отказ вместо повтора");
+                        (CallVerdict::Reject(REPEAT_REJECT.to_owned()), "reject")
+                    }
+                };
+                calls[i].verdict = verdict;
+                loop_detected(&sh.deps, st, detector::REPEAT, action).await?;
+            }
+            (Reaction::Reject(text), Some(i)) => {
+                calls[i].verdict = CallVerdict::Reject(text);
+                loop_detected(&sh.deps, st, detector::REPEAT, "reject").await?;
+            }
+            (Reaction::Block(d), _) => out.block = Some(d),
+            (Reaction::Nudge(text), _) => {
+                loop_detected(&sh.deps, st, detector::REPEAT, "nudge").await?;
+                out.nudges.push(text);
+            }
+            (other, _) => {
+                tracing::error!(run = %st.run, reaction = ?other,
+                    "реакция детектора не применяется до пакета");
+            }
+        }
+    }
+    for &i in &idx {
+        let c = &calls[i];
+        if c.verdict == CallVerdict::Run {
+            let kind = sh
+                .registry
+                .get(&c.call.name)
+                .map_or(ToolKind::Read, |t| t.spec().kind);
+            out.subjects.insert(c.call.id.clone(), kind);
+        }
+    }
+    Ok(out)
+}
+
+/// Факты хода для `on_results`: результаты исполняемых вызовов с хэшем блоба
+/// содержимого. Блоб пишется здесь (`put_blob` идемпотентен, адрес — содержимое): он
+/// нужен повтору D54 и записан раньше снимка, который хранит его хэш.
+async fn results_facts(
+    sh: &Shared,
+    results: &[Part],
+    subjects: &BTreeMap<String, ToolKind>,
+) -> Result<Vec<(String, ToolKind, bool, BlobHash)>, LoopError> {
+    let store = store_of(&sh.deps);
+    let mut facts = Vec::new();
+    for p in results {
+        let Part::ToolResult {
+            call_id,
+            content,
+            is_error,
+        } = p
+        else {
+            continue;
+        };
+        if let Some(kind) = subjects.get(call_id) {
+            let hash = store.put_blob(content.as_bytes()).await?;
+            facts.push((call_id.clone(), *kind, *is_error, hash));
+        }
+    }
+    Ok(facts)
+}
+
+/// Реакции хода после результатов: nudge повтора (D54), цикл (D55), застой (D56).
+/// `Some` — выход вместо границы. После nudge цикла — рецитация задачи (D55).
+async fn apply_detected(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    repeat_nudges: &[String],
+    reaction: Reaction,
+) -> Result<Option<Transition>, LoopError> {
+    push_nudges(st, repeat_nudges)?;
+    match reaction {
+        Reaction::None => Ok(None),
+        Reaction::Nudge(text) => {
+            let cycle = text == CYCLE_NUDGE;
+            let d = if cycle {
+                detector::CYCLE
+            } else {
+                detector::REPEAT
+            };
+            tracing::info!(run = %st.run, turn = st.turn, detector = d, "детектор: nudge");
+            loop_detected(deps, st, d, "nudge").await?;
+            push_nudges(st, &[text])?;
+            if cycle {
+                st.conv.push_user(recite_task(&st.task, st.setup.n_ctx))?;
+            }
+            Ok(None)
+        }
+        Reaction::Block(d) => {
+            tracing::warn!(run = %st.run, turn = st.turn, detector = d, "детектор: run blocked");
+            loop_detected(deps, st, d, "block").await?;
+            finish_with(st, RunStatus::Blocked).map(Some)
+        }
+        other => {
+            tracing::error!(run = %st.run, reaction = ?other,
+                "реакция детектора не применяется после хода");
+            Ok(None)
+        }
+    }
+}
+
+/// `loop.detected {detector, action, turn}` (D63).
+async fn loop_detected(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    detector: &str,
+    action: &str,
+) -> Result<(), StoreError> {
+    st.last_seq = append(
+        &deps.journal,
+        st.run,
+        Actor::Runtime,
+        EventKind::LoopDetected,
+        json!({ "detector": detector, "action": action, "turn": st.turn }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Что делать после пакета вызовов.

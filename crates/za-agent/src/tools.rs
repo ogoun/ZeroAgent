@@ -6,7 +6,8 @@
 //! `parallel` выполняются одновременно в `JoinSet`, любой другой вызов — барьер.
 //!
 //! Вызов, отклонённый разбором ответа ([`CallVerdict::Reject`]) или гейтом режима
-//! ([`gate`]), слот не запускает: результат-ошибка без эффекта. Вызов, требующий
+//! ([`gate`]), слот не запускает: результат-ошибка без эффекта. Повтор
+//! ([`CallVerdict::Reuse`], R1-B2 D54) — тоже без эффекта: результат — готовый текст. Вызов, требующий
 //! одобрения, и `ask_user` перед слотом читают состояние прерывания (исключение
 //! D30: `open → resolved` необратимо): решения нет — прерывание открывается и пакет
 //! возвращает `suspend`.
@@ -143,6 +144,8 @@ struct Executed {
 enum Plan {
     /// Результат без эффекта: отказ разбора, гейта, неизвестный инструмент.
     Immediate(String),
+    /// Результат без эффекта и без ошибки: прошлый результат повторного вызова (D54).
+    Reused(String),
     /// Разрешённый вызов; `parallel` — можно в группу одновременных чтений.
     Run {
         tool: Arc<dyn Tool>,
@@ -217,6 +220,11 @@ pub async fn run_tools(
         let action = match &plans[i] {
             Plan::Immediate(text) => {
                 out.results.push(result(call, text.clone(), true));
+                i += 1;
+                continue;
+            }
+            Plan::Reused(text) => {
+                out.results.push(result(call, text.clone(), false));
                 i += 1;
                 continue;
             }
@@ -302,8 +310,11 @@ pub async fn run_tools(
 
 /// Решение по вызову без обращения к журналу.
 fn plan(reg: &ToolRegistry, mode: RunMode, pc: &PlannedCall) -> Plan {
-    if let CallVerdict::Reject(text) = &pc.verdict {
-        return Plan::Immediate(text.clone());
+    match &pc.verdict {
+        CallVerdict::Reject(text) => return Plan::Immediate(text.clone()),
+        // Повтор не исполняется и не проходит гейт: ничего не делается (D54).
+        CallVerdict::Reuse(text) => return Plan::Reused(text.clone()),
+        CallVerdict::Run => {}
     }
     let call = &pc.call;
     let Some(tool) = reg.get(&call.name) else {
