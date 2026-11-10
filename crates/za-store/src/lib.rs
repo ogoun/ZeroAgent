@@ -173,6 +173,10 @@ pub struct StoreOptions {
     pub max_page_count: Option<u64>,
     /// Надёжность фиксации по умолчанию; [`ProjectStore::append_durable`] всегда `Full`.
     pub durability: Durability,
+    /// Только тесты сбоя (`crash_writer --abort-in-migration`): аварийно завершить
+    /// процесс посреди миграции этой версии — после её SQL, до COMMIT.
+    #[doc(hidden)]
+    pub abort_in_migration: Option<u32>,
 }
 
 /// Хранилище проекта. Клонирование дешёвое: все клоны делят потоки и соединения.
@@ -241,7 +245,7 @@ impl ProjectStore {
         let path = dir.join(DB_FILE);
         let mut conn = Connection::open(&path)?;
         writer::configure(&conn, opts.durability)?;
-        migrate::migrate(&mut conn)?;
+        migrate::migrate_with(&mut conn, opts.abort_in_migration)?;
         if let Some(n) = opts.max_page_count {
             let n = i64::try_from(n).unwrap_or(i64::MAX);
             conn.pragma_update(None, "max_page_count", n)?;

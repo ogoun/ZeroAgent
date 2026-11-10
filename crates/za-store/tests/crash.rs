@@ -5,8 +5,8 @@
 //! SIGKILL на Linux, TerminateProcess на Windows), открывает журнал заново
 //! и проверяет, что все напечатанные `seq` на месте. В режиме `--audit` писатель
 //! добавляет записи аудита (R1-C1 D91): после убийства цепочка цела, подтверждённые
-//! записи на месте; первый раунд идёт по копии журнала R1-B1 (схема 2), поэтому
-//! убийство может попасть и в миграцию 3.
+//! записи на месте. Сбой посреди миграции 3 проверяется детерминированно: писатель с
+//! `--abort-in-migration 3` аварийно завершается после SQL миграции, до COMMIT.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
@@ -176,9 +176,8 @@ fn acknowledged_durable_events_survive_kill() {
 
 /// Записи аудита переживают `kill -9`: после каждого убийства цепочка цела (без
 /// разрыва), подтверждённые записи на месте, `seq` идут подряд с 1. Журнал общий для
-/// всех раундов, цепочка продолжается через сбои. Первый раунд начинается с журнала
-/// R1-B1 схемы 2 и убивается без ожидания подтверждений: сбой может прийтись на
-/// миграцию 3, которая идёт одной транзакцией.
+/// всех раундов, цепочка продолжается через сбои. Журнал — копия golden R1-B1 схемы 2:
+/// миграцию 3 делает первый раунд.
 #[test]
 fn audit_chain_survives_kill() {
     let d = dir("crash-audit");
@@ -191,13 +190,7 @@ fn audit_chain_survives_kill() {
     let mut acked_all: Vec<u64> = Vec::new();
     for round in 0..12u64 {
         let mut w = spawn_writer(&d, Mode::Audit);
-        let mut acked = if round < 2 {
-            // Сразу после запуска: открытие и миграция ещё идут.
-            std::thread::sleep(Duration::from_millis(5 + round * 20));
-            Vec::new()
-        } else {
-            read_seqs_for(&mut w, Duration::from_millis(30 + round * 23))
-        };
+        let mut acked = read_seqs_for(&mut w, Duration::from_millis(30 + round * 23));
         kill(&mut w, &mut acked);
         acked_all.extend(acked.iter().map(|q| q.0));
         let s = open_after_kill(&d);
@@ -227,4 +220,61 @@ fn audit_chain_survives_kill() {
         !acked_all.is_empty(),
         "писатель не подтвердил ни одной записи"
     );
+}
+
+/// Сбой посреди миграции 3 (ревью задачи 4, m5) — детерминированно: писатель
+/// `--abort-in-migration 3` по копии журнала R1-B1 (схема 2) аварийно завершается после
+/// SQL миграции, до COMMIT. Журнал остаётся схемы 2 без таблицы `audit`; следующее
+/// открытие доводит его до 3, события на месте, аудит пишется и проверяется.
+#[test]
+fn abort_inside_migration_3_leaves_schema_2() {
+    let d = dir("crash-migration");
+    let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../za-agent/tests/golden/r1b1_v1/approval/store/journal.db");
+    std::fs::copy(golden, d.join("journal.db")).unwrap();
+    let raw = |d: &Path| {
+        let c = rusqlite::Connection::open(d.join("journal.db")).unwrap();
+        let v: u32 = c
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        let audit: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'audit'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let events: i64 = c
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        (v, audit, events)
+    };
+    let (_, _, events_before) = raw(&d);
+    let out = Command::new(env!("CARGO_BIN_EXE_crash_writer"))
+        .arg(&d)
+        .arg("--abort-in-migration")
+        .arg("3")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "писатель не упал: {out:?}");
+    assert!(out.stdout.is_empty(), "писатель успел записать: {out:?}");
+    assert_eq!(raw(&d), (2, 0, events_before), "миграция оставила следы");
+
+    let s = open_after_kill(&d);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert_eq!(raw(&d).0, 3);
+    assert_eq!(raw(&d).2, events_before);
+    let a = rt
+        .block_on(s.append_audit(za_store::AuditNew {
+            actor: "user".into(),
+            action: "grant.added".into(),
+            target: "/x".into(),
+            payload: serde_json::json!({}),
+        }))
+        .unwrap();
+    assert_eq!(a.seq, 1);
+    assert_eq!(rt.block_on(s.verify_audit()).unwrap(), Ok(()));
 }

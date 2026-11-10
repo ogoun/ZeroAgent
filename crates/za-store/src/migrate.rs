@@ -18,7 +18,14 @@ pub(crate) fn latest() -> u32 {
 }
 
 /// Доводит схему до последней версии.
+#[cfg(test)]
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+    migrate_with(conn, None)
+}
+
+/// Доводит схему до последней версии; `abort_at` — тестовая точка сбоя: процесс
+/// аварийно завершается после SQL миграции этой версии, до COMMIT.
+pub(crate) fn migrate_with(conn: &mut Connection, abort_at: Option<u32>) -> Result<(), StoreError> {
     let current: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if current > latest() {
         return Err(StoreError::SchemaTooNew {
@@ -30,6 +37,10 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", version)?;
+        if abort_at == Some(*version) {
+            tracing::error!(version, "тестовый сбой посреди миграции");
+            std::process::abort();
+        }
         tx.commit()?;
         tracing::info!(version, "миграция журнала применена");
     }

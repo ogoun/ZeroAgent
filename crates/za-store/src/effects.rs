@@ -342,7 +342,7 @@ pub(crate) fn resolve_in(
         .optional()?
         .ok_or_else(|| StoreError::UnknownInterrupt(id.to_owned()))?;
     let n = c.execute(
-        "UPDATE interrupts SET status = ?1, response = ?2          WHERE id = ?3 AND status = ?4",
+        "UPDATE interrupts SET status = ?1, response = ?2 WHERE id = ?3 AND status = ?4",
         params![
             INTERRUPT_RESOLVED,
             canonical_json(&response),

@@ -1,12 +1,13 @@
 //! Тестовый писатель для проверки устойчивости журнала к `kill -9`
 //! (`tests/crash.rs`). Не для использования вне тестов.
 //!
-//! `crash_writer <dir> [--durable | --audit]`: открывает журнал в `<dir>` и бесконечно
+//! `crash_writer <dir> [--durable | --audit | --abort-in-migration N]`: открывает журнал в `<dir>` и бесконечно
 //! пишет события из нескольких потоков (чтобы убийство попадало и в середину
 //! group commit). После подтверждения каждого события печатает его `seq`
 //! отдельной строкой и сразу сбрасывает stdout. С `--durable` пишет через
 //! `append_durable`, с `--audit` — записи аудита (`append_audit`, R1-C1 D91) и печатает
-//! их `seq`.
+//! их `seq`. С `--abort-in-migration N` процесс аварийно завершается посреди миграции
+//! схемы версии N (после её SQL, до COMMIT) и ничего не пишет.
 
 use std::future::Future;
 use std::io::Write;
@@ -19,7 +20,7 @@ use std::thread::{self, Thread};
 
 use serde_json::json;
 use za_protocol::{Actor, EventKind, NewEvent, RunId};
-use za_store::{AuditNew, ProjectStore, StoreError};
+use za_store::{AuditNew, ProjectStore, StoreError, StoreOptions};
 
 /// Число параллельных потоков-клиентов.
 const CLIENTS: usize = 4;
@@ -35,11 +36,22 @@ enum Mode {
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     let Some(dir) = args.next().map(PathBuf::from) else {
-        eprintln!("использование: crash_writer <dir> [--durable | --audit]");
+        eprintln!(
+            "использование: crash_writer <dir> [--durable | --audit | --abort-in-migration N]"
+        );
         return ExitCode::from(2);
     };
+    let mut opts = StoreOptions::default();
     let mode = match args.next() {
         None => Mode::Events,
+        Some(a) if a == "--abort-in-migration" => {
+            let Some(v) = args.next().and_then(|v| v.to_str()?.parse().ok()) else {
+                eprintln!("crash_writer: --abort-in-migration ждёт номер версии");
+                return ExitCode::from(2);
+            };
+            opts.abort_in_migration = Some(v);
+            Mode::Events
+        }
         Some(a) if a == "--durable" => Mode::Durable,
         Some(a) if a == "--audit" => Mode::Audit,
         Some(a) => {
@@ -47,7 +59,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let store = match ProjectStore::open(&dir) {
+    let store = match ProjectStore::open_with(&dir, opts) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("crash_writer: {e}");

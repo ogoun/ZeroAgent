@@ -796,6 +796,21 @@ async fn audit_chain_links_and_verifies() {
     assert_eq!(s.last_audit("approval.").await.unwrap(), None);
 }
 
+/// Голова цепочки — якорь против удаления хвоста (m1): `(seq, hash)` последней записи.
+#[tokio::test]
+async fn audit_head_is_last_entry() {
+    let s = open("audit-head");
+    assert_eq!(s.audit_head().await.unwrap(), None);
+    s.append_audit(n("user", "grant.added", "/x", json!({})))
+        .await
+        .unwrap();
+    let b = s
+        .append_audit(n("user", "trust.revoked", "/p", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(s.audit_head().await.unwrap(), Some((2, b.hash)));
+}
+
 /// Хэш записи считается по формуле D91: BLAKE3 от `prev_hash`, нулевого байта и
 /// канонического JSON полей записи.
 #[tokio::test]

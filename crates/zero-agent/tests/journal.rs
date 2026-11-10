@@ -225,11 +225,12 @@ fn answer_writes_approval_audit() {
 fn answer_trust_records_trust_in_audit() {
     let e = env("answer-trust");
     std::fs::write(e.project.join("AGENTS.md"), "правила проекта").unwrap();
+    // Показанный набор — текущий: хэш набора в payload прерывания (m2).
+    let shown = zero_agent::trust::trust_set(&e.project).unwrap();
     with_run(&e, async |s, run| {
         for id in ["trust-a", "trust-b"] {
-            s.open_interrupt(id, run, "trust", json!({"files": {}}))
-                .await
-                .unwrap();
+            let p = json!({"files": shown.files, "set_hash": shown.hash()});
+            s.open_interrupt(id, run, "trust", p).await.unwrap();
         }
     });
     let wrong = e.run(&[
@@ -271,11 +272,24 @@ fn answer_trust_records_trust_in_audit() {
     );
     drop(s);
 
-    let d = answer(&e, "trust-b", "--deny");
+    // Отказ с заметкой: заметка и в ответе, и в аудите (m7).
+    let d = e.run(&[
+        "answer",
+        "--project",
+        e.project_arg(),
+        "--interrupt",
+        "trust-b",
+        "--deny",
+        "--note",
+        "чужой репозиторий",
+    ]);
     assert_eq!(d.code(), Some(0), "{d:?}");
     let s = e.store();
     let row = rt.block_on(s.interrupt("trust-b")).unwrap().unwrap();
-    assert_eq!(row.response, Some(json!({"trusted": false})));
+    assert_eq!(
+        row.response,
+        Some(json!({"trusted": false, "note": "чужой репозиторий"}))
+    );
     let all = rt.block_on(s.audit_entries(0, 10)).unwrap();
     assert_eq!(all.len(), 3);
     assert_eq!(
@@ -283,33 +297,94 @@ fn answer_trust_records_trust_in_audit() {
         ("approval.resolved", "trust-b")
     );
     assert_eq!(all[2].payload["approved"], json!(false));
+    assert_eq!(all[2].payload["note"], json!("чужой репозиторий"));
     assert_eq!(rt.block_on(s.verify_audit()).unwrap(), Ok(()));
 }
 
+/// m2: набор доверенных файлов изменился между вопросом и ответом — доверие не
+/// записывается, открывается новое прерывание с текущим набором (код 3), старое закрыто
+/// ссылкой на новое. Ответ на новое записывает доверие.
 #[test]
-fn locked_journal_message() {
-    let e = env("locked");
-    let (run, ()) = with_run(&e, async |_, _| ());
-    // Журнал держит «запущенный run» — открытое хранилище этого процесса.
-    let _held = e.store();
-    let run = run.to_string();
-    for args in [
-        vec!["audit", "--project", e.project_arg()],
-        vec![
-            "journal",
-            "export",
-            "--project",
-            e.project_arg(),
-            "--run",
-            &run,
-        ],
+fn trust_set_changed_after_question_asks_again() {
+    let e = env("trust-changed");
+    std::fs::write(e.project.join("AGENTS.md"), "до вопроса").unwrap();
+    let shown = zero_agent::trust::trust_set(&e.project).unwrap();
+    with_run(&e, async |s, run| {
+        let p = json!({"files": shown.files, "set_hash": shown.hash()});
+        s.open_interrupt("trust-c", run, "trust", p).await.unwrap();
+    });
+    std::fs::write(e.project.join("AGENTS.md"), "после вопроса").unwrap();
+    let o = answer(&e, "trust-c", "--approve");
+    assert_eq!(o.code(), Some(3), "{o:?}");
+    assert!(o.stderr.contains("изменились"), "{o:?}");
+    let now = zero_agent::trust::trust_set(&e.project).unwrap();
+    let new_id = format!("trust-c-set{}", &now.hash()[..16]);
+    assert!(o.stderr.contains(&new_id), "{o:?}");
+    let rt = rt();
+    let s = e.store();
+    assert_eq!(rt.block_on(s.last_audit("trust.")).unwrap(), None);
+    let old = rt.block_on(s.interrupt("trust-c")).unwrap().unwrap();
+    assert_eq!(old.response, Some(json!({"superseded_by": new_id})));
+    let fresh = rt.block_on(s.interrupt(&new_id)).unwrap().unwrap();
+    assert_eq!(fresh.kind, "trust");
+    assert_eq!(
+        fresh.payload.as_ref().unwrap()["set_hash"],
+        json!(now.hash())
+    );
+    drop(s);
+    let ok = answer(&e, &new_id, "--approve");
+    assert_eq!(ok.code(), Some(0), "{ok:?}");
+    let s = e.store();
+    let g = rt.block_on(s.last_audit("trust.")).unwrap().unwrap();
+    assert_eq!(g.payload, json!({"files": now.files}));
+}
+
+/// m3: `audit` на журнале с `NULL` или не-JSON в записи — текст разрыва D91 и код 1;
+/// список печатает записи до разрыва.
+#[test]
+fn audit_verify_reports_break_on_null_and_garbage() {
+    for (name, sql, at) in [
+        (
+            "audit-null",
+            "UPDATE audit SET actor = NULL WHERE seq = 2",
+            2,
+        ),
+        (
+            "audit-garbage",
+            "UPDATE audit SET payload = 'not json' WHERE seq = 2",
+            2,
+        ),
     ] {
-        let o = e.run(&args);
-        assert_eq!(o.code(), Some(1), "{args:?}: {o:?}");
-        assert!(
-            o.stderr
-                .contains("журнал проекта занят запущенным run; повторите после его остановки"),
-            "{args:?}: {o:?}"
-        );
+        let e = env(name);
+        with_run(&e, async |s, _| {
+            for i in 0..3 {
+                s.append_audit(za_store::AuditNew {
+                    actor: "user".into(),
+                    action: "grant.added".into(),
+                    target: format!("/x/{i}"),
+                    payload: json!({"i": i}),
+                })
+                .await
+                .unwrap();
+            }
+        });
+        rusqlite_exec(&e, sql);
+        let text = format!("разрыв цепочки аудита на записи {at}");
+        let v = e.run(&["audit", "--project", e.project_arg(), "--verify"]);
+        assert_eq!(v.code(), Some(1), "{v:?}");
+        assert!(v.stderr.contains(&text), "{v:?}");
+        let l = e.run(&["audit", "--project", e.project_arg()]);
+        assert_eq!(l.code(), Some(1), "{l:?}");
+        assert!(l.stderr.contains(&text), "{l:?}");
+        assert_eq!(l.stdout.lines().count(), 1, "{l:?}");
+        assert!(l.stdout.contains("/x/0"), "{l:?}");
     }
+}
+
+/// SQL в журнал проекта мимо хранилища (подделка записи); хранилище закрыто.
+fn rusqlite_exec(e: &Env, sql: &str) {
+    rusqlite::Connection::open(e.journal_dir().join("journal.db"))
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
 }

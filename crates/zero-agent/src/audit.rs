@@ -153,15 +153,18 @@ pub async fn cmd_audit(
     secrets: &KnownSecrets,
 ) -> Result<ExitCode, AuditCmdError> {
     let store = open(home, project)?;
-    let entries = all_entries(&store).await?;
+    // Сначала проверка: строка с `NULL` или не-JSON даёт текст разрыва D91, а не ошибку
+    // разбора записи (ревью задачи 4, m3).
     let check = store.verify_audit().await?;
     if verify {
+        // Цепочка цела — записи идут подряд с 1, их число — `seq` головы.
+        let count = store.audit_head().await?.map_or(0, |(seq, _)| seq);
         match (&check, json) {
-            (Ok(()), false) => println!("цепочка аудита цела: записей {}", entries.len()),
+            (Ok(()), false) => println!("цепочка аудита цела: записей {count}"),
             (Err(b), false) => eprintln!("zero-agent: {b}"),
             (Ok(()), true) => println!(
                 "{}",
-                canonical_json(&serde_json::json!({"ok": true, "entries": entries.len()}))
+                canonical_json(&serde_json::json!({"ok": true, "entries": count}))
             ),
             (Err(b), true) => println!(
                 "{}",
@@ -169,8 +172,10 @@ pub async fn cmd_audit(
             ),
         }
     } else {
+        // При разрыве печатаются записи до него: они разбираются и цепочку продолжают.
+        let upto = check.as_ref().err().map(|b| b.seq.saturating_sub(1));
         let mut out = String::new();
-        for e in entries {
+        for e in entries_upto(&store, upto).await? {
             let e = AuditEntry {
                 target: secrets.mask(&e.target),
                 payload: secrets.mask_value(e.payload),
@@ -196,12 +201,21 @@ pub async fn cmd_audit(
     })
 }
 
-/// Все записи аудита по возрастанию `seq`.
-async fn all_entries(store: &ProjectStore) -> Result<Vec<AuditEntry>, StoreError> {
+/// Записи аудита по возрастанию `seq`, не дальше `upto` (`None` — все).
+async fn entries_upto(
+    store: &ProjectStore,
+    upto: Option<u64>,
+) -> Result<Vec<AuditEntry>, StoreError> {
     let mut all = Vec::new();
     loop {
         let after = all.last().map_or(0, |e: &AuditEntry| e.seq);
-        let page = store.audit_entries(after, PAGE).await?;
+        let left = upto.map_or(PAGE, |u| {
+            PAGE.min(usize::try_from(u.saturating_sub(after)).unwrap_or(PAGE))
+        });
+        if left == 0 {
+            return Ok(all);
+        }
+        let page = store.audit_entries(after, left).await?;
         if page.is_empty() {
             return Ok(all);
         }

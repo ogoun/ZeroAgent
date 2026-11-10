@@ -14,7 +14,9 @@
 //! --verify`). Решения по аудиту принимаются только на целой цепочке:
 //! [`ProjectStore::last_audit`] на разорванной цепочке даёт [`StoreError::Corrupt`].
 //! Удаление хвоста цепочки (последних записей) хэшами не обнаруживается — это свойство
-//! любой цепочки без внешнего якоря.
+//! любой цепочки без внешнего якоря; якорь — голова цепочки [`ProjectStore::audit_head`],
+//! сохранённая вне таблицы (снимок run, задача 13). Против процесса с правом записи в
+//! `journal.db` цепочка без ключа не защищает: он пересчитает её целиком.
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -157,6 +159,28 @@ impl ProjectStore {
             };
             tx.finish()?;
             Ok(out)
+        })
+        .await
+    }
+
+    /// Голова цепочки: `(seq, hash)` последней записи; `None` у пустого аудита. Цепочка
+    /// не проверяется. Внешний якорь против удаления хвоста (ревью задачи 4, m1): голову,
+    /// сохранённую раньше (снимок run, задача 13), сверяют с записью `seq` — запись
+    /// пропала или хэш другой, значит хвост удалён или подменён.
+    pub async fn audit_head(&self) -> Result<Option<(u64, String)>, StoreError> {
+        self.read(|c| {
+            c.query_row(
+                "SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(s, h)| {
+                u64::try_from(s)
+                    .map(|s| (s, h))
+                    .map_err(|_| corrupt("отрицательный seq аудита"))
+            })
+            .transpose()
         })
         .await
     }

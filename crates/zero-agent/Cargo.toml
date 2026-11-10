@@ -38,3 +38,5 @@ tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "net"
 axum.workspace = true
 # Тело ответа с обрывом посреди стрима (`Frame`) в тесте повтора `ask`.
 http-body.workspace = true
+# Подделка записи аудита мимо хранилища в тесте `audit --verify` (R1-C1, задача 4).
+rusqlite.workspace = true

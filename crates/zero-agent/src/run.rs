@@ -17,6 +17,7 @@
 //! `approval.resolved`, а при доверии ещё `trust.granted` с набором доверенных файлов на
 //! момент ответа (D83).
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -34,7 +35,7 @@ use za_core::{
 };
 use za_llm::{EndpointId, SelectError, Selection};
 use za_protocol::{
-    Budget, BudgetKind, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Seq, Tier,
+    Actor, Budget, BudgetKind, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Seq, Tier,
     audit_action, pause_reason,
 };
 use za_store::{AuditNew, INTERRUPT_OPEN, InterruptRow, ProjectStore, StoreError};
@@ -43,6 +44,7 @@ use crate::config::load_config;
 use crate::home;
 use crate::journal::open_retrying;
 use crate::models::{CommandError, PROBE_WAIT, start_gateway, state_text, wait_endpoint};
+use crate::trust::{TrustSet, trust_set};
 
 /// Код выхода: `done` или `partial`.
 pub const EXIT_DONE: u8 = 0;
@@ -58,6 +60,10 @@ pub const EXIT_BLOCKED: u8 = 5;
 pub const EXIT_CANCELLED: u8 = 6;
 /// Имя файла журнала в каталоге журнала проекта.
 pub const JOURNAL_FILE: &str = "journal.db";
+/// Поле payload прерывания доверия с хэшем показанного набора (`TrustSet::hash`).
+pub const TRUST_SET_HASH: &str = "set_hash";
+/// Разделитель в id повторного прерывания доверия (`<база>-set<хэш>`).
+const TRUST_REASK_MARK: &str = "-set";
 /// Actor записей аудита, которые пишет решение пользователя в `answer`.
 const AUDIT_ACTOR_USER: &str = "user";
 /// Файл инструкций проекта (блок 5, D22).
@@ -863,13 +869,20 @@ pub async fn cmd_answer(
     let response = match (&answer, row.kind.as_str()) {
         (Answer::Text(t), k) if k == InterruptKind::Input.as_str() => Some(json!({"answer": t})),
         (Answer::Approve | Answer::Deny(_), k) if k == approval || k == trust => {
-            let audit = decision_audit(&row, &answer, &project).await?;
-            let response = match &answer {
-                a if k == trust => json!({"trusted": *a == Answer::Approve}),
-                Answer::Deny(note) => {
-                    json!({"approved": false, "note": note.clone().unwrap_or_default()})
+            let mut set = None;
+            if k == trust && answer == Answer::Approve && row.status == INTERRUPT_OPEN {
+                let now = current_trust_set(&project).await?;
+                if !shown_trust_matches(row.payload.as_ref(), &now) {
+                    return reask_trust(&store, &row, &project, now).await;
                 }
-                _ => json!({"approved": true, "note": ""}),
+                set = Some(now);
+            }
+            let audit = decision_audit(&row, &answer, &project, set.as_ref())?;
+            let response = match &answer {
+                Answer::Approve if k == trust => json!({"trusted": true}),
+                Answer::Approve => json!({"approved": true, "note": ""}),
+                a if k == trust => json!({"trusted": false, "note": deny_note(a)}),
+                a => json!({"approved": false, "note": deny_note(a)}),
             };
             let applied = store.resolve_with_audit(interrupt, response, audit).await?;
             return Ok(answered(applied, interrupt, &project, row.run));
@@ -922,19 +935,16 @@ fn answered(applied: bool, interrupt: &str, project: &Path, run: RunId) -> ExitC
     ExitCode::from(EXIT_DONE)
 }
 
-/// Записи аудита решения пользователя (D91): `approval.resolved` с id прерывания, а при
-/// доверии (`trust-…`, `--approve`) ещё `trust.granted` с путём проекта и набором
-/// доверенных файлов, пересчитанным в момент ответа (D83).
-async fn decision_audit(
+/// Записи аудита решения пользователя (D91): `approval.resolved` с id прерывания и
+/// заметкой к отказу, а при доверии (`set` — набор, пересчитанный в момент ответа и
+/// совпавший с показанным, D83) ещё `trust.granted` с путём проекта и набором.
+fn decision_audit(
     row: &InterruptRow,
     answer: &Answer,
     project: &Path,
+    set: Option<&TrustSet>,
 ) -> Result<Vec<AuditNew>, RunError> {
     let approved = *answer == Answer::Approve;
-    let note = match answer {
-        Answer::Deny(Some(n)) => n.clone(),
-        _ => String::new(),
-    };
     let mut audit = vec![AuditNew {
         actor: AUDIT_ACTOR_USER.to_owned(),
         action: audit_action::APPROVAL_RESOLVED.to_owned(),
@@ -943,22 +953,11 @@ async fn decision_audit(
             "run": row.run.to_string(),
             "kind": row.kind,
             "approved": approved,
-            "note": note,
+            "note": deny_note(answer),
         }),
     }];
-    if approved && row.kind == InterruptKind::Trust.as_str() {
-        let dir = project.to_path_buf();
-        let set = tokio::task::spawn_blocking(move || crate::trust::trust_set(&dir))
-            .await
-            .map_err(|e| RunError::TrustSet {
-                path: project.to_path_buf(),
-                source: std::io::Error::other(e.to_string()),
-            })?
-            .map_err(|source| RunError::TrustSet {
-                path: project.to_path_buf(),
-                source,
-            })?;
-        let payload = serde_json::to_value(&set)
+    if let Some(set) = set {
+        let payload = serde_json::to_value(set)
             .map_err(|e| StoreError::Serde(format!("набор доверенных файлов: {e}")))?;
         audit.push(AuditNew {
             actor: AUDIT_ACTOR_USER.to_owned(),
@@ -968,6 +967,79 @@ async fn decision_audit(
         });
     }
     Ok(audit)
+}
+
+/// Заметка к отказу; у одобрения — пустая.
+fn deny_note(answer: &Answer) -> String {
+    match answer {
+        Answer::Deny(Some(n)) => n.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Набор доверенных файлов проекта сейчас (`spawn_blocking`: обход ФС).
+async fn current_trust_set(project: &Path) -> Result<TrustSet, RunError> {
+    let dir = project.to_path_buf();
+    let err = |source| RunError::TrustSet {
+        path: project.to_path_buf(),
+        source,
+    };
+    tokio::task::spawn_blocking(move || trust_set(&dir))
+        .await
+        .map_err(|e| err(std::io::Error::other(e.to_string())))?
+        .map_err(err)
+}
+
+/// Совпадает ли набор `set` с показанным в payload прерывания доверия (ревью задачи 4,
+/// m2): по `set_hash`, а без него — по `files`. Payload без того и другого — не
+/// совпадает: доверие даётся только тому, что показано.
+fn shown_trust_matches(payload: Option<&Value>, set: &TrustSet) -> bool {
+    let Some(p) = payload else { return false };
+    if let Some(h) = p.get(TRUST_SET_HASH).and_then(Value::as_str) {
+        return h == set.hash();
+    }
+    p.get("files")
+        .and_then(|f| serde_json::from_value::<BTreeMap<String, String>>(f.clone()).ok())
+        .is_some_and(|f| f == set.files)
+}
+
+/// Набор изменился после вопроса: новое прерывание доверия с текущим набором, старое
+/// закрывается ответом `{"superseded_by": <новый id>}` от рантайма (доверие не
+/// записывается). id нового — `<база>-set<16 hex хэша набора>`: повтор после сбоя
+/// откроет то же прерывание. Код 3, подсказка ответить на новое.
+async fn reask_trust(
+    store: &ProjectStore,
+    row: &InterruptRow,
+    project: &Path,
+    set: TrustSet,
+) -> Result<ExitCode, RunError> {
+    let hash = set.hash();
+    let base = row.id.split(TRUST_REASK_MARK).next().unwrap_or(&row.id);
+    let new_id = format!("{base}{TRUST_REASK_MARK}{}", &hash[..16]);
+    let payload = json!({
+        "project": display_path(project),
+        "files": set.files,
+        TRUST_SET_HASH: hash,
+    });
+    store
+        .open_interrupt(&new_id, row.run, InterruptKind::Trust.as_str(), payload)
+        .await?;
+    let closed = store
+        .resolve_interrupt_as(&row.id, json!({"superseded_by": new_id}), Actor::Runtime)
+        .await?;
+    if !closed {
+        eprintln!(
+            "zero-agent: прерывание {} уже решено, ответ не изменён",
+            row.id
+        );
+        return Ok(ExitCode::from(EXIT_ERROR));
+    }
+    eprintln!("zero-agent: доверенные файлы проекта изменились после вопроса, доверие не записано");
+    eprintln!(
+        "zero-agent: ответьте: zero-agent answer --project {} --interrupt {new_id} --approve|--deny",
+        quoted(project)
+    );
+    Ok(ExitCode::from(EXIT_NEEDS_DECISION))
 }
 
 #[cfg(test)]
