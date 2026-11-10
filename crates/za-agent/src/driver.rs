@@ -15,6 +15,11 @@
 //! (R1-B2 D43); `ContextOverflow` хода — аварийная компакция и один повтор (R1-B2 D49).
 //! Детекторы (R1-B2 D54–D56, [`crate::DetectorState`]): до пакета вызовов — повтор,
 //! отказ или `blocked`; после результатов хода — nudge цикла с рецитацией или `blocked`.
+//! Детекторы хода (D57, D60–D62): после принятого ответа — падение кэша
+//! (`context.alert`), порча JSON подряд (компакция на ближайшей границе, затем пауза
+//! `model_loop`), обещание без действия до ветки ответа top (nudge, исход `promise`);
+//! после пакета — ошибки инструмента одного класса (пауза перед следующим вызовом
+//! модели в `select!` с сигналами, затем пауза `tool_errors`).
 //!
 //! Чистая пауза (D5): событие шага, снимок `{next: Boundary, exit: Some}` на `seq`
 //! этого события, затем статус. Конечные состояния после записи статуса вызывают
@@ -42,8 +47,8 @@ use za_core::{
     ToolKind, ToolRegistry, Transition, pause_reason_for,
 };
 use za_llm::{
-    BoxFuture, EndpointId, ErrorClass, FinishReason, ModelCall, ModelPort, Part, ReasoningMode,
-    RequestMeta, ToolChoice,
+    BoxFuture, CachedTokensField, EndpointId, ErrorClass, FinishReason, ModelCall, ModelPort, Part,
+    ReasoningMode, RequestMeta, ToolChoice,
 };
 use za_protocol::{
     Actor, BlobHash, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId,
@@ -60,8 +65,8 @@ use crate::context::{
 use crate::control::ControlRx;
 use crate::conversation::{Conversation, HistoryError};
 use crate::detect::{
-    CYCLE_NUDGE, DetectorState, REPEAT_MARK, REPEAT_REJECT, Reaction, StreamWatch, retry_params,
-    thinking_timeout,
+    CYCLE_NUDGE, DetectorState, REPEAT_MARK, REPEAT_REJECT, Reaction, StreamWatch,
+    promise_without_action, retry_params, thinking_timeout,
 };
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
@@ -1137,6 +1142,8 @@ const COMPACT_TRUNCATION: &str = "truncation";
 const COMPACT_WINDOW: &str = "window";
 /// Причина компакции: `ContextOverflow` хода (D49).
 const COMPACT_OVERFLOW: &str = "overflow";
+/// Причина компакции: ходы подряд с порчей JSON (D61), аварийная.
+const COMPACT_PARSE: &str = "parse_errors";
 /// Подозрение на обрезку в пределах стольких ходов после компакции по этой причине —
 /// пауза `context` (D43).
 const TRUNCATION_REPEAT_TURNS: u32 = 2;
@@ -1173,9 +1180,11 @@ async fn context_thresholds(
         est = prune_results(deps, st, step, est).await?;
     }
     let pending = st.meter.compact_pending;
+    // D61: порча JSON подряд — аварийная компакция на этой границе.
+    let parse = st.detectors.compaction_due();
     let threshold = over_share(est, reserve, compact_at, n_ctx);
     let window = beyond_window(est, reserve, n_ctx);
-    if !(pending || window || (threshold && !st.meter.suppressed)) {
+    if !(pending || parse || window || (threshold && !st.meter.suppressed)) {
         if threshold {
             tracing::debug!(run = %st.run, step, estimate = est.tokens, reserve,
                 "компакция по порогу подавлена: прошлая не опустила оценку ниже порога (D70)");
@@ -1184,6 +1193,8 @@ async fn context_thresholds(
     }
     let reason = if pending {
         COMPACT_TRUNCATION
+    } else if parse {
+        COMPACT_PARSE
     } else if window {
         COMPACT_WINDOW
     } else {
@@ -1192,6 +1203,7 @@ async fn context_thresholds(
     // Запрос компакции не помещается в окно — сразу аварийный вход (D49).
     let budget = ContextBudget::for_context(n_ctx);
     let emergency = window
+        || parse
         || u64::from(est.tokens)
             + u64::from(rubric_tokens())
             + u64::from(budget.compaction_reserve)
@@ -1334,6 +1346,8 @@ async fn run_compaction(
             st.epoch += 1;
             st.meter.reset();
             st.meter.compact_pending = false;
+            // Любая компакция даёт новую эпоху: назначенная по порче JSON (D61) не нужна.
+            st.detectors.compaction_done();
             tracing::info!(run = %st.run, step, epoch = st.epoch, reason, emergency = c.emergency,
                 before = c.before, after = c.after, tail = c.tail, omitted = c.omitted,
                 "история сжата: новая эпоха");
@@ -1510,6 +1524,35 @@ async fn check_truncation(
     }
     st.meter.compact_pending = true;
     Ok(false)
+}
+
+/// D62: падение кэша по расходу принятого хода — `context.alert {kind: "cache_drop",
+/// prev_share, share, first_diff, turn}` и `warn`. Хэши сообщений запроса — `refs`
+/// последнего `persist` (запрос хода собран из них); хэши прошлого запроса — из
+/// [`DetectorState`] (снимок). Поле кэша эндпоинта читается из `capabilities` вне
+/// эффекта (исключение D30, как `parallel_tools`): от него зависит только событие, а
+/// не ход run.
+async fn check_cache(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    out: &TurnOutput,
+) -> Result<(), StoreError> {
+    let cached_supported = deps
+        .model
+        .capabilities(&st.setup.endpoint)
+        .is_some_and(|c| c.cached_tokens_field != CachedTokensField::None);
+    let prev = st.detectors.remember_request_refs(&st.refs);
+    let Some(mut alert) =
+        st.detectors
+            .on_usage(&out.usage, cached_supported, st.epoch, &prev, &st.refs)
+    else {
+        return Ok(());
+    };
+    alert["turn"] = json!(st.turn);
+    tracing::warn!(run = %st.run, turn = st.turn, alert = %alert,
+        "доля входа из кэша упала вдвое без смены эпохи истории");
+    st.last_seq = context_alert(&deps.journal, st.run, alert).await?;
+    Ok(())
 }
 
 /// `context.alert {kind: "n_ctx_unknown", endpoint, n_ctx}` (D43): старт run и resume
@@ -1804,12 +1847,52 @@ async fn model_output(
     if let Some(tps) = output_tps(out.usage.output, out.ttft_ms, out.duration_ms) {
         st.counters.output_tps = Some(tps);
     }
+    check_cache(deps, st, &out).await?;
     let rev = review(&out, &st.tools, &st.classes, st.turn);
     report_parse_errors(deps.model.as_ref(), st.run, call, rev.parse_errors);
+    // D61: порча JSON подряд. Пауза — до фиксации хода: испорченный ответ в историю не
+    // идёт, resume спрашивает модель заново с той же истории (как обрыв D58).
+    match st.detectors.on_parse_errors(rev.parse_errors) {
+        Reaction::None => {}
+        Reaction::Compact => {
+            tracing::warn!(run = %st.run, turn = st.turn,
+                "порча JSON три хода подряд: аварийная компакция на ближайшей границе");
+            loop_detected(deps, st, detector::PARSE_ERRORS, "compact").await?;
+        }
+        Reaction::Pause(reason) => {
+            tracing::warn!(run = %st.run, turn = st.turn,
+                "порча JSON и после компакции: пауза model_loop");
+            turn_finished(deps, st, "error", Some(&rev)).await?;
+            loop_detected(deps, st, detector::PARSE_ERRORS, "pause").await?;
+            return clean_pause(deps, st, LoopExit::Paused(reason)).await;
+        }
+        other => tracing::error!(run = %st.run, reaction = ?other,
+            "реакция детектора порчи JSON не применяется"),
+    }
     st.conv.commit_turn(out.service, rev.assistant.clone())?;
     // База счётчика (D41): ход принят, история включает его ответ.
     st.meter
         .after_reply(st.conv.messages().len(), &out.usage, Some(&rev.assistant));
+
+    // D60: обещание без действия — до ветки «текст top — ответ». Ход с другими
+    // замечаниями разбора (неразобранный вызов, мутация в тексте, обрезка) — не
+    // обещание: у модели была попытка действия, nudge уже есть.
+    let promise = rev.calls.is_empty()
+        && out.finish == FinishReason::Stop
+        && rev.parse_errors == 0
+        && rev.nudges.is_empty()
+        && promise_without_action(&rev.text);
+    if !promise {
+        st.detectors.reset_promise();
+    } else if let Reaction::Nudge(text) = st.detectors.on_promise(st.setup.role) {
+        // Первое обещание: nudge, в счёт пустых ходов D18 не идёт.
+        tracing::info!(run = %st.run, turn = st.turn, "обещание без действия: nudge");
+        turn_finished(deps, st, "promise", Some(&rev)).await?;
+        loop_detected(deps, st, detector::PROMISE, "nudge").await?;
+        push_nudges(st, &[text])?;
+        return Ok(Transition::Goto(BOUNDARY));
+    }
+    // Второе обещание подряд — обычный ход: у top ответ, у субагентов пустой ход D18.
 
     if !rev.calls.is_empty() {
         st.counters.empty_turns = 0;
@@ -1952,17 +2035,21 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         executed,
         ..
     } = out;
-    // Детекторы после результатов хода (D55, D56) — когда ход доходит до границы.
+    // Детекторы после результатов хода (D55–D57) — когда ход доходит до границы.
     let facts = match verdict {
-        ToolsVerdict::Next { .. } | ToolsVerdict::Pause => {
-            Some(results_facts(sh, &results, &executed, &screened).await?)
-        }
+        ToolsVerdict::Next { .. } | ToolsVerdict::Pause => Some((
+            results_facts(sh, &results, &executed, &screened).await?,
+            executed_errors(&results, &executed, &screened),
+        )),
         _ => None,
     };
     st.conv.push_results(results)?;
-    let reaction = match facts {
-        Some(f) => st.detectors.on_results(st.turn, &f, false),
-        None => Reaction::None,
+    let (reaction, errors) = match facts {
+        Some((f, e)) => (
+            st.detectors.on_results(st.turn, &f, false),
+            st.detectors.on_tool_errors(&e),
+        ),
+        None => (Reaction::None, Reaction::None),
     };
     match verdict {
         ToolsVerdict::Finish(status) => {
@@ -1992,6 +2079,9 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             if let Some(t) = apply_detected(deps, st, &screened.nudges, reaction).await? {
                 return Ok(t);
             }
+            if let Some(t) = apply_tool_errors(deps, st, errors).await? {
+                return Ok(t);
+            }
             Ok(Transition::Goto(BOUNDARY))
         }
         ToolsVerdict::Pause => {
@@ -1999,6 +2089,12 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             push_nudges(st, &rev.nudges)?;
             if let Some(t) = apply_detected(deps, st, &screened.nudges, reaction).await? {
                 return Ok(t);
+            }
+            // Пауза по команде важнее паузы перед ходом и паузы `tool_errors`: run и так
+            // встаёт; счёт ошибок уже учтён и попадёт в снимок.
+            if errors != Reaction::None {
+                tracing::debug!(run = %st.run, reaction = ?errors,
+                    "реакция на ошибки инструмента поглощена паузой по команде");
             }
             command_pause(sh, st).await
         }
@@ -2185,6 +2281,102 @@ async fn apply_detected(
             tracing::error!(run = %st.run, reaction = ?other,
                 "реакция детектора не применяется после хода");
             Ok(None)
+        }
+    }
+}
+
+/// D57: (класс, `is_error`) исполненных вызовов хода в порядке результатов. Повтор
+/// прошлого результата, отказ детектора, гейта или пользователя и неначатые вызовы —
+/// не исполнение (`ToolsOutcome::executed`, Carry задачи 6) и не входят.
+fn executed_errors(
+    results: &[Part],
+    executed: &[String],
+    screened: &Screened,
+) -> Vec<(ToolKind, bool)> {
+    results
+        .iter()
+        .filter_map(|p| match p {
+            Part::ToolResult {
+                call_id, is_error, ..
+            } if executed.contains(call_id) => {
+                screened.subjects.get(call_id).map(|k| (*k, *is_error))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// D57: реакция на ошибки инструмента одного класса. `Sleep` — `loop.detected {action:
+/// "sleep"}` и пауза перед следующим вызовом модели ([`backoff`]); `Pause` —
+/// `loop.detected {action: "pause"}` и пауза run `tool_errors`. `Some` — выход вместо
+/// границы.
+async fn apply_tool_errors(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    reaction: Reaction,
+) -> Result<Option<Transition>, LoopError> {
+    match reaction {
+        Reaction::None => Ok(None),
+        Reaction::Sleep(d) => {
+            tracing::warn!(run = %st.run, turn = st.turn, pause = ?d,
+                "ошибки инструмента подряд: пауза перед следующим ходом");
+            loop_detected(deps, st, detector::TOOL_ERRORS, "sleep").await?;
+            backoff(deps, st, d).await?;
+            Ok(None)
+        }
+        Reaction::Pause(reason) => {
+            tracing::warn!(run = %st.run, turn = st.turn,
+                "шестая ошибка инструмента подряд: пауза tool_errors");
+            loop_detected(deps, st, detector::TOOL_ERRORS, "pause").await?;
+            clean_pause(deps, st, LoopExit::Paused(reason))
+                .await
+                .map(Some)
+        }
+        other => {
+            tracing::error!(run = %st.run, reaction = ?other,
+                "реакция детектора ошибок инструмента не применяется");
+            Ok(None)
+        }
+    }
+}
+
+/// Пауза перед следующим вызовом модели (D57) — `select!` по таймеру и флагам
+/// управления: `pause` и `cancel` прерывают её сразу (NFR-03), `pausing`/`cancelling`
+/// пишутся в момент наблюдения (D26), остальное делает граница шага. Время паузы — не
+/// эффект: реплей шага ждёт её снова, решение то же.
+async fn backoff(deps: &LoopDeps, st: &mut LoopState, d: Duration) -> Result<(), StoreError> {
+    let mut flags = st.sig.flags();
+    let sleep = tokio::time::sleep(d);
+    tokio::pin!(sleep);
+    let mut watching = true;
+    loop {
+        let f = *flags.borrow_and_update();
+        let to = if f.cancel {
+            Some(RunStatus::Cancelling)
+        } else if f.pause {
+            Some(RunStatus::Pausing)
+        } else {
+            None
+        };
+        if let Some(to) = to {
+            return mark_stop(
+                &deps.journal,
+                st.run,
+                &mut st.generation,
+                &mut st.stopping,
+                to,
+            )
+            .await;
+        }
+        tokio::select! {
+            biased;
+            () = &mut sleep => return Ok(()),
+            ch = flags.changed(), if watching => {
+                // Отправитель живёт в `Signals`; закрытый канал — только таймер.
+                if ch.is_err() {
+                    watching = false;
+                }
+            }
         }
     }
 }

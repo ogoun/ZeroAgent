@@ -19,7 +19,9 @@
 //! старых результатов [`prune`], компакция [`compact`], R1-B2 D40–D50, D65, D66),
 //! инспектор запроса хода [`inspect`] и метрики run [`run_metrics`] (D52, D53), детекторы
 //! повтора, цикла и застоя [`DetectorState`] (D54–D56), повтора текста и бесконечного
-//! рассуждения в стриме [`StreamWatch`] (D58, D59). Модель
+//! рассуждения в стриме [`StreamWatch`] (D58, D59), обещания без действия
+//! [`promise_without_action`], ошибок инструмента, порчи JSON и падения кэша (D57,
+//! D60–D62). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod budget;
@@ -48,8 +50,9 @@ pub use context::{
 pub use control::{ControlRx, InputMode, RunControl, control_channel, submit_input};
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted, cut_points, split_tail};
 pub use detect::{
-    CYCLE_NUDGE, Degenerate, DetectorState, REPEAT_MARK, REPEAT_NUDGE, REPEAT_REJECT, Reaction,
-    StreamWatch, THINKING_TIMEOUT, call_fingerprint, retry_params, thinking_timeout,
+    CYCLE_NUDGE, Degenerate, DetectorState, PROMISE_NUDGE, REPEAT_MARK, REPEAT_NUDGE,
+    REPEAT_REJECT, Reaction, StreamWatch, THINKING_TIMEOUT, call_fingerprint,
+    promise_without_action, retry_params, thinking_timeout,
 };
 pub use driver::{CrashHook, CrashPoint, LoopDeps, LoopError, LoopOutcome, RunSpec, start_run};
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};

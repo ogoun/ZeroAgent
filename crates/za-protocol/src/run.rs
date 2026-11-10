@@ -81,6 +81,12 @@ pub mod detector {
     pub const REPETITION: &str = "repetition";
     /// Бесконечное рассуждение (D59); тот же хвост у квитанции `interrupted:thinking`.
     pub const THINKING: &str = "thinking";
+    /// Обещание без действия: ход без вызовов с оборотом «I will…» (D60).
+    pub const PROMISE: &str = "promise";
+    /// Ошибки подряд у инструментов одного класса (D57).
+    pub const TOOL_ERRORS: &str = "tool_errors";
+    /// Ходы подряд с неразобранными вызовами — порча JSON (D61).
+    pub const PARSE_ERRORS: &str = "parse_errors";
 }
 
 /// Причины ошибки run: поле `reason` события `run.status` при переходе в `failed`.
