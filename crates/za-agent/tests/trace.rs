@@ -1,16 +1,20 @@
 //! Трасса дрейфа префикса (CTX-002, R1-B2 задача 9): золотой список запросов модели
-//! длинного run с компакцией и тот же список после сбоя и resume.
+//! длинного run с удалением старых результатов и компакциями, проверка «история внутри
+//! эпохи только дописывается» и тот же список после сбоя и resume.
 //!
 //! Сценарий: окно 8192, тир small (`Effort(Low)`: резерв 3072 — D40, компакция при
 //! оценке ≥ 0,75 × 8192 − 3072 = 3072, удаление старых результатов — при оценке ≥ 2253).
-//! Модель 9 раз вызывает `echo` с номером хода, инструмент отвечает 1600 байт ASCII
-//! (своими для каждого хода: детекторы повтора и застоя молчат), десятый ход — ответ.
-//! Модель не сообщает расход (`usage.input == 0`): оценка — весь запрос байтами / 4
-//! (D41). RunId фиксирован: путь выгрузки при удалении результата содержит id run.
+//! Модель 9 раз вызывает `echo {"i": n}`, десятый ход — ответ. Вывод `echo` — ASCII,
+//! свой для каждого хода (детекторы повтора и застоя молчат): ходы 1–6 — 1600 байт
+//! (≈ 415 токенов на ход), с хода 6 оценка выше порога удаления и результат старше 4
+//! ходов заменяется ссылкой; ходы 7–9 — 4000 байт (≈ 1015 токенов), и оценка после
+//! удаления доходит до порога компакции. Модель не сообщает расход
+//! (`usage.input == 0`): оценка — весь запрос байтами / 4 (D41). RunId фиксирован: путь
+//! выгрузки при удалении результата содержит id run.
 //!
-//! Золотой файл `tests/golden/trace_prefixes.json` пишется первым прогоном (файла нет
-//! или `ZA_UPDATE_GOLDEN=1`) и коммитится; меняется только вместе с намеренной правкой
-//! промптов, запроса или правил контекста.
+//! Золотой файл `tests/golden/trace_prefixes.json` перезаписывается только при
+//! `ZA_UPDATE_GOLDEN=1` и коммитится; без файла тест падает. Меняется только вместе с
+//! намеренной правкой промптов, запроса или правил контекста.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,9 +67,15 @@ const N_CTX: u32 = 8192;
 /// Ходов с вызовом `echo`; ход `CALLS + 1` — ответ.
 const CALLS: u32 = 9;
 
-/// Длина вывода `echo`, байт: ниже лимита выгрузки 0,15 × 8192 × 4 = 4915 и выше
-/// 1024 (результат можно удалить, D45).
+/// Длина вывода `echo` ходов 1..=`SHORT_TURNS`, байт: выше 1024 (результат можно
+/// удалить, D45).
 const ECHO_BYTES: usize = 1600;
+
+/// Ходов с коротким выводом; дальше вывод [`ECHO_LONG_BYTES`].
+const SHORT_TURNS: u32 = 6;
+
+/// Длина вывода `echo` поздних ходов, байт: ниже лимита выгрузки 0,15 × 8192 × 4 = 4915.
+const ECHO_LONG_BYTES: usize = 4000;
 
 fn golden_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/trace_prefixes.json")
@@ -81,8 +91,7 @@ fn dir(name: &str) -> PathBuf {
     d
 }
 
-/// `echo {"text": t}` возвращает `t`. Модель передаёт [`echo_text`] хода: 1600 байт
-/// ASCII, свои для каждого хода.
+/// `echo {"i": n}` возвращает [`echo_text`] хода `n`: ASCII, свой для каждого хода.
 struct Echo {
     spec: ToolSpec,
 }
@@ -93,10 +102,13 @@ impl Tool for Echo {
     }
 
     fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
-        let text = args["text"].as_str().unwrap_or_default().to_owned();
+        let i = args["i"]
+            .as_u64()
+            .and_then(|i| u32::try_from(i).ok())
+            .unwrap_or(0);
         Box::pin(async move {
             ToolOutput {
-                content: text,
+                content: echo_text(i),
                 is_error: false,
             }
         })
@@ -104,8 +116,13 @@ impl Tool for Echo {
 }
 
 fn echo_text(i: u32) -> String {
+    let len = if i <= SHORT_TURNS {
+        ECHO_BYTES
+    } else {
+        ECHO_LONG_BYTES
+    };
     let line = format!("echo line {i:04} abcdefghijklmnopqrstuvwxyz0123456789\n");
-    line.repeat(ECHO_BYTES.div_ceil(line.len()))[..ECHO_BYTES].to_owned()
+    line.repeat(len.div_ceil(line.len()))[..len].to_owned()
 }
 
 fn registry() -> ToolRegistry {
@@ -225,7 +242,7 @@ fn reply_for(req: &ChatRequest, turn_calls: u32) -> Script {
             vec![Part::ToolCall(ToolCall {
                 id: format!("call_{i}"),
                 name: "echo".into(),
-                arguments: json!({ "text": echo_text(i) }),
+                arguments: json!({ "i": i }),
                 raw_arguments: None,
             })],
             FinishReason::ToolCalls,
@@ -359,29 +376,103 @@ async fn reference(name: &str) -> (Vec<Event>, usize) {
     (events(&f.store, f.run).await, f.model.compactions())
 }
 
-/// Золотая трасса из файла; `None` — файла нет или `ZA_UPDATE_GOLDEN=1`.
-fn read_golden() -> Option<Value> {
-    if std::env::var("ZA_UPDATE_GOLDEN").is_ok_and(|v| v == "1") {
-        return None;
+/// Золотая трасса. Файл перезаписывается только при `ZA_UPDATE_GOLDEN=1` (один раз
+/// на прогон); без файла тест падает: CI сравнивает, а не пишет эталон сам себе.
+async fn golden() -> Value {
+    static WRITE: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
+    let mut written = WRITE.lock().await;
+    let update = std::env::var("ZA_UPDATE_GOLDEN").is_ok_and(|v| v == "1");
+    if update && !*written {
+        let (evs, _) = reference("golden_write").await;
+        let mut text = serde_json::to_string_pretty(&trace(&evs)).unwrap();
+        text.push('\n');
+        std::fs::write(golden_path(), text).unwrap();
+        eprintln!("записан {}", golden_path().display());
+        *written = true;
     }
-    let text = std::fs::read_to_string(golden_path()).ok()?;
-    Some(serde_json::from_str(&text).expect("golden/trace_prefixes.json — не JSON"))
+    let text = std::fs::read_to_string(golden_path()).unwrap_or_else(|e| {
+        panic!(
+            "нет {}: {e}; эталон пишется командой ZA_UPDATE_GOLDEN=1 cargo test -p za-agent --test trace",
+            golden_path().display()
+        )
+    });
+    serde_json::from_str(&text).expect("golden/trace_prefixes.json — не JSON")
 }
 
-/// Золотая трасса: из файла, а если его нет — из эталонного прогона (файл пишется).
-async fn golden() -> Value {
-    static WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _g = WRITE.lock().await;
-    if let Some(g) = read_golden() {
-        return g;
+/// Итог проверки [`check_append_only`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AppendOnly {
+    /// Пар соседних запросов одной эпохи: история только дописана.
+    pairs: usize,
+    /// Удалений старых результатов (`context.pruned`).
+    pruned: usize,
+    /// Компакций (`context.compacted`).
+    compacted: usize,
+}
+
+/// Дрейф истории (CTX-002, NFR-06): внутри эпохи `messages` (блобы) каждого
+/// `model.request` — строгий префикс `messages` следующего запроса, в том числе запроса
+/// компакции. Эпоху меняют только `context.pruned` и `context.compacted`, их `epoch`
+/// растёт на 1. После удаления первое сообщение (`<env>` и задача) прежнее.
+fn check_append_only(evs: &[Event]) -> Result<AppendOnly, String> {
+    let mut out = AppendOnly::default();
+    let mut epoch = 0u64;
+    let mut prev: Option<&Vec<Value>> = None;
+    let mut rewrite: Option<EventKind> = None;
+    for e in evs {
+        match e.kind {
+            EventKind::ContextPruned | EventKind::ContextCompacted => {
+                let got = e.payload["epoch"].as_u64();
+                if got != Some(epoch + 1) {
+                    return Err(format!(
+                        "seq {}: эпоха {got:?}, ждали {}",
+                        e.seq.0,
+                        epoch + 1
+                    ));
+                }
+                epoch += 1;
+                if e.kind == EventKind::ContextPruned {
+                    out.pruned += 1;
+                } else {
+                    out.compacted += 1;
+                }
+                rewrite = Some(e.kind.clone());
+            }
+            EventKind::ModelRequest => {
+                let cur = e.payload["messages"]
+                    .as_array()
+                    .ok_or_else(|| format!("seq {}: нет messages", e.seq.0))?;
+                if let Some(p) = prev {
+                    match rewrite {
+                        None => {
+                            if cur.len() <= p.len() || cur[..p.len()] != p[..] {
+                                return Err(format!(
+                                    "seq {}: история эпохи {epoch} переписана, а не дописана",
+                                    e.seq.0
+                                ));
+                            }
+                            out.pairs += 1;
+                        }
+                        Some(EventKind::ContextPruned) => {
+                            if cur.first() != p.first() {
+                                return Err(format!(
+                                    "seq {}: удаление сменило первое сообщение",
+                                    e.seq.0
+                                ));
+                            }
+                        }
+                        // Компакция: новая история; первое сообщение может совпасть
+                        // с прошлым (та же сводка у двух компакций подряд).
+                        Some(_) => {}
+                    }
+                }
+                prev = Some(cur);
+                rewrite = None;
+            }
+            _ => {}
+        }
     }
-    let (evs, _) = reference("golden_write").await;
-    let t = trace(&evs);
-    let mut text = serde_json::to_string_pretty(&t).unwrap();
-    text.push('\n');
-    std::fs::write(golden_path(), text).unwrap();
-    eprintln!("записан {}", golden_path().display());
-    t
+    Ok(out)
 }
 
 /// `(turn, request)` ходов без запросов компакции, по порядку.
@@ -431,6 +522,37 @@ async fn trace_prefix_hashes_match_golden() {
     assert_eq!(compacted.len(), compactions);
     // Детекторы не вмешивались.
     assert!(of_kind(&evs, EventKind::LoopDetected).is_empty());
+    // История внутри эпохи только дописывается; в сценарии есть и удаление, и компакция.
+    let a = check_append_only(&evs).unwrap();
+    assert!(a.pruned >= 1 && a.compacted >= 1, "{a:?}");
+    assert!(a.pairs >= 5, "{a:?}");
+}
+
+/// RED-проверка самой проверки: копия журнала эталона с подменённым блобом сообщения
+/// внутри эпохи (как если бы рантайм переписал историю) — `check_append_only` отвергает.
+#[tokio::test]
+async fn append_only_check_catches_rewrite() {
+    let (evs, _) = reference("append_only").await;
+    assert!(check_append_only(&evs).is_ok());
+    // Второй запрос run: та же эпоха, что у первого.
+    let i = evs
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == EventKind::ModelRequest)
+        .nth(1)
+        .map(|(i, _)| i)
+        .unwrap();
+    for at in [0, 1] {
+        let mut forged = evs.clone();
+        forged[i].payload["messages"][at] = json!("0".repeat(64));
+        let err = check_append_only(&forged).unwrap_err();
+        assert!(err.contains("переписана"), "{err}");
+    }
+    // Удаление без события: следующий запрос короче — тоже переписывание.
+    let mut cut = evs.clone();
+    let msgs = cut[i].payload["messages"].as_array().unwrap().clone();
+    cut[i].payload["messages"] = Value::Array(msgs[..1].to_vec());
+    assert!(check_append_only(&cut).is_err());
 }
 
 /// Сбой в точке `at` один раз, resume: запросы ходов совпадают с golden, сводка не

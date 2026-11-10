@@ -36,7 +36,8 @@ pub struct Fake {
 }
 
 impl Fake {
-    /// Сервер с окном `n_ctx` в `/props`; `usage = false` — стрим без расхода.
+    /// Сервер с окном `n_ctx` в `/props`; `usage = false` — стрим без расхода. Без
+    /// расхода тело ответа буферизуется целиком: паузы [`paced_reply`] пропадают.
     pub fn start(n_ctx: u32, usage: bool, chat: ChatHandler) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -148,16 +149,67 @@ pub fn chunk(delta: Value) -> String {
     )
 }
 
-/// Конец ответа: `finish_reason`, usage и `[DONE]`.
+/// Расход хода в стриме: `prompt_tokens`, из них из кэша (`timings.cache_n`), вывод.
+#[derive(Debug, Clone, Copy)]
+pub struct Spend {
+    pub prompt: u64,
+    pub cached: u64,
+    pub output: u64,
+}
+
+/// Расход сценариев R1-B1: 12 токенов входа без кэша, 3 — вывода.
+pub const FIXED: Spend = Spend {
+    prompt: 12,
+    cached: 0,
+    output: 3,
+};
+
+/// Правдоподобный расход запроса `seen.last()`: вход — байты JSON сообщений и описаний
+/// инструментов / 4 (не меньше оценки клиента по тексту, D43 не подозревает обрезку),
+/// из кэша — общее начало JSON сообщений с прошлым запросом / 4 (кэш префикса одного
+/// слота llama-server).
+pub fn spend_of(seen: &[Value]) -> Spend {
+    let Some(cur) = seen.last() else {
+        return FIXED;
+    };
+    let msgs = |b: &Value| serde_json::to_string(&b["messages"]).unwrap_or_default();
+    let now = msgs(cur);
+    let tools = serde_json::to_string(&cur["tools"]).unwrap_or_default();
+    let prompt = ((now.len() + tools.len()) / 4) as u64;
+    // Первый запрос — холодный кэш.
+    let cached = seen.len().checked_sub(2).map_or(0, |i| {
+        let before = msgs(&seen[i]);
+        let common = before
+            .bytes()
+            .zip(now.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        ((common + tools.len()) / 4) as u64
+    });
+    Spend {
+        prompt,
+        cached: cached.min(prompt),
+        output: 3,
+    }
+}
+
+/// Конец ответа: `finish_reason`, usage [`FIXED`] и `[DONE]`.
 pub fn tail(finish: &str) -> String {
+    tail_with(finish, FIXED)
+}
+
+/// Конец ответа с расходом `u` (`usage` и `timings` llama.cpp) и `[DONE]`.
+pub fn tail_with(finish: &str, u: Spend) -> String {
     let mut s = sse(
         &json!({"choices": [{"index": 0, "finish_reason": finish, "delta": {}}],
                 "object": "chat.completion.chunk", "model": "qwen"}),
     );
     s.push_str(&sse(
         &json!({"choices": [], "object": "chat.completion.chunk", "model": "qwen",
-        "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
-        "timings": {"cache_n": 0, "prompt_n": 12, "predicted_n": 3}}),
+        "usage": {"prompt_tokens": u.prompt, "completion_tokens": u.output,
+                  "total_tokens": u.prompt + u.output},
+        "timings": {"cache_n": u.cached, "prompt_n": u.prompt - u.cached,
+                    "predicted_n": u.output}}),
     ));
     s.push_str("data: [DONE]\n\n");
     s
@@ -167,24 +219,34 @@ pub fn sse_reply(body: String) -> Response {
     ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }
 
-/// Ответ текстом из частей, `finish_reason = stop`.
+/// Ответ текстом из частей, `finish_reason = stop`, расход [`FIXED`].
 pub fn text_reply(parts: &[&str]) -> Response {
+    text_reply_with(parts, FIXED)
+}
+
+/// [`text_reply`] с расходом `u`.
+pub fn text_reply_with(parts: &[&str], u: Spend) -> Response {
     let mut body = chunk(json!({"role": "assistant", "content": null}));
     for p in parts {
         body.push_str(&chunk(json!({"content": p})));
     }
-    body.push_str(&tail("stop"));
+    body.push_str(&tail_with("stop", u));
     sse_reply(body)
 }
 
 /// Ответ одним вызовом инструмента `name` с аргументами `args` (JSON-текст).
 pub fn call_reply(id: &str, name: &str, args: &str) -> Response {
+    call_reply_with(id, name, args, FIXED)
+}
+
+/// [`call_reply`] с расходом `u`.
+pub fn call_reply_with(id: &str, name: &str, args: &str, u: Spend) -> Response {
     let mut body = chunk(json!({"role": "assistant", "content": null}));
     body.push_str(&chunk(
         json!({"tool_calls": [{"index": 0, "id": id, "type": "function",
         "function": {"name": name, "arguments": args}}]}),
     ));
-    body.push_str(&tail("tool_calls"));
+    body.push_str(&tail_with("tool_calls", u));
     sse_reply(body)
 }
 
