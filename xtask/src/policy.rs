@@ -234,9 +234,12 @@ fn resolved_llm_features(root: &Path, pkg: &str) -> Result<Vec<String>, String> 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let res = Command::new(cargo)
         .args([
-            "tree", "--locked", "-p", pkg, "-e", "normal", "--target", "all", "--prefix", "none",
-            "-f", "{p}|{f}",
+            "tree", "--locked", "--color", "never", "-p", pkg, "-e", "normal", "--target", "all",
+            "--prefix", "none", "-f", "{p}|{f}",
         ])
+        // CI задаёт CARGO_TERM_COLOR=always: без явного отказа от цвета маркер `(*)` приходит
+        // с ANSI-кодами и разбирается как имя функции.
+        .env("CARGO_TERM_COLOR", "never")
         .current_dir(root)
         .output()
         .map_err(|e| format!("cargo tree -p {pkg}: {e}"))?;
