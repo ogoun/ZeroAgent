@@ -2,7 +2,7 @@
 //! (D77, D82).
 
 use crate::command::{
-    Cmd, Expr, Inner, analyze, dynamic_cmd, method_expr, norm, percent_var, pwsh_expr,
+    Cmd, Expr, Inner, analyze, arg_is_expr, dynamic_cmd, method_expr, norm, percent_var, pwsh_expr,
     pwsh_expression,
 };
 use crate::lex::lex_code;
@@ -59,6 +59,29 @@ const KNOWN: &[&str] = &[
     "find", "rsync", "robocopy", "psql", "mysql", "sqlite3", "twine", "gem", "nuget",
 ];
 
+/// Навигация и чтение: их позиционные аргументы — пути и данные, не команды (N4).
+#[rustfmt::skip]
+const NAV_READ: &[&str] = &[
+    "cd", "chdir", "pushd", "popd", "set-location", "sl", "push-location", "pop-location",
+    "get-item", "gi", "get-childitem", "tree", "realpath", "readlink", "ldd", "pgrep", "pkill",
+    "killall", "rmdir", "rename-item", "ren", "rename", "basename", "dirname", "ls", "dir",
+];
+
+/// Менеджеры пакетов: имена пакетов в аргументах — данные, не команды (N4).
+#[rustfmt::skip]
+const PKG_MANAGERS: &[&str] = &[
+    "pacman", "dnf", "yum", "apk", "zypper", "conda", "snap", "pipx", "nix-env", "emerge",
+    "port", "pkg", "xbps-install", "apt", "apt-get", "brew", "choco", "winget", "scoop",
+];
+
+/// Интерпретаторы: их скрипт и аргументы — данные (`python x.py eval`, `node b.js git`);
+/// встроенный код ловит `inner_of`/`foreign_inner` (N4).
+#[rustfmt::skip]
+const INTERPRETERS: &[&str] = &[
+    "py", "pypy", "node", "deno", "bun", "perl", "ruby", "php", "lua", "luajit", "rscript", "tsx",
+    "ts-node",
+];
+
 pub(crate) fn check_cmd(
     c: &Cmd,
     lang: Lang,
@@ -78,6 +101,18 @@ pub(crate) fn check_cmd(
             Expr::Safe | Expr::Network => None,
         };
     }
+    // Метод объекта в аргументе: `Write-Output (gi x).Delete($true)` (N1).
+    if lang == Lang::Pwsh {
+        for a in &c.args {
+            if arg_is_expr(a) {
+                match pwsh_expr(a) {
+                    Expr::Label(l) => return Some(l),
+                    Expr::Unknown => return Some(label::UNPARSED),
+                    _ => {}
+                }
+            }
+        }
+    }
     if dynamic_cmd(c) {
         return Some(label::UNPARSED);
     }
@@ -89,20 +124,50 @@ pub(crate) fn check_cmd(
             .iter()
             .find_map(|s| direct(s, *l, outside)),
         Some(Inner::Code(..)) => Some(label::UNPARSED),
-        _ => {
-            (!KNOWN.contains(&c.name.as_str()) && hides_danger(&c.args)).then_some(label::UNPARSED)
-        }
+        _ => (!KNOWN.contains(&c.name.as_str()) && hides_danger(c)).then_some(label::UNPARSED),
     }
 }
 
-/// Отдельное слово аргументов — известная опасная команда.
-fn hides_danger(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        !a.starts_with('-') && !a.contains(' ') && {
-            let n = norm(a);
-            DANGER_WORDS.contains(&n.as_str()) || n.starts_with("mkfs")
+/// Команда в позиции запуска внутри аргументов неизвестной команды — известная опасная
+/// команда (N4: только позиция команды, не любой аргумент).
+fn hides_danger(c: &Cmd) -> bool {
+    // Навигация, чтение, менеджеры пакетов, интерпретаторы: их аргументы — данные (N4).
+    if NAV_READ.contains(&c.name.as_str())
+        || PKG_MANAGERS.contains(&c.name.as_str())
+        || INTERPRETERS.contains(&c.name.as_str())
+        || c.name.starts_with("python")
+    {
+        return false;
+    }
+    let a = &c.args;
+    // Первое позиционное слово (после опций) либо слово после `--`/`-c`/`-e`/`--run`/`exec`.
+    let mut i = 0;
+    let mut positions = Vec::new();
+    while let Some(x) = a.get(i) {
+        if matches!(
+            x.as_str(),
+            "--" | "-c" | "-e" | "--run" | "--command" | "exec" | "-exec"
+        ) {
+            positions.extend(a.get(i + 1).map(String::as_str));
+            i += 2;
+            continue;
         }
-    })
+        if x.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        positions.push(x.as_str());
+        break;
+    }
+    positions.iter().any(|a| dangerous_word(a))
+}
+
+fn dangerous_word(a: &str) -> bool {
+    if a.starts_with('-') || a.contains(' ') {
+        return false;
+    }
+    let n = norm(a);
+    DANGER_WORDS.contains(&n.as_str()) || n.starts_with("mkfs")
 }
 
 /// `(вывод, цель-файл)` перенаправления; дублирование дескриптора и here-doc — без цели.
@@ -244,13 +309,16 @@ fn classify(
             write_targets(a).any(|t| write_out(t, outside)),
             label::OVERWRITE,
         ),
-        "%" | "foreach-object" => {
-            a.iter()
-                .find(|x| !x.starts_with(['-', '{']))
-                .and_then(|m| match method_expr(m) {
-                    Some(Expr::Label(l)) => Some(l),
-                    _ => None,
-                })
+        "%" | "foreach-object" | "foreach" => {
+            // `% Delete`, `foreach Delete`, `% -MemberName Delete`.
+            let m = a
+                .iter()
+                .skip_while(|x| x.eq_ignore_ascii_case("-membername"))
+                .find(|x| !x.starts_with(['-', '{']));
+            m.and_then(|m| match method_expr(m) {
+                Some(Expr::Label(l)) => Some(l),
+                _ => None,
+            })
         }
         "find" => find_label(a, lang, outside, recurse),
         "git" => git_label(a),
@@ -497,6 +565,27 @@ fn git_label(a: &[String]) -> Option<&'static str> {
         .iter()
         .position(|x| x == "--")
         .is_some_and(|p| p + 1 < rest.len());
+    // Подкоманды и опции git, исполняющие команду (N3, тот же класс, что `git -c` и
+    // `git config`): значение исполняется локально.
+    if git_exec_subcommand(sub, rest) {
+        return Some(label::UNPARSED);
+    }
+    // Позиционный путь-операнд `restore` (не опция и не значение `-s`/`--source`): такой
+    // `restore` откатывает рабочую копию.
+    let has_path_operand = {
+        let mut skip = false;
+        rest.iter().any(|x| {
+            if skip {
+                skip = false;
+                return false;
+            }
+            if matches!(x.as_str(), "-s" | "--source") {
+                skip = true;
+                return false;
+            }
+            !x.starts_with('-') && x != "--"
+        })
+    };
     let reset = match sub {
         "config" => {
             return git_config_key(rest)
@@ -508,8 +597,9 @@ fn git_label(a: &[String]) -> Option<&'static str> {
         "checkout" => short('f') || has("--force") || all_paths || after_dashdash,
         "switch" => short('f') || has("--force") || has("--discard-changes"),
         "restore" => {
+            // Откат рабочей копии: симметрично `git checkout -- <файл>` (N6).
             let staged_only = (has("--staged") || short('S')) && !(has("--worktree") || short('W'));
-            !staged_only && all_paths
+            !staged_only && (all_paths || after_dashdash || has_path_operand)
         }
         "clean" => (short('f') || has("--force")) && !(short('n') || has("--dry-run")),
         "stash" => matches!(rest.first().map(String::as_str), Some("drop" | "clear")),
@@ -539,6 +629,25 @@ fn git_label(a: &[String]) -> Option<&'static str> {
         _ => false,
     };
     reset.then_some(label::GIT_RESET)
+}
+
+/// Подкоманда или опция git, исполняющая команду оболочки (N3). Значение опций
+/// `--exec`/`--upload-pack`/`--receive-pack`/`--extcmd`/`--to-command` исполняется
+/// локально; `submodule foreach` и `bisect run` запускают команду в каждом модуле/шаге.
+fn git_exec_subcommand(sub: &str, rest: &[String]) -> bool {
+    let first = rest.first().map(String::as_str);
+    if (sub == "submodule" && first == Some("foreach")) || (sub == "bisect" && first == Some("run"))
+    {
+        return true;
+    }
+    rest.iter().any(|x| {
+        let key = x.split('=').next().unwrap_or("");
+        matches!(
+            key,
+            "--exec" | "--extcmd" | "--upload-pack" | "--receive-pack" | "--to-command"
+        ) || (key == "-x" && matches!(sub, "rebase" | "difftool" | "mergetool"))
+            || (key == "-u" && matches!(sub, "clone" | "fetch" | "ls-remote"))
+    })
 }
 
 /// `DROP TABLE|DATABASE|SCHEMA` или `TRUNCATE` в аргументах клиента СУБД.

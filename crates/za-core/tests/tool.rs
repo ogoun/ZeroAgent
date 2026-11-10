@@ -262,6 +262,8 @@ fn protocol_strings_stable() {
             irreversible::SQL_DROP,
             irreversible::OVERWRITE,
             irreversible::UNPARSED,
+            irreversible::EXEC_UNTRUSTED,
+            irreversible::GIT_CONFIG_EXEC,
         ],
         [
             "delete",
@@ -271,7 +273,9 @@ fn protocol_strings_stable() {
             "infra",
             "sql_drop",
             "overwrite",
-            "unparsed"
+            "unparsed",
+            "exec_untrusted",
+            "git_config_exec"
         ]
     );
     assert_eq!(

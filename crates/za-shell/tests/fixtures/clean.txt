@@ -57,3 +57,38 @@ P ipconfig /all
 P ipconfig /all | Select-String IPv4
 P findstr /s /i foo *.cs
 P git log -n 3
+# N4: переход в каталог с «опасным» именем и чтение — не команды
+B cd git
+B cd cmd
+B cd eval
+B pushd cmd
+B tree cmd
+B python run.py eval
+B python -m eval
+B node scripts/build.js git
+B bun run eval
+B pgrep curl
+B pkill -f curl
+B killall nc
+B ldd ./build/app
+B readlink -f build/app
+B realpath git
+B rename-item rm rm2
+P Get-Item git
+P gi .\eval
+P Set-Location git
+P Push-Location cmd
+P Rename-Item rm rm2
+# N4: менеджеры пакетов — имена пакетов это данные
+B pacman -S git curl
+B dnf install -y git curl wget
+B yum install git
+B apk add git curl bash
+B zypper install git
+B conda install git
+B apt install git curl
+B apt-get install -y git
+# N5b: вызов на границе слова (platform.system не os.system)
+B python -c "import platform; print(platform.system())"
+# git restore --staged только снимает из индекса
+B git restore --staged src/main.rs

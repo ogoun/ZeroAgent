@@ -867,3 +867,86 @@ fn clean_fixture_is_silent() {
         assert!(out.is_empty(), "{c}: {out:?}");
     }
 }
+
+// --- Раунд исправлений 2 (повторное ревью) --------------------------------------------
+
+#[test]
+fn n1_powershell_residual_bypasses() {
+    for (c, k) in [
+        ("gci ./out -r | foreach Delete", "delete"),
+        ("(gci ./out -r).ForEach('Delete')", "delete"),
+        ("Write-Output (gi ./out).Delete($true)", "delete"),
+        (r"[IO.File]::Replace('a','./out',$null)", "overwrite"),
+        ("cmd /c rd/s/q ./out", "delete"),
+    ] {
+        assert!(labels(c, P).contains(&k), "{c}: {:?}", labels(c, P));
+    }
+    // Динамическое имя члена: имя метода неизвестно.
+    assert!(
+        labels("(gi ./out).$m($true)", P).contains(&"unparsed"),
+        "dynamic member"
+    );
+}
+
+#[test]
+fn n2_executing_shells_from_unknown_commands() {
+    for c in [
+        "fish -c 'rm -rf ./out'",
+        "csh -c 'rm -rf ./out'",
+        "nu -c 'rm -rf ./out'",
+    ] {
+        assert!(labels(c, B).contains(&"delete"), "{c}: {:?}", labels(c, B));
+    }
+}
+
+#[test]
+fn n3_git_subcommands_that_execute() {
+    for c in [
+        "git submodule foreach 'rm -rf ./out'",
+        "git rebase -x 'rm -rf ./out' HEAD~1",
+        "git ls-remote --upload-pack='sh -c id' .",
+    ] {
+        assert!(
+            labels(c, B).contains(&"unparsed"),
+            "{c}: {:?}",
+            labels(c, B)
+        );
+    }
+}
+
+#[test]
+fn n4_navigation_and_package_managers_are_silent() {
+    for c in [
+        "cd cmd",
+        "pushd eval",
+        "pacman -S git curl",
+        "python run.py eval",
+    ] {
+        assert!(labels(c, B).is_empty(), "{c}: {:?}", labels(c, B));
+    }
+    for c in ["Get-Item git", "Set-Location cmd"] {
+        assert!(labels(c, P).is_empty(), "{c}: {:?}", labels(c, P));
+    }
+}
+
+#[test]
+fn n5a_clustered_python_flags_with_code() {
+    for c in [
+        "python -Ic 'import shutil; shutil.rmtree(\"./out\")'",
+        "python -uc 'import os; os.system(\"id\")'",
+    ] {
+        assert!(
+            labels(c, B).contains(&"unparsed"),
+            "{c}: {:?}",
+            labels(c, B)
+        );
+    }
+}
+
+#[test]
+fn n6_git_restore_and_checkout_file_are_symmetric() {
+    assert!(labels("git checkout -- src/main.rs", B).contains(&"git_reset"));
+    assert!(labels("git restore src/main.rs", B).contains(&"git_reset"));
+    // `--staged` только снимает из индекса — не откат рабочей копии.
+    assert!(labels("git restore --staged src/main.rs", B).is_empty());
+}

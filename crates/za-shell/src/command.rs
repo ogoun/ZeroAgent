@@ -27,8 +27,8 @@ pub(crate) struct Cmd {
 /// Служебные слова, после которых идёт команда.
 #[rustfmt::skip]
 const RESERVED: &[&str] = &[
-    "then", "do", "else", "elif", "elseif", "if", "while", "until", "for", "foreach", "switch",
-    "try", "catch", "finally", "function", "filter", "trap", "!", "{",
+    "then", "do", "else", "elif", "elseif", "if", "while", "until", "for", "switch", "try",
+    "catch", "finally", "function", "filter", "trap", "!", "{",
 ];
 
 /// Обёртки (I3): `(имя, опции со значением, позиционных слов перед командой)`.
@@ -154,6 +154,17 @@ pub(crate) fn analyze(argv: &[String], lang: Lang) -> Option<Cmd> {
         }
     }
     let raw0 = w.get(i)?.clone();
+    // cmd склеивает ключи с именем (`rd/s/q`): имя — до первого `/`, остаток — ключи (N1).
+    if lang == Lang::Cmd
+        && let Some((head, tail)) = raw0.split_once('/')
+        && !head.is_empty()
+    {
+        let mut args: Vec<String> = tail.split('/').map(|s| format!("/{s}")).collect();
+        args.extend(w[i + 1..].iter().cloned());
+        let name = norm(head);
+        let inner = inner_of(&name, &args);
+        return Some(cmd(&name, head.to_string(), &args, call, inner));
+    }
     let name = norm(&raw0);
     let inner = inner_of(&name, &w[i + 1..]);
     Some(cmd(&name, raw0, &w[i + 1..], call, inner))
@@ -316,6 +327,13 @@ pub(crate) fn pwsh_expression(raw: &str) -> bool {
         || raw.starts_with(|c: char| c.is_ascii_digit())
 }
 
+/// Слово-аргумент PowerShell — выражение с вызовом метода (`(gi x).Delete($true)`),
+/// которое нужно прогнать через [`pwsh_expr`] (N1).
+pub(crate) fn arg_is_expr(raw: &str) -> bool {
+    (raw.starts_with(['(', '[']) || raw.starts_with("@(")) && raw.contains(").")
+        || raw.starts_with('$') && raw.contains('.') && raw.contains('(')
+}
+
 /// Имя команды вычисляется при исполнении — команда неизвестна.
 pub(crate) fn dynamic_cmd(c: &Cmd) -> bool {
     dynamic(&c.raw0)
@@ -347,7 +365,8 @@ fn code_or_opaque(code: String, lang: Lang) -> Inner {
 /// Строка вложенной интерпретации команды, если команда — интерпретатор.
 fn inner_of(name: &str, args: &[String]) -> Option<Inner> {
     match name {
-        "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "mksh" | "yash" => posix_inner(args),
+        "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "mksh" | "yash" | "fish" | "tcsh"
+        | "csh" | "nu" | "xonsh" | "elvish" => posix_inner(args),
         "eval" => (!args.is_empty()).then(|| code_or_opaque(args.join(" "), Lang::Bash)),
         "source" => args
             .first()
@@ -440,19 +459,34 @@ const FOREIGN_DANGER: &[&str] = &[
     "os.remove", "net::http", "lwp::", "io::socket", "fileutils.rm", "file.delete",
 ];
 
+/// Опасный вызов на границе слова: токен не следует за буквой, цифрой, `_` или `.`.
+/// Так `platform.system()` и `.remove(1)` не считаются `os.system`/`os.remove` (N5b).
+/// Эвристика — защита «в глубину», а не граница (обфускация её обходит, записанный риск).
+fn contains_danger(src: &str) -> bool {
+    let b = src.as_bytes();
+    FOREIGN_DANGER.iter().any(|d| {
+        src.match_indices(d).any(|(i, _)| {
+            i == 0 || !matches!(b[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.')
+        })
+    })
+}
+
 /// `python`, `perl`, `ruby`, `node`, `php`, `Rscript`, `lua` (I4): без кода и без
 /// скрипта — код из stdin; встроенный код с опасными вызовами — неразобран.
 fn foreign_inner(name: &str, args: &[String]) -> Option<Inner> {
     let python = name.starts_with("python") || name == "py" || name.starts_with("pypy");
-    let (code, vals): (&[&str], &[&str]) = match name {
-        _ if python => (&["-c"], &["-W", "-X", "-Q"]),
+    // `code` — длинные флаги кода, `letters` — короткие буквы кода (в т. ч. в кластере
+    // `-Ic`, N5a), `vals` — опции со значением.
+    let (code, letters, vals): (&[&str], &[char], &[&str]) = match name {
+        _ if python => (&[], &['c'], &["-W", "-X", "-Q"]),
         "node" => (
-            &["-e", "--eval", "-p", "--print"],
+            &["--eval", "--print"],
+            &['e', 'p'],
             &["-r", "--require", "--import"],
         ),
-        "perl" | "ruby" => (&[], &["-I", "-M", "-r"]),
-        "php" => (&["-r"], &["-c", "-d"]),
-        "rscript" | "lua" | "luajit" => (&["-e"], &[]),
+        "perl" | "ruby" => (&[], &['e', 'E'], &["-I", "-M", "-r"]),
+        "php" => (&["-r"], &['r'], &["-c", "-d"]),
+        "rscript" | "lua" | "luajit" => (&["-e"], &['e'], &[]),
         _ => return None,
     };
     let mut i = 0;
@@ -462,18 +496,13 @@ fn foreign_inner(name: &str, args: &[String]) -> Option<Inner> {
             break;
         }
         if a.len() > 1 && a.starts_with('-') {
-            let cluster_e = matches!(name, "perl" | "ruby")
-                && !a.starts_with("--")
-                && a[1..].contains(['e', 'E']);
-            if code.contains(&a.as_str()) || cluster_e {
+            let cluster = !a.starts_with("--") && a[1..].contains(letters);
+            if code.contains(&a.as_str()) || cluster {
                 let src = args
                     .get(i + 1)
                     .map(|s| s.to_lowercase())
                     .unwrap_or_default();
-                return FOREIGN_DANGER
-                    .iter()
-                    .any(|d| src.contains(d))
-                    .then_some(Inner::Opaque);
+                return contains_danger(&src).then_some(Inner::Opaque);
             }
             if (python && a == "-m")
                 || matches!(
@@ -674,7 +703,8 @@ pub(crate) fn pwsh_expr(raw: &str) -> Expr {
         let t = t.to_lowercase();
         ty = Some(t.strip_prefix("system.").unwrap_or(&t).to_string());
     }
-    let mut methods = Vec::new();
+    // Пары `(имя метода, первая строка-аргумент)` вызовов верхнего уровня.
+    let mut methods: Vec<(String, Option<String>)> = Vec::new();
     let mut depth = 0usize;
     while let Some(&c) = chars.get(i) {
         match c {
@@ -691,6 +721,10 @@ pub(crate) fn pwsh_expr(raw: &str) -> Expr {
                 if c == ':' && chars.get(j) == Some(&':') {
                     j += 1;
                 }
+                // Динамическое имя члена `.(…)`, `.$x`, `.@(…)` — имя неизвестно (N1).
+                if c == '.' && matches!(chars.get(j), Some('(' | '$' | '@')) {
+                    return Expr::Unknown;
+                }
                 let start = j;
                 while chars
                     .get(j)
@@ -700,7 +734,9 @@ pub(crate) fn pwsh_expr(raw: &str) -> Expr {
                 }
                 let first_digit = chars.get(start).is_some_and(|x| x.is_ascii_digit());
                 if j > start && !first_digit && chars.get(j) == Some(&'(') {
-                    methods.push(chars[start..j].iter().collect::<String>().to_lowercase());
+                    let name = chars[start..j].iter().collect::<String>().to_lowercase();
+                    let arg = first_string_arg(&chars, j);
+                    methods.push((name, arg));
                 }
                 i = j;
                 continue;
@@ -710,13 +746,58 @@ pub(crate) fn pwsh_expr(raw: &str) -> Expr {
         i += 1;
     }
     let safe_type = ty.as_deref().is_some_and(|t| SAFE_TYPES.contains(&t));
-    for m in &methods {
+    let fs_type = ty
+        .as_deref()
+        .is_some_and(|t| matches!(t, "io.file" | "io.directory" | "file" | "directory"));
+    for (m, arg) in &methods {
         if let Some(e) = method_expr(m) {
             return e;
+        }
+        // `.ForEach('Delete')`/`.Where('Delete')`: имя метода задано строкой (N1).
+        if matches!(m.as_str(), "foreach" | "where")
+            && let Some(e) = arg.as_deref().and_then(method_expr)
+        {
+            return e;
+        }
+        // На `[IO.File]`/`[IO.Directory]` безопасно только чтение (N1).
+        if fs_type
+            && !m.starts_with("readall")
+            && !matches!(
+                m.as_str(),
+                "exists"
+                    | "getfiles"
+                    | "getdirectories"
+                    | "enumeratefiles"
+                    | "enumeratedirectories"
+                    | "readlines"
+            )
+        {
+            return Expr::Label(label::OVERWRITE);
         }
         if !SAFE_METHODS.contains(&m.as_str()) && !safe_type {
             return Expr::Unknown;
         }
     }
     Expr::Safe
+}
+
+/// Первая строка-аргумент вызова, открытая `(` в позиции `open`.
+fn first_string_arg(chars: &[char], open: usize) -> Option<String> {
+    let mut i = open + 1;
+    while let Some(&c) = chars.get(i) {
+        match c {
+            ' ' | '\t' => i += 1,
+            '\'' | '"' => {
+                let q = c;
+                i += 1;
+                let start = i;
+                while chars.get(i).is_some_and(|&x| x != q) {
+                    i += 1;
+                }
+                return Some(chars[start..i].iter().collect());
+            }
+            _ => return None,
+        }
+    }
+    None
 }
