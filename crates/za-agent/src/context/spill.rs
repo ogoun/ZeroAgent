@@ -11,8 +11,16 @@
 //! Файлы лежат только в `<project>/.zero-agent/work/spill/`; каталог
 //! `.zero-agent/work/` получает `.gitignore` со строкой `*`. Запись — через временный
 //! файл и переименование: оборванная запись не оставляет полуфайла под именем spill.
+//!
+//! Запись не идёт через ссылки (SEC-004; m5 финального ревью R1-B2): ни один компонент
+//! пути под корнем проекта (`.zero-agent`, `work`, `spill`), ни `.gitignore`, ни файл
+//! выгрузки не могут быть символической ссылкой или junction, а каталог выгрузки после
+//! `canonicalize` лежит внутри корня проекта. Иначе — ошибка записи: вывод уходит в
+//! контекст с пометкой `full output not saved`, удаление на границе — `prune_failed`.
+//! Проверка и запись — не одна атомарная операция: подмена каталога между ними
+//! (TOCTOU) — принятый риск до песочницы файловых инструментов R1-C.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -198,13 +206,14 @@ pub(crate) fn write_spill(project_dir: &Path, name: &str, bytes: &[u8]) -> io::R
             format!("недопустимое имя файла выгрузки: {name}"),
         ));
     }
-    let dir = project_dir.join(SPILL_DIR);
-    std::fs::create_dir_all(&dir)?;
+    spill_dir(project_dir)?;
     let ignore = project_dir.join(WORK_DIR).join(".gitignore");
+    not_link(&ignore)?;
     if std::fs::read(&ignore).ok().as_deref() != Some(WORK_GITIGNORE.as_bytes()) {
         atomic_write(&ignore, WORK_GITIGNORE.as_bytes())?;
     }
     let file = file_of(project_dir, name);
+    not_link(&file)?;
     if std::fs::metadata(&file).is_ok_and(|m| m.len() == bytes.len() as u64)
         && std::fs::read(&file).is_ok_and(|b| b == bytes)
     {
@@ -213,6 +222,54 @@ pub(crate) fn write_spill(project_dir: &Path, name: &str, bytes: &[u8]) -> io::R
     atomic_write(&file, bytes)?;
     tracing::debug!(file = %file.display(), bytes = bytes.len(), "вывод выгружен в файл");
     Ok(())
+}
+
+/// Каталог выгрузки `<project>/.zero-agent/work/spill`: создаётся по компонентам, ни
+/// один компонент не ссылка и не junction, канонический путь — внутри корня проекта.
+fn spill_dir(project_dir: &Path) -> io::Result<PathBuf> {
+    let mut dir = project_dir.to_path_buf();
+    for part in Path::new(SPILL_DIR).components() {
+        dir.push(part);
+        not_link(&dir)?;
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            // Уже есть (или создан параллельной записью) — проверить ещё раз.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                not_link(&dir)?;
+                if !dir.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("путь каталога выгрузки — не каталог: {}", dir.display()),
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let root = std::fs::canonicalize(project_dir)?;
+    let real = std::fs::canonicalize(&dir)?;
+    if !real.starts_with(&root) {
+        return Err(io::Error::other(format!(
+            "каталог выгрузки {} вне проекта {}",
+            real.display(),
+            root.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// Путь — не символическая ссылка и не junction (на Windows junction — тоже ссылка у
+/// `symlink_metadata`); отсутствующий путь допустим.
+fn not_link(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(io::Error::other(format!(
+            "путь выгрузки — символическая ссылка или junction: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn file_of(project_dir: &Path, name: &str) -> PathBuf {
@@ -224,14 +281,24 @@ fn file_of(project_dir: &Path, name: &str) -> PathBuf {
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Запись через временный файл рядом (`<имя>.<pid>-<n>.tmp`) и переименование.
-/// Любой сбой удаляет временный файл: остатка `.tmp` нет.
+/// Временный файл создаётся заново (`create_new`): чужая ссылка на его месте — ошибка,
+/// а не запись по ней. Любой сбой удаляет временный файл: остатка `.tmp` нет.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".{}-{n}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    let r = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
-    if r.is_err() {
+    let mut created = false;
+    let r = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            created = true;
+            f.write_all(bytes)
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if r.is_err() && created {
         let _ = std::fs::remove_file(&tmp);
     }
     r

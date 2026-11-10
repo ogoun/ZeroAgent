@@ -407,6 +407,7 @@ async fn step_zero(
         at_boundary: AtBoundary::default(),
         meter: Default::default(),
         legacy_step: false,
+        turn_attempt: 0,
         task: spec.task,
         env_text,
         user_inputs: Vec::new(),
@@ -1619,6 +1620,7 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
     // Повтор после обрыва детектором (D58, D59): `Reaction::RetryTurn`.
     let mut retry: Option<Reaction> = None;
     loop {
+        st.turn_attempt = attempt;
         let mut opts = turn_options(st);
         if let Some(r) = &retry {
             apply_retry(st, &mut opts, r);
@@ -2645,7 +2647,12 @@ fn push_nudges(st: &mut LoopState, nudges: &[String]) -> Result<(), HistoryError
     Ok(())
 }
 
-/// `turn.finished {turn, outcome, calls, repairs, rejected}` (D8).
+/// `turn.finished {turn, step, turn_attempt, outcome, calls, repairs, rejected}` (D8).
+///
+/// Реплей шага после паузы посреди него (одобрение, `ask_user`, сбой) пишет событие
+/// снова: запись не гасится, иначе сбой до события его теряет (at-least-once). Ключ
+/// события — `(turn, turn_attempt)`; потребители (`<state>`, `stats`) берут последнее
+/// событие ключа (финальное ревью R1-B2, I1).
 async fn turn_finished(
     deps: &LoopDeps,
     st: &mut LoopState,
@@ -2667,6 +2674,8 @@ async fn turn_finished_with(
         rev.map_or((0, 0, 0), |r| (r.calls.len(), r.repairs, r.rejected));
     let mut payload = json!({
         "turn": st.turn,
+        "step": st.ctx.step(),
+        "turn_attempt": st.turn_attempt,
         "outcome": outcome,
         "calls": calls,
         "repairs": repairs,

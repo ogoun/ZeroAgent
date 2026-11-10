@@ -26,8 +26,8 @@ use crate::context::{TEMPLATE_TOKENS, message_text};
 use crate::conversation::{Conversation, HistoryError, LoadError};
 use crate::prompt::approx_tokens;
 use crate::request::{FrozenPrefix, request_hash};
-use crate::resume::RUNTIME_CONTROL;
-use crate::turn::{COMPACT_KIND, MODEL_ERROR};
+use crate::resume::{RUNTIME_CONTROL, turn_finished_key};
+use crate::turn::{COMPACT_EFFECT, COMPACT_KIND, MODEL_EFFECT, MODEL_ERROR};
 
 /// Страница чтения журнала.
 const PAGE: usize = 1024;
@@ -87,9 +87,11 @@ pub struct RunMetrics {
     pub ttft_p95_ms: Option<u64>,
     /// Средняя скорость вывода по вызовам, где она известна, токены/с.
     pub output_tps: Option<f64>,
-    /// Ошибки модели по классам (`ErrorClass`, snake_case) из квитанций `model_error:`.
+    /// Ошибки модели по классам (`ErrorClass`, snake_case) из квитанций `model_error:`
+    /// эффектов `model` и `compact`; квитанция без блоба результата пропускается.
     pub errors: BTreeMap<String, u32>,
-    /// Сумма `turn.finished.repairs`.
+    /// Сумма `turn.finished.repairs` по ключам `(turn, turn_attempt)`: у повторённого
+    /// реплеем события берётся последнее.
     pub repairs: u32,
     /// Запросы компакции (`model.request` с `kind: "compact"`, разные `effect_key`).
     pub compactions: u32,
@@ -196,6 +198,11 @@ pub async fn run_metrics(store: &ProjectStore, run: RunId) -> Result<RunMetrics,
     let (mut turns, mut steps, mut compactions) =
         (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     let (mut ttft, mut tps) = (Vec::new(), Vec::new());
+    // Реплей шага пишет `turn.finished` повторно: исправления — по последнему событию
+    // ключа хода (финальное ревью R1-B2, I1).
+    let mut repairs: BTreeMap<(u64, u64), u32> = BTreeMap::new();
+    // Имя эффекта по ключу: квитанции разбираются только у эффектов модели.
+    let mut effect_names: BTreeMap<&str, &str> = BTreeMap::new();
     for e in &evs {
         let p = &e.payload;
         match e.kind {
@@ -203,7 +210,7 @@ pub async fn run_metrics(store: &ProjectStore, run: RunId) -> Result<RunMetrics,
                 if let Some(t) = turn_of(e) {
                     turns.insert(t);
                 }
-                m.repairs = m.repairs.saturating_add(u32_of(p.get("repairs")));
+                repairs.insert(turn_finished_key(p), u32_of(p.get("repairs")));
             }
             EventKind::ModelRequest => {
                 // Без `effect_key` каждый запрос — свой шаг.
@@ -226,7 +233,22 @@ pub async fn run_metrics(store: &ProjectStore, run: RunId) -> Result<RunMetrics,
                 ttft.extend(p.get("ttft_ms").and_then(Value::as_u64));
                 tps.extend(p.get("output_tps").and_then(Value::as_f64));
             }
+            EventKind::EffectIntent => {
+                if let (Some(k), Some(n)) = (
+                    p.get("key").and_then(Value::as_str),
+                    p.get("name").and_then(Value::as_str),
+                ) {
+                    effect_names.insert(k, n);
+                }
+            }
             EventKind::EffectReceipt => {
+                let name = p
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .and_then(|k| effect_names.get(k));
+                if !name.is_some_and(|n| *n == MODEL_EFFECT || *n == COMPACT_EFFECT) {
+                    continue;
+                }
                 if let Some(class) = model_error_class(store, p).await? {
                     *m.errors.entry(class).or_default() += 1;
                 }
@@ -234,6 +256,7 @@ pub async fn run_metrics(store: &ProjectStore, run: RunId) -> Result<RunMetrics,
             _ => {}
         }
     }
+    m.repairs = repairs.values().fold(0u32, |acc, &n| acc.saturating_add(n));
     m.turns = count(turns.len());
     m.steps = count(steps.len());
     m.compactions = count(compactions.len());
@@ -386,7 +409,8 @@ fn n_ctx_at(evs: &[Event], seq: Seq, current: u32) -> u32 {
         .map_or(current, |n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
-/// Класс ошибки модели квитанции-отказа `model_error:` (D7); прочие квитанции — `None`.
+/// Класс ошибки модели квитанции-отказа `model_error:` (D7); прочие квитанции и
+/// квитанция без блоба результата (`warn`) — `None`.
 async fn model_error_class(store: &ProjectStore, p: &Value) -> Result<Option<String>, StoreError> {
     let result = match (
         p.get("result"),
@@ -396,7 +420,15 @@ async fn model_error_class(store: &ProjectStore, p: &Value) -> Result<Option<Str
         (None, Some(h)) => match store.get_blob(&BlobHash(h.to_owned())).await? {
             Some(raw) => serde_json::from_slice(&raw)
                 .map_err(|e| StoreError::Corrupt(format!("результат эффекта в блобе {h}: {e}")))?,
-            None => return Err(StoreError::Corrupt(format!("нет блоба результата {h}"))),
+            None => {
+                // Отказ `stats` целиком из-за одной квитанции хуже пропуска (m1 финального
+                // ревью R1-B2): метрика ошибок неполна, остальные считаются.
+                tracing::warn!(
+                    blob = h,
+                    "нет блоба результата квитанции: квитанция пропущена"
+                );
+                return Ok(None);
+            }
         },
         (None, None) => return Ok(None),
     };

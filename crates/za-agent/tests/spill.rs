@@ -763,3 +763,167 @@ async fn prune_failure_is_journaled() {
     let last: za_agent::Snapshot = serde_json::from_value(snaps.last().unwrap().1.clone()).unwrap();
     assert_eq!(last.epoch, 0);
 }
+
+// ---- Финальное ревью R1-B2, m5: выгрузка не пишет через ссылки ----
+
+/// Ссылка-каталог `link` → `target`: на Windows — junction (`mklink /J`, прав
+/// администратора не нужно), на Unix — символическая ссылка.
+fn dir_link(link: &Path, target: &Path) {
+    #[cfg(windows)]
+    {
+        // `mklink` понимает только `\`: путь собирается заново по компонентам.
+        let native = |p: &Path| p.components().collect::<PathBuf>();
+        let (link, target) = (native(link), native(target));
+        let out = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .expect("cmd не запустился");
+        assert!(
+            out.status.success(),
+            "mklink /J: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+/// Проект и чужой каталог рядом с ним (вне проекта).
+fn project_and_outside(name: &str) -> (PathBuf, PathBuf) {
+    let base = dir(name);
+    let (project, outside) = (base.join("project"), base.join("outside"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    (project, outside)
+}
+
+fn is_empty_dir(d: &Path) -> bool {
+    std::fs::read_dir(d).unwrap().next().is_none()
+}
+
+/// `.zero-agent/work` — junction (символическая ссылка) на каталог вне проекта: ни
+/// выгрузка, ни удаление старых результатов туда не пишут, обе — ошибка записи.
+#[test]
+fn spill_refuses_linked_work_dir() {
+    let (project, outside) = project_and_outside("link_work");
+    std::fs::create_dir_all(project.join(".zero-agent")).unwrap();
+    dir_link(&project.join(".zero-agent/work"), &outside);
+    let raw = "строка\n".repeat(1000);
+    let e = spill(&project, "r-1-1", &raw, &raw, 1000).unwrap_err();
+    assert!(e.to_string().contains("ссылка"), "{e}");
+    let run = RunId::new();
+    let mut results = vec!["ok".to_owned(); 6];
+    results[0] = "x".repeat(5000);
+    assert!(prune(&history(&results), run, &project, 4, 1024).is_err());
+    assert!(is_empty_dir(&outside), "запись вне проекта");
+}
+
+/// Ссылкой может быть любой компонент: `.zero-agent` целиком и `spill`.
+#[test]
+fn spill_refuses_linked_parent_and_spill_dir() {
+    let (project, outside) = project_and_outside("link_parent");
+    dir_link(&project.join(".zero-agent"), &outside);
+    let raw = "y".repeat(5000);
+    assert!(spill(&project, "r-1-1", &raw, &raw, 1000).is_err());
+    assert!(is_empty_dir(&outside), "запись вне проекта");
+
+    let (project, outside) = project_and_outside("link_spill");
+    std::fs::create_dir_all(project.join(".zero-agent/work")).unwrap();
+    dir_link(&project.join(SPILL_DIR), &outside);
+    assert!(spill(&project, "r-1-1", &raw, &raw, 1000).is_err());
+    assert!(is_empty_dir(&outside), "запись вне проекта");
+}
+
+/// Сам файл выгрузки — ссылка на файл вне проекта: файл не переписан. На Windows
+/// ссылка на файл требует прав (режим разработчика); без них проверка пропускается,
+/// путь каталогов проверяют тесты выше через junction.
+#[test]
+fn spill_refuses_linked_file() {
+    let (project, outside) = project_and_outside("link_file");
+    std::fs::create_dir_all(project.join(SPILL_DIR)).unwrap();
+    let target = outside.join("victim.txt");
+    std::fs::write(&target, "чужой файл").unwrap();
+    let link = spill_file(&project, "r-1-1");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    if let Err(e) = std::os::windows::fs::symlink_file(&target, &link) {
+        eprintln!("ссылка на файл не создана ({e}): проверка пропущена");
+        return;
+    }
+    let raw = "y".repeat(5000);
+    assert!(spill(&project, "r-1-1", &raw, &raw, 1000).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "чужой файл");
+}
+
+/// Путь драйвера: вызов инструмента с большим выводом и junction на месте
+/// `.zero-agent/work` — результат с пометкой `full output not saved`, вне проекта пусто.
+#[tokio::test]
+async fn linked_work_dir_output_not_saved() {
+    let (project, outside) = project_and_outside("link_tools");
+    std::fs::create_dir_all(project.join(".zero-agent")).unwrap();
+    dir_link(&project.join(".zero-agent/work"), &outside);
+    let s = ProjectStore::open(&project.join("store")).unwrap();
+    let run = RunId::new();
+    s.create_run(NewRun {
+        id: run,
+        project_id: "p".into(),
+        parent_id: None,
+        role: RunRole::Top,
+        model_profile: None,
+    })
+    .await
+    .unwrap();
+    let j = Journal::new(s.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY));
+    let raw: String = (0..5120).map(|i| format!("l {i:05}\n")).collect();
+    let mut reg = ToolRegistry::default();
+    reg.register(Arc::new(Big {
+        spec: tool_spec("big", Some(4096)),
+        out: raw,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }))
+    .unwrap();
+    let env = ToolEnv {
+        run,
+        project_dir: project.clone(),
+        mode: RunMode::Ask,
+        parallel: false,
+        spill: Some(SpillCfg {
+            n_ctx: 8192,
+            share: 0.15,
+        }),
+    };
+    let planned = [PlannedCall {
+        call: ToolCall {
+            id: "c1".into(),
+            name: "big".into(),
+            arguments: json!({}),
+            raw_arguments: None,
+        },
+        source: CallSource::Native,
+        verdict: CallVerdict::Run,
+    }];
+    let (_tx, mut sig) = signal_channel();
+    let mut ctx = RunCtx::resume_at(s.clone(), run, 0, 0);
+    let out = tokio::time::timeout(
+        limit(),
+        run_tools(&mut ctx, &j, &reg, &env, &planned, &mut sig),
+    )
+    .await
+    .expect("run_tools не вернулся за предел теста")
+    .unwrap();
+    let Part::ToolResult { content, .. } = &out.results[0] else {
+        panic!("не результат");
+    };
+    assert!(
+        content.contains("full output not saved"),
+        "{}",
+        split(content).1
+    );
+    assert!(content.len() <= 4096 + 120, "{}", content.len());
+    assert!(is_empty_dir(&outside), "запись вне проекта");
+}

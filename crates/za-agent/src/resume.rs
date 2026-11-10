@@ -13,6 +13,8 @@
 //! параметрами хода R1-B1 (`LoopState::legacy_step`): `request_hash` и ключи эффектов
 //! совпадают с журналом (`effect_seq` из снимка, эффект `context` — только на границе).
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 use za_core::{Recovery, RunCtx, recover};
 use za_llm::EndpointId;
@@ -323,6 +325,7 @@ async fn restore(
         meter: snap.meter,
         // D66: шаг R1-B1 посреди хода доигрывается с параметрами хода R1-B1.
         legacy_step: snap.v == SNAPSHOT_V1 && snap.next == Next::Model,
+        turn_attempt: 0,
         task,
         env_text,
         user_inputs,
@@ -404,16 +407,26 @@ async fn inputs_of(store: &ProjectStore, msgs: &[Message]) -> Result<Vec<UserInp
 /// Исходы `turn.finished`, после которых ход повторяется в том же шаге (D69).
 const RETRIED_OUTCOMES: [&str; 2] = ["overflow", "degenerate"];
 
+/// Ключ события `turn.finished`: `(turn, turn_attempt)`. Реплей шага после паузы
+/// посреди него пишет событие повторно (at-least-once); потребители считают ключи, а не
+/// события, и берут последнее событие ключа (финальное ревью R1-B2, I1). У событий
+/// R1-B1 поля `turn_attempt` нет — попытка 0.
+pub(crate) fn turn_finished_key(p: &Value) -> (u64, u64) {
+    let get = |k: &str| p.get(k).and_then(Value::as_u64).unwrap_or(0);
+    (get("turn"), get("turn_attempt"))
+}
+
 /// Текст <state>: шаги, последняя причина паузы, решённые неизвестные исходы, мутирующие вызовы
 /// (имя и аргументы до 120 символов) — эффект ReadOnly "state".
 ///
-/// Шаги — число `turn.finished` с конечным исходом (без `overflow` и `degenerate`, R1-B2
-/// D69); пауза — причина последнего перехода в `paused` (`blocked_on_budget` — так и
+/// Шаги — число ключей `turn.finished` ([`turn_finished_key`]) с конечным исходом
+/// последнего события ключа (без `overflow` и `degenerate`, R1-B2 D69); пауза — причина последнего перехода в `paused` (`blocked_on_budget` — так и
 /// пишется); мутирующие вызовы — намерения классов `Idempotent` и `NonIdempotent`, кроме
 /// вызовов модели (ход, сводка компакции) и хука памяти, с квитанцией-успехом без `is_error`.
 /// Имена и аргументы экранируются [`escape_untrusted`].
 pub async fn state_block(store: &ProjectStore, run: RunId) -> Result<String, StoreError> {
-    let mut steps = 0u64;
+    // Ключ хода → исход последнего события ключа конечный.
+    let mut turns: BTreeMap<(u64, u64), bool> = BTreeMap::new();
     let mut last_pause = String::from("none");
     let mut changes = Vec::new();
     let mut cursor = Seq(0);
@@ -425,10 +438,12 @@ pub async fn state_block(store: &ProjectStore, run: RunId) -> Result<String, Sto
             match e.kind {
                 // Исходы `overflow` и `degenerate` — не конец хода: ход повторяется в
                 // том же шаге (D69).
-                EventKind::TurnFinished
-                    if !RETRIED_OUTCOMES.contains(&e.payload["outcome"].as_str().unwrap_or("")) =>
-                {
-                    steps += 1
+                EventKind::TurnFinished => {
+                    let outcome = e.payload["outcome"].as_str().unwrap_or("");
+                    turns.insert(
+                        turn_finished_key(&e.payload),
+                        !RETRIED_OUTCOMES.contains(&outcome),
+                    );
                 }
                 EventKind::RunStatus => {
                     let to = serde_json::from_value::<RunStatus>(e.payload["to"].clone()).ok();
@@ -465,6 +480,7 @@ pub async fn state_block(store: &ProjectStore, run: RunId) -> Result<String, Sto
             Some(escape_untrusted(&format!("{key} → {d}")))
         })
         .collect();
+    let steps = turns.values().filter(|&&done| done).count();
     Ok(format!(
         "<state>\nsteps done: {steps}; last pause: {}\nunknown outcomes: {}\nchanges made: {}\n</state>",
         escape_untrusted(&last_pause),

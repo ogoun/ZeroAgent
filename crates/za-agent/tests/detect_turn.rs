@@ -100,6 +100,10 @@ fn promise_patterns() {
         "I am going to rebuild the index.",
         "Now, I'll open the file.",
         "Let me run the tests:\n```\ncargo test\n```",
+        // Условие в другом предложении обещание не снимает (m2 финального ревью R1-B2).
+        "If you want more, ask. Let me run the tests now.",
+        "Если нужно, скажите. Сейчас проверю логи.",
+        "Let me check if you have the config.",
     ] {
         assert!(promise_without_action(t), "{t}");
     }
@@ -147,6 +151,16 @@ fn promise_normal_answers_not_detected() {
         "I'll let you know if anything changes.",
         "The tests will pass after the fix.",
         "Утилита проверяет файл и запускает тесты.",
+        // Условное предложение — предложение, а не обещание (m2 финального ревью R1-B2).
+        "If you want, I'll add tests for this.",
+        "If you'd like, I can add tests for this.",
+        "If you\u{2019}d like, I'll run the full suite.",
+        "If needed, I'll rerun the build.",
+        "Готово. If necessary, I will update the docs.",
+        "Если хотите, я добавлю тесты.",
+        "Если нужно, проверю ещё раз.",
+        "Тесты зелёные. Если потребуется, запущу полный набор.",
+        "При желании давайте обновим README.",
     ] {
         assert!(!promise_without_action(t), "{t:?}");
     }

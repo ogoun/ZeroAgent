@@ -88,6 +88,33 @@ const PROMISE_CLOSINGS: [&str; 8] = [
     "i will be happy",
     "i will be glad",
 ];
+/// Условные обороты: оборот обещания после них в том же предложении — предложение
+/// пользователю («If you want, I'll add tests», «Если нужно, проверю ещё раз»), а не
+/// обещание действия (m2 финального ревью R1-B2). Нижний регистр, границы слова.
+const PROMISE_CONDITIONALS: [&str; 22] = [
+    "if you",
+    "if needed",
+    "if necessary",
+    "if desired",
+    "if required",
+    "if preferred",
+    "if it helps",
+    "if that helps",
+    "should you",
+    "если хотите",
+    "если хочешь",
+    "если желаете",
+    "если нужно",
+    "если надо",
+    "если потребуется",
+    "если понадобится",
+    "если необходимо",
+    "если вам",
+    "если тебе",
+    "при желании",
+    "при необходимости",
+    "по желанию",
+];
 
 /// Ошибок подряд в классе инструмента до паузы run (D57): шестая.
 const TOOL_ERRORS_PAUSE: u32 = 6;
@@ -102,7 +129,8 @@ const CACHE_SHARE_MIN: f64 = 0.5;
 /// оборот обещания действия ([`PROMISE_PATTERNS`], [`PROMISE_VERBS_RU`]) с границами
 /// слова Unicode с обеих сторон. Вежливые концовки («Let me know…», «I'll be
 /// happy…») не считаются; текст, кончающийся вопросом, — вопрос пользователю, а не
-/// обещание. Последняя строка: «Let me summarize:» со списком после него — уже ответ;
+/// обещание; оборот после условного оборота ([`PROMISE_CONDITIONALS`]) в том же
+/// предложении — предложение, а не обещание. Последняя строка: «Let me summarize:» со списком после него — уже ответ;
 /// если текст кончается блоком кода, смотрится строка перед ним («Let me run:» и
 /// команда в блоке — обещание).
 ///
@@ -130,10 +158,19 @@ pub fn promise_without_action(text: &str) -> bool {
     for c in PROMISE_CLOSINGS {
         tail = tail.replace(c, " ");
     }
-    PROMISE_PATTERNS
-        .iter()
-        .chain(PROMISE_VERBS_RU.iter())
-        .any(|p| has_word(&tail, p))
+    // Предложения — до `.`, `!`, `;`: условие одного предложения не снимает обещание
+    // другого («If you want more, ask. Let me run the tests»).
+    tail.split(['.', '!', ';']).any(|sentence| {
+        let cond = PROMISE_CONDITIONALS
+            .iter()
+            .filter_map(|c| word_positions(sentence, c).next())
+            .min()
+            .unwrap_or(usize::MAX);
+        PROMISE_PATTERNS
+            .iter()
+            .chain(PROMISE_VERBS_RU.iter())
+            .any(|p| word_positions(sentence, p).any(|i| i < cond))
+    })
 }
 
 /// Текст до завершающего блока кода Markdown (```` ``` ````), если текст им кончается.
@@ -149,11 +186,19 @@ fn before_trailing_code(t: &str) -> &str {
 
 /// `needle` входит в `hay` целыми словами: до и после него нет буквы или цифры
 /// (Unicode: кириллица тоже).
+#[cfg(test)]
 fn has_word(hay: &str, needle: &str) -> bool {
-    hay.match_indices(needle).any(|(i, m)| {
+    word_positions(hay, needle).next().is_some()
+}
+
+/// Байтовые позиции вхождений `needle` в `hay` целыми словами: до и после вхождения
+/// нет буквы или цифры (Unicode: кириллица тоже).
+fn word_positions<'a>(hay: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    hay.match_indices(needle).filter_map(move |(i, m)| {
         let before = hay[..i].chars().next_back();
         let after = hay[i + m.len()..].chars().next();
-        before.is_none_or(|c| !c.is_alphanumeric()) && after.is_none_or(|c| !c.is_alphanumeric())
+        (before.is_none_or(|c| !c.is_alphanumeric()) && after.is_none_or(|c| !c.is_alphanumeric()))
+            .then_some(i)
     })
 }
 

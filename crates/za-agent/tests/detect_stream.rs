@@ -257,6 +257,20 @@ fn thinking_over_budget() {
     assert_eq!(w.on_reasoning("rrrr", t0), Some(Degenerate::Thinking));
 }
 
+/// m4 финального ревью R1-B2: предел — в символах, не в байтах. Рассуждение на
+/// кириллице (2 байта на символ) в пределе символов не обрывается, за ним — обрывается.
+#[test]
+fn thinking_limit_counts_chars_for_cyrillic() {
+    let low = ReasoningMode::Effort(Effort::Low);
+    let limit = 2048 * 3 / 2 * 4;
+    let t0 = Instant::now();
+    let mut w = StreamWatch::new(&low);
+    for i in 0..limit / 64 {
+        assert_eq!(w.on_reasoning(&"ж".repeat(64), t0), None, "дельта {i}");
+    }
+    assert_eq!(w.on_reasoning("жжжж", t0), Some(Degenerate::Thinking));
+}
+
 #[test]
 fn thinking_timeout() {
     let t0 = Instant::now();

@@ -19,8 +19,8 @@
 //! ```` ``` ````) n-граммы не действуют, а правилу единицы нужно [`CODE_MIN_COPIES`] копий и
 //! [`CODE_MIN_REPEAT_BYTES`] байт: повторяющиеся данные (JSON, `INSERT`, лог) не петля.
 //!
-//! Бесконечное рассуждение (D59, Ruling I-2): байты рассуждения / 4 больше бюджета × 1,5
-//! (основной предел) или рассуждение дольше дедлайна без текста и вызовов. Дедлайн —
+//! Бесконечное рассуждение (D59, Ruling I-2): символы рассуждения / 4 больше бюджета × 1,5
+//! (основной предел; символы, а не байты — m4 финального ревью R1-B2) или рассуждение дольше дедлайна без текста и вызовов. Дедлайн —
 //! [`thinking_timeout`]: `max(300 с, бюджет / max(tps, 10) × 1,5)`. Он стоит в `select!`
 //! стрима (`turn.rs`), поэтому замолчавший стрим тоже обрывается. Время передаётся явно
 //! (`tokio::time::Instant`, как у `DeltaBuffer`), детектор детерминирован.
@@ -130,13 +130,15 @@ pub struct StreamWatch {
     text_chars: usize,
     /// Байт текста с прошлой проверки повтора.
     since_check: usize,
-    /// Байт рассуждения попытки.
-    reasoning_bytes: u64,
+    /// Символов рассуждения попытки.
+    reasoning_chars: u64,
     /// Начало рассуждения попытки (первая дельта рассуждения).
     reasoning_since: Option<Instant>,
     /// В попытке был текст или вызов: тайм-аут рассуждения снят.
     acted: bool,
-    /// Предел байт рассуждения: бюджет × 1,5 × 4 (D59); 0 — без предела.
+    /// Предел символов рассуждения: бюджет × 1,5 × 4 (D59; символы, а не байты — m4
+    /// финального ревью R1-B2: у кириллицы 2 байта на символ, байтовый предел рвал бы
+    /// законное рассуждение на русском около 0,9–1,2 бюджета); 0 — без предела.
     reasoning_limit: u64,
     /// Дедлайн рассуждения от его начала (D59).
     timeout: Duration,
@@ -147,7 +149,7 @@ pub struct StreamWatch {
 
 impl StreamWatch {
     /// Бюджет рассуждения — [`thinking_budget`] режима хода (D40, D59). У режима без
-    /// бюджета (`Off`) предела байт нет, остаётся тайм-аут: модель, которая не умеет
+    /// бюджета (`Off`) предела символов нет, остаётся тайм-аут: модель, которая не умеет
     /// выключать мышление, иначе обрывалась бы на первой дельте и в повторе. Дедлайн —
     /// [`THINKING_TIMEOUT`]; по бюджету и скорости — [`StreamWatch::with_timeout`].
     pub fn new(reasoning: &ReasoningMode) -> StreamWatch {
@@ -155,7 +157,7 @@ impl StreamWatch {
             text: String::new(),
             text_chars: 0,
             since_check: 0,
-            reasoning_bytes: 0,
+            reasoning_chars: 0,
             reasoning_since: None,
             acted: false,
             reasoning_limit: u64::from(thinking_budget(reasoning)) * 6,
@@ -203,15 +205,15 @@ impl StreamWatch {
         hit.then_some(Degenerate::Repetition)
     }
 
-    /// Дельта рассуждения в момент `now` (D59): предел байт или тайм-аут без текста и
+    /// Дельта рассуждения в момент `now` (D59): предел символов или тайм-аут без текста и
     /// вызовов.
     pub fn on_reasoning(&mut self, delta: &str, now: Instant) -> Option<Degenerate> {
         if delta.is_empty() {
             return None;
         }
         self.reasoning_since.get_or_insert(now);
-        self.reasoning_bytes += delta.len() as u64;
-        if self.reasoning_limit > 0 && self.reasoning_bytes > self.reasoning_limit {
+        self.reasoning_chars += delta.chars().count() as u64;
+        if self.reasoning_limit > 0 && self.reasoning_chars > self.reasoning_limit {
             return Some(Degenerate::Thinking);
         }
         match self.deadline() {
@@ -238,7 +240,7 @@ impl StreamWatch {
         self.text.clear();
         self.text_chars = 0;
         self.since_check = 0;
-        self.reasoning_bytes = 0;
+        self.reasoning_chars = 0;
         self.reasoning_since = None;
         self.acted = false;
         self.dropped_fences = 0;

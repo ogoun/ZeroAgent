@@ -1306,3 +1306,104 @@ async fn resume_to_unknown_window_alerts() {
     let (_, after) = last_snapshot(&f.store, f.run).await;
     assert_eq!(after.setup.n_ctx, 8192);
 }
+
+// ---- Финальное ревью R1-B2, I1: `turn.finished` при реплее после паузы посреди шага ----
+
+/// Ход с одним вызовом `name`; аргументы — JSON строкой: нормализация исправляет их
+/// (`ArgsParsedFromString`), у хода `repairs = 1`.
+fn repaired_call(id: &str, name: &str, args: &str) -> Vec<Result<StreamEvent, ModelError>> {
+    vec![Ok(StreamEvent::Finished {
+        message: Message {
+            role: Role::Assistant,
+            parts: vec![Part::ToolCall(ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: Value::String(args.into()),
+                raw_arguments: None,
+            })],
+        },
+        finish: FinishReason::ToolCalls,
+        usage: Usage::default(),
+    })]
+}
+
+/// Число шагов в `<state>` и `repairs` в метриках — как у прогона без паузы: два хода,
+/// одно исправление.
+async fn assert_counted_once(f: &Fx) {
+    let state = state_block(&f.store, f.run).await.unwrap();
+    assert!(state.contains("steps done: 2;"), "{state}");
+    let m = za_agent::run_metrics(&f.store, f.run).await.unwrap();
+    assert_eq!(m.repairs, 1, "{m:?}");
+    assert_eq!(m.turns, 2, "{m:?}");
+    // Реплей пишет `turn.finished` повторно (at-least-once), ключ события тот же.
+    let evs = events(&f.store, f.run).await;
+    let fin = of_kind(&evs, EventKind::TurnFinished);
+    assert!(fin.len() >= 3, "реплей не переписал событие: {fin:?}");
+    let first = &fin[0].payload;
+    assert_eq!(first["turn"], 1);
+    assert_eq!(first["turn_attempt"], 0);
+    assert!(first["step"].as_u64().is_some(), "{first}");
+    assert_eq!(fin[1].payload["turn"], 1);
+    assert_eq!(fin[1].payload["step"], first["step"]);
+}
+
+/// I1: `ask_user` → ответ → resume: ход 1 не считается дважды.
+#[tokio::test]
+async fn ask_user_resume_counts_turn_once() {
+    let f = fx("i1_ask_user");
+    f.model.push(repaired_call(
+        "q1",
+        "ask_user",
+        "{\"question\": \"Какой файл?\"}",
+    ));
+    f.model.push(answer("ок"));
+    let mut s = ask();
+    s.tier = Some(Tier::Standard);
+    let out = start(&f, s).await.unwrap();
+    let LoopOutcome::Paused {
+        interrupt: Some(id),
+        ..
+    } = out
+    else {
+        panic!("ожидалась пауза на ask_user: {out:?}");
+    };
+    assert!(
+        f.store
+            .resolve_interrupt(&id, json!({"answer": "a.rs"}))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    assert_counted_once(&f).await;
+}
+
+/// I1: одобрение → resume: ход 1 не считается дважды.
+#[tokio::test]
+async fn approval_resume_counts_turn_once() {
+    let f = fx("i1_approval");
+    f.model.push(repaired_call("c1", "incr", "{\"n\": 1}"));
+    f.model.push(answer("ок"));
+    let out = start(&f, ask()).await.unwrap();
+    let LoopOutcome::Paused {
+        interrupt: Some(id),
+        ..
+    } = out
+    else {
+        panic!("ожидалась пауза needs_approval: {out:?}");
+    };
+    assert!(
+        f.store
+            .resolve_interrupt(&id, json!({"approved": true}))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    assert_eq!(f.incr.load(Ordering::SeqCst), 1);
+    assert_counted_once(&f).await;
+}

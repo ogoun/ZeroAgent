@@ -568,3 +568,48 @@ async fn metrics_from_journal() {
     let empty = run_metrics(&store, RunId::new()).await.unwrap();
     assert_eq!(empty, za_agent::RunMetrics::default());
 }
+
+/// Финальное ревью R1-B2, m1: квитанция без блоба результата (у модели и у
+/// инструмента) — не отказ `stats`: пропуск с `warn`, остальные метрики считаются.
+#[tokio::test]
+async fn metrics_skip_missing_receipt_blob() {
+    let store = ProjectStore::open(&dir("metrics_no_blob")).unwrap();
+    let run = RunId::new();
+    store
+        .create_run(NewRun {
+            id: run,
+            project_id: "p".into(),
+            parent_id: None,
+            role: RunRole::Top,
+            model_profile: Some("a".into()),
+        })
+        .await
+        .unwrap();
+    for (key, name) in [("km", "model"), ("kt", "read")] {
+        event(
+            &store,
+            run,
+            EventKind::EffectIntent,
+            json!({"key": key, "class": "read_only", "name": name, "args": {}}),
+        )
+        .await;
+        event(
+            &store,
+            run,
+            EventKind::EffectReceipt,
+            json!({"key": key, "result_blob": "0".repeat(64)}),
+        )
+        .await;
+    }
+    event(
+        &store,
+        run,
+        EventKind::TurnFinished,
+        json!({"turn": 1, "step": 1, "turn_attempt": 0, "outcome": "calls",
+               "calls": 1, "repairs": 2, "rejected": 0}),
+    )
+    .await;
+    let m = run_metrics(&store, run).await.unwrap();
+    assert!(m.errors.is_empty(), "{m:?}");
+    assert_eq!((m.turns, m.repairs), (1, 2), "{m:?}");
+}
