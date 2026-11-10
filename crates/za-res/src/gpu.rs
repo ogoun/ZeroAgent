@@ -1,12 +1,12 @@
-//! GPU через `nvidia-smi` (D6): отдельный процесс на замер, таймаут, `kill_on_drop`.
+//! GPU через `nvidia-smi` (D6): отдельный процесс на замер с таймаутом через
+//! `za_jail::Runner` (R1-C1 D73: дерево процесса убивается по таймауту и при броске future).
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::process::Command;
 use tokio::time::Instant;
+use za_jail::{CommandSpec, DirectRunner, EnvMode, Exit, Runner, RunnerError};
 
 use crate::snapshot::{GpuSample, GpuStatus};
 
@@ -24,6 +24,8 @@ const QUERY_ARGS: [&str; 2] = [
 const FIELDS: usize = 8;
 /// Предел длины причины недоступности.
 const REASON_MAX_CHARS: usize = 256;
+/// Предел захвата вывода `nvidia-smi` (строка на GPU, десятки байт).
+const OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// Ошибка опроса `nvidia-smi`; текст попадает в `GpuStatus::Unavailable::reason`.
 #[derive(Debug, thiserror::Error)]
@@ -124,45 +126,38 @@ async fn run_query(
     timeout: Duration,
     tmp_dir: &Path,
 ) -> Result<Vec<GpuSample>, QueryError> {
-    let mut cmd = Command::new(exe);
     // Окружение — только белый список: ключи `ZA_SECRET_*` и прочее окружение daemon
     // дочернему процессу не достаются (путь к нему настраивается в `[resources]`).
-    cmd.env_clear()
-        .envs(child_env(std::env::vars_os(), tmp_dir))
-        .args(QUERY_ARGS)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        /// Без консольного окна у дочернего процесса.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let child = cmd.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => QueryError::NotFound,
-        _ => QueryError::Spawn(e),
+    // `EnvMode::Clear` берёт из родителя `PATH`, `SystemRoot`, `WINDIR`; остальное из
+    // прежнего белого списка и `TMP`/`TEMP`/`TMPDIR` — через `env_set`.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| tmp_dir.to_path_buf());
+    let mut spec = CommandSpec::new(exe, cwd, timeout);
+    spec.args = QUERY_ARGS.iter().map(OsString::from).collect();
+    spec.env_mode = EnvMode::Clear;
+    spec.env_set = child_env(std::env::vars_os(), tmp_dir);
+    // Вывод `nvidia-smi` — строки на GPU, предел большого захвата не нужен.
+    spec.capture_limit = OUTPUT_LIMIT;
+    let out = DirectRunner.run(spec).await.map_err(|e| match e {
+        RunnerError::Spawn { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            QueryError::NotFound
+        }
+        RunnerError::Spawn { source, .. } => QueryError::Spawn(source),
+        RunnerError::Io(e) => QueryError::Wait(e),
     })?;
-    // По таймауту future ожидания бросается вместе с `Child`, `kill_on_drop` убивает процесс.
-    let out = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| QueryError::Timeout(timeout))?
-        .map_err(QueryError::Wait)?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    let failed = |code: String| {
         // nvidia-smi пишет причину отказа драйвера в stdout, прочие — в stderr.
-        let message = first_line(&stderr)
-            .or_else(|| first_line(&stdout))
+        let message = first_line(&out.stderr)
+            .or_else(|| first_line(&out.stdout))
             .unwrap_or_default();
-        let code = out
-            .status
-            .code()
-            .map_or_else(|| "без кода".to_string(), |c| format!("код {c}"));
-        return Err(QueryError::Failed { code, message });
+        QueryError::Failed { code, message }
+    };
+    match out.exit {
+        Exit::Code(0) => {}
+        Exit::Code(c) => return Err(failed(format!("код {c}"))),
+        Exit::Signal(s) => return Err(failed(format!("сигнал {s}"))),
+        Exit::Timeout => return Err(QueryError::Timeout(timeout)),
     }
-    let gpus = parse_nvidia_smi_csv(&stdout).map_err(QueryError::Parse)?;
+    let gpus = parse_nvidia_smi_csv(&out.stdout).map_err(QueryError::Parse)?;
     if gpus.is_empty() {
         return Err(QueryError::NoGpu);
     }

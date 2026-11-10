@@ -71,3 +71,17 @@ libc = { version = "=0.2.191", default-features = false }
 # Число жёстких ссылок открытого файла на Windows (R1-C1 I3, `open_checked`): API
 # `file::information` без `unsafe` в нашем коде. Крейт уже в Cargo.lock через `same-file`.
 winapi-util = "=0.1.11"
+# Запуск дочерних процессов деревом (R1-C1 D73, D84, ADR 0005): Job Object с
+# `KILL_ON_JOB_CLOSE` на Windows и группа процессов на Unix, без `unsafe` в нашем коде.
+# Версия — та, что в локальном реестре cargo. Функции: `tokio1` (асинхронный API),
+# `job-object`, `process-group`, `kill-on-drop` (без неё Job Object не получает
+# `KILL_ON_JOB_CLOSE`), `creation-flags` (`CREATE_NO_WINDOW`, как раньше у `nvidia-smi`;
+# без неё `JobObject` перезаписывает флаги создания). Лицензия MIT OR Apache-2.0.
+process-wrap = { version = "=10.0.1", default-features = false, features = ["tokio1", "job-object", "process-group", "kill-on-drop", "creation-flags"] }
+# Только Unix (`za-jail`): `killpg` и `kill` группы без `unsafe` — убить дерево при броске
+# future и остатки после смерти агента (D84). Версия — та, что в локальном реестре cargo;
+# крейт и так приходит через `process-wrap`. Лицензия MIT.
+nix = { version = "=0.31.3", default-features = false, features = ["signal", "process"] }
+# Только Windows (`za-jail`): тип флагов создания процесса для `CreationFlags`
+# (`CREATE_NO_WINDOW`). Крейт уже в дереве через `process-wrap` и `sysinfo`, новых крейтов нет.
+windows = { version = "=0.62.2", features = ["Win32_System_Threading"] }

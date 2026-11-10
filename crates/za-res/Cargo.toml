@@ -10,16 +10,18 @@ description = "zero-agent: za-res"
 workspace = true
 
 [dependencies]
-# Из крейтов za-* — только протокол (D1, проверяется `cargo xtask policy`).
+# Из крейтов za-* — только протокол (D1) и запуск процессов `za-jail` (R1-C1 D73:
+# `nvidia-smi` через `Runner`); проверяется `cargo xtask policy`.
 za-protocol = { path = "../za-protocol" }
+za-jail = { path = "../za-jail" }
 serde.workspace = true
 jiff.workspace = true
 sysinfo.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-# Таймеры опроса, `spawn_blocking`, процесс `nvidia-smi` с таймаутом и `kill_on_drop`, канал снимков.
-tokio = { workspace = true, features = ["sync", "time", "rt", "process", "macros"] }
+# Таймеры опроса, `spawn_blocking`, канал снимков; процесс `nvidia-smi` — через `za-jail`.
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 
 [dev-dependencies]
 serde_json.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "rt", "process", "macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "rt-multi-thread", "test-util"] }

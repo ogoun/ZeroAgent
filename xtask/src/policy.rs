@@ -2,10 +2,12 @@
 //!
 //! Правила: только crates.io в `Cargo.lock`, запрет перечисленных
 //! агентных фреймворков, направление зависимостей между `za-*`
-//! (`za-res` — только от `za-protocol`, `za-core` и `za-agent` — `za-llm` без функций
+//! (`za-res` — только от `za-protocol` и `za-jail`, `za-core` и `za-agent` — `za-llm` без функций
 //! по умолчанию, `za-agent` — только над нижними слоями, и они от него не зависят),
 //! лимит размера `za-core` (ARC-011), инструменты сборки (`tiktoken-rs`) — только у
-//! `xtask`.
+//! `xtask`. R1-C1 (D73): направления `za-jail`, `za-tools`, `za-secrets`; запуск процессов
+//! (`std::process::Command`, `tokio::process::Command`) в `crates/*/src` — только в
+//! `za-jail` (SEC-006); в `Cargo.lock` нет `openssl-sys`, `native-tls`, `libdbus-sys`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,8 @@ use serde::Deserialize;
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 /// Запрещённые пакеты (чужие агентные фреймворки).
 const FORBIDDEN_PACKAGES: &[&str] = &["rig-core", "adk-rust", "autoagents"];
+/// Запрещённые пакеты: TLS только встроенный (rustls), без системного D-Bus (R1-C1).
+const FORBIDDEN_SYSTEM_PACKAGES: &[&str] = &["openssl-sys", "native-tls", "libdbus-sys"];
 /// Крейты, от которых `za-core` зависеть не должен.
 const CORE_FORBIDDEN_DEPS: &[&str] = &[
     "za-server",
@@ -25,15 +29,35 @@ const CORE_FORBIDDEN_DEPS: &[&str] = &[
     // `za-agent` — общим правилом нижних слоёв ниже.
     "za-res",
     "reqwest",
+    // Крейты R1-C1 стоят над `za-core` (D73).
+    "za-jail",
+    "za-tools",
+    "za-secrets",
 ];
 /// Крейты workspace, от которых может зависеть `za-agent` (ADR 0004).
-const AGENT_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-store", "za-core", "za-llm", "za-res"];
+/// R1-C1 D73: `za-secrets` — да; `za-tools` и `za-jail` — нет ни в каком виде.
+const AGENT_ALLOWED_ZA_DEPS: &[&str] = &[
+    "za-protocol",
+    "za-store",
+    "za-core",
+    "za-llm",
+    "za-res",
+    "za-secrets",
+];
 /// Крейты, подключающие `za-llm` только без функций: без HTTP и `Gateway`.
 const PURE_LLM_USERS: &[&str] = &["za-core", "za-agent"];
 /// Внешние крейты, которые `za-agent` подключать не должен: модель — только через `ModelPort`.
 const AGENT_FORBIDDEN_DEPS: &[&str] = &["reqwest"];
-/// Единственный крейт `za-*`, от которого может зависеть `za-res` (D1).
-const RES_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol"];
+/// Крейты `za-*`, от которых может зависеть `za-res`: протокол (D1) и запуск
+/// `nvidia-smi` через `za-jail` (R1-C1 D73).
+const RES_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-jail"];
+/// Крейты `za-*`, от которых может зависеть `za-tools` (обычные зависимости, R1-C1 D73).
+const TOOLS_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-core", "za-jail"];
+/// Где можно запускать процессы, и почему (SEC-006). Путь — от корня, через `/`.
+const PROCESS_ALLOWED: &[(&str, &str)] = &[(
+    "crates/za-jail/",
+    "единственная точка запуска процессов: дерево, тайм-аут, окружение (R1-C1 D84)",
+)];
 /// Крейты только для `xtask` (R1-B2 D64): счёт токенов промптов в CI, не в продукте.
 const XTASK_ONLY_DEPS: &[&str] = &["tiktoken-rs"];
 
@@ -90,6 +114,11 @@ pub fn check_lock_sources(lock: &str) -> Vec<Violation> {
             if FORBIDDEN_PACKAGES.contains(&v) {
                 out.push(Violation(format!("запрещённый пакет `{v}`")));
             }
+            if FORBIDDEN_SYSTEM_PACKAGES.contains(&v) {
+                out.push(Violation(format!(
+                    "запрещённый пакет `{v}`: TLS только rustls, без системных OpenSSL и D-Bus"
+                )));
+            }
         } else if let Some(src) = value_of(line, "source")
             && !src.starts_with(CRATES_IO)
         {
@@ -128,8 +157,34 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                 && !RES_ALLOWED_ZA_DEPS.contains(&dep.name.as_str())
             {
                 out.push(Violation(format!(
-                    "za-res не должен зависеть от {} (допустим только za-protocol)",
+                    "za-res не должен зависеть от {} (допустимы {})",
+                    dep.name,
+                    RES_ALLOWED_ZA_DEPS.join(", ")
+                )));
+            }
+            // Все виды: `za-jail` — нижний слой без крейтов workspace (D73).
+            if pkg.name == "za-jail" && is_workspace_crate(&dep.name) {
+                out.push(Violation(format!(
+                    "za-jail не должен зависеть от {}",
                     dep.name
+                )));
+            }
+            // Обычные зависимости: `za-secrets` — без крейтов workspace и внешних (D73).
+            if pkg.name == "za-secrets" && dep.kind.as_deref() != Some("dev") {
+                out.push(Violation(format!(
+                    "za-secrets не должен иметь зависимостей ({})",
+                    dep.name
+                )));
+            }
+            if pkg.name == "za-tools"
+                && dep.kind.as_deref() != Some("dev")
+                && is_workspace_crate(&dep.name)
+                && !TOOLS_ALLOWED_ZA_DEPS.contains(&dep.name.as_str())
+            {
+                out.push(Violation(format!(
+                    "za-tools не должен зависеть от {} (допустимы {})",
+                    dep.name,
+                    TOOLS_ALLOWED_ZA_DEPS.join(", ")
                 )));
             }
             // Только то, что попадает в сборку: dev-зависимости тестов не в счёт.
@@ -266,6 +321,65 @@ fn resolved_llm_features(root: &Path, pkg: &str) -> Result<Vec<String>, String> 
     Ok(parse_tree_features(&String::from_utf8_lossy(&res.stdout), "za-llm").unwrap_or_default())
 }
 
+/// Запуск процессов в исходнике `rel` (путь от корня через `/`) вне [`PROCESS_ALLOWED`]:
+/// `std::process::Command`, `tokio::process::Command`, `Command::new`, импорт `Command`
+/// из `process::{…}`. Строки-комментарии не считаются.
+pub fn check_process_spawn(rel: &str, text: &str) -> Vec<Violation> {
+    if PROCESS_ALLOWED
+        .iter()
+        .any(|(prefix, _)| rel.starts_with(prefix))
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        let hit = code.contains("process::Command")
+            || code.contains("Command::new")
+            || (code.contains("process::{") && code.contains("Command"));
+        if hit {
+            out.push(Violation(format!(
+                "{rel}:{}: запуск процесса вне za-jail (только через za_jail::Runner, SEC-006)",
+                i + 1
+            )));
+        }
+    }
+    out
+}
+
+/// Исходники `crates/*/src/**/*.rs`: путь от корня через `/` и текст.
+fn crate_sources(root: &Path) -> std::io::Result<Vec<(String, String)>> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(root, &path, out)?;
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.push((rel, std::fs::read_to_string(&path)?));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    for krate in std::fs::read_dir(root.join("crates"))? {
+        let src = krate?.path().join("src");
+        if src.is_dir() {
+            walk(root, &src, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Крейт workspace: `za-*` или бинарник `zero-agent`.
 fn is_workspace_crate(name: &str) -> bool {
     name.starts_with("za-") || name == "zero-agent"
@@ -347,6 +461,9 @@ fn collect(root: &Path) -> Result<Vec<Violation>, String> {
     let lines =
         count_lines(&root.join("crates/za-shell/src")).map_err(|e| format!("za-shell: {e}"))?;
     out.extend(check_size("za-shell", lines, limit));
+    for (rel, text) in crate_sources(root).map_err(|e| format!("crates/*/src: {e}"))? {
+        out.extend(check_process_spawn(&rel, &text));
+    }
     Ok(out)
 }
 
@@ -586,6 +703,84 @@ version = \"0.0.1\"
             ..dep("tiktoken-rs")
         };
         assert_eq!(check_direction(&meta_with("za-core", dev)).len(), 1);
+    }
+    #[test]
+    fn system_tls_and_dbus_packages_are_rejected() {
+        for p in ["openssl-sys", "native-tls", "libdbus-sys"] {
+            let lock = format!(
+                "[[package]]\nname = \"{p}\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n"
+            );
+            assert_eq!(check_lock_sources(&lock).len(), 1, "{p}");
+        }
+    }
+    #[test]
+    fn r1c1_crate_directions() {
+        // za-jail — без крейтов workspace, в том числе dev.
+        assert_eq!(check_direction(&meta("za-jail", "za-core")).len(), 1);
+        let dev = Dependency {
+            kind: Some("dev".into()),
+            ..dep("za-protocol")
+        };
+        assert_eq!(check_direction(&meta_with("za-jail", dev)).len(), 1);
+        assert!(check_direction(&meta("za-jail", "process-wrap")).is_empty());
+        // za-res → za-jail разрешено.
+        assert!(check_direction(&meta("za-res", "za-jail")).is_empty());
+        // za-agent → za-secrets да, za-tools и za-jail нет ни в каком виде.
+        assert!(check_direction(&meta("za-agent", "za-secrets")).is_empty());
+        for d in ["za-tools", "za-jail"] {
+            assert_eq!(check_direction(&meta("za-agent", d)).len(), 1, "{d}");
+            let dev = Dependency {
+                kind: Some("dev".into()),
+                ..dep(d)
+            };
+            assert_eq!(
+                check_direction(&meta_with("za-agent", dev)).len(),
+                1,
+                "dev {d}"
+            );
+        }
+        // za-core — не от новых крейтов.
+        for d in ["za-jail", "za-tools", "za-secrets"] {
+            assert_eq!(check_direction(&meta("za-core", d)).len(), 1, "{d}");
+        }
+        // za-tools — только от za-protocol, za-core, za-jail.
+        for ok in ["za-protocol", "za-core", "za-jail", "similar"] {
+            assert!(check_direction(&meta("za-tools", ok)).is_empty(), "{ok}");
+        }
+        assert_eq!(check_direction(&meta("za-tools", "za-store")).len(), 1);
+        // xtask → za-tools (случаи бюджета промптов, D93).
+        assert!(check_direction(&meta("xtask", "za-tools")).is_empty());
+        // za-secrets — без зависимостей.
+        assert_eq!(check_direction(&meta("za-secrets", "serde")).len(), 1);
+        assert_eq!(check_direction(&meta("za-secrets", "za-protocol")).len(), 1);
+    }
+    #[test]
+    fn process_spawn_outside_jail_is_rejected() {
+        let v = check_process_spawn(
+            "crates/za-tools/src/x.rs",
+            "let c = Command::new(\"git\");\n",
+        );
+        assert_eq!(v.len(), 1);
+        assert!(v[0].0.contains("crates/za-tools/src/x.rs:1"), "{v:?}");
+        for line in [
+            "use std::process::Command;",
+            "use tokio::process::Command;",
+            "use std::process::{Command, Stdio};",
+            "let c = tokio::process::Command::new(exe);",
+        ] {
+            assert_eq!(
+                check_process_spawn("crates/za-res/src/gpu.rs", line).len(),
+                1,
+                "{line}"
+            );
+        }
+        assert!(check_process_spawn("crates/za-jail/src/direct.rs", "Command::new(x)").is_empty());
+        assert!(
+            check_process_spawn("crates/za-core/src/a.rs", "// Command::new — пример").is_empty()
+        );
+        assert!(
+            check_process_spawn("crates/za-core/src/a.rs", "use std::process::Stdio;").is_empty()
+        );
     }
     #[test]
     fn core_over_limit_is_reported() {

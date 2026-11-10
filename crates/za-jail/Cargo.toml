@@ -1,0 +1,34 @@
+[package]
+name = "za-jail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-jail"
+
+[lints]
+workspace = true
+
+# Единственное место запуска дочерних процессов (R1-C1 D73, D84, SEC-006): трейт `Runner`
+# и `DirectRunner` без ОС-изоляции. Крейтов `za-*` здесь нет (проверяет `cargo xtask policy`).
+[dependencies]
+process-wrap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# `process` — дочерние процессы, `io-util` — потоковое чтение вывода, `time` — дедлайны,
+# `rt` — `spawn_blocking`, `macros` — `select!`; `rt-multi-thread` — только тестовому
+# помощнику `za_jail_tree` (режим `--runner`).
+tokio = { workspace = true, features = ["process", "io-util", "time", "rt", "rt-multi-thread", "macros", "fs"] }
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+# Проверка, что процессы дерева мертвы (зомби считается мёртвым, Ruling 5.19).
+sysinfo.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "time", "rt", "rt-multi-thread", "macros", "fs"] }
