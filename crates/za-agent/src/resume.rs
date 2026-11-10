@@ -328,7 +328,12 @@ async fn restore(
         user_inputs,
         epoch: snap.epoch,
         last_next_step: snap.last_next_step,
-        detectors: snap.detectors,
+        detectors: {
+            // D62: кэш сервера за время паузы или на новом эндпоинте не тот, что был.
+            let mut d = snap.detectors;
+            d.reset_cache();
+            d
+        },
     })
 }
 

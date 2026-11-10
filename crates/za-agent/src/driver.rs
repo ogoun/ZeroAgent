@@ -52,7 +52,8 @@ use za_llm::{
 };
 use za_protocol::{
     Actor, BlobHash, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId,
-    RunMode, RunRole, RunStatus, Seq, Tier, canonical_json, detector, fail_reason, pause_reason,
+    RunMode, RunRole, RunStatus, Seq, Tier, alert_kind, canonical_json, detector, detector_action,
+    fail_reason, pause_reason,
 };
 use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
@@ -1276,7 +1277,7 @@ async fn check_sufficient(
             &deps.journal,
             st.run,
             json!({
-                "kind": "compaction_insufficient",
+                "kind": alert_kind::COMPACTION_INSUFFICIENT,
                 "step": step,
                 "estimate": est.tokens,
                 "reserve": reserve,
@@ -1378,7 +1379,7 @@ async fn run_compaction(
                 &deps.journal,
                 st.run,
                 json!({
-                    "kind": "compaction_failed",
+                    "kind": alert_kind::COMPACTION_FAILED,
                     "step": step,
                     "class": error.class,
                     "error": error.message,
@@ -1447,7 +1448,7 @@ async fn prune_results(
             st.last_seq = context_alert(
                 &deps.journal,
                 st.run,
-                json!({ "kind": "prune_failed", "step": step, "error": e.to_string() }),
+                json!({ "kind": alert_kind::PRUNE_FAILED, "step": step, "error": e.to_string() }),
             )
             .await?;
             return Ok(before);
@@ -1503,7 +1504,7 @@ async fn check_truncation(
         &deps.journal,
         st.run,
         json!({
-            "kind": "truncation_suspected",
+            "kind": alert_kind::TRUNCATION_SUSPECTED,
             "turn": st.turn,
             "estimate": estimate,
             "input": input,
@@ -1568,7 +1569,7 @@ pub(crate) async fn n_ctx_unknown(
     context_alert(
         j,
         run,
-        json!({ "kind": "n_ctx_unknown", "endpoint": endpoint.0, "n_ctx": n_ctx }),
+        json!({ "kind": alert_kind::N_CTX_UNKNOWN, "endpoint": endpoint.0, "n_ctx": n_ctx }),
     )
     .await
 }
@@ -1586,7 +1587,7 @@ pub(crate) async fn n_ctx_changed(
     context_alert(
         j,
         run,
-        json!({ "kind": "n_ctx_changed", "endpoint": endpoint.0, "from": from, "to": to }),
+        json!({ "kind": alert_kind::N_CTX_CHANGED, "endpoint": endpoint.0, "from": from, "to": to }),
     )
     .await
 }
@@ -1699,7 +1700,7 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
                 if retry.is_some() {
                     tracing::warn!(run = %st.run, turn = st.turn, detector = name,
                         "повтор хода снова оборван детектором: пауза model_loop");
-                    loop_detected(deps, st, name, "pause").await?;
+                    loop_detected(deps, st, name, detector_action::PAUSE).await?;
                     return clean_pause(deps, st, LoopExit::Paused(pause_reason::MODEL_LOOP)).await;
                 }
                 if let Some(t) = retry_over_budget(deps, st).await? {
@@ -1707,7 +1708,7 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
                 }
                 tracing::warn!(run = %st.run, turn = st.turn, detector = name,
                     "стрим хода оборван детектором: повтор хода");
-                loop_detected(deps, st, name, "retry").await?;
+                loop_detected(deps, st, name, detector_action::RETRY).await?;
                 let (sampling, reasoning) = retry_params(d, &opts.sampling);
                 retry = Some(Reaction::RetryTurn {
                     sampling,
@@ -1857,13 +1858,13 @@ async fn model_output(
         Reaction::Compact => {
             tracing::warn!(run = %st.run, turn = st.turn,
                 "порча JSON три хода подряд: аварийная компакция на ближайшей границе");
-            loop_detected(deps, st, detector::PARSE_ERRORS, "compact").await?;
+            loop_detected(deps, st, detector::PARSE_ERRORS, detector_action::COMPACT).await?;
         }
         Reaction::Pause(reason) => {
             tracing::warn!(run = %st.run, turn = st.turn,
                 "порча JSON и после компакции: пауза model_loop");
             turn_finished(deps, st, "error", Some(&rev)).await?;
-            loop_detected(deps, st, detector::PARSE_ERRORS, "pause").await?;
+            loop_detected(deps, st, detector::PARSE_ERRORS, detector_action::PAUSE).await?;
             return clean_pause(deps, st, LoopExit::Paused(reason)).await;
         }
         other => tracing::error!(run = %st.run, reaction = ?other,
@@ -1888,7 +1889,7 @@ async fn model_output(
         // Первое обещание: nudge, в счёт пустых ходов D18 не идёт.
         tracing::info!(run = %st.run, turn = st.turn, "обещание без действия: nudge");
         turn_finished(deps, st, "promise", Some(&rev)).await?;
-        loop_detected(deps, st, detector::PROMISE, "nudge").await?;
+        loop_detected(deps, st, detector::PROMISE, detector_action::NUDGE).await?;
         push_nudges(st, &[text])?;
         return Ok(Transition::Goto(BOUNDARY));
     }
@@ -1958,7 +1959,7 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
     let screened = screen_calls(sh, st, &mut rev.calls).await?;
     if let Some(d) = screened.block {
         tracing::warn!(run = %st.run, turn = st.turn, detector = d, "детектор повтора: run blocked");
-        loop_detected(deps, st, d, "block").await?;
+        loop_detected(deps, st, d, detector_action::BLOCK).await?;
         st.conv.close_interrupted();
         return finish_with(st, RunStatus::Blocked);
     }
@@ -2079,6 +2080,12 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             if let Some(t) = apply_detected(deps, st, &screened.nudges, reaction).await? {
                 return Ok(t);
             }
+            // Пакет оборван вводом: ввод обнулит счёт на границе, ждать перед ним незачем
+            // (пауза run `tool_errors` остаётся).
+            let errors = match errors {
+                Reaction::Sleep(_) if aborted => Reaction::None,
+                r => r,
+            };
             if let Some(t) = apply_tool_errors(deps, st, errors).await? {
                 return Ok(t);
             }
@@ -2181,12 +2188,15 @@ async fn screen_calls(
                         } else {
                             CallVerdict::Reuse(text)
                         };
-                        (verdict, "reuse")
+                        (verdict, detector_action::REUSE)
                     }
                     None => {
                         tracing::warn!(run = %st.run, blob = %result.0,
                             "прошлого результата повтора нет: отказ вместо повтора");
-                        (CallVerdict::Reject(REPEAT_REJECT.to_owned()), "reject")
+                        (
+                            CallVerdict::Reject(REPEAT_REJECT.to_owned()),
+                            detector_action::REJECT,
+                        )
                     }
                 };
                 calls[i].verdict = verdict;
@@ -2196,11 +2206,11 @@ async fn screen_calls(
             (Reaction::Reject(text), Some(i)) => {
                 calls[i].verdict = CallVerdict::Reject(text);
                 out.intercepted.insert(calls[i].call.id.clone());
-                loop_detected(&sh.deps, st, detector::REPEAT, "reject").await?;
+                loop_detected(&sh.deps, st, detector::REPEAT, detector_action::REJECT).await?;
             }
             (Reaction::Block(d), _) => out.block = Some(d),
             (Reaction::Nudge(text), _) => {
-                loop_detected(&sh.deps, st, detector::REPEAT, "nudge").await?;
+                loop_detected(&sh.deps, st, detector::REPEAT, detector_action::NUDGE).await?;
                 out.nudges.push(text);
             }
             (other, _) => {
@@ -2264,7 +2274,7 @@ async fn apply_detected(
         Reaction::None => Ok(None),
         Reaction::Nudge(text) => {
             tracing::info!(run = %st.run, turn = st.turn, "детектор цикла: nudge");
-            loop_detected(deps, st, detector::CYCLE, "nudge").await?;
+            loop_detected(deps, st, detector::CYCLE, detector_action::NUDGE).await?;
             let recite = text == CYCLE_NUDGE;
             push_nudges(st, &[text])?;
             if recite {
@@ -2274,7 +2284,7 @@ async fn apply_detected(
         }
         Reaction::Block(d) => {
             tracing::warn!(run = %st.run, turn = st.turn, detector = d, "детектор: run blocked");
-            loop_detected(deps, st, d, "block").await?;
+            loop_detected(deps, st, d, detector_action::BLOCK).await?;
             finish_with(st, RunStatus::Blocked).map(Some)
         }
         other => {
@@ -2320,14 +2330,14 @@ async fn apply_tool_errors(
         Reaction::Sleep(d) => {
             tracing::warn!(run = %st.run, turn = st.turn, pause = ?d,
                 "ошибки инструмента подряд: пауза перед следующим ходом");
-            loop_detected(deps, st, detector::TOOL_ERRORS, "sleep").await?;
+            loop_detected(deps, st, detector::TOOL_ERRORS, detector_action::SLEEP).await?;
             backoff(deps, st, d).await?;
             Ok(None)
         }
         Reaction::Pause(reason) => {
             tracing::warn!(run = %st.run, turn = st.turn,
                 "шестая ошибка инструмента подряд: пауза tool_errors");
-            loop_detected(deps, st, detector::TOOL_ERRORS, "pause").await?;
+            loop_detected(deps, st, detector::TOOL_ERRORS, detector_action::PAUSE).await?;
             clean_pause(deps, st, LoopExit::Paused(reason))
                 .await
                 .map(Some)

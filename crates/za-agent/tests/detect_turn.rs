@@ -82,10 +82,24 @@ fn promise_patterns() {
         "I'll fix it.",
         "I\u{2019}ll fix it.",
         "Next, I open the config.",
-        "Now I run cargo test.",
+        "Now I'll run cargo test.",
         "Я сейчас посмотрю.",
         "Давайте посмотрим журнал.",
         "Приступаю к правке.",
+        // Корпус обещаний Ruling I-2 ревью задачи 8.
+        "Сейчас проверю.",
+        "Сейчас посмотрю конфиг.",
+        "Запущу тесты.",
+        "Проверю логи сборки.",
+        "Исправлю импорт.",
+        "Теперь я исправлю тест.",
+        "Далее я обновлю README.",
+        "Let's check the logs.",
+        "Let us look at the config.",
+        "I'm going to rebuild the index.",
+        "I am going to rebuild the index.",
+        "Now, I'll open the file.",
+        "Let me run the tests:\n```\ncargo test\n```",
     ] {
         assert!(promise_without_action(t), "{t}");
     }
@@ -120,6 +134,19 @@ fn promise_normal_answers_not_detected() {
         "Summary: the module is split into three files, tests pass.",
         "Let me summarize the changes:\n- edited src/a.rs\n- tests pass",
         "Давайте подведём итог:\n1. файл исправлен\n2. тесты зелёные",
+        // Корпус ложных срабатываний Ruling I-2 ревью задачи 8: границы слова Unicode.
+        "Сейчас ясно, в чём ошибка: индекс сдвинут.",
+        "Сейчас явно видно, что кэш пуст.",
+        "Сейчас я вижу, что тест зелёный.",
+        "Теперь я понимаю причину: кэш не сброшен.",
+        "Now I see the issue: the index is off by one.",
+        "Now I understand: the config was stale.",
+        "Рабочие приступают к сборке в 9:00.",
+        "Проверено: всё работает.",
+        "Проверка прошла, сборка зелёная.",
+        "I'll let you know if anything changes.",
+        "The tests will pass after the fix.",
+        "Утилита проверяет файл и запускает тесты.",
     ] {
         assert!(!promise_without_action(t), "{t:?}");
     }
@@ -142,9 +169,7 @@ fn promise_top_second_time_accepted() {
         )],
     );
     assert_eq!(d.on_promise(RunRole::Top), nudge);
-    // Любой другой ход (ответ, пустой ход) и ввод пользователя — тоже.
-    d.reset_promise();
-    assert_eq!(d.on_promise(RunRole::Worker), nudge);
+    // Ввод пользователя — тоже (любой другой ход сбрасывает серию в драйвере).
     d.on_user_input();
     assert_eq!(d.on_promise(RunRole::Worker), nudge);
     assert_eq!(d.on_promise(RunRole::Worker), Reaction::None);
@@ -196,28 +221,77 @@ fn tool_error_backoff_then_pause() {
     assert_eq!(d.on_tool_errors(&[(ToolKind::Exec, true)]), Reaction::None);
 }
 
-/// Порядок результатов в пакете и сильнейшая реакция хода.
+/// Ruling I-1 ревью задачи 8: счёт — по ходам. Шесть параллельных ошибок одного
+/// класса в одном ходе — +1, без паузы; успех класса в том же ходе — обнуление.
 #[test]
-fn tool_errors_in_one_batch() {
+fn tool_errors_counted_per_turn() {
     let mut d = DetectorState::default();
-    // [ошибка, успех] — счёт 0; [успех, ошибка] — 1.
+    let six = [(ToolKind::Read, true); 6];
+    assert_eq!(d.on_tool_errors(&six), Reaction::None);
+    assert_eq!(d.on_tool_errors(&six), Reaction::None);
+    assert_eq!(
+        d.on_tool_errors(&six),
+        sleep_s(1),
+        "третий ход, не шестая ошибка"
+    );
+    // Успех класса в ходе с ошибкой — счёт класса обнулён.
     assert_eq!(
         d.on_tool_errors(&[(ToolKind::Read, true), (ToolKind::Read, false)]),
         Reaction::None
     );
+    assert_eq!(d.on_tool_errors(&six), Reaction::None);
+    assert_eq!(d.on_tool_errors(&six), Reaction::None);
+    assert_eq!(d.on_tool_errors(&six), sleep_s(1));
+    // Сильнейшая реакция по классам: Read на третьем ходе, Exec на четвёртом.
+    let mut d = DetectorState::default();
+    d.on_tool_errors(&[(ToolKind::Exec, true)]);
+    for _ in 0..2 {
+        d.on_tool_errors(&[(ToolKind::Exec, true), (ToolKind::Read, true)]);
+    }
     assert_eq!(
-        d.on_tool_errors(&[(ToolKind::Read, false), (ToolKind::Read, true)]),
-        Reaction::None
-    );
-    // Три ошибки в одном пакете: 2, 3, 4 подряд — сильнейшая Sleep(2 s).
-    assert_eq!(
-        d.on_tool_errors(&[
-            (ToolKind::Read, true),
-            (ToolKind::Read, true),
-            (ToolKind::Read, true),
-        ]),
+        d.on_tool_errors(&[(ToolKind::Exec, true), (ToolKind::Read, true)]),
         sleep_s(2)
     );
+}
+
+/// Ruling I-1: цикл «правка → ошибка Exec» (TDD) паузы не даёт — успешная правка
+/// обнуляет счёт всех классов; и в одном ходе, и в разных.
+#[test]
+fn edit_then_exec_error_cycle_no_pause() {
+    let mut d = DetectorState::default();
+    for i in 0..10 {
+        assert_eq!(d.on_tool_errors(&[(ToolKind::Edit, false)]), Reaction::None);
+        assert_eq!(
+            d.on_tool_errors(&[(ToolKind::Exec, true)]),
+            Reaction::None,
+            "ход {i}"
+        );
+    }
+    let mut d = DetectorState::default();
+    for i in 0..10 {
+        let r = d.on_tool_errors(&[(ToolKind::Edit, false), (ToolKind::Exec, true)]);
+        assert_eq!(r, Reaction::None, "ход {i}");
+    }
+    // Успешный Exec обнуляет и Read.
+    let mut d = DetectorState::default();
+    for _ in 0..2 {
+        d.on_tool_errors(&[(ToolKind::Read, true)]);
+    }
+    d.on_tool_errors(&[(ToolKind::Exec, false)]);
+    assert_eq!(d.on_tool_errors(&[(ToolKind::Read, true)]), Reaction::None);
+}
+
+/// Ruling I-1: ввод пользователя обнуляет счёт ошибок.
+#[test]
+fn user_input_resets_tool_errors() {
+    let mut d = DetectorState::default();
+    for _ in 0..2 {
+        d.on_tool_errors(&[(ToolKind::Exec, true)]);
+    }
+    d.on_user_input();
+    assert_eq!(d.on_tool_errors(&[(ToolKind::Exec, true)]), Reaction::None);
+    assert_eq!(d.on_tool_errors(&[(ToolKind::Exec, true)]), Reaction::None);
+    assert_eq!(d.on_tool_errors(&[(ToolKind::Exec, true)]), sleep_s(1));
 }
 
 /// Нормальная работа: ошибки вперемешку с успехами того же класса, редкие ошибки
@@ -227,10 +301,11 @@ fn tool_errors_normal_work_no_reaction() {
     let mut d = DetectorState::default();
     for i in 0..50 {
         let r = d.on_tool_errors(&[
-            (ToolKind::Exec, i % 2 == 0),
             (ToolKind::Read, i % 3 == 0),
-            (ToolKind::Edit, false),
+            (ToolKind::Control, i % 2 == 0),
         ]);
+        assert_eq!(r, Reaction::None, "ход {i}");
+        let r = d.on_tool_errors(&[(ToolKind::Control, false)]);
         assert_eq!(r, Reaction::None, "ход {i}");
     }
     assert_eq!(d.on_tool_errors(&[]), Reaction::None);
@@ -245,8 +320,6 @@ fn parse_error_chain() {
     assert_eq!(d.on_parse_errors(1), Reaction::None);
     assert_eq!(d.on_parse_errors(1), Reaction::Compact);
     assert!(d.compaction_due());
-    d.compaction_done();
-    assert!(!d.compaction_due());
     assert_eq!(d.on_parse_errors(1), Reaction::None);
     assert_eq!(
         d.on_parse_errors(2),
@@ -360,7 +433,6 @@ fn turn_state_roundtrips_and_defaults() {
     d.on_tool_errors(&[(ToolKind::Exec, true)]);
     d.on_parse_errors(1);
     d.on_usage(&usage(1000, 900), true, 2, &[], &[]);
-    d.remember_request_refs(&[h("m0")]);
     let v = serde_json::to_value(&d).unwrap();
     assert_eq!(
         serde_json::from_value::<DetectorState>(v.clone()).unwrap(),
@@ -369,8 +441,8 @@ fn turn_state_roundtrips_and_defaults() {
     // Снимок без детекторов хода (задачи 6–7) — пустое состояние.
     let mut old = v;
     old.as_object_mut().unwrap().remove("turn");
-    let mut back: DetectorState = serde_json::from_value(old).unwrap();
-    assert_eq!(back.remember_request_refs(&[]), Vec::<BlobHash>::new());
+    let back: DetectorState = serde_json::from_value(old).unwrap();
+    assert_eq!(back, DetectorState::default());
 }
 
 // ---- Драйвер ----
@@ -420,6 +492,10 @@ impl Tool for Probe {
         let out = match self.spec.schema.name.as_str() {
             "bash" => ToolOutput {
                 content: format!("exit 1: {}", args["cmd"]),
+                is_error: true,
+            },
+            "fail" => ToolOutput {
+                content: format!("no such file {}", args["p"]),
                 is_error: true,
             },
             _ => ToolOutput {
@@ -485,6 +561,7 @@ fn fx_with(name: &str, model: ScriptedModel) -> Fx {
     for (name, kind, class) in [
         ("bash", ToolKind::Exec, EffectClass::NonIdempotent),
         ("read", ToolKind::Read, EffectClass::ReadOnly),
+        ("fail", ToolKind::Read, EffectClass::ReadOnly),
     ] {
         reg.register(Arc::new(Probe {
             spec: spec_of(name, kind, class),
@@ -511,13 +588,17 @@ fn fx_with(name: &str, model: ScriptedModel) -> Fx {
 }
 
 fn spec(role: RunRole) -> RunSpec {
+    spec_mode(role, RunMode::Ask)
+}
+
+fn spec_mode(role: RunRole, run_mode: RunMode) -> RunSpec {
     RunSpec {
         project_id: "p".into(),
         project_dir: PathBuf::from("H:/p"),
         role,
         parent: None,
         endpoint: EndpointId("local".into()),
-        run_mode: RunMode::Ask,
+        run_mode,
         work_mode: None,
         tier: None,
         budget: Budget::default(),
@@ -1052,6 +1133,184 @@ async fn cache_steady_no_alert() {
     }
     f.model.push(answer);
     assert_eq!(start(&f, RunRole::Top).await, done("Готово."));
+    let alerts = payloads(&f, EventKind::ContextAlert)
+        .await
+        .into_iter()
+        .filter(|p| p["kind"] == "cache_drop")
+        .count();
+    assert_eq!(alerts, 0);
+}
+
+// ---- Исправления после ревью (раунд 1) ----
+
+fn fail_calls(ids: &[&str]) -> Script {
+    finished(
+        ids.iter()
+            .map(|id| call_part(id, "fail", json!({ "p": id })))
+            .collect(),
+        FinishReason::ToolCalls,
+        Usage::default(),
+    )
+}
+
+async fn tool_error_events(f: &Fx) -> Vec<(String, String, u64)> {
+    detected(f)
+        .await
+        .into_iter()
+        .filter(|(d, _, _)| d == "tool_errors")
+        .collect()
+}
+
+/// I-1: шесть параллельных ошибок чтения в одном ходе — одна ошибка хода, без паузы.
+#[tokio::test]
+async fn parallel_errors_one_turn_no_pause() {
+    let f = fx("parallel_errors");
+    f.model
+        .push(fail_calls(&["c1", "c2", "c3", "c4", "c5", "c6"]));
+    f.model.push(text("Файлов нет."));
+    assert_eq!(start(&f, RunRole::Top).await, done("Файлов нет."));
+    assert!(tool_error_events(&f).await.is_empty());
+}
+
+/// M-4: повтор упавшего чтения — отказ D54 без исполнения, в счёт D57 не идёт.
+#[tokio::test]
+async fn repeated_failed_read_not_counted() {
+    let f = fx("reuse_not_counted");
+    for n in 1..=4 {
+        f.model.push(finished(
+            vec![call_part(&format!("c{n}"), "fail", json!({"p": "a"}))],
+            FinishReason::ToolCalls,
+            Usage::default(),
+        ));
+    }
+    f.model.push(text("Файла нет."));
+    assert_eq!(start(&f, RunRole::Top).await, done("Файла нет."));
+    let d = detected(&f).await;
+    assert!(d.iter().any(|(det, _, _)| det == "repeat"), "{d:?}");
+    assert!(tool_error_events(&f).await.is_empty(), "{d:?}");
+}
+
+/// M-4: отказ гейта (режим Plan) — не исполнение, в счёт D57 не идёт.
+#[tokio::test]
+async fn gate_denials_not_counted() {
+    let f = fx("gate_not_counted");
+    for n in 1..=6 {
+        f.model.push(bash(&format!("c{n}")));
+    }
+    f.model.push(text("В режиме плана запуск запрещён."));
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let out = within(
+        "start_run",
+        start_run(&f.deps, f.run, spec_mode(RunRole::Top, RunMode::Plan), rx),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, done("В режиме плана запуск запрещён."));
+    let started = events(&f.store, f.run)
+        .await
+        .iter()
+        .filter(|e| e.kind == EventKind::ToolStarted)
+        .count();
+    assert_eq!(started, 0, "bash не исполнялся");
+    assert!(tool_error_events(&f).await.is_empty());
+}
+
+/// M-5: сбой после третьего испорченного хода — после resume компакция `parse_errors`
+/// ровно одна, третий ход не спрашивается у модели заново.
+#[tokio::test]
+async fn parse_errors_compaction_replays_once() {
+    let f = fx_with(
+        "parse_replay",
+        ScriptedModel::new(default_caps(BackendKind::LlamaCpp)).with_context(32768),
+    );
+    for n in 1..=3 {
+        f.model.push(broken(&format!("c{n}")));
+    }
+    let mut crashing = f.deps.clone();
+    crashing.crash = crash_at(CrashPoint::AfterModelEffect { step: 3 });
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let err = within(
+        "start_run",
+        start_run(&crashing, f.run, spec(RunRole::Top), rx),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, LoopError::Halted), "{err:?}");
+    assert_eq!(f.model.calls().len(), 3);
+
+    f.model.push(text(
+        "## Decisions\nd\n## Files changed\n-\n## Errors\n-\n## Next step\nn",
+    ));
+    f.model.push(text("Готово."));
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let out = within(
+        "resume_run",
+        resume_run(&f.deps, f.run, ResumeChange::default(), rx),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, done("Готово."));
+    assert_eq!(f.model.calls().len(), 5, "третий ход — из квитанции");
+    let compacted = payloads(&f, EventKind::ContextCompacted).await;
+    assert_eq!(compacted.len(), 1, "{compacted:?}");
+    assert_eq!(compacted[0]["reason"], "parse_errors");
+    let compact = detected(&f)
+        .await
+        .into_iter()
+        .filter(|(d, a, _)| d == "parse_errors" && a == "compact")
+        .count();
+    assert_eq!(compact, 1);
+}
+
+/// Minor (D62): метка кэша сбрасывается при resume — первый ход после него не
+/// сравнивается с ходом до паузы.
+#[tokio::test]
+async fn cache_mark_reset_on_resume() {
+    let f = fx_with(
+        "cache_resume",
+        ScriptedModel::new(default_caps(BackendKind::LlamaCpp)).with_context(32768),
+    );
+    f.model.push(finished(
+        vec![call_part("c1", "read", json!({"p": "a"}))],
+        FinishReason::ToolCalls,
+        usage(4000, 3600),
+    ));
+    // Чистая пауза по команде после первого хода (по `tool.started`): resume начнёт
+    // новую границу, а не реплей хода с меткой.
+    let (ctl, rx) = control_channel(f.store.clone(), f.run);
+    let mut bus = f.bus.subscribe();
+    let watcher = tokio::spawn(async move {
+        nth_of(&mut bus, EventKind::ToolStarted, 1, |_| true).await;
+        ctl.pause();
+    });
+    let out = within(
+        "start_run",
+        start_run(&f.deps, f.run, spec(RunRole::Top), rx),
+    )
+    .await
+    .unwrap();
+    within("наблюдатель", watcher).await.unwrap();
+    assert_eq!(out, paused(pause_reason::COMMAND));
+    let snap = last_snapshot(&f.store, f.run).await;
+    assert_ne!(
+        snap.detectors,
+        DetectorState::default(),
+        "метка кэша в снимке"
+    );
+
+    let mut answer = text("Готово.");
+    if let Some(Ok(StreamEvent::Finished { usage: u, .. })) = answer.last_mut() {
+        *u = usage(4400, 400);
+    }
+    f.model.push(answer);
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let out = within(
+        "resume_run",
+        resume_run(&f.deps, f.run, ResumeChange::default(), rx),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, done("Готово."));
     let alerts = payloads(&f, EventKind::ContextAlert)
         .await
         .into_iter()

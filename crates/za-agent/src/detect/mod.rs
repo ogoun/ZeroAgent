@@ -113,10 +113,12 @@ impl DetectorState {
     }
 
     /// Ввод пользователя (очередь, прерывание, поправка) сбрасывает окно повтора
-    /// (Ruling I-3 ревью задачи 6) и серию обещаний (D60).
+    /// (Ruling I-3 ревью задачи 6), серию обещаний (D60) и счёт ошибок инструмента
+    /// (D57, Ruling I-1 ревью задачи 8).
     pub fn on_user_input(&mut self) {
         self.repeat.on_user_input();
         self.turn.reset_promise();
+        self.turn.reset_tool_errors();
     }
 
     /// D60: ход без вызовов с `finish = Stop` и оборотом обещания
@@ -128,15 +130,17 @@ impl DetectorState {
     }
 
     /// Ход — не обещание (вызовы, ответ, пустой ход): серия обещаний прервана (D60).
-    pub fn reset_promise(&mut self) {
+    pub(crate) fn reset_promise(&mut self) {
         self.turn.reset_promise();
     }
 
-    /// D57: результаты исполненных вызовов хода по порядку — (класс инструмента,
-    /// `is_error`). Ошибки подряд в одном классе: третья — `Sleep(1 s)`, четвёртая —
-    /// `Sleep(2 s)`, пятая — `Sleep(4 s)`, шестая — `Pause("tool_errors")` (счёт класса
-    /// начинается заново). Успех класса сбрасывает его счёт, другие классы не трогает.
-    /// Реакция хода — сильнейшая: пауза run, затем самый длинный `Sleep`.
+    /// D57: результаты исполненных вызовов хода — (класс инструмента, `is_error`).
+    /// Счёт — по ходам (Ruling I-1 ревью задачи 8): класс получает +1 за ход, в котором
+    /// у него есть ошибка и нет успеха; успех класса обнуляет его счёт; успешный Edit
+    /// или Exec обнуляет счёт всех классов. Ходы подряд с ошибкой класса: третий —
+    /// `Sleep(1 s)`, четвёртый — `Sleep(2 s)`, пятый — `Sleep(4 s)`, шестой —
+    /// `Pause("tool_errors")` (счёт класса начинается заново). Реакция хода —
+    /// сильнейшая по классам: пауза run, затем самый длинный `Sleep`.
     ///
     /// Передаются только исполненные вызовы (`ToolsOutcome::executed`): повтор прошлого
     /// результата (D54), отказ детектора, гейта или пользователя — не исполнение и
@@ -159,14 +163,20 @@ impl DetectorState {
     }
 
     /// Компакция выполнена (любая: история уже новая эпоха) — назначенная снята.
-    pub fn compaction_done(&mut self) {
+    pub(crate) fn compaction_done(&mut self) {
         self.turn.compaction_done();
     }
 
     /// Запоминает хэши сообщений запроса текущего хода и возвращает хэши прошлого
     /// (для `prev_refs` в [`DetectorState::on_usage`]).
-    pub fn remember_request_refs(&mut self, refs: &[BlobHash]) -> Vec<BlobHash> {
+    pub(crate) fn remember_request_refs(&mut self, refs: &[BlobHash]) -> Vec<BlobHash> {
         self.turn.remember_request_refs(refs)
+    }
+
+    /// Resume: метка кэша прошлого хода сброшена (D62) — кэш сервера мог остыть за
+    /// паузу, эндпоинт мог смениться; первый ход после resume не сравнивается.
+    pub(crate) fn reset_cache(&mut self) {
+        self.turn.reset_cache();
     }
 
     /// D62: расход принятого хода. `Some` — payload `context.alert {kind: "cache_drop",

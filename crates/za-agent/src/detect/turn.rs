@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use za_core::ToolKind;
 use za_llm::Usage;
-use za_protocol::{BlobHash, RunRole, pause_reason};
+use za_protocol::{BlobHash, RunRole, alert_kind, pause_reason};
 
 use super::Reaction;
 
@@ -21,22 +21,68 @@ pub const PROMISE_NUDGE: &str = "You said you would act but made no tool call. M
 
 /// Сколько последних символов текста смотрит детектор обещания (D60).
 const PROMISE_TAIL_CHARS: usize = 200;
-/// Обороты обещания действия (D60), в нижнем регистре.
-const PROMISE_PATTERNS: [&str; 9] = [
-    "i will ",
-    "i'll ",
-    "let me ",
-    "next, i ",
-    "now i ",
-    "я сейчас",
-    "сейчас я",
-    "давайте ",
+/// Обороты обещания действия (D60; Ruling I-2 ревью задачи 8): будущее 1-го лица и
+/// приглашения, в нижнем регистре, пробелы одиночные. Совпадение — с границами слова
+/// Unicode с обеих сторон («now i see», «сейчас ясно», «приступают» — не обещания).
+const PROMISE_PATTERNS: [&str; 15] = [
+    "i will",
+    "i'll",
+    "i am going to",
+    "i'm going to",
+    "let me",
+    "let's",
+    "let us",
+    "next, i",
+    "next i",
+    "now i'll",
+    "now i will",
+    "now, i'll",
+    "now, i will",
+    "давайте",
+    "далее я",
+];
+/// Русские глаголы будущего времени 1-го лица (D60, Ruling I-2): «Сейчас проверю»,
+/// «Запущу тесты», «Теперь я исправлю» — обещание действия в любом месте последней
+/// строки.
+const PROMISE_VERBS_RU: [&str; 30] = [
+    "проверю",
+    "посмотрю",
+    "запущу",
+    "исправлю",
+    "сделаю",
+    "открою",
+    "прочитаю",
+    "прочту",
+    "начну",
+    "попробую",
+    "выполню",
+    "изучу",
+    "поищу",
+    "добавлю",
+    "напишу",
+    "перепишу",
+    "обновлю",
+    "поправлю",
+    "соберу",
+    "займусь",
     "приступаю",
+    "проверим",
+    "посмотрим",
+    "запустим",
+    "исправим",
+    "сделаем",
+    "начнём",
+    "начнем",
+    "попробуем",
+    "займёмся",
 ];
 /// Вежливые концовки ответа, содержащие оборот обещания, но не обещающие действия:
 /// «Let me know if…», «I'll be happy to…». Вырезаются до поиска оборотов.
-const PROMISE_CLOSINGS: [&str; 5] = [
+const PROMISE_CLOSINGS: [&str; 8] = [
     "let me know",
+    "let us know",
+    "i'll let you know",
+    "i will let you know",
     "i'll be happy",
     "i'll be glad",
     "i will be happy",
@@ -52,15 +98,21 @@ const PARSE_PAUSE_AFTER: u32 = 2;
 /// Доля `cached / input` прошлого хода, от которой падение кэша замечается (D62).
 const CACHE_SHARE_MIN: f64 = 0.5;
 
-/// D60: в последних 200 символах текста (без учёта регистра) есть оборот обещания
-/// действия. Оборот считается с границы слова («the API will» — не «I will»);
-/// вежливые концовки («Let me know…», «I'll be happy…») не считаются; текст,
-/// кончающийся вопросом, — вопрос пользователю, а не обещание; оборот ищется в
-/// последней строке: «Let me summarize:» со списком после него — уже ответ.
+/// D60: в последних 200 символах последней строки текста (без учёта регистра) есть
+/// оборот обещания действия ([`PROMISE_PATTERNS`], [`PROMISE_VERBS_RU`]) с границами
+/// слова Unicode с обеих сторон. Вежливые концовки («Let me know…», «I'll be
+/// happy…») не считаются; текст, кончающийся вопросом, — вопрос пользователю, а не
+/// обещание. Последняя строка: «Let me summarize:» со списком после него — уже ответ;
+/// если текст кончается блоком кода, смотрится строка перед ним («Let me run:» и
+/// команда в блоке — обещание).
 ///
 /// Вызывающий проверяет остальное условие D60: в ходе нет вызовов и `finish = Stop`.
 pub fn promise_without_action(text: &str) -> bool {
     let trimmed = text.trim_end();
+    if trimmed.ends_with('?') {
+        return false;
+    }
+    let trimmed = before_trailing_code(trimmed);
     if trimmed.is_empty() || trimmed.ends_with('?') {
         return false;
     }
@@ -68,25 +120,40 @@ pub fn promise_without_action(text: &str) -> bool {
     let last = trimmed.rsplit('\n').next().unwrap_or(trimmed);
     let chars: Vec<char> = last.chars().collect();
     let start = chars.len().saturating_sub(PROMISE_TAIL_CHARS);
-    // Типографский апостроф — как обычный: «I’ll» тоже обещание.
-    let mut tail: String = chars[start..]
+    // Типографский апостроф — как обычный: «I’ll» тоже обещание; пробелы одиночные.
+    let lower = chars[start..]
         .iter()
         .collect::<String>()
         .to_lowercase()
         .replace('\u{2019}', "'");
+    let mut tail = lower.split_whitespace().collect::<Vec<_>>().join(" ");
     for c in PROMISE_CLOSINGS {
         tail = tail.replace(c, " ");
     }
-    PROMISE_PATTERNS.iter().any(|p| has_word_start(&tail, p))
+    PROMISE_PATTERNS
+        .iter()
+        .chain(PROMISE_VERBS_RU.iter())
+        .any(|p| has_word(&tail, p))
 }
 
-/// `needle` входит в `hay` с начала слова: перед ним нет буквы или цифры.
-fn has_word_start(hay: &str, needle: &str) -> bool {
-    hay.match_indices(needle).any(|(i, _)| {
-        hay[..i]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_alphanumeric())
+/// Текст до завершающего блока кода Markdown (```` ``` ````), если текст им кончается.
+fn before_trailing_code(t: &str) -> &str {
+    let Some(body) = t.strip_suffix("```") else {
+        return t;
+    };
+    match body.rfind("```") {
+        Some(i) => t[..i].trim_end(),
+        None => t,
+    }
+}
+
+/// `needle` входит в `hay` целыми словами: до и после него нет буквы или цифры
+/// (Unicode: кириллица тоже).
+fn has_word(hay: &str, needle: &str) -> bool {
+    hay.match_indices(needle).any(|(i, m)| {
+        let before = hay[..i].chars().next_back();
+        let after = hay[i + m.len()..].chars().next();
+        before.is_none_or(|c| !c.is_alphanumeric()) && after.is_none_or(|c| !c.is_alphanumeric())
     })
 }
 
@@ -154,12 +221,29 @@ impl TurnState {
         self.promised = false;
     }
 
+    /// D57 (Ruling I-1 ревью задачи 8): счёт — по ходам. Успешный исполненный Edit
+    /// или Exec обнуляет счёт всех классов (как сброс окна D54: правка — прогресс).
+    /// Иначе класс с успехом в ходе обнуляется, класс с ошибкой и без успеха получает
+    /// +1 за ход (параллельный пакет из шести ошибок — одна).
     pub(super) fn on_tool_errors(&mut self, results: &[(ToolKind, bool)]) -> Reaction {
+        let has = |kind: ToolKind, err: bool| results.iter().any(|&(k, e)| k == kind && e == err);
+        if has(ToolKind::Edit, false) || has(ToolKind::Exec, false) {
+            self.tool_errors = ToolErrors::default();
+            return Reaction::None;
+        }
         let mut worst = Reaction::None;
-        for &(kind, is_error) in results {
+        for kind in [
+            ToolKind::Read,
+            ToolKind::Edit,
+            ToolKind::Exec,
+            ToolKind::Control,
+        ] {
             let n = self.tool_errors.of(kind);
-            if !is_error {
+            if has(kind, false) {
                 *n = 0;
+                continue;
+            }
+            if !has(kind, true) {
                 continue;
             }
             *n += 1;
@@ -176,6 +260,17 @@ impl TurnState {
             worst = stronger(worst, r);
         }
         worst
+    }
+
+    /// Ввод пользователя обнуляет счёт ошибок (Ruling I-1 ревью задачи 8).
+    pub(super) fn reset_tool_errors(&mut self) {
+        self.tool_errors = ToolErrors::default();
+    }
+
+    /// Метка кэша прошлого хода сброшена: resume (кэш сервера мог остыть, эндпоинт мог
+    /// смениться) — первый ход после него не сравнивается (Ruling minor ревью задачи 8).
+    pub(super) fn reset_cache(&mut self) {
+        self.cache = None;
     }
 
     pub(super) fn on_parse_errors(&mut self, n: u32) -> Reaction {
@@ -240,7 +335,7 @@ impl TurnState {
             return None;
         }
         Some(json!({
-            "kind": "cache_drop",
+            "kind": alert_kind::CACHE_DROP,
             "prev_share": prev.share,
             "share": share,
             "first_diff": first_diff(prev_refs, refs),
@@ -274,11 +369,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn word_start_only() {
-        assert!(has_word_start("ok. let me run", "let me "));
-        assert!(has_word_start("let me run", "let me "));
-        assert!(!has_word_start("the api will return", "i will "));
-        assert!(!has_word_start("you know i did", "now i "));
+    fn whole_words_only() {
+        assert!(has_word("ok. let me run", "let me"));
+        assert!(has_word("let me", "let me"));
+        assert!(!has_word("the api will return", "i will"));
+        assert!(!has_word("сейчас ясно", "сейчас я"));
+        assert!(!has_word("они приступают", "приступаю"));
+        assert!(has_word("приступаю.", "приступаю"));
+    }
+
+    #[test]
+    fn trailing_code_block() {
+        assert_eq!(before_trailing_code("Run:\n```\nx\n```"), "Run:");
+        assert_eq!(before_trailing_code("no code"), "no code");
+        assert_eq!(before_trailing_code("```"), "```");
     }
 
     #[test]

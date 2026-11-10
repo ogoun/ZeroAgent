@@ -89,6 +89,48 @@ pub mod detector {
     pub const PARSE_ERRORS: &str = "parse_errors";
 }
 
+/// Действие детектора: поле `action` события `loop.detected` (R1-B2 D63).
+///
+/// Значения — часть протокола (их читают UI и инспектор), менять строки нельзя.
+pub mod detector_action {
+    /// Прошлый результат показан без исполнения (D54).
+    pub const REUSE: &str = "reuse";
+    /// Вызов отклонён без исполнения (D54).
+    pub const REJECT: &str = "reject";
+    /// Управляющее сообщение модели (D54, D55, D60).
+    pub const NUDGE: &str = "nudge";
+    /// Run — `blocked` (D54–D56).
+    pub const BLOCK: &str = "block";
+    /// Повтор хода с другими параметрами (D58, D59).
+    pub const RETRY: &str = "retry";
+    /// Run — `paused` (D57–D59, D61).
+    pub const PAUSE: &str = "pause";
+    /// Пауза перед следующим вызовом модели (D57).
+    pub const SLEEP: &str = "sleep";
+    /// Аварийная компакция на ближайшей границе (D61).
+    pub const COMPACT: &str = "compact";
+}
+
+/// Вид события `context.alert`: поле `kind` (R1-B2 D43, D45, D62, D70).
+///
+/// Значения — часть протокола (их читают UI и инспектор), менять строки нельзя.
+pub mod alert_kind {
+    /// Эндпоинт не сообщил размер окна, принят по умолчанию (D43).
+    pub const N_CTX_UNKNOWN: &str = "n_ctx_unknown";
+    /// Окно сменилось на resume (D43).
+    pub const N_CTX_CHANGED: &str = "n_ctx_changed";
+    /// Расход хода меньше половины оценки: вероятна обрезка сервером (D43).
+    pub const TRUNCATION_SUSPECTED: &str = "truncation_suspected";
+    /// Файл выгрузки не записан, удаление пропущено (D45).
+    pub const PRUNE_FAILED: &str = "prune_failed";
+    /// После компакции оценка выше порога (D70).
+    pub const COMPACTION_INSUFFICIENT: &str = "compaction_insufficient";
+    /// Компакция завершилась ошибкой модели (D46).
+    pub const COMPACTION_FAILED: &str = "compaction_failed";
+    /// Доля входа из кэша упала без смены эпохи истории (D62).
+    pub const CACHE_DROP: &str = "cache_drop";
+}
+
 /// Причины ошибки run: поле `reason` события `run.status` при переходе в `failed`.
 ///
 /// Короткий машинный код класса ошибки цикла; подробность — в логах. Значения —
