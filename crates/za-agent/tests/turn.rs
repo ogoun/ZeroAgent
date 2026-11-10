@@ -234,8 +234,8 @@ async fn signals_keep_last_flag_and_priority() {
     tx.input();
     tx.pause();
     tx.pause(); // повтор не теряется и не дублируется
-    assert_eq!(rx.recv().await, Signal::Pause);
-    assert_eq!(rx.recv().await, Signal::Input);
+    assert_eq!(within("сигнал pause", rx.recv()).await, Signal::Pause);
+    assert_eq!(within("сигнал input", rx.recv()).await, Signal::Input);
     tx.cancel();
     assert_eq!(rx.drain(), Some(Signal::Cancel));
     assert_eq!(rx.drain(), None);
@@ -536,6 +536,17 @@ async fn refusal_is_reported_not_committed() {
     assert_eq!(out.message, text_msg(Role::Assistant, "частич"));
 }
 
+/// Предел любого ожидания в тестах: зависание становится понятной паникой.
+const WAIT: Duration = Duration::from_secs(10);
+
+/// Ожидание с пределом [`WAIT`]; по истечении — паника с описанием `what`.
+async fn within<F: std::future::Future>(what: &str, fut: F) -> F::Output {
+    match tokio::time::timeout(WAIT, fut).await {
+        Ok(v) => v,
+        Err(_) => panic!("не дождались за {WAIT:?}: {what}"),
+    }
+}
+
 /// Обрыв хода сигналом (D7, NFR-03): drop стрима не позже 200 мс после сигнала,
 /// квитанция `interrupted:*`; реплей отдаёт тот же обрыв из журнала без стрима.
 async fn abort_with(name: &str, signal: Signal) {
@@ -546,7 +557,23 @@ async fn abort_with(name: &str, signal: Signal) {
     ctx.next_step();
     let key = EffectKey::derive(run, 1, 0);
     let (tx, mut sig) = signal_channel();
-    let sender = tokio::spawn(async move {
+    // Одна задача и шлёт сигнал, и замечает drop. Сигнал уходит только после того, как
+    // стрим открыт и дельта `a` принята ходом (она видна в журнале после сброса по
+    // сроку). Сценарий `push_open` держит стрим открытым до сигнала, поэтому момент
+    // drop не может проскочить мимо опроса.
+    let watched = m.clone();
+    let store = s.clone();
+    let observer = tokio::spawn(async move {
+        loop {
+            let delta_seen = loop_events(&store, run)
+                .await
+                .iter()
+                .any(|(k, _)| *k == EventKind::ModelDelta);
+            if watched.open_streams() > 0 && delta_seen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
         let at = tokio::time::Instant::now();
         match signal {
@@ -554,27 +581,20 @@ async fn abort_with(name: &str, signal: Signal) {
             Signal::Cancel => tx.cancel(),
             Signal::Input => tx.input(),
         }
-        (tx, at)
-    });
-    // Момент drop стрима, а не возврата `model_turn`: записи журнала после обрыва
-    // (сброс дельты, квитанция) в предел NFR-03 не входят.
-    let watched = m.clone();
-    let watcher = tokio::spawn(async move {
-        let mut opened = false;
-        loop {
-            match watched.open_streams() {
-                0 if opened => return tokio::time::Instant::now(),
-                0 => {}
-                _ => opened = true,
-            }
+        // Момент drop стрима, а не возврата `model_turn`: записи журнала после обрыва
+        // (квитанция) в предел NFR-03 не входят.
+        while watched.open_streams() > 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        (tx, at, tokio::time::Instant::now())
     });
-    let err = model_turn(&mut ctx, &j, m.as_ref(), call(run), &refs(), 1, &mut sig)
-        .await
-        .unwrap_err();
-    let (_tx, at) = sender.await.unwrap();
-    let dropped = watcher.await.unwrap();
+    let err = within(
+        "обрыв хода сигналом",
+        model_turn(&mut ctx, &j, m.as_ref(), call(run), &refs(), 1, &mut sig),
+    )
+    .await
+    .unwrap_err();
+    let (_tx, at, dropped) = within("сигнал и drop стрима", observer).await.unwrap();
     assert!(
         matches!(err, TurnError::Aborted { signal: s, source: EffectSource::Live } if s == signal),
         "{err:?}"
@@ -591,7 +611,7 @@ async fn abort_with(name: &str, signal: Signal) {
         receipt_error(&s, run, &key).await,
         format!("interrupted:{tag}")
     );
-    // Дельта до обрыва сброшена в журнал.
+    // Дельта до обрыва записана в журнал ровно один раз.
     let deltas: Vec<Value> = loop_events(&s, run)
         .await
         .into_iter()
@@ -606,9 +626,12 @@ async fn abort_with(name: &str, signal: Signal) {
     // Реплей: квитанция обрыва из журнала, стрим не открывается.
     let mut ctx = RunCtx::resume_at(s.clone(), run, 1, 0);
     let (_tx2, mut sig2) = signal_channel();
-    let again = model_turn(&mut ctx, &j, m.as_ref(), call(run), &refs(), 1, &mut sig2)
-        .await
-        .unwrap_err();
+    let again = within(
+        "реплей обрыва",
+        model_turn(&mut ctx, &j, m.as_ref(), call(run), &refs(), 1, &mut sig2),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(again, TurnError::Aborted { signal: s, source: EffectSource::Journal } if s == signal),
         "{again:?}"
@@ -963,6 +986,30 @@ fn review_length_does_not_count_parse_errors() {
     let r = review(&out, &tools(), &classes(), 1);
     assert_eq!(r.parse_errors, 0);
     assert!(reject_text(&r.calls[0].verdict).starts_with("not executed: response cut"));
+}
+
+/// При `Length` извлечённый вызов обрезан пределом вывода, а не испорчен: nudge про
+/// валидный JSON неуместен, вместо него один nudge про обрезку (D23, английский).
+#[test]
+fn review_length_nudges_about_cut_not_json() {
+    let cut = "<tool_call>
+{\"name\": \"read_file\", \"arguments\": {\"pa
+</tool_call>";
+    let out = output(
+        vec![Part::Text(format!(
+            "{cut}
+{cut}"
+        ))],
+        FinishReason::Length,
+    );
+    let r = review(&out, &tools(), &classes(), 2);
+    assert_eq!(r.parse_errors, 0);
+    assert!(r.calls.is_empty());
+    assert_eq!(r.nudges.len(), 1, "{:?}", r.nudges);
+    let n = &r.nudges[0];
+    assert!(!n.contains("valid JSON"), "{n}");
+    assert!(n.contains("finish_reason=length"), "{n}");
+    assert!(n.is_ascii(), "{n}");
 }
 
 #[test]
