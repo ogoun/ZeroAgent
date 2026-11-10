@@ -33,7 +33,8 @@ mod tracker;
 mod unique_dir;
 
 pub use edit::{
-    EditHook, EditPoint, edit_tool, edit_tool_with_hook, multi_edit_tool, multi_edit_tool_with_hook,
+    EditHome, EditHook, EditPoint, clean_edit_leftovers, clean_leftovers_older, edit_tool,
+    edit_tool_with_hook, multi_edit_tool, multi_edit_tool_with_hook,
 };
 
 pub use fs::{

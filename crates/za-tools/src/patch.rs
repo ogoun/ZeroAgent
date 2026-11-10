@@ -73,7 +73,7 @@ pub fn apply(text: &str, old: &str, new: &str) -> Result<(String, MatchLevel), P
     let styled = |s: &str| restyle(&s.replace("\r\n", "\n"), crlf);
 
     // 1. Точно.
-    let starts: Vec<usize> = text.match_indices(old).map(|(i, _)| i).collect();
+    let starts = overlapping(text, old);
     match starts.len() {
         0 => {}
         1 => {
@@ -94,7 +94,7 @@ pub fn apply(text: &str, old: &str, new: &str) -> Result<(String, MatchLevel), P
 
     // 2. Без `\r\n`.
     if !norm.removed.is_empty() || old_n.len() != old.len() {
-        let starts: Vec<usize> = norm.text.match_indices(&old_n).map(|(i, _)| i).collect();
+        let starts = overlapping(&norm.text, &old_n);
         match starts.len() {
             0 => {}
             1 => {
@@ -139,7 +139,12 @@ pub fn apply(text: &str, old: &str, new: &str) -> Result<(String, MatchLevel), P
             1 => {
                 let i = found[0];
                 let k = old_lines.len();
-                let (s, e) = (lines[i].0, lines[i + k - 1].1);
+                let (s, mut e) = (lines[i].0, lines[i + k - 1].1);
+                // Удаление целых строк (m1): `old` с `\n` и пустой `new` убирают и перевод
+                // строки найденного места, как на точном уровне.
+                if had_nl && new_n.is_empty() && e < norm.text.len() {
+                    e += 1;
+                }
                 let replacement = if level == MatchLevel::Indent {
                     let found_lines: Vec<&str> = (i..i + k)
                         .map(|j| &norm.text[lines[j].0..lines[j].1])
@@ -207,6 +212,23 @@ fn splice(text: &str, a: usize, b: usize, with: &str) -> String {
     out.push_str(&text[..a]);
     out.push_str(with);
     out.push_str(&text[b..]);
+    out
+}
+
+/// Начала всех вхождений `pat` в `text`, в том числе перекрывающихся (I1): поиск
+/// сдвигается на один символ, а не на длину совпадения. `"}\n}\n}\n"` содержит
+/// `"}\n}\n"` дважды — это неоднозначность, а не одно место.
+fn overlapping(text: &str, pat: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(i) = text[pos..].find(pat) {
+        let at = pos + i;
+        out.push(at);
+        pos = at + text[at..].chars().next().map_or(1, char::len_utf8);
+        if pos > text.len() {
+            break;
+        }
+    }
     out
 }
 

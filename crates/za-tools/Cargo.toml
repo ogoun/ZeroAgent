@@ -29,5 +29,9 @@ similar.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
+# Только Unix: `geteuid` — владелец файла правки и каталога маркеров (I2, m11 задачи 7).
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

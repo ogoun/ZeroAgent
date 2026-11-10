@@ -12,16 +12,60 @@ use za_core::paths::{Roots, classify, resolve};
 use za_core::{Access, Approval, Postcondition, RiskClass, Tool, ToolCx, ToolKind, ToolOutput};
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier};
 use za_tools::{
-    EditHook, EditPoint, MatchLevel, PatchError, ReadTracker, TrackError, apply, edit_tool,
-    edit_tool_with_hook, multi_edit_tool, read_tool, shrink_guard,
+    EditHome, EditHook, EditPoint, MatchLevel, PatchError, ReadTracker, TrackError, apply,
+    clean_edit_leftovers, clean_leftovers_older, edit_tool, edit_tool_with_hook, multi_edit_tool,
+    read_tool, shrink_guard,
 };
 
 #[path = "../../../test-support/unique_dir.rs"]
 mod shared_dir;
 
-/// Чистый каталог теста `CARGO_TARGET_TMPDIR/za-tools-edit/<name>-<pid>-<n>`.
+/// Корень проекта теста `CARGO_TARGET_TMPDIR/za-tools-edit/<name>-<pid>-<n>/p`; рядом —
+/// `ZA_HOME` теста `../h` (маркеры правок, m11).
 fn unique_dir(name: &str) -> PathBuf {
-    shared_dir::unique_dir("za-tools-edit", name)
+    let d = shared_dir::unique_dir("za-tools-edit", name);
+    std::fs::create_dir_all(d.join("h")).unwrap();
+    std::fs::create_dir_all(d.join("p")).unwrap();
+    d.join("p")
+}
+
+/// Идентификатор проекта тестов.
+const PROJECT_ID: &str = "0123456789abcdef";
+
+/// `ZA_HOME` теста для проекта `root`.
+fn home(root: &Path) -> EditHome {
+    EditHome {
+        za_home: root.parent().unwrap().join("h"),
+        project_id: PROJECT_ID.to_owned(),
+    }
+}
+
+/// `ZA_HOME` инструмента, который не вызывается (контракт, предметы вызова).
+fn no_home() -> EditHome {
+    EditHome {
+        za_home: PathBuf::from("no-home"),
+        project_id: PROJECT_ID.to_owned(),
+    }
+}
+
+/// Каталог маркеров правок проекта `root`.
+fn markers(root: &Path) -> PathBuf {
+    home(root)
+        .za_home
+        .join("projects")
+        .join(PROJECT_ID)
+        .join("edits")
+}
+
+/// Файлы каталога (пусто, если его нет).
+fn names(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn write(root: &Path, rel: &str, bytes: impl AsRef<[u8]>) {
@@ -99,8 +143,8 @@ impl Kit {
         Self {
             cx: Cx::new(root),
             read: read_tool(t.clone()),
-            edit: edit_tool(t.clone()),
-            multi: multi_edit_tool(t),
+            edit: edit_tool(t.clone(), home(root)),
+            multi: multi_edit_tool(t, home(root)),
         }
     }
 
@@ -126,14 +170,19 @@ fn canonical(root: &Path, rel: &str) -> PathBuf {
         .path
 }
 
-/// Временные файлы правки (`.za-edit-*.tmp`) в каталоге.
-fn leftovers(dir: &Path) -> Vec<String> {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+/// Временные файлы правки проекта: `.za-edit-*.tmp` рядом с целью в корне и `*.tmp` в
+/// `.zero-agent/work/edits` (m3).
+fn leftovers(root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = names(root)
+        .into_iter()
         .filter(|n| n.starts_with(".za-edit-"))
-        .collect()
+        .collect();
+    out.extend(
+        names(&root.join(".zero-agent/work/edits"))
+            .into_iter()
+            .filter(|n| n.ends_with(".tmp")),
+    );
+    out
 }
 
 /// Ссылка на файл. На Windows требует режима разработчика или прав администратора: без
@@ -562,18 +611,23 @@ async fn retry_with_marker_is_idempotent_after_restart() {
     // Маркер называется по file_stem (без ':').
     let stem = cx.effect_key.file_stem();
     assert!(!stem.contains(':'));
-    let marker = root
-        .join(".zero-agent/work/edits")
-        .join(format!("{stem}.json"));
+    // Маркер — вне проекта, в `ZA_HOME/projects/<id>/edits` (m11): `bash` его не подделает.
+    let marker = markers(&root).join(format!("{stem}.json"));
     assert!(marker.is_file(), "{}", marker.display());
+    assert!(
+        !root
+            .join(".zero-agent/work/edits")
+            .join(format!("{stem}.json"))
+            .exists()
+    );
     // Перезапуск: новый трекер, тот же ключ эффекта — тот же результат, файл изменён раз.
-    let fresh = edit_tool(ReadTracker::new());
+    let fresh = edit_tool(ReadTracker::new(), home(&root));
     let again = call_cx(&fresh, cx.clone(), args.clone()).await;
     assert_eq!(again, first);
     assert_eq!(bytes(&root, "a.rs"), b"2\n");
     // Файл изменён третьим содержимым — повтор отвергается.
     write(&root, "a.rs", "3\n");
-    let o = call_cx(&edit_tool(ReadTracker::new()), cx, args).await;
+    let o = call_cx(&edit_tool(ReadTracker::new(), home(&root)), cx, args).await;
     assert!(o.is_error);
     assert_eq!(
         o.content,
@@ -638,11 +692,11 @@ async fn protected_places_are_denied() {
         ".zero-agent/work/edits/x.json",
         ".git/new-file",
     ] {
-        let o = k.edit(json!({"path": p, "old": "", "new": "x"})).await;
-        // На Unix `.GIT` — другой каталог: его просто нет, создать файл там можно.
+        // На Unix `.GIT` — другой, незащищённый каталог: проверка до вызова (m10).
         if cfg!(unix) && p.starts_with(".GIT") {
             continue;
         }
+        let o = k.edit(json!({"path": p, "old": "", "new": "x"})).await;
         assert!(o.is_error, "{p}");
         assert_eq!(o.content, "denied: protected path", "{p}");
     }
@@ -694,15 +748,20 @@ async fn hard_link_is_refused() {
         .edit(json!({"path": "b.txt", "old": "1", "new": "2"}))
         .await;
     assert!(o.is_error);
-    assert!(
-        o.content
-            .starts_with("refusing to write a file with several hard links"),
-        "{}",
-        o.content
+    // Путь в отказе — относительный, как в остальных текстах (m5).
+    assert_eq!(
+        o.content,
+        "refusing to write a file with several hard links: b.txt"
     );
     assert_eq!(bytes(&root, "a.txt"), b"1\n");
     assert_eq!(bytes(&root, "b.txt"), b"1\n");
     assert!(leftovers(&root).is_empty());
+    // Маркер записан до rename и удалён при отказе (I3).
+    assert!(
+        names(&markers(&root)).is_empty(),
+        "{:?}",
+        names(&markers(&root))
+    );
 }
 
 #[cfg(windows)]
@@ -746,12 +805,13 @@ async fn device_file_is_refused() {
 #[tokio::test]
 async fn outside_path_is_a_write_subject() {
     // Граница — решение политики (D77): инструмент сообщает путь с Access::Write.
-    let tool = edit_tool(ReadTracker::new());
+    let tool = edit_tool(ReadTracker::new(), no_home());
     let s = tool.subjects(&json!({"path": "../x.rs", "old": "a", "new": "b"}));
     assert_eq!(s.paths.len(), 1);
     assert_eq!(s.paths[0].arg, "../x.rs");
     assert_eq!(s.paths[0].access, Access::Write);
-    let s = multi_edit_tool(ReadTracker::new()).subjects(&json!({"path": "a.rs", "edits": []}));
+    let s = multi_edit_tool(ReadTracker::new(), no_home())
+        .subjects(&json!({"path": "a.rs", "edits": []}));
     assert_eq!(s.paths[0].access, Access::Write);
     assert!(tool.subjects(&json!({})).paths.is_empty());
 }
@@ -826,7 +886,7 @@ async fn swap_before_rename_is_refused() {
     let hook = hook_once(EditPoint::BeforeRename, false, |p| {
         std::fs::write(p, "third\n").unwrap();
     });
-    let edit = edit_tool_with_hook(tracker, hook);
+    let edit = edit_tool_with_hook(tracker, home(&root), hook);
     let o = call_cx(
         &edit,
         cx.next(),
@@ -837,6 +897,12 @@ async fn swap_before_rename_is_refused() {
     assert_eq!(o.content, "file changed during the edit; read it again");
     assert_eq!(bytes(&root, "a.rs"), b"third\n");
     assert!(leftovers(&root).is_empty());
+    // Маркер удалён: файл не равен after (I3).
+    assert!(
+        names(&markers(&root)).is_empty(),
+        "{:?}",
+        names(&markers(&root))
+    );
 }
 
 #[tokio::test]
@@ -862,7 +928,7 @@ async fn link_swapped_in_before_rename_is_refused() {
         std::fs::remove_file(p).unwrap();
         file_link(p, &other).unwrap();
     });
-    let edit = edit_tool_with_hook(tracker, hook);
+    let edit = edit_tool_with_hook(tracker, home(&root), hook);
     let o = call_cx(
         &edit,
         cx.next(),
@@ -905,14 +971,24 @@ async fn crash_before_rename_keeps_file_and_retry_completes() {
         seen2.lock().unwrap().push(p.to_path_buf());
     });
     let args = json!({"path": "a.rs", "old": "1", "new": "2"});
-    let o = call_cx(&edit_tool_with_hook(tracker, hook), cx.next(), args.clone()).await;
+    let o = call_cx(
+        &edit_tool_with_hook(tracker, home(&root), hook),
+        cx.next(),
+        args.clone(),
+    )
+    .await;
     assert!(o.is_error);
     // Сбой до rename: файл прежний целиком (атомарность), временный файл остался.
     assert_eq!(bytes(&root, "a.rs"), b"1\n");
     assert_eq!(seen.lock().unwrap().as_slice(), [canonical(&root, "a.rs")]);
     assert_eq!(leftovers(&root).len(), 1);
+    // Временный файл — в work_dir, а не рядом с целью (m3); свежий сирота не трогается.
+    let work = names(&root.join(".zero-agent/work/edits"));
+    assert!(work.iter().any(|n| n.ends_with(".tmp")), "{work:?}");
+    assert_eq!(clean_edit_leftovers(&root).unwrap(), 0);
+    assert_eq!(leftovers(&root).len(), 1);
     // Перезапуск: новый трекер, тот же ключ — маркер «before» продолжает правку.
-    let o = call_cx(&edit_tool(ReadTracker::new()), cx.same(), args).await;
+    let o = call_cx(&edit_tool(ReadTracker::new(), home(&root)), cx.same(), args).await;
     assert!(!o.is_error, "{}", o.content);
     assert_eq!(bytes(&root, "a.rs"), b"2\n");
     assert!(leftovers(&root).is_empty());
@@ -924,9 +1000,13 @@ async fn crash_before_rename_keeps_file_and_retry_completes() {
 fn contract_matches_d74() {
     let roles = vec![RunRole::Top, RunRole::Orchestrator, RunRole::Worker];
     for (tool, name, tier) in [
-        (edit_tool(ReadTracker::new()), "edit", Tier::Small),
         (
-            multi_edit_tool(ReadTracker::new()),
+            edit_tool(ReadTracker::new(), no_home()),
+            "edit",
+            Tier::Small,
+        ),
+        (
+            multi_edit_tool(ReadTracker::new(), no_home()),
             "multi_edit",
             Tier::Standard,
         ),
@@ -948,4 +1028,160 @@ fn contract_matches_d74() {
             "{name}"
         );
     }
+}
+
+// ---- раунд исправлений 1 ----
+
+#[test]
+fn overlapping_matches_are_ambiguous() {
+    // I1: `match_indices` не видит перекрытий; совпадения считаются со сдвигом на символ.
+    assert_eq!(
+        apply("}\n}\n}\n", "}\n}\n", "x"),
+        Err(PatchError::Ambiguous { lines: vec![1, 2] })
+    );
+    // То же на уровне LineEndings.
+    assert_eq!(
+        apply("}\r\n}\r\n}\r\n", "}\n}\n", "x"),
+        Err(PatchError::Ambiguous { lines: vec![1, 2] })
+    );
+    assert_eq!(
+        apply("aaa", "aa", "b"),
+        Err(PatchError::Ambiguous { lines: vec![1, 1] })
+    );
+    // Многобайтные символы: сдвиг по границе символа.
+    assert_eq!(apply("жжx", "жx", "y").unwrap().0, "жy");
+}
+
+#[test]
+fn deleting_lines_on_fuzzy_levels_removes_newline() {
+    // m1: удаление строки на построчном уровне не оставляет пустую строку.
+    assert_eq!(
+        apply("a\nx \nb\n", "x\n", "").unwrap(),
+        ("a\nb\n".into(), MatchLevel::TrailingSpace)
+    );
+    assert_eq!(
+        apply("a\r\n\tx()\r\nb\r\n", "  x()\n", "").unwrap(),
+        ("a\r\nb\r\n".into(), MatchLevel::Indent)
+    );
+}
+
+#[tokio::test]
+async fn overlapping_old_is_refused_by_tool() {
+    let root = unique_dir("overlap");
+    write(&root, "a.rs", "}\n}\n}\n");
+    let mut k = Kit::new(&root);
+    k.read("a.rs").await;
+    let o = k
+        .edit(json!({"path": "a.rs", "old": "}\n}\n", "new": "x\n"}))
+        .await;
+    assert!(o.is_error);
+    assert_eq!(
+        o.content,
+        "old matches 2 places (lines 1, 2); add surrounding lines"
+    );
+    assert_eq!(bytes(&root, "a.rs"), b"}\n}\n}\n");
+}
+
+#[tokio::test]
+async fn read_only_file_is_refused() {
+    // I2: rename обошёл бы `chmod a-w` (Unix) и упал бы на Windows; отказ на обеих ОС.
+    let root = unique_dir("read_only");
+    write(&root, "ro.txt", "1\n");
+    let p = root.join("ro.txt");
+    let mut perms = std::fs::metadata(&p).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&p, perms.clone()).unwrap();
+    let mut k = Kit::new(&root);
+    k.read("ro.txt").await;
+    let o = k
+        .edit(json!({"path": "ro.txt", "old": "1", "new": "2"}))
+        .await;
+    assert!(o.is_error);
+    assert_eq!(o.content, "cannot write ro.txt: permission denied");
+    assert_eq!(bytes(&root, "ro.txt"), b"1\n");
+    assert!(std::fs::metadata(&p).unwrap().permissions().readonly());
+    assert!(leftovers(&root).is_empty());
+    assert!(names(&markers(&root)).is_empty());
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&p, perms).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_modes_of_new_and_owner_only_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_dir("modes");
+    let mut k = Kit::new(&root);
+    let mode = |p: &str| {
+        std::fs::metadata(root.join(p))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    // Новый файл — 0644 (временный создавался 0600, m4).
+    let o = k
+        .edit(json!({"path": "new.txt", "old": "", "new": "x\n"}))
+        .await;
+    assert!(!o.is_error, "{}", o.content);
+    assert_eq!(mode("new.txt"), 0o644);
+    // Секретный файл 0600 остаётся 0600.
+    write(&root, "secret.txt", "s\n");
+    std::fs::set_permissions(
+        root.join("secret.txt"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    k.read("secret.txt").await;
+    let o = k
+        .edit(json!({"path": "secret.txt", "old": "s", "new": "t"}))
+        .await;
+    assert!(!o.is_error, "{}", o.content);
+    assert_eq!(mode("secret.txt"), 0o600);
+    // Без права записи владельца (0555) — отказ.
+    write(&root, "rx.sh", "a\n");
+    std::fs::set_permissions(root.join("rx.sh"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    k.read("rx.sh").await;
+    let o = k
+        .edit(json!({"path": "rx.sh", "old": "a", "new": "b"}))
+        .await;
+    assert_eq!(o.content, "cannot write rx.sh: permission denied");
+    assert_eq!(bytes(&root, "rx.sh"), b"a\n");
+    // Каталог маркеров закрыт на запись другим.
+    let m = std::fs::metadata(markers(&root))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(m & 0o022, 0, "{m:o}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn writable_by_others_marker_dir_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_dir("marker_dir_mode");
+    std::fs::create_dir_all(markers(&root)).unwrap();
+    std::fs::set_permissions(markers(&root), std::fs::Permissions::from_mode(0o777)).unwrap();
+    write(&root, "a.txt", "1\n");
+    let mut k = Kit::new(&root);
+    k.read("a.txt").await;
+    let o = k
+        .edit(json!({"path": "a.txt", "old": "1", "new": "2"}))
+        .await;
+    assert_eq!(o.content, "internal error: edit tool failed");
+    assert_eq!(bytes(&root, "a.txt"), b"1\n");
+}
+
+#[test]
+fn leftovers_are_cleaned_by_age() {
+    // m3: сироты прошлых сбоев в work_dir("edits"); свежие (живая правка) не трогаются.
+    let root = unique_dir("clean");
+    write(&root, ".zero-agent/work/edits/old-run-1-1.tmp", "x");
+    write(&root, ".zero-agent/work/edits/keep.json", "{}");
+    assert_eq!(clean_edit_leftovers(&root).unwrap(), 0);
+    assert!(root.join(".zero-agent/work/edits/old-run-1-1.tmp").exists());
+    assert_eq!(clean_leftovers_older(&root, Duration::ZERO).unwrap(), 1);
+    assert!(!root.join(".zero-agent/work/edits/old-run-1-1.tmp").exists());
+    assert!(root.join(".zero-agent/work/edits/keep.json").exists());
 }

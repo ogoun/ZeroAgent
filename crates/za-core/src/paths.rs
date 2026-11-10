@@ -1009,7 +1009,8 @@ const RENAME_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Атомарная замена файла `target` готовым файлом `tmp` (D88, D98). Блокирующая.
 ///
-/// `tmp` и `target` лежат в одном каталоге (иначе `rename` не атомарен).
+/// `tmp` и `target` должны лежать на одном томе: иначе `rename` не атомарен и даёт
+/// `ErrorKind::CrossesDevices` — тогда вызывающий кладёт временный файл рядом с целью.
 /// 1. `tmp` — обычный файл, не ссылка, одна жёсткая ссылка.
 /// 2. `target`, если есть, — не ссылка и не junction (ссылка не подменяется файлом,
 ///    Ruling 7.14), обычный файл с одной жёсткой ссылкой (I3).
@@ -1023,16 +1024,6 @@ const RENAME_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 /// процессом вне Job или группы (до SEC-100).
 pub fn replace_checked(tmp: &ResolvedPath, target: &ResolvedPath) -> io::Result<()> {
     let _drives = DriveScope::enter();
-    if tmp.path.parent() != target.path.parent() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "временный файл {} не рядом с {}",
-                tmp.path.display(),
-                target.path.display()
-            ),
-        ));
-    }
     #[cfg(windows)]
     check_drive(&target.path, &|| target.path.display().to_string()).map_err(io::Error::other)?;
     let t = open_checked(tmp, false)?;

@@ -3,21 +3,29 @@
 //! Вызов: разбор аргументов → [`classify`] (сетевые и device-пути, ADS, имена устройств
 //! отвергаются без обращения к ФС) → в `spawn_blocking`:
 //! 1. [`resolve`] с `Access::Write`: путь канонический, ссылки и junction раскрыты.
-//!    Защищённое место (D79: `.git/`, `.zero-agent/` целиком — включая рабочие файлы
-//!    агента, маркеры которых модель подделывать не должна) — `denied: protected path`.
-//!    `ZA_HOME` инструмент не знает, его защищает политика по разрешённым путям (D79,
-//!    D80). Путь вне проекта инструмент не отвергает: это решение политики (`Ask`, D77),
-//!    инструмент сообщает его в [`Tool::subjects`] с `Access::Write`.
-//! 2. Маркер повтора `work_dir("edits")/<file_stem>.json`: файл уже равен `after` —
-//!    результат маркера; равен `before` — правка продолжается (проверку трекера
-//!    прерванная попытка уже прошла на этом содержимом); иначе — ошибка.
+//!    Защищённое место (D79: `ZA_HOME`, `.git/`, `.zero-agent/` целиком — включая
+//!    рабочие файлы агента, Ruling 2) — `denied: protected path`. Путь вне проекта
+//!    инструмент не отвергает: это решение политики (`Ask`, D77), инструмент сообщает его
+//!    в [`Tool::subjects`] с `Access::Write`. Файл только для чтения (Windows) или без
+//!    права записи владельца, или чужой (Unix) — отказ (I2): `rename` поверх него
+//!    обошёл бы `chmod a-w` и сменил бы владельца.
+//! 2. Маркер повтора `ZA_HOME/projects/<project_id>/edits/<file_stem>.json` ([`EditHome`],
+//!    m11): вне проекта, поэтому `bash` его не подделает. Каталог — через
+//!    [`home_dir`], на Unix он принадлежит текущему пользователю и закрыт на запись
+//!    группе и прочим. Файл уже равен `after` — результат маркера; равен `before` —
+//!    правка продолжается (проверку трекера прерванная попытка уже прошла на этом
+//!    содержимом, Ruling 1); иначе — ошибка. Отказ после записи маркера удаляет его,
+//!    если файл не равен `after` (I3).
 //! 3. [`ReadTracker`] по каноническому пути: правка только прочитанного и не изменившегося
 //!    файла. Создание нового файла (`old` пуст, файла нет) её пропускает.
 //! 4. Патчер [`crate::patch::apply`], для `multi_edit` — по очереди на копии.
 //! 5. Защита от перезаписи [`shrink_guard`].
-//! 6. Запись по каноническому пути: временный файл рядом с целью ([`open_checked`]), права
-//!    цели, маркер, сверка, что цель не изменилась, и [`replace_checked`] (`rename`, на
-//!    Windows с повторами). Ссылка не подменяется файлом: пишется её цель.
+//! 6. Запись по каноническому пути: временный файл (`work_dir("edits")/<file_stem>.tmp`
+//!    для цели в проекте, иначе или при другом томе — рядом с целью; [`open_checked`],
+//!    на Unix 0600 до записи и права цели перед `rename`), маркер, сверка, что цель не
+//!    изменилась, и [`replace_checked`] (`rename`, на Windows с повторами). Ссылка не
+//!    подменяется файлом: пишется её цель. Остатки прошлых сбоев убирает
+//!    [`clean_edit_leftovers`] при старте run (m3).
 //!
 //! BOM, стиль переводов строк и отсутствие `\n` в конце сохраняются. Файл не в UTF-8 и
 //! файл больше [`READ_MAX_BYTES`] не правятся.
@@ -32,8 +40,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 use za_core::paths::{
-    LexPath, ResolvedPath, Roots, classify, create_parents_checked, display, open_checked,
-    remove_checked, replace_checked, resolve, stat_checked, work_dir,
+    LexPath, ResolvedPath, Roots, classify, create_parents_checked, display, home_dir,
+    open_checked, read_dir_checked, remove_checked, replace_checked, resolve, stat_checked, within,
+    work_dir,
 };
 use za_core::{
     Access, Approval, BoxFuture, Postcondition, RawPath, RiskClass, Subjects, Tool, ToolCx,
@@ -53,8 +62,16 @@ use crate::tracker::{ReadTracker, TrackError};
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// Служебный каталог проекта: целиком защищён от правки (см. модуль).
 const ZA_DIR: &str = ".zero-agent";
-/// Подкаталог маркеров повтора в `work_dir`.
+/// Подкаталог временных файлов правки в `work_dir` и маркеров в `ZA_HOME/projects/<id>`.
 const EDITS_DIR: &str = "edits";
+/// Временный файл правки старше этого — сирота прошлого сбоя (m3): правка длится не
+/// дольше тайм-аута вызова (30 с).
+const LEFTOVER_AGE: Duration = Duration::from_secs(120);
+/// Права временного файла до записи (m4) и нового файла (Unix).
+#[cfg(unix)]
+const TMP_MODE: u32 = 0o600;
+#[cfg(unix)]
+const NEW_FILE_MODE: u32 = 0o644;
 /// Версия формата маркера.
 const MARKER_V: u32 = 1;
 /// Предел размера файла маркера при чтении.
@@ -261,34 +278,58 @@ struct Marker {
 
 // ---- инструмент ----
 
+/// Где правка хранит маркеры повтора (m11): `za_home/projects/<project_id>/edits`.
+/// `ZA_HOME` должен существовать; `project_id` — идентификатор проекта журнала
+/// (`zero-agent::home::project_id`), без `/`, `\` и `:`. Тот же `ZA_HOME` защищает
+/// от правки разрешение пути (D79).
+#[derive(Debug, Clone)]
+pub struct EditHome {
+    pub za_home: PathBuf,
+    pub project_id: String,
+}
+
 struct EditTool {
     spec: ToolSpec,
     tracker: Arc<ReadTracker>,
+    home: EditHome,
     multi: bool,
     hook: Option<EditHook>,
 }
 
 /// Инструмент `edit(path, old, new, allow_shrink?)`.
-pub fn edit_tool(tracker: Arc<ReadTracker>) -> Arc<dyn Tool> {
-    build(tracker, false, None)
+pub fn edit_tool(tracker: Arc<ReadTracker>, home: EditHome) -> Arc<dyn Tool> {
+    build(tracker, home, false, None)
 }
 
 /// Инструмент `multi_edit(path, edits[{old, new}], allow_shrink?)`.
-pub fn multi_edit_tool(tracker: Arc<ReadTracker>) -> Arc<dyn Tool> {
-    build(tracker, true, None)
+pub fn multi_edit_tool(tracker: Arc<ReadTracker>, home: EditHome) -> Arc<dyn Tool> {
+    build(tracker, home, true, None)
 }
 
-/// [`edit_tool`] с крюком сбоя тестов.
-pub fn edit_tool_with_hook(tracker: Arc<ReadTracker>, hook: EditHook) -> Arc<dyn Tool> {
-    build(tracker, false, Some(hook))
+/// [`edit_tool`] с крюком сбоя. Только для тестов (m12), как `CrashHook` и `FaultHook`.
+pub fn edit_tool_with_hook(
+    tracker: Arc<ReadTracker>,
+    home: EditHome,
+    hook: EditHook,
+) -> Arc<dyn Tool> {
+    build(tracker, home, false, Some(hook))
 }
 
-/// [`multi_edit_tool`] с крюком сбоя тестов.
-pub fn multi_edit_tool_with_hook(tracker: Arc<ReadTracker>, hook: EditHook) -> Arc<dyn Tool> {
-    build(tracker, true, Some(hook))
+/// [`multi_edit_tool`] с крюком сбоя. Только для тестов (m12).
+pub fn multi_edit_tool_with_hook(
+    tracker: Arc<ReadTracker>,
+    home: EditHome,
+    hook: EditHook,
+) -> Arc<dyn Tool> {
+    build(tracker, home, true, Some(hook))
 }
 
-fn build(tracker: Arc<ReadTracker>, multi: bool, hook: Option<EditHook>) -> Arc<dyn Tool> {
+fn build(
+    tracker: Arc<ReadTracker>,
+    home: EditHome,
+    multi: bool,
+    hook: Option<EditHook>,
+) -> Arc<dyn Tool> {
     let path =
         json!({ "type": "string", "description": "File path, relative to the project root" });
     let shrink = json!({
@@ -363,6 +404,7 @@ fn build(tracker: Arc<ReadTracker>, multi: bool, hook: Option<EditHook>) -> Arc<
             tainted: false,
         },
         tracker,
+        home,
         multi,
         hook,
     })
@@ -375,6 +417,7 @@ impl Tool for EditTool {
 
     fn call(&self, args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         let tracker = self.tracker.clone();
+        let home = self.home.clone();
         let hook = self.hook.clone();
         let multi = self.multi;
         Box::pin(async move {
@@ -396,6 +439,7 @@ impl Tool for EditTool {
                 args_hash,
                 req,
                 tracker,
+                home,
                 hook,
             };
             blocking(move || job.run(&lex)).await
@@ -486,6 +530,7 @@ struct Job {
     args_hash: String,
     req: Request,
     tracker: Arc<ReadTracker>,
+    home: EditHome,
     hook: Option<EditHook>,
 }
 
@@ -495,6 +540,9 @@ struct Before {
     bytes: Option<Vec<u8>>,
     hash: Option<String>,
     perms: Option<Permissions>,
+    /// Можно ли заменить файл (I2): не только для чтения, на Unix — право записи
+    /// владельца и владелец — текущий пользователь.
+    writable: bool,
 }
 
 fn hash_hex(bytes: &[u8]) -> String {
@@ -506,10 +554,22 @@ fn short(h: Option<&str>) -> &str {
 }
 
 impl Job {
+    /// Правка; в текстах отказов абсолютный канонический путь цели заменяется путём для
+    /// модели (m5): внутри проекта — относительным.
     fn run(self, lex: &LexPath) -> ToolOutput {
-        // `ZA_HOME` инструменту неизвестен: на его месте — `.zero-agent` проекта, так
-        // защищённым становится весь служебный каталог (см. модуль).
-        let roots = match Roots::canonical(&self.project, &self.project.join(ZA_DIR)) {
+        let mut shown_abs: Option<(String, String)> = None;
+        let mut out = self.run_inner(lex, &mut shown_abs);
+        if out.is_error
+            && let Some((abs, shown)) = shown_abs
+            && abs != shown
+        {
+            out.content = out.content.replace(&abs, &shown);
+        }
+        out
+    }
+
+    fn run_inner(&self, lex: &LexPath, shown_abs: &mut Option<(String, String)>) -> ToolOutput {
+        let roots = match Roots::canonical(&self.project, &self.home.za_home) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(project = %self.project.display(), error = %e, "корень проекта не канонизирован");
@@ -521,24 +581,29 @@ impl Job {
             Ok(r) => r,
             Err(e) => return ToolOutput::error(e.to_string()),
         };
-        if r.protected {
+        // Весь `.zero-agent` проекта, включая рабочие файлы агента (Ruling 2).
+        if r.protected || within(&root.join(ZA_DIR), &r.path) {
             return ToolOutput::error(denied_text());
         }
         let shown = display(&root, &r.path);
+        *shown_abs = Some((r.path.display().to_string(), shown.clone()));
+        // Остаток прерванной попытки этого же вызова (m3).
+        for tmp in self.tmp_candidates(&root, &r) {
+            discard(&tmp);
+        }
         let before = match read_before(&root, &r) {
             Ok(b) => b,
             Err(o) => return o,
         };
+        if before.bytes.is_some() && !before.writable {
+            return ToolOutput::error(write_error_text(&shown, io::ErrorKind::PermissionDenied));
+        }
 
         // 1. Маркер повтора.
-        let marker_r = match work_dir(&root, EDITS_DIR) {
-            Ok(dir) => ResolvedPath {
-                path: dir.join(format!("{}.json", self.stem)),
-                inside: true,
-                protected: false,
-            },
+        let marker_r = match self.marker_path(&roots.za_home) {
+            Ok(m) => m,
             Err(e) => {
-                tracing::error!(error = %e, "каталог маркеров правок не создан");
+                tracing::error!(error = %e, "каталог маркеров правок недоступен");
                 return ToolOutput::error(INTERNAL);
             }
         };
@@ -629,7 +694,12 @@ impl Job {
             after: after_hash.clone(),
             output: output.clone(),
         };
-        match self.write(&root, &r, &shown, &before, &after_bytes, &marker_r, &marker) {
+        let target = Target {
+            root: &root,
+            r: &r,
+            shown: &shown,
+        };
+        match self.write(&target, &before, &after_bytes, &marker_r, &marker) {
             Ok(()) => {
                 self.tracker.mark(self.run, &r.path, &after_hash);
                 output
@@ -642,38 +712,72 @@ impl Job {
         self.hook.as_ref().is_some_and(|h| h(point, path))
     }
 
-    /// Временный файл рядом с целью, маркер, сверка цели и `rename`.
-    #[allow(clippy::too_many_arguments)]
+    /// Маркер `ZA_HOME/projects/<project_id>/edits/<file_stem>.json` (m11). Каталог —
+    /// [`home_dir`] от канонического `ZA_HOME`, на Unix — свой и закрытый ([`check_private`]).
+    fn marker_path(&self, za_home: &Path) -> io::Result<ResolvedPath> {
+        let dir = home_dir(
+            za_home,
+            &format!("projects/{}/{EDITS_DIR}", self.home.project_id),
+        )?;
+        check_private(&dir)?;
+        Ok(ResolvedPath {
+            path: dir.join(format!("{}.json", self.stem)),
+            inside: false,
+            protected: false,
+        })
+    }
+
+    /// Места временного файла по порядку: `work_dir("edits")` для цели в проекте (m3),
+    /// затем рядом с целью (цель вне проекта или на другом томе).
+    fn tmp_candidates(&self, root: &Path, r: &ResolvedPath) -> Vec<ResolvedPath> {
+        let mut out = Vec::new();
+        if r.inside {
+            match work_dir(root, EDITS_DIR) {
+                Ok(dir) => out.push(ResolvedPath {
+                    path: dir.join(format!("{}.tmp", self.stem)),
+                    inside: true,
+                    protected: false,
+                }),
+                Err(e) => tracing::warn!(error = %e, "каталог временных файлов правки недоступен"),
+            }
+        }
+        if let Some(parent) = r.path.parent() {
+            out.push(ResolvedPath {
+                path: parent.join(format!(".za-edit-{}.tmp", self.stem)),
+                inside: r.inside,
+                protected: false,
+            });
+        }
+        out
+    }
+
+    /// Временный файл, маркер, сверка цели и `rename`. Отказ после записи маркера
+    /// удаляет маркер, если файл не равен `after` (I3).
     fn write(
         &self,
-        root: &Path,
-        r: &ResolvedPath,
-        shown: &str,
+        t: &Target<'_>,
         before: &Before,
         bytes: &[u8],
         marker_r: &ResolvedPath,
         marker: &Marker,
     ) -> Result<(), ToolOutput> {
         let werr = |e: &io::Error| {
-            if e.raw_os_error().is_some() {
-                ToolOutput::error(write_error_text(shown, e.kind()))
+            if e.raw_os_error().is_some() && e.kind() != io::ErrorKind::CrossesDevices {
+                ToolOutput::error(write_error_text(t.shown, e.kind()))
             } else {
-                ToolOutput::error(error_text(shown, e))
+                ToolOutput::error(error_text(t.shown, e))
             }
         };
         if before.bytes.is_none() {
-            create_parents_checked(r).map_err(|e| werr(&e))?;
+            create_parents_checked(t.r).map_err(|e| werr(&e))?;
         }
-        let Some(parent) = r.path.parent() else {
+        let candidates = self.tmp_candidates(t.root, t.r);
+        let Some(first) = candidates.first() else {
             return Err(ToolOutput::error(INTERNAL));
         };
-        let tmp = ResolvedPath {
-            path: parent.join(format!(".za-edit-{}.tmp", self.stem)),
-            inside: r.inside,
-            protected: false,
-        };
-        write_tmp(&tmp, bytes, before.perms.clone()).map_err(|e| {
-            discard(&tmp);
+        let perms = target_perms(before);
+        write_tmp(first, bytes, perms.clone()).map_err(|e| {
+            discard(first);
             werr(&e)
         })?;
         // Маркер — до `rename` (D88): сбой после замены даёт повтору `after`.
@@ -681,34 +785,132 @@ impl Job {
             Ok(j) => j,
             Err(e) => {
                 tracing::error!(error = %e, "маркер правки не сериализован");
-                discard(&tmp);
+                discard(first);
                 return Err(ToolOutput::error(INTERNAL));
             }
         };
         if let Err(e) = write_marker(marker_r, &self.stem, &marker_json) {
             tracing::error!(error = %e, path = %marker_r.path.display(), "маркер правки не записан");
-            discard(&tmp);
+            discard(first);
             return Err(ToolOutput::error(INTERNAL));
         }
-        if self.crash(EditPoint::BeforeRename, &r.path) {
+        if self.crash(EditPoint::BeforeRename, &t.r.path) {
             return Err(ToolOutput::error(INTERRUPTED));
         }
+        let fail = |o: ToolOutput, tmp: &ResolvedPath| {
+            discard(tmp);
+            drop_marker(marker_r, t.r, &marker.after);
+            Err(o)
+        };
         // Цель не изменилась с проверок: та же сверка содержимого, что и у трекера.
-        match read_before(root, r) {
+        match read_before(t.root, t.r) {
             Ok(now) if now.hash == before.hash => {}
-            Ok(_) => {
-                discard(&tmp);
-                return Err(ToolOutput::error(CHANGED_DURING));
-            }
-            Err(o) => {
-                discard(&tmp);
-                return Err(o);
+            Ok(_) => return fail(ToolOutput::error(CHANGED_DURING), first),
+            Err(o) => return fail(o, first),
+        }
+        let mut tmp = first;
+        loop {
+            match replace_checked(tmp, t.r) {
+                Ok(()) => return Ok(()),
+                // Другой том (в проект смонтирован другой том): временный файл — рядом.
+                Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                    let Some(next) = candidates.iter().skip_while(|c| c.path != tmp.path).nth(1)
+                    else {
+                        return fail(werr(&e), tmp);
+                    };
+                    discard(tmp);
+                    if let Err(e) = write_tmp(next, bytes, perms.clone()) {
+                        return fail(werr(&e), next);
+                    }
+                    tmp = next;
+                }
+                Err(e) => return fail(werr(&e), tmp),
             }
         }
-        replace_checked(&tmp, r).map_err(|e| {
-            discard(&tmp);
-            werr(&e)
-        })
+    }
+}
+
+/// Цель правки для записи.
+struct Target<'a> {
+    root: &'a Path,
+    r: &'a ResolvedPath,
+    shown: &'a str,
+}
+
+/// Права файла после замены: права цели, а у нового файла на Unix — 0644.
+fn target_perms(before: &Before) -> Option<Permissions> {
+    if let Some(p) = &before.perms {
+        return Some(p.clone());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(Permissions::from_mode(NEW_FILE_MODE))
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+/// Удаляет маркер после отказа (I3), если файл не равен `after`: `rename` не состоялся,
+/// и повтор не должен счесть правку начатой. Файл уже равен `after` (сбой сверки после
+/// `rename`) — маркер остаётся: повтор вернёт его результат.
+fn drop_marker(marker: &ResolvedPath, r: &ResolvedPath, after: &str) {
+    let current = open_checked(r, false).ok().and_then(|f| {
+        let mut bytes = Vec::new();
+        (&f).take(READ_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .ok()
+            .map(|_| hash_hex(&bytes))
+    });
+    if current.as_deref() == Some(after) {
+        return;
+    }
+    match remove_checked(marker) {
+        Ok(()) => {}
+        Err(e) if is_missing(&e) => {}
+        Err(e) => {
+            tracing::warn!(path = %marker.path.display(), error = %e, "маркер правки не удалён")
+        }
+    }
+}
+
+/// Каталог маркеров (Unix): настоящий каталог текущего пользователя, закрытый на запись
+/// группе и прочим (как реестр групп `za-jail`, N4 задачи 5).
+#[cfg(unix)]
+fn check_private(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(dir)?;
+    let me = nix::unistd::geteuid().as_raw();
+    if !m.file_type().is_dir() || m.uid() != me || m.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "каталог маркеров правок {}: не свой каталог или доступен на запись другим (uid {}, права {:o})",
+                dir.display(),
+                m.uid(),
+                m.mode() & 0o777
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Файл можно заменить (I2): Windows — не только для чтения; Unix — право записи
+/// владельца и владелец — текущий пользователь.
+fn writable(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.mode() & 0o200 != 0 && meta.uid() == nix::unistd::geteuid().as_raw()
+    }
+    #[cfg(not(unix))]
+    {
+        !meta.permissions().readonly()
     }
 }
 
@@ -718,6 +920,7 @@ fn read_before(root: &Path, r: &ResolvedPath) -> Result<Before, ToolOutput> {
         bytes: None,
         hash: None,
         perms: None,
+        writable: true,
     };
     match stat_checked(r) {
         Ok(m) if m.is_dir() => {
@@ -744,23 +947,31 @@ fn read_before(root: &Path, r: &ResolvedPath) -> Result<Before, ToolOutput> {
     Ok(Before {
         hash: Some(hash_hex(&bytes)),
         bytes: Some(bytes),
+        writable: writable(&meta),
         perms: Some(meta.permissions()),
     })
 }
 
-/// Временный файл: через [`open_checked`] (обычный файл, не ссылка, путь сверен),
-/// усечение остатка прошлой попытки, байты, права цели, `fsync`.
+/// Временный файл: через [`open_checked`] (обычный файл, не ссылка, одна жёсткая
+/// ссылка, путь сверен), на Unix сразу 0600 (m4), усечение остатка прошлой попытки,
+/// байты, `fsync` и права цели — до `rename`.
 fn write_tmp(tmp: &ResolvedPath, bytes: &[u8], perms: Option<Permissions>) -> io::Result<()> {
     let mut f = open_checked(tmp, true)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(Permissions::from_mode(TMP_MODE))?;
+    }
     f.set_len(0)?;
     f.write_all(bytes)?;
+    f.sync_all()?;
     if let Some(p) = perms {
         f.set_permissions(p)?;
     }
-    f.sync_all()
+    Ok(())
 }
 
-/// Удаляет временный файл после отказа; не удалось — `warn`.
+/// Удаляет временный файл; нет его — ничего, не удалось — `warn`.
 fn discard(tmp: &ResolvedPath) {
     match remove_checked(tmp) {
         Ok(()) => {}
@@ -771,14 +982,14 @@ fn discard(tmp: &ResolvedPath) {
     }
 }
 
-/// Маркер: атомарно, через временный файл в том же каталоге.
+/// Маркер: атомарно, через временный файл в том же каталоге (0600 на Unix).
 fn write_marker(marker: &ResolvedPath, stem: &str, json: &[u8]) -> io::Result<()> {
     let Some(dir) = marker.path.parent() else {
         return Err(io::Error::other("маркер без каталога"));
     };
     let tmp = ResolvedPath {
         path: dir.join(format!(".{stem}.json.tmp")),
-        inside: true,
+        inside: false,
         protected: false,
     };
     let r = write_tmp(&tmp, json, None).and_then(|()| replace_checked(&tmp, marker));
@@ -788,7 +999,7 @@ fn write_marker(marker: &ResolvedPath, stem: &str, json: &[u8]) -> io::Result<()
     r
 }
 
-/// Маркер повтора, если он есть и читается; испорченный — `warn` и `None`.
+/// Маркер повтора, если он есть и читается; испорченный или чужой — `warn` и `None`.
 fn load_marker(marker: &ResolvedPath) -> Option<Marker> {
     let f = match open_checked(marker, false) {
         Ok(f) => f,
@@ -798,6 +1009,15 @@ fn load_marker(marker: &ResolvedPath) -> Option<Marker> {
             return None;
         }
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let me = nix::unistd::geteuid().as_raw();
+        if !f.metadata().is_ok_and(|m| m.uid() == me) {
+            tracing::warn!(path = %marker.path.display(), "маркер правки чужой, пропущен");
+            return None;
+        }
+    }
     let mut bytes = Vec::new();
     if let Err(e) = (&f).take(MARKER_MAX).read_to_end(&mut bytes) {
         tracing::warn!(path = %marker.path.display(), error = %e, "маркер правки не прочитан");
@@ -814,6 +1034,55 @@ fn load_marker(marker: &ResolvedPath) -> Option<Marker> {
             None
         }
     }
+}
+
+/// Убирает временные файлы правок — сироты прошлых сбоев (m3) — из
+/// `<project>/.zero-agent/work/edits`: только `*.tmp` старше двух минут (живая правка
+/// другого run того же проекта длится не дольше тайм-аута вызова). Блокирующая.
+/// Вызывается при старте run (подключение — задача 12). Возвращает число удалённых.
+/// Временные файлы рядом с целью вне проекта так не находятся; их убирает повтор того же
+/// вызова.
+pub fn clean_edit_leftovers(project: &Path) -> io::Result<usize> {
+    clean_leftovers_older(project, LEFTOVER_AGE)
+}
+
+/// [`clean_edit_leftovers`] с заданным возрастом сироты (для тестов).
+#[doc(hidden)]
+pub fn clean_leftovers_older(project: &Path, age: Duration) -> io::Result<usize> {
+    let _drives = za_core::paths::DriveScope::enter();
+    let roots = Roots::canonical(project, project)?;
+    let dir_r = ResolvedPath {
+        path: work_dir(&roots.project, EDITS_DIR)?,
+        inside: true,
+        protected: false,
+    };
+    let mut n = 0;
+    for name in read_dir_checked(&dir_r)? {
+        let name = name.to_string_lossy().into_owned();
+        if !name.ends_with(".tmp") {
+            continue;
+        }
+        let f = ResolvedPath {
+            path: dir_r.path.join(&name),
+            inside: true,
+            protected: false,
+        };
+        let old = stat_checked(&f)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|a| a >= age);
+        if old {
+            match remove_checked(&f) {
+                Ok(()) => n += 1,
+                Err(e) => {
+                    tracing::warn!(path = %f.path.display(), error = %e, "сирота правки не удалена")
+                }
+            }
+        }
+    }
+    Ok(n)
 }
 
 /// Результат (TOOL-003): заголовок, пометка уровня совпадения и унифицированный diff с

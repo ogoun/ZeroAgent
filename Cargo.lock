@@ -2253,6 +2253,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "nix",
  "serde",
  "serde_json",
  "similar",
