@@ -48,19 +48,24 @@ const TAIL_DIVISOR: u32 = 5;
 const RECITATION: &str = "Current task: ";
 /// Раздел `## User messages` без вводов.
 const NO_USER_MESSAGES: &str = "none";
+/// Вводы пользователя в сводке — не больше `n_ctx / 4` токенов (25 %, Ruling minor).
+const USER_MESSAGES_DIVISOR: u32 = 4;
+/// Аварийный хвост — не больше `n_ctx / 10` (Ruling I-1: бюджет меньше обычного).
+const EMERGENCY_TAIL_DIVISOR: u32 = 10;
 
-/// D47: goal, user_messages и model_part — через escape_untrusted.
-///
-/// Формат: `<summary>`, `## Goal` и цель, `## User messages` и по строке на ввод (у
-/// поправки — префикс `[correct] `; вводов нет — `none`), затем часть модели, затем
-/// `</summary>`. `escape_untrusted` идемпотентна, поэтому уже экранированный ввод
-/// истории не меняется, а `</summary>` в части модели становится `&lt;/summary&gt;`.
+/// D47 (Ruling I-3): разделы рантайма — `## Goal` (цель) и `## User messages` (по
+/// строке на ввод, у поправки — префикс `[correct] `; вводов нет — `none`), затем
+/// часть модели в блоке `<summary from="model">…</summary>`. Всё через
+/// `escape_untrusted`: модель не закроет блок (`</summary>` → `&lt;/summary&gt;`), а её
+/// строки `## User messages` или `[correct] …` остаются внутри блока модели — снаружи
+/// их не спутать с разделами рантайма. Функция идемпотентна для уже экранированного
+/// ввода истории.
 pub fn summary_block(
     goal: &str,
     user_messages: &[(String, bool /* correct */)],
     model_part: &str,
 ) -> String {
-    let mut s = String::from("<summary>\n## Goal\n");
+    let mut s = String::from("## Goal\n");
     s.push_str(&escape_untrusted(goal));
     s.push_str("\n## User messages\n");
     if user_messages.is_empty() {
@@ -74,9 +79,33 @@ pub fn summary_block(
         s.push_str(&escape_untrusted(text));
         s.push('\n');
     }
+    s.push_str("<summary from=\"model\">\n");
     s.push_str(&escape_untrusted(model_part.trim()));
     s.push_str("\n</summary>");
     s
+}
+
+/// Вводы для сводки в пределах `budget` токенов (байты / 4): с новых к старым, пока
+/// помещаются; выпавшие старые — строка `[N earlier user messages omitted]` в начале
+/// списка. Цель в бюджет не входит и всегда остаётся целиком.
+fn limit_user_messages(users: Vec<(String, bool)>, budget: u32) -> Vec<(String, bool)> {
+    let mut used = 0u64;
+    let mut keep = 0;
+    for (text, _) in users.iter().rev() {
+        let cost = u64::from(approx_tokens(text)) + 1;
+        if used + cost > u64::from(budget) {
+            break;
+        }
+        used += cost;
+        keep += 1;
+    }
+    let omitted = users.len() - keep;
+    let mut out = Vec::with_capacity(keep + 1);
+    if omitted > 0 {
+        out.push((format!("[{omitted} earlier user messages omitted]"), false));
+    }
+    out.extend(users.into_iter().skip(omitted));
+    out
 }
 
 /// Раздел `## Next step` части модели (D47, D50): строки после заголовка до
@@ -270,10 +299,6 @@ pub async fn compact(
     let recovery = v.get("text").and_then(Value::as_str);
 
     // Новая эпоха: первое сообщение, хвост, рецитация (D46, D48).
-    let summary = summary_block(input.goal, &users, &model_part);
-    let next_step = next_step_of(&model_part).unwrap_or_default();
-    let request_at = input.user_inputs.last().and_then(|u| u.at);
-    let split = split_tail(input.conv, request_at, n_ctx / TAIL_DIVISOR);
     let current = users.last().map_or(input.goal, |(t, _)| t.as_str());
     let recitation = render_control(
         ControlFrom::Runtime,
@@ -281,6 +306,15 @@ pub async fn compact(
         "",
         &format!("{RECITATION}{current}"),
     );
+    let shown = limit_user_messages(users.clone(), n_ctx / USER_MESSAGES_DIVISOR);
+    let summary = summary_block(input.goal, &shown, &model_part);
+    let next_step = next_step_of(&model_part).unwrap_or_default();
+    let request_at = input.user_inputs.last().and_then(|u| u.at);
+    let split = if emergency {
+        emergency_split(input.conv, request_at, n_ctx / EMERGENCY_TAIL_DIVISOR)
+    } else {
+        split_tail(input.conv, request_at, n_ctx / TAIL_DIVISOR)
+    };
     let conv = input
         .conv
         .rebased(
@@ -319,6 +353,30 @@ fn normal_input(input: &CompactInput<'_>) -> Result<(Conversation, usize), TurnE
     let mut c = input.conv.clone();
     c.push_user(rubric_message()).map_err(history_err)?;
     Ok((c, 0))
+}
+
+/// Хвост аварийной компакции (Ruling I-1): как [`split_tail`] с бюджетом `max_tokens`,
+/// и если суффикс больше бюджета — первая точка разреза дальше, с которой он
+/// помещается; не помещается ни с одной — минимальный хвост с последней точки
+/// разреза. Без точек разреза — как [`split_tail`].
+fn emergency_split(conv: &Conversation, request_at: Option<usize>, max_tokens: u32) -> usize {
+    let msgs = conv.messages();
+    let split = split_tail(conv, request_at, max_tokens);
+    let suffix =
+        |from: usize| -> u64 { msgs[from.min(msgs.len())..].iter().map(message_cost).sum() };
+    if suffix(split) <= u64::from(max_tokens) {
+        return split;
+    }
+    let points: Vec<usize> = cut_points(conv)
+        .into_iter()
+        .filter(|&p| p > split)
+        .collect();
+    points
+        .iter()
+        .copied()
+        .find(|&p| suffix(p) <= u64::from(max_tokens))
+        .or_else(|| points.last().copied())
+        .unwrap_or(split)
 }
 
 /// Вход аварийной компакции (D49): первое сообщение (с `[N earlier messages omitted]`

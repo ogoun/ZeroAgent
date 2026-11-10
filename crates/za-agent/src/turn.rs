@@ -117,6 +117,9 @@ pub struct Signals {
     seen: ControlFlags,
     /// Отправитель тех же флагов: цикл снимает применённую паузу ([`Signals::clear_pause`]).
     flags_tx: Arc<watch::Sender<ControlFlags>>,
+    /// Сигнал ввода, пришедший во время компакции (R1-B2, Ruling I-2): компакция его не
+    /// ждёт, но он не теряется — следующий `recv` отдаёт его сразу, граница снимает.
+    deferred_input: bool,
 }
 
 impl Signals {
@@ -150,6 +153,9 @@ impl Signals {
             if let Some(s) = self.unseen_flag() {
                 return s;
             }
+            if std::mem::take(&mut self.deferred_input) {
+                return Signal::Input;
+            }
             if !flags_open && !input_open {
                 return std::future::pending().await;
             }
@@ -174,7 +180,20 @@ impl Signals {
     pub fn drain(&mut self) -> Option<Signal> {
         // Ввод прочитает сама граница, сигнал о нём устарел.
         while self.input.try_recv().is_ok() {}
+        self.deferred_input = false;
         self.unseen_flag()
+    }
+
+    /// Ввод уже прочитан границей (повторное чтение после компакции): отложенный и
+    /// накопленный сигнал ввода устарели. Флаги не трогаются.
+    pub(crate) fn discard_input(&mut self) {
+        while self.input.try_recv().is_ok() {}
+        self.deferred_input = false;
+    }
+
+    /// Сигнал ввода пришёл во время компакции: отдать его следующему `recv`.
+    fn defer_input(&mut self) {
+        self.deferred_input = true;
     }
 
     /// Клон watch::Receiver — для наблюдения флагов рядом с future пакета инструментов (D26).
@@ -207,6 +226,7 @@ pub fn signal_channel() -> (SignalTx, Signals) {
             input: input_rx,
             seen: ControlFlags::default(),
             flags_tx,
+            deferred_input: false,
         },
     )
 }
@@ -599,6 +619,23 @@ impl LiveTurn<'_> {
         call: ModelCall,
         sig: &mut Signals,
     ) -> Result<TurnOutput, Live> {
+        // Ввод во время компакции откладывается после её конца: внутри стрима
+        // отложенный сигнал отдавался бы тому же `recv` снова и снова.
+        let mut input_seen = false;
+        let r = self.stream(model, call, sig, &mut input_seen).await;
+        if input_seen {
+            sig.defer_input();
+        }
+        r
+    }
+
+    async fn stream(
+        self,
+        model: &dyn ModelPort,
+        call: ModelCall,
+        sig: &mut Signals,
+        input_seen: &mut bool,
+    ) -> Result<TurnOutput, Live> {
         let endpoint = call.endpoint.0.clone();
         // D67: параметры хода вне истории — по ним инспектор восстанавливает запрос точно.
         let r = &call.request;
@@ -653,8 +690,9 @@ impl LiveTurn<'_> {
                     if deadline.is_some() => Step::Timer,
             };
             match step {
-                // Компакцию ввод не обрывает: его прочитает следующая граница (D46).
-                Step::Signal(Signal::Input) if self.compact => {}
+                // Компакцию ввод не обрывает, но сигнал не теряется (Ruling I-2): граница
+                // перечитывает ввод после компакции, ход после аварийной — обрывается.
+                Step::Signal(Signal::Input) if self.compact => *input_seen = true,
                 Step::Signal(s) => {
                     // Drop закрывает соединение (D2 R1-A) до записи квитанции.
                     drop(stream);

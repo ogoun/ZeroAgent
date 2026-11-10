@@ -217,6 +217,8 @@ const STATE_EFFECT: &str = "state";
 const MEMORY_EFFECT: &str = "memory.snapshot";
 /// Имя эффекта оценки контекста на границе шага (R1-B2 D42).
 const CONTEXT_EFFECT: &str = "context";
+/// Имя эффекта повторного чтения ввода после компакции на границе (R1-B2, Ruling I-2).
+const INBOX_EFFECT: &str = "inbox";
 /// Префикс квитанции-отказа эффекта, у которого внутри не прочитался журнал.
 const STORE_ERROR: &str = "store_error:";
 /// `n_ctx`, если эндпоинт не сообщает размер контекста (D37).
@@ -522,6 +524,8 @@ async fn drive(deps: &LoopDeps, st: &mut LoopState, at: NodeId) -> Result<LoopOu
         .node(node(MODEL))
         .node(node(TOOLS))
         .edge(BOUNDARY, MODEL)
+        // Реплей обрыва компакции на границе (D7): новая граница без хода.
+        .edge(BOUNDARY, BOUNDARY)
         .edge(MODEL, TOOLS)
         .edge(MODEL, BOUNDARY)
         .edge(TOOLS, BOUNDARY);
@@ -828,7 +832,30 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
         return budget_exceeded(deps, st, kind, used, limit).await;
     }
     // (6) Ввод в историю.
-    for i in &b.inputs {
+    push_inbox(deps, st, &b.inputs).await?;
+    st.inbox_after = b.inbox_after;
+    // (6') Первая граница resume со снимка `Boundary`: после ввода — `resume` с блоком
+    // `<state>` (A.6). Блок — эффект: реплей границы получает тот же текст.
+    if st.at_boundary.resume_note {
+        let text = state_effect(deps, st).await?;
+        st.conv.push_user(render_control_trusted(
+            ControlFrom::Runtime,
+            ControlAction::Resume,
+            "",
+            &text,
+        ))?;
+        st.at_boundary.resume_note = false;
+    }
+    boundary_tail(sh, st, step).await
+}
+
+/// Шаг (6) границы: ввод и поправки — в историю и `user_inputs` (D66).
+async fn push_inbox(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    inputs: &[Inbox],
+) -> Result<(), LoopError> {
+    for i in inputs {
         match i {
             Inbox::Input { seq, text } => {
                 if text.is_empty() {
@@ -861,19 +888,63 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
             }
         }
     }
-    st.inbox_after = b.inbox_after;
-    // (6') Первая граница resume со снимка `Boundary`: после ввода — `resume` с блоком
-    // `<state>` (A.6). Блок — эффект: реплей границы получает тот же текст.
-    if st.at_boundary.resume_note {
-        let text = state_effect(deps, st).await?;
-        st.conv.push_user(render_control_trusted(
-            ControlFrom::Runtime,
-            ControlAction::Resume,
-            "",
-            &text,
-        ))?;
-        st.at_boundary.resume_note = false;
+    Ok(())
+}
+
+/// Повторное чтение ввода после компакции на границе (Ruling I-2): эффект `inbox`
+/// (`ReadOnly`, `{step}`) — ввод, пришедший во время компакции, попадает в историю до
+/// хода модели. Эффект есть после каждой компакции на границе, поэтому реплей
+/// повторяет те же ключи; сигнал ввода после него устарел.
+async fn reread_inbox(deps: &LoopDeps, st: &mut LoopState, step: u64) -> Result<(), LoopError> {
+    let store = store_of(deps);
+    let (run, after) = (st.run, st.inbox_after);
+    let mut failure: Option<StoreError> = None;
+    let fref = &mut failure;
+    let r = st
+        .ctx
+        .effect(
+            EffectSpec {
+                class: EffectClass::ReadOnly,
+                name: INBOX_EFFECT.into(),
+                args: json!({ "step": step }),
+            },
+            move || async move {
+                match read_boundary(&store, run, after).await {
+                    Ok(v) => serde_json::to_value(&v)
+                        .map_err(|e| format!("{STORE_ERROR} ввод не сериализуется: {e}")),
+                    Err(e) => {
+                        let msg = format!("{STORE_ERROR} {e}");
+                        *fref = Some(e);
+                        Err(msg)
+                    }
+                }
+            },
+        )
+        .await;
+    if let Some(e) = failure {
+        st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
+        return Err(LoopError::Store(e));
     }
+    let v = r.map_err(effect_err)?;
+    let b: BoundaryValue = serde_json::from_value(v).map_err(|e| {
+        let e = StoreError::Corrupt(format!("квитанция inbox шага {step}: {e}"));
+        st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
+        LoopError::Store(e)
+    })?;
+    push_inbox(deps, st, &b.inputs).await?;
+    st.inbox_after = b.inbox_after;
+    st.sig.discard_input();
+    Ok(())
+}
+
+/// Граница после ввода: напоминания (7), `context` и пороги (7'), `persist`,
+/// `turn.started`, снимок `Model` (8)–(10).
+async fn boundary_tail(
+    sh: &Shared,
+    st: &mut LoopState,
+    step: u64,
+) -> Result<Transition, LoopError> {
+    let deps = &sh.deps;
     // (7) Напоминания хуков: чистые функции позиции, реплей зовёт их снова.
     let info = za_core::BoundaryInfo {
         run: st.run,
@@ -1113,26 +1184,50 @@ async fn context_thresholds(
             > u64::from(n_ctx);
     let done_emergency = match run_compaction(sh, st, step, emergency, reason).await? {
         CompactStep::Done { emergency } => emergency,
-        CompactStep::Skipped => return Ok(None),
+        CompactStep::Skipped => return Ok(Some(Transition::Goto(BOUNDARY))),
         CompactStep::Exit(t) => return Ok(Some(t)),
     };
+    reread_inbox(deps, st, step).await?;
     if pending {
         st.meter.truncation_turn = Some(st.turn);
     }
     let est = context_effect(deps, st, step, 2).await?;
     check_sufficient(deps, st, step, est, reserve).await?;
-    if done_emergency || !beyond_window(est, reserve, n_ctx) {
+    if !beyond_window(est, reserve, n_ctx) {
         return Ok(None);
     }
-    // Хвост новой эпохи сам не помещается в окно: одна аварийная компакция (D49, 1.17).
+    if done_emergency {
+        return window_pause(deps, st, step, est, reserve).await.map(Some);
+    }
+    // Новая эпоха сама не помещается в окно: одна аварийная компакция с минимальным
+    // хвостом (D49, Ruling 1.17, I-1).
     match run_compaction(sh, st, step, true, COMPACT_WINDOW).await? {
         CompactStep::Done { .. } => {}
-        CompactStep::Skipped => return Ok(None),
+        CompactStep::Skipped => return Ok(Some(Transition::Goto(BOUNDARY))),
         CompactStep::Exit(t) => return Ok(Some(t)),
     }
+    reread_inbox(deps, st, step).await?;
     let est = context_effect(deps, st, step, 3).await?;
     check_sufficient(deps, st, step, est, reserve).await?;
+    if beyond_window(est, reserve, n_ctx) {
+        return window_pause(deps, st, step, est, reserve).await.map(Some);
+    }
     Ok(None)
+}
+
+/// После аварийной компакции запрос хода всё ещё выше окна (Ruling 1.17, I-1): пауза
+/// `context` без хода — повторять компакцию бесполезно, ход ушёл бы за окно. Событие
+/// `compaction_insufficient` уже записано.
+async fn window_pause(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    step: u64,
+    est: Estimate,
+    reserve: u32,
+) -> Result<Transition, LoopError> {
+    tracing::warn!(run = %st.run, step, estimate = est.tokens, reserve, n_ctx = st.setup.n_ctx,
+        "после аварийной компакции запрос выше окна: run на паузе context");
+    clean_pause(deps, st, LoopExit::Paused(pause_reason::CONTEXT)).await
 }
 
 /// D70: после компакции `оценка + резерв ≥ compact_at × n_ctx` — компакция бесполезна:

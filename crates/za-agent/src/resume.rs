@@ -54,7 +54,7 @@ const STATE_PAGE: usize = 512;
 /// Версия снимка R1-B1 (D66): читается.
 const SNAPSHOT_V1: u32 = 1;
 /// Начало управляющего сообщения рантайма: не ввод пользователя (D66).
-const RUNTIME_CONTROL: &str = "<control from=\"runtime\"";
+pub(crate) const RUNTIME_CONTROL: &str = "<control from=\"runtime\"";
 /// Начало поправки пользователя (A.6, `prompts/control.txt`).
 const USER_CORRECT: &str = "<control from=\"user\" action=\"correct\"";
 /// Конец управляющего сообщения.
@@ -206,6 +206,8 @@ pub async fn resume_run(
                 // компакцию на первой границе (D6, R1-B2 D43).
                 if from != to {
                     st.last_seq = n_ctx_changed(j, run, &ep, from, to).await?;
+                    // Подавление D70 посчитано для прежнего окна.
+                    st.meter.suppressed = false;
                 }
                 // База счётчика посчитана токенизатором прежней модели (D41).
                 st.meter.reset();
