@@ -1,5 +1,6 @@
 //! Библиотечная часть бинарника zero-agent: каталог данных, открытие журнала, конфигурация
-//! (`config.toml`), команды моделей (`models`, `ask`), ресурсов (`resources`) и `doctor`.
+//! (`config.toml`), команды моделей (`models`, `ask`), ресурсов (`resources`), `doctor` и
+//! цикла агента (`run`, `answer`, R1-B1).
 
 pub mod config;
 pub mod doctor;
@@ -7,3 +8,4 @@ pub mod home;
 pub mod journal;
 pub mod models;
 pub mod resources;
+pub mod run;

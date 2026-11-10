@@ -1,8 +1,9 @@
 //! Бинарник `zero-agent`: `doctor`, `demo-run`, `replay` (R0), `models`, `ask`,
-//! `resources` (R1-A).
+//! `resources` (R1-A), `run`, `answer` (R1-B1).
 //!
 //! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы, ошибка
-//! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя.
+//! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя;
+//! у `run` ещё 4 — пауза или `blocked_on_budget`, 5 — `blocked`, 6 — `cancelled` (D28).
 //! Журнал проекта лежит в
 //! `ZA_HOME/projects/<project_id>/` (ARC-020), `log.txt` демонстрации — в
 //! каталоге проекта.
@@ -16,22 +17,22 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
+use za_agent::WorkMode;
 use za_core::{CrashPoint, DemoConfig, DemoOutcome, EffectError, replay_hash, run_demo};
-use za_protocol::{Priority, RunId};
+use za_protocol::{Priority, RunId, RunMode, Tier};
 use za_store::{ProjectStore, StoreError};
 use zero_agent::doctor::{self, LLAMA_URL_ENV};
 use zero_agent::home::{self, NoHome};
 use zero_agent::journal::open_retrying;
 use zero_agent::models::{self, AskArgs, CommandError};
 use zero_agent::resources;
-
-/// Код выхода «нужно решение пользователя».
-const EXIT_NEEDS_DECISION: u8 = 3;
-/// Имя файла журнала в каталоге журнала проекта.
-const JOURNAL_FILE: &str = "journal.db";
+use zero_agent::run::{
+    self as agent_run, Answer, EXIT_NEEDS_DECISION, JOURNAL_FILE, NewRunArgs, ResumeArgs,
+    RunAction, RunArgs, RunCrash, RunError, parse_run_crash,
+};
 /// Переменная окружения с фильтром логов; без неё читается `RUST_LOG`.
 const LOG_ENV: &str = "ZA_LOG";
 /// Фильтр логов по умолчанию.
@@ -44,7 +45,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[command(
     name = "zero-agent",
     version,
-    about = "zero-agent, этапы R0 и R1-A: журнал, эффекты, модели, ресурсы"
+    about = "zero-agent, этапы R0, R1-A и R1-B1: журнал, эффекты, модели, ресурсы, цикл агента"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -111,6 +112,170 @@ enum Cmd {
         #[arg(long)]
         watch: bool,
     },
+    /// Run агента: ответ — в stdout, первая строка stderr — `run <id>`; Ctrl+C — пауза.
+    Run(RunCli),
+    /// Ответ на прерывание run: вопрос модели, одобрение вызова, неизвестный исход.
+    #[command(group(
+        ArgGroup::new("reply")
+            .required(true)
+            .args(["text", "approve", "deny", "done", "not_done"])
+    ))]
+    Answer {
+        /// Каталог проекта.
+        #[arg(long)]
+        project: PathBuf,
+        /// id прерывания из подсказки `run`.
+        #[arg(long)]
+        interrupt: String,
+        /// Ответ на вопрос модели (`input-…`).
+        #[arg(long)]
+        text: Option<String>,
+        /// Одобрить вызов (`appr-…`).
+        #[arg(long)]
+        approve: bool,
+        /// Отказать в вызове (`appr-…`).
+        #[arg(long)]
+        deny: bool,
+        /// Заметка к отказу.
+        #[arg(long, requires = "deny")]
+        note: Option<String>,
+        /// Действие выполнено (`unk-…`).
+        #[arg(long)]
+        done: bool,
+        /// Действие не выполнено (`unk-…`).
+        #[arg(long)]
+        not_done: bool,
+    },
+}
+
+/// Аргументы `run`.
+#[derive(Debug, clap::Args)]
+struct RunCli {
+    /// Каталог проекта (должен существовать).
+    #[arg(long)]
+    project: PathBuf,
+    /// Продолжить run.
+    #[arg(long, value_parser = parse_run)]
+    resume: Option<RunId>,
+    /// id эндпоинта; без него — `models.default`. С `--resume` — смена модели на границе шага.
+    #[arg(long)]
+    model: Option<String>,
+    /// Режим run; по умолчанию `ask`.
+    #[arg(long, value_enum, conflicts_with = "resume")]
+    mode: Option<ModeArg>,
+    /// Режим работы (overlay промпта).
+    #[arg(long, value_enum, conflicts_with = "resume")]
+    work_mode: Option<WorkModeArg>,
+    /// Тир промпта; без него — по размеру контекста модели.
+    #[arg(long, value_enum, conflicts_with = "resume")]
+    tier: Option<TierArg>,
+    /// Предел ожидания в очереди к модели, с; без него — без предела.
+    #[arg(long, value_name = "СЕК", conflicts_with = "resume")]
+    max_wait: Option<u64>,
+    /// Предел шагов поверх `[budgets.run]`.
+    #[arg(long)]
+    max_steps: Option<u32>,
+    /// Предел токенов поверх `[budgets.run]`.
+    #[arg(long)]
+    max_tokens: Option<u64>,
+    /// Добавить `AGENTS.md` проекта в промпт.
+    #[arg(long, conflicts_with = "resume")]
+    agents_md: bool,
+    /// Ввод пользователя для продолжаемого run.
+    #[arg(long, requires = "resume")]
+    input: Option<String>,
+    /// Аварийно завершить процесс: `after-delta:N` (тесты, D33).
+    #[arg(long, hide = true, value_parser = parse_run_crash)]
+    crash_at: Option<RunCrash>,
+    /// Текст задачи.
+    #[arg(required_unless_present = "resume", conflicts_with = "resume")]
+    task: Option<String>,
+}
+
+/// Режим run (CORE-106).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModeArg {
+    ReadOnly,
+    Plan,
+    Ask,
+    AcceptEdits,
+    Auto,
+}
+
+impl From<ModeArg> for RunMode {
+    fn from(m: ModeArg) -> Self {
+        match m {
+            ModeArg::ReadOnly => RunMode::ReadOnly,
+            ModeArg::Plan => RunMode::Plan,
+            ModeArg::Ask => RunMode::Ask,
+            ModeArg::AcceptEdits => RunMode::AcceptEdits,
+            ModeArg::Auto => RunMode::Auto,
+        }
+    }
+}
+
+/// Режим работы (A.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum WorkModeArg {
+    Coder,
+    Researcher,
+    Operator,
+    Writer,
+}
+
+impl From<WorkModeArg> for WorkMode {
+    fn from(m: WorkModeArg) -> Self {
+        match m {
+            WorkModeArg::Coder => WorkMode::Coder,
+            WorkModeArg::Researcher => WorkMode::Researcher,
+            WorkModeArg::Operator => WorkMode::Operator,
+            WorkModeArg::Writer => WorkMode::Writer,
+        }
+    }
+}
+
+/// Тир промпта (PRM-002, D20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TierArg {
+    Small,
+    Standard,
+    Full,
+}
+
+impl From<TierArg> for Tier {
+    fn from(t: TierArg) -> Self {
+        match t {
+            TierArg::Small => Tier::Small,
+            TierArg::Standard => Tier::Standard,
+            TierArg::Full => Tier::Full,
+        }
+    }
+}
+
+fn run_args(r: RunCli) -> RunArgs {
+    let action = match r.resume {
+        Some(run) => RunAction::Resume(ResumeArgs {
+            run,
+            model: r.model,
+            input: r.input,
+        }),
+        None => RunAction::New(NewRunArgs {
+            model: r.model,
+            run_mode: r.mode.map(Into::into).unwrap_or_default(),
+            work_mode: r.work_mode.map(Into::into),
+            tier: r.tier.map(Into::into),
+            max_wait: r.max_wait.map(Duration::from_secs),
+            agents_md: r.agents_md,
+            task: r.task.unwrap_or_default(),
+        }),
+    };
+    RunArgs {
+        project: r.project,
+        action,
+        max_steps: r.max_steps,
+        max_tokens: r.max_tokens,
+        crash: r.crash_at,
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -165,6 +330,8 @@ enum AppError {
     Json(serde_json::Error),
     #[error(transparent)]
     Command(#[from] CommandError),
+    #[error(transparent)]
+    Run(#[from] RunError),
 }
 
 fn parse_run(s: &str) -> Result<RunId, String> {
@@ -283,6 +450,31 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
         Cmd::Resources { json, watch } => {
             let home = home::za_home()?;
             Ok(resources::cmd_resources(&home, json, watch).await?)
+        }
+        Cmd::Run(r) => {
+            let home = home::za_home()?;
+            Ok(agent_run::cmd_run(&home, run_args(r)).await?)
+        }
+        Cmd::Answer {
+            project,
+            interrupt,
+            text,
+            approve,
+            deny,
+            note,
+            done,
+            not_done: _,
+        } => {
+            let home = home::za_home()?;
+            // Ровно один вид ответа обеспечивает группа `reply`.
+            let answer = match text {
+                Some(t) => Answer::Text(t),
+                None if approve => Answer::Approve,
+                None if deny => Answer::Deny(note),
+                None if done => Answer::Done,
+                None => Answer::NotDone,
+            };
+            Ok(agent_run::cmd_answer(&home, &project, &interrupt, answer).await?)
         }
     }
 }

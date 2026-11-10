@@ -15,14 +15,19 @@ za-store = { path = "../za-store" }
 za-core = { path = "../za-core" }
 za-llm = { path = "../za-llm" }
 za-res = { path = "../za-res" }
+# Цикл агента: команды `run` и `answer` (R1-B1).
+za-agent = { path = "../za-agent" }
 clap.workspace = true
-# `macros` — `join!` проверок doctor, `time` — ожидание зондов и `resources --watch`.
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# `macros` — `join!` проверок doctor и `select!` команды `run`, `time` — ожидание зондов и
+# `resources --watch`, `signal` — Ctrl+C команды `run` (пауза, второй — выход).
+tokio = { workspace = true, features = ["rt", "macros", "time", "signal"] }
 toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 blake3.workspace = true
+# Дата `<env>` первого сообщения run (`YYYY-MM-DD` по UTC, D24).
+jiff.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
