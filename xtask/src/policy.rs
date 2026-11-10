@@ -54,10 +54,16 @@ const RES_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-jail"];
 /// Крейты `za-*`, от которых может зависеть `za-tools` (обычные зависимости, R1-C1 D73).
 const TOOLS_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-core", "za-jail"];
 /// Где можно запускать процессы, и почему (SEC-006). Путь — от корня, через `/`.
-const PROCESS_ALLOWED: &[(&str, &str)] = &[(
-    "crates/za-jail/",
-    "единственная точка запуска процессов: дерево, тайм-аут, окружение (R1-C1 D84)",
-)];
+const PROCESS_ALLOWED: &[(&str, &str)] = &[
+    (
+        "crates/za-jail/",
+        "единственная точка запуска процессов: дерево, тайм-аут, окружение (R1-C1 D84)",
+    ),
+    (
+        "crates/zero-agent/build.rs",
+        "сценарий сборки: `$RUSTC --version` при компиляции, в продукт не входит",
+    ),
+];
 /// Крейты только для `xtask` (R1-B2 D64): счёт токенов промптов в CI, не в продукте.
 const XTASK_ONLY_DEPS: &[&str] = &["tiktoken-rs"];
 
@@ -323,7 +329,8 @@ fn resolved_llm_features(root: &Path, pkg: &str) -> Result<Vec<String>, String> 
 
 /// Запуск процессов в исходнике `rel` (путь от корня через `/`) вне [`PROCESS_ALLOWED`]:
 /// `std::process::Command`, `tokio::process::Command`, `Command::new`, импорт `Command`
-/// из `process::{…}`. Строки-комментарии не считаются.
+/// из `process::{…}`, `nix`-запуск (`posix_spawn`, `unistd::exec*`, `unistd::fork`). Строки-
+/// комментарии не считаются (блочные `/* */` могут дать ложное срабатывание).
 pub fn check_process_spawn(rel: &str, text: &str) -> Vec<Violation> {
     if PROCESS_ALLOWED
         .iter()
@@ -339,7 +346,11 @@ pub fn check_process_spawn(rel: &str, text: &str) -> Vec<Violation> {
         }
         let hit = code.contains("process::Command")
             || code.contains("Command::new")
-            || (code.contains("process::{") && code.contains("Command"));
+            || (code.contains("process::{") && code.contains("Command"))
+            // Безопасные API запуска `nix` (ревью задачи 5, M5).
+            || code.contains("posix_spawn")
+            || code.contains("unistd::exec")
+            || code.contains("unistd::fork");
         if hit {
             out.push(Violation(format!(
                 "{rel}:{}: запуск процесса вне za-jail (только через za_jail::Runner, SEC-006)",
@@ -350,7 +361,7 @@ pub fn check_process_spawn(rel: &str, text: &str) -> Vec<Violation> {
     out
 }
 
-/// Исходники `crates/*/src/**/*.rs`: путь от корня через `/` и текст.
+/// Исходники `crates/*/src/**/*.rs` и `crates/*/build.rs`: путь от корня через `/` и текст.
 fn crate_sources(root: &Path) -> std::io::Result<Vec<(String, String)>> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
@@ -372,9 +383,19 @@ fn crate_sources(root: &Path) -> std::io::Result<Vec<(String, String)>> {
     }
     let mut out = Vec::new();
     for krate in std::fs::read_dir(root.join("crates"))? {
-        let src = krate?.path().join("src");
+        let krate = krate?.path();
+        let src = krate.join("src");
         if src.is_dir() {
             walk(root, &src, &mut out)?;
+        }
+        // Сценарий сборки тоже может запускать процессы.
+        let build = krate.join("build.rs");
+        if build.is_file() {
+            let rel = format!(
+                "crates/{}/build.rs",
+                krate.file_name().unwrap_or_default().to_string_lossy()
+            );
+            out.push((rel, std::fs::read_to_string(&build)?));
         }
     }
     Ok(out)
@@ -767,6 +788,9 @@ version = \"0.0.1\"
             "use tokio::process::Command;",
             "use std::process::{Command, Stdio};",
             "let c = tokio::process::Command::new(exe);",
+            "nix::spawn::posix_spawnp(&path, &actions, &attr, &args, &env)",
+            "use nix::unistd::execvp;",
+            "match unsafe { nix::unistd::fork() } {",
         ] {
             assert_eq!(
                 check_process_spawn("crates/za-res/src/gpu.rs", line).len(),
@@ -775,6 +799,13 @@ version = \"0.0.1\"
             );
         }
         assert!(check_process_spawn("crates/za-jail/src/direct.rs", "Command::new(x)").is_empty());
+        assert!(
+            check_process_spawn("crates/zero-agent/build.rs", "Command::new(rustc)").is_empty()
+        );
+        assert_eq!(
+            check_process_spawn("crates/za-tools/build.rs", "Command::new(x)").len(),
+            1
+        );
         assert!(
             check_process_spawn("crates/za-core/src/a.rs", "// Command::new — пример").is_empty()
         );

@@ -5,24 +5,30 @@
 //! строку в файл. Флаги:
 //! - `--depth N` — запустить себя с `--depth N-1` (потомки наследуют stdout и stderr);
 //! - `--hold` — не завершаться (держит унаследованные каналы);
-//! - `--background` — запустить потомков с `--hold` и сразу выйти, не дожидаясь их;
+//! - `--background` — запустить потомков с `--hold` и выйти, не дожидаясь их; с
+//!   `--pid-file` — после того как в файле появятся строки всех `N+1` процессов;
+//! - `--newpgrp` — Unix: потомок уходит в свою группу (`setpgid`, как GNU `timeout`);
 //! - `--exit C` — код выхода (после ожидания потомка);
 //! - `--spam BYTES` — напечатать BYTES байт `x` в stdout и выйти;
-//! - `--runner LEFTOVER` — стать родителем: через `DirectRunner` запустить себя с
-//!   остальными флагами и файлом остатка `LEFTOVER`, ждать без конца.
+//! - `--runner FILE` — стать родителем: через `DirectRunner` запустить себя с остальными
+//!   флагами и записью реестра групп `FILE`, ждать без конца.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use za_jail::{CommandSpec, DirectRunner, Runner};
+use za_jail::{CommandSpec, DirectRunner, Leftover, Runner};
+
+/// Сколько `--background` ждёт строки потомков в `--pid-file`.
+const BACKGROUND_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct Args {
     depth: u32,
     hold: bool,
     background: bool,
+    newpgrp: bool,
     exit: u8,
     spam: Option<usize>,
     pid_file: Option<PathBuf>,
@@ -38,6 +44,7 @@ fn parse() -> Result<Args, String> {
             "--depth" => a.depth = value()?.parse().map_err(|e| format!("--depth: {e}"))?,
             "--hold" => a.hold = true,
             "--background" => a.background = true,
+            "--newpgrp" => a.newpgrp = true,
             "--exit" => a.exit = value()?.parse().map_err(|e| format!("--exit: {e}"))?,
             "--spam" => a.spam = Some(value()?.parse().map_err(|e| format!("--spam: {e}"))?),
             "--pid-file" => a.pid_file = Some(value()?.into()),
@@ -48,11 +55,14 @@ fn parse() -> Result<Args, String> {
     Ok(a)
 }
 
-/// Флаги потомка: та же конфигурация на уровень ниже.
-fn child_args(a: &Args, hold: bool) -> Vec<String> {
-    let mut v = vec!["--depth".to_string(), (a.depth - 1).to_string()];
+/// Флаги дерева уровнем ниже (`depth` — глубина потомка).
+fn tree_args(a: &Args, depth: u32, hold: bool) -> Vec<String> {
+    let mut v = vec!["--depth".to_string(), depth.to_string()];
     if hold {
         v.push("--hold".into());
+    }
+    if a.newpgrp {
+        v.push("--newpgrp".into());
     }
     v.push("--exit".into());
     v.push(a.exit.to_string());
@@ -84,22 +94,34 @@ fn hold_forever() -> ! {
     }
 }
 
+/// Ждёт `n` строк `pid` в файле (не дольше [`BACKGROUND_WAIT`]).
+fn wait_lines(file: &Path, n: usize) {
+    let start = Instant::now();
+    while start.elapsed() < BACKGROUND_WAIT {
+        let lines = std::fs::read_to_string(file)
+            .map(|t| t.lines().filter(|l| l.starts_with("pid ")).count())
+            .unwrap_or(0);
+        if lines >= n {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn run_as_runner(a: &Args, leftover: PathBuf) -> Result<ExitCode, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut spec = CommandSpec::new(exe, cwd, Duration::from_secs(24 * 3600));
     // Дерево под родителем — те же флаги без `--runner`.
-    let mut args = vec!["--depth".to_string(), a.depth.to_string()];
-    if a.hold {
-        args.push("--hold".into());
-    }
-    if let Some(p) = &a.pid_file {
-        args.push("--pid-file".into());
-        args.push(p.display().to_string());
-    }
-    spec.args = args.into_iter().map(Into::into).collect();
-    spec.leftover_file = Some(leftover);
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    spec.args = tree_args(a, a.depth, a.hold)
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    spec.leftover = Some(Leftover {
+        file: leftover,
+        run: "test-run".into(),
+    });
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
@@ -118,6 +140,18 @@ fn main() -> ExitCode {
             ExitCode::from(101)
         }
     }
+}
+
+fn spawn_child(a: &Args) -> Result<std::process::Child, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(exe);
+    cmd.args(tree_args(a, a.depth - 1, a.hold || a.background));
+    #[cfg(unix)]
+    if a.newpgrp {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn().map_err(|e| e.to_string())
 }
 
 fn real_main() -> Result<ExitCode, String> {
@@ -139,17 +173,14 @@ fn real_main() -> Result<ExitCode, String> {
     }
     announce(&a).map_err(|e| e.to_string())?;
     let child = if a.depth > 0 {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        Some(
-            Command::new(exe)
-                .args(child_args(&a, a.hold || a.background))
-                .spawn()
-                .map_err(|e| e.to_string())?,
-        )
+        Some(spawn_child(&a)?)
     } else {
         None
     };
     if a.background {
+        if let Some(p) = &a.pid_file {
+            wait_lines(p, a.depth as usize + 1);
+        }
         return Ok(ExitCode::from(a.exit));
     }
     if a.hold {

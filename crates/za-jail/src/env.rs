@@ -6,8 +6,13 @@ use crate::{CommandSpec, EnvMode};
 
 /// Префикс секретов: `ZA_SECRET_*` и `ZA_SECRETS_*` (и любое имя, начинающееся с него).
 const SECRET_PREFIX: &str = "ZA_SECRET";
-/// Переменные, которые `EnvMode::Inherit` снимает всегда.
-const ALWAYS_REMOVED: &[&str] = &["ZA_HOME"];
+/// Переменные, которые `EnvMode::Inherit` снимает всегда: каталог данных агента, адрес
+/// его модели (`LLAMA_URL` может содержать учётные данные, ревью задачи 5 M9) и маркер
+/// дерева родителя (свой ставит `DirectRunner` на Linux).
+///
+/// Ключи провайдеров пользователя (`*_API_KEY`, `*_TOKEN`) не снимаются: по D84 и
+/// SEC-041 собственные ключи агента живут только в `ZA_SECRET_*`.
+const ALWAYS_REMOVED: &[&str] = &["ZA_HOME", "LLAMA_URL", "ZA_JAIL_CALL"];
 /// Единственные переменные родителя, которые переходят в `EnvMode::Clear`.
 const CLEAR_KEEP: &[&str] = &["PATH", "SystemRoot", "WINDIR"];
 /// Переменные временного каталога, указывающие на `CommandSpec::tmp_dir`.
@@ -18,8 +23,9 @@ const NON_INTERACTIVE: &[(&str, &str)] =
 
 /// Окружение дочернего процесса из окружения-основы `base` (обычно `std::env::vars_os()`).
 ///
-/// - `EnvMode::Inherit`: всё из `base`, кроме секретов (`ZA_SECRET*`), `ZA_HOME` и
-///   `spec.remove_env`; плюс `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`.
+/// - `EnvMode::Inherit`: всё из `base`, кроме секретов (`ZA_SECRET*`), `ZA_HOME`,
+///   `LLAMA_URL`, `ZA_JAIL_CALL` и `spec.remove_env`; плюс `GIT_TERMINAL_PROMPT=0`,
+///   `GCM_INTERACTIVE=never`.
 /// - `EnvMode::Clear`: из `base` — только `PATH`, `SystemRoot`, `WINDIR`.
 ///
 /// Затем `TMP`, `TEMP`, `TMPDIR` = `spec.tmp_dir` (если задан) и `spec.env_set` (заменяют

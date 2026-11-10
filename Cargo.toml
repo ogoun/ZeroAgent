@@ -78,10 +78,12 @@ winapi-util = "=0.1.11"
 # `KILL_ON_JOB_CLOSE`), `creation-flags` (`CREATE_NO_WINDOW`, как раньше у `nvidia-smi`;
 # без неё `JobObject` перезаписывает флаги создания). Лицензия MIT OR Apache-2.0.
 process-wrap = { version = "=10.0.1", default-features = false, features = ["tokio1", "job-object", "process-group", "kill-on-drop", "creation-flags"] }
-# Только Unix (`za-jail`): `killpg` и `kill` группы без `unsafe` — убить дерево при броске
-# future и остатки после смерти агента (D84). Версия — та, что в локальном реестре cargo;
-# крейт и так приходит через `process-wrap`. Лицензия MIT.
-nix = { version = "=0.31.3", default-features = false, features = ["signal", "process"] }
+# Только Unix (`za-jail`): `killpg`, `kill`, `waitpid` и `PR_SET_CHILD_SUBREAPER` без
+# `unsafe` — убить дерево при броске future и остатки после смерти агента (D84);
+# `fs` — `O_NOFOLLOW` при чтении реестра групп. Версия — та, что в локальном реестре
+# cargo; крейт и так приходит через `process-wrap` (у него те же `fs` и `signal`).
+# Лицензия MIT.
+nix = { version = "=0.31.3", default-features = false, features = ["signal", "process", "fs"] }
 # Только Windows (`za-jail`): тип флагов создания процесса для `CreationFlags`
 # (`CREATE_NO_WINDOW`). Крейт уже в дереве через `process-wrap` и `sysinfo`, новых крейтов нет.
 windows = { version = "=0.62.2", features = ["Win32_System_Threading"] }

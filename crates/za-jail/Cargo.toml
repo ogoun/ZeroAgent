@@ -18,9 +18,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # `process` — дочерние процессы, `io-util` — потоковое чтение вывода, `time` — дедлайны,
-# `rt` — `spawn_blocking`, `macros` — `select!`; `rt-multi-thread` — только тестовому
-# помощнику `za_jail_tree` (режим `--runner`).
-tokio = { workspace = true, features = ["process", "io-util", "time", "rt", "rt-multi-thread", "macros", "fs"] }
+# `rt` — рантайм тестового помощника `za_jail_tree --runner`, `macros` — `select!`,
+# `fs` — запись реестра групп, `sync` — кэш кодовой страницы консоли.
+tokio = { workspace = true, features = ["process", "io-util", "time", "rt", "macros", "fs", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
@@ -31,4 +31,4 @@ windows.workspace = true
 [dev-dependencies]
 # Проверка, что процессы дерева мертвы (зомби считается мёртвым, Ruling 5.19).
 sysinfo.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "time", "rt", "rt-multi-thread", "macros", "fs"] }
+tokio = { workspace = true, features = ["process", "io-util", "time", "rt", "rt-multi-thread", "macros", "fs", "sync"] }

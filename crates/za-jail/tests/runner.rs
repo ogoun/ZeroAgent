@@ -62,22 +62,28 @@ fn pids(text: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Процесс мёртв: его нет или он зомби (Ruling 5.19).
-fn dead(pid: u32) -> bool {
+/// Время старта процесса (sysinfo), `None` — процесса нет или он зомби.
+fn started(pid: u32) -> Option<u64> {
     use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
     let pid = Pid::from_u32(pid);
     let mut sys = System::new().expect("sysinfo");
     sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     sys.process(pid)
-        .is_none_or(|p| p.status() == ProcessStatus::Zombie)
+        .filter(|p| p.status() != ProcessStatus::Zombie)
+        .map(|p| p.start_time())
 }
 
-/// Ждёт, пока все `pids` умрут.
+/// Ждёт, пока все `pids` умрут. Процесс мёртв, если его нет, он зомби (Ruling 5.19) или
+/// под тем же номером уже другой процесс (другое время старта, ревью задачи 5 M7).
 async fn all_dead(pids: &[u32], what: &str) {
+    let first: Vec<(u32, Option<u64>)> = pids.iter().map(|p| (*p, started(*p))).collect();
     within(Duration::from_secs(10), what, async {
         loop {
-            let alive: Vec<u32> = pids.iter().copied().filter(|p| !dead(*p)).collect();
-            if alive.is_empty() {
+            let alive = first
+                .iter()
+                .filter(|(p, t)| t.is_some() && started(*p) == *t)
+                .count();
+            if alive == 0 {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -138,13 +144,16 @@ fn env_drops_secrets_case_insensitive_on_windows() {
             ("DROP_ME", "x"),
             ("TMP", "C:/system-temp"),
             ("KEEP", "k"),
+            ("LLAMA_URL", "http://u:p@host"),
+            ("ZA_JAIL_CALL", "parent-marker"),
         ]),
         &s,
         true,
     );
     assert!(env.iter().all(|(k, _)| {
         let up = k.to_string_lossy().to_ascii_uppercase();
-        !up.starts_with("ZA_SECRET") && up != "ZA_HOME" && up != "DROP_ME"
+        !up.starts_with("ZA_SECRET")
+            && !["ZA_HOME", "DROP_ME", "LLAMA_URL", "ZA_JAIL_CALL"].contains(&up.as_str())
     }));
     for k in ["TMP", "TEMP", "TMPDIR"] {
         let found: Vec<_> = env.iter().filter(|(n, _)| n == k).collect();
@@ -164,6 +173,19 @@ fn env_drops_secrets_case_insensitive_on_windows() {
     );
     assert!(names(&env).contains(&"KEEP".to_string()));
     assert!(names(&env).contains(&"PATH".to_string()));
+}
+
+#[test]
+fn spec_debug_hides_env_values() {
+    let mut s = CommandSpec::new("x", ".", Duration::from_secs(1));
+    s.env_set = vec![("TOKEN".into(), "sk-secret-value".into())];
+    s.base_env = Some(vec![("ZA_SECRET_K".into(), "base-secret".into())]);
+    let d = format!("{s:?}");
+    assert!(d.contains("TOKEN=<redacted>"), "{d}");
+    assert!(
+        !d.contains("sk-secret-value") && !d.contains("base-secret"),
+        "{d}"
+    );
 }
 
 #[test]
@@ -323,9 +345,12 @@ async fn dropped_future_kills_tree() {
 #[tokio::test(flavor = "multi_thread")]
 async fn background_child_does_not_hold_call() {
     let project = dir("background");
+    let file = project.join("pids.txt");
+    let file_s = file.display().to_string();
+    // С `--pid-file` главный процесс выходит, только когда все три pid записаны.
     let s = spec(
         &project,
-        &["--depth", "2", "--background"],
+        &["--depth", "2", "--background", "--pid-file", &file_s],
         Duration::from_secs(3600),
     );
     let out = within(
@@ -338,8 +363,7 @@ async fn background_child_does_not_hold_call() {
     assert_eq!(out.exit, Exit::Code(0));
     assert!(out.background_killed, "{out:?}");
     let p = pids(&out.stdout);
-    // Главный процесс и хотя бы потомок, державший вывод (внук мог не успеть до убийства).
-    assert!(p.len() >= 2, "{:?}", out.stdout);
+    assert_eq!(p.len(), 3, "{:?}", out.stdout);
     all_dead(&p, "фоновые потомки").await;
 }
 
@@ -361,9 +385,58 @@ async fn capture_is_capped() {
     assert!(out.stdout_truncated && !out.stderr_truncated);
 }
 
+// ---- Декодирование вывода (Windows) ----
+
+/// Вывод `cmd /u` — UTF-16LE без BOM.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn utf16_output_is_decoded() {
+    let project = dir("utf16");
+    let mut s = CommandSpec::new("cmd", &project, scaled(Duration::from_secs(20)));
+    s.args = ["/u", "/d", "/c", "echo hello"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let out = within(Duration::from_secs(30), "cmd /u", DirectRunner.run(s))
+        .await
+        .expect("запуск");
+    assert_eq!(out.stdout, "hello\n");
+}
+
+/// Вывод `cmd` в OEM-кодировке консоли. На станции с кодовой страницей 866 — кириллица
+/// без замен; на прочих страницах проверка пропускается с сообщением.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn oem_output_is_decoded_by_console_code_page() {
+    let project = dir("oem");
+    let chcp = CommandSpec::new("chcp.com", &project, scaled(Duration::from_secs(20)));
+    let cp = within(Duration::from_secs(30), "chcp", DirectRunner.run(chcp))
+        .await
+        .expect("chcp");
+    let page: Option<u32> = cp
+        .stdout
+        .split(|c: char| !c.is_ascii_digit())
+        .rfind(|t| !t.is_empty())
+        .and_then(|t| t.parse().ok());
+    if page != Some(866) {
+        eprintln!("пропуск: кодовая страница консоли {page:?}, не 866");
+        return;
+    }
+    let mut s = CommandSpec::new("cmd", &project, scaled(Duration::from_secs(20)));
+    s.args = ["/d", "/c", "echo Привет"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let out = within(Duration::from_secs(30), "cmd echo", DirectRunner.run(s))
+        .await
+        .expect("запуск");
+    assert_eq!(out.stdout, "Привет\n");
+}
+
 // ---- Смерть родителя ----
 
 /// Родитель (`za_jail_tree --runner`) запускает через `DirectRunner` дерево глубины 2.
+#[cfg(any(windows, target_os = "linux"))]
 fn spawn_parent(project: &Path, leftover: &Path, pid_file: &Path) -> std::process::Child {
     std::process::Command::new(tree())
         .args(["--runner"])
@@ -378,48 +451,6 @@ fn spawn_parent(project: &Path, leftover: &Path, pid_file: &Path) -> std::proces
         .expect("родитель")
 }
 
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn leftovers_reaped_after_parent_and_leader_death() {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-
-    let project = dir("reap");
-    let procs = project.join(".zero-agent/work/procs");
-    std::fs::create_dir_all(&procs).unwrap();
-    let leftover = procs.join("run-1-0.json");
-    let pid_file = project.join("pids.txt");
-    let mut parent = spawn_parent(&project, &leftover, &pid_file);
-    let p = wait_pid_file(&pid_file, 3).await;
-    let rec: serde_json::Value = within(Duration::from_secs(20), "файл остатка", async {
-        loop {
-            if let Ok(b) = tokio::fs::read(&leftover).await
-                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b)
-            {
-                return v;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    let pgid = i32::try_from(rec["pgid"].as_i64().expect("pgid")).unwrap();
-    assert!(rec["starttime"].as_u64().is_some());
-    // SIGKILL родителю: его `Drop` не выполняется, группа остаётся.
-    parent.kill().unwrap();
-    parent.wait().unwrap();
-    // Лидер группы тоже убит: остатки находятся по pgrp, а не по лидеру.
-    kill(Pid::from_raw(pgid), Signal::SIGKILL).unwrap();
-    let killed = tokio::task::spawn_blocking({
-        let project = project.clone();
-        move || DirectRunner::reap_leftovers(&project)
-    })
-    .await
-    .unwrap();
-    assert!(killed >= 1, "убито {killed}");
-    all_dead(&p, "остатки дерева").await;
-    assert!(!leftover.exists(), "файл остатка удалён");
-}
-
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
 async fn parent_death_closes_job() {
@@ -428,8 +459,313 @@ async fn parent_death_closes_job() {
     let mut parent = spawn_parent(&project, &project.join("unused.json"), &pid_file);
     let p = wait_pid_file(&pid_file, 3).await;
     parent.kill().unwrap();
-    parent.wait().unwrap();
+    let _ = parent.wait();
     // Без reap: Job закрывается вместе с родителем (`KILL_ON_JOB_CLOSE`).
     all_dead(&p, "дерево после смерти родителя").await;
-    assert_eq!(DirectRunner::reap_leftovers(&project), 0);
+}
+
+/// Вне Linux `reap_leftovers` сразу возвращает 0 и файлов не трогает.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn reap_is_noop_off_linux() {
+    let registry = dir("reap_noop");
+    std::fs::write(registry.join("a.json"), "{}").unwrap();
+    assert_eq!(DirectRunner::reap_leftovers(&registry), 0);
+    assert!(registry.join("a.json").exists());
+}
+
+// ---- Linux: реестр групп, subreaper, уход из группы ----
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use za_jail::Leftover;
+
+    /// Реестр групп как под `ZA_HOME/projects/<id>/procs` (в тесте — внутри своего каталога).
+    fn registry(name: &str) -> PathBuf {
+        let r = dir(name).join("home/projects/p1/procs");
+        std::fs::create_dir_all(&r).unwrap();
+        r
+    }
+
+    fn boot_id() -> String {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// `starttime` (поле 22) из `/proc/<pid>/stat`.
+    fn starttime(pid: u32) -> u64 {
+        let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let rest = &s[s.rfind(')').unwrap() + 1..];
+        rest.split_whitespace()
+            .nth(22 - 3)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// Живая «жертва» в своей группе: `za_jail_tree --hold`.
+    fn victim() -> (std::process::Child, u32) {
+        use std::os::unix::process::CommandExt;
+        let c = std::process::Command::new(tree())
+            .args(["--depth", "0", "--hold"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("жертва");
+        let pid = c.id();
+        (c, pid)
+    }
+
+    fn record(pid: u32, start: u64, boot: &str) -> String {
+        serde_json::json!({
+            "v": 1, "run": "r1", "pgid": pid, "leader_pid": pid,
+            "leader_starttime": start, "boot_id": boot, "marker": "m-test",
+        })
+        .to_string()
+    }
+
+    fn reap(dir: &Path) -> usize {
+        DirectRunner::reap_leftovers(dir)
+    }
+
+    fn alive(pid: u32) -> bool {
+        started(pid).is_some()
+    }
+
+    fn cleanup(mut c: std::process::Child) {
+        let _ = c.kill();
+        // Зомби мог собрать subreaper тестового процесса: ошибка ожидания не важна.
+        let _ = c.wait();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leftovers_reaped_after_parent_and_leader_death() {
+        let reg = registry("reap");
+        let leftover = reg.join("run-1-0.json");
+        let project = dir("reap_project");
+        let pid_file = project.join("pids.txt");
+        let mut parent = spawn_parent(&project, &leftover, &pid_file);
+        let p = wait_pid_file(&pid_file, 3).await;
+        let rec: serde_json::Value =
+            within(Duration::from_secs(20), "запись реестра", async {
+                loop {
+                    if let Ok(b) = tokio::fs::read(&leftover).await
+                        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b)
+                    {
+                        return v;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+        let pgid = i32::try_from(rec["pgid"].as_i64().expect("pgid")).unwrap();
+        assert_eq!(rec["v"], 1);
+        assert_eq!(rec["run"], "test-run");
+        assert_eq!(rec["leader_pid"], rec["pgid"]);
+        assert!(rec["leader_starttime"].as_u64().unwrap() > 0);
+        assert_eq!(rec["boot_id"], boot_id().as_str());
+        // SIGKILL родителю: его `Drop` не выполняется, группа остаётся.
+        parent.kill().unwrap();
+        let _ = parent.wait();
+        // Лидер группы тоже убит: остатки находятся по группе.
+        kill(Pid::from_raw(pgid), Signal::SIGKILL).unwrap();
+        let killed = tokio::task::spawn_blocking(move || DirectRunner::reap_leftovers(&reg))
+            .await
+            .unwrap();
+        assert!(killed >= 1, "убито {killed}");
+        all_dead(&p, "остатки дерева").await;
+        assert!(!leftover.exists(), "запись реестра удалена");
+    }
+
+    #[test]
+    fn reap_kills_exactly_matching_record() {
+        let reg = registry("reap_match");
+        let (c, pid) = victim();
+        let f = reg.join("a.json");
+        std::fs::write(&f, record(pid, starttime(pid), &boot_id())).unwrap();
+        assert!(reap(&reg) >= 1);
+        assert!(!f.exists());
+        cleanup(c);
+        assert!(!alive(pid));
+    }
+
+    #[test]
+    fn reap_ignores_registry_link() {
+        let base = dir("reap_link");
+        let real = base.join("elsewhere");
+        std::fs::create_dir_all(&real).unwrap();
+        let (c, pid) = victim();
+        std::fs::write(real.join("a.json"), record(pid, starttime(pid), &boot_id())).unwrap();
+        std::fs::write(real.join("user.json"), "{\"user\": 1}").unwrap();
+        let link = base.join("procs");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(reap(&link), 0);
+        assert!(alive(pid), "сигнал через ссылку на каталог");
+        assert!(real.join("a.json").exists() && real.join("user.json").exists());
+        cleanup(c);
+    }
+
+    #[test]
+    fn reap_keeps_foreign_json() {
+        let reg = registry("reap_foreign");
+        let (c, pid) = victim();
+        let files = [
+            ("garbage.json", "not json".to_string()),
+            // Старый формат с `starttime: 0`.
+            ("old.json", format!("{{\"pgid\": {pid}, \"starttime\": 0}}")),
+        ];
+        for (n, t) in &files {
+            std::fs::write(reg.join(n), t).unwrap();
+        }
+        // Ссылка на файл с верной записью — не наш файл.
+        let outside = dir("reap_foreign_out").join("rec.json");
+        std::fs::write(&outside, record(pid, starttime(pid), &boot_id())).unwrap();
+        std::os::unix::fs::symlink(&outside, reg.join("link.json")).unwrap();
+        assert_eq!(reap(&reg), 0);
+        assert!(alive(pid));
+        for (n, _) in &files {
+            assert!(reg.join(n).exists(), "{n} удалён");
+        }
+        assert!(reg.join("link.json").exists() && outside.exists());
+        cleanup(c);
+    }
+
+    #[test]
+    fn reap_without_starttime_sends_no_signal() {
+        let reg = registry("reap_zero");
+        let (c, pid) = victim();
+        let f = reg.join("a.json");
+        std::fs::write(&f, record(pid, 0, &boot_id())).unwrap();
+        assert_eq!(reap(&reg), 0);
+        assert!(alive(pid));
+        assert!(
+            f.exists(),
+            "запись с неизвестным starttime — не наша, не удаляется"
+        );
+        cleanup(c);
+    }
+
+    #[test]
+    fn reap_other_boot_sends_no_signal() {
+        let reg = registry("reap_boot");
+        let (c, pid) = victim();
+        let f = reg.join("a.json");
+        let other = "00000000-0000-0000-0000-000000000000";
+        assert_ne!(other, boot_id());
+        std::fs::write(&f, record(pid, starttime(pid), other)).unwrap();
+        assert_eq!(reap(&reg), 0);
+        assert!(alive(pid));
+        // Своя запись прошлой загрузки: удаляется без сигнала.
+        assert!(!f.exists());
+        cleanup(c);
+    }
+
+    #[test]
+    fn reap_skips_reused_leader_number() {
+        let reg = registry("reap_reused");
+        let (c, pid) = victim();
+        let f = reg.join("a.json");
+        // Номер лидера занят процессом с другим временем старта.
+        std::fs::write(&f, record(pid, starttime(pid) - 1, &boot_id())).unwrap();
+        assert_eq!(reap(&reg), 0);
+        assert!(alive(pid));
+        cleanup(c);
+    }
+
+    /// Потомок и внук уходят в свои группы (`setpgid`, как GNU `timeout`): тайм-аут
+    /// убивает и их.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setpgid_descendant_killed_on_timeout() {
+        let project = dir("newpgrp_timeout");
+        let s = spec(
+            &project,
+            &["--depth", "2", "--hold", "--newpgrp"],
+            scaled(Duration::from_secs(2)),
+        );
+        let out = within(
+            Duration::from_secs(2) + KILL_GRACE * 2 + Duration::from_secs(10),
+            "тайм-аут дерева",
+            DirectRunner.run(s),
+        )
+        .await
+        .expect("тайм-аут — не ошибка");
+        assert_eq!(out.exit, Exit::Timeout);
+        let p = pids(&out.stdout);
+        assert_eq!(p.len(), 3, "{:?}", out.stdout);
+        all_dead(&p, "потомки в своих группах").await;
+    }
+
+    /// Главный процесс выходит, потомок в своей группе держит вывод: он усыновлён
+    /// агентом-subreaper и убит по маркеру.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setpgid_background_child_killed() {
+        let project = dir("newpgrp_bg");
+        let file = project.join("pids.txt");
+        let file_s = file.display().to_string();
+        let s = spec(
+            &project,
+            &[
+                "--depth",
+                "2",
+                "--background",
+                "--newpgrp",
+                "--pid-file",
+                &file_s,
+            ],
+            Duration::from_secs(3600),
+        );
+        let out = within(
+            Duration::from_secs(20),
+            "фоновые потомки",
+            DirectRunner.run(s),
+        )
+        .await
+        .expect("запуск");
+        assert!(out.background_killed, "{out:?}");
+        let p = pids(&out.stdout);
+        assert_eq!(p.len(), 3, "{:?}", out.stdout);
+        all_dead(&p, "потомки в своих группах").await;
+    }
+
+    /// Бросок future: дерево (с уходом из группы) убито, запись реестра удалена.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_removes_registry_record() {
+        let reg = registry("cancel");
+        let project = dir("cancel_project");
+        let file = project.join("pids.txt");
+        let file_s = file.display().to_string();
+        let mut s = spec(
+            &project,
+            &["--depth", "2", "--hold", "--newpgrp", "--pid-file", &file_s],
+            Duration::from_secs(3600),
+        );
+        let rec = reg.join("run-1-1.json");
+        s.leftover = Some(Leftover {
+            file: rec.clone(),
+            run: "run-1".into(),
+        });
+        let mut fut = DirectRunner.run(s);
+        let p = tokio::select! {
+            r = &mut fut => panic!("дерево с --hold завершилось само: {r:?}"),
+            p = async {
+                let p = wait_pid_file(&file, 3).await;
+                within(Duration::from_secs(20), "запись реестра", async {
+                    while !rec.exists() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+                p
+            } => p,
+        };
+        drop(fut);
+        assert!(!rec.exists(), "запись реестра удалена при броске");
+        all_dead(&p, "дерево после броска").await;
+        assert_eq!(reap(&reg), 0);
+    }
 }

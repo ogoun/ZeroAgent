@@ -656,19 +656,7 @@ pub fn display(root: &Path, p: &Path) -> String {
 /// `.zero-agent/work/` пишется `.gitignore` со строкой `*` (не через ссылку). Возвращает
 /// путь от `root`.
 pub fn work_dir(root: &Path, sub: &str) -> io::Result<PathBuf> {
-    let bad = || {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("недопустимое имя рабочего каталога: {sub:?}"),
-        )
-    };
-    let parts: Vec<&str> = sub.split('/').collect();
-    if parts
-        .iter()
-        .any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains(['\\', ':', '\0']))
-    {
-        return Err(bad());
-    }
+    let parts = sub_parts(sub)?;
     let mut dir = root.to_path_buf();
     for (i, part) in [ZA_DIR, WORK]
         .into_iter()
@@ -691,6 +679,46 @@ pub fn work_dir(root: &Path, sub: &str) -> io::Result<PathBuf> {
         )));
     }
     Ok(dir)
+}
+
+/// Каталог агента внутри `ZA_HOME`: `<home>/<sub>` (например, реестр групп процессов
+/// `projects/<project_id>/procs`, R1-C1 D84). Блокирующая. `sub` — как у [`work_dir`].
+///
+/// `home` должен существовать; компоненты под ним создаются по одному, ни один не может
+/// быть символической ссылкой или junction, канонический путь итога — внутри
+/// канонического `home`. Возвращает путь от `home`.
+pub fn home_dir(home: &Path, sub: &str) -> io::Result<PathBuf> {
+    let parts = sub_parts(sub)?;
+    let mut dir = home.to_path_buf();
+    for part in parts {
+        dir.push(part);
+        make_dir(&dir)?;
+    }
+    let canon_home = std::fs::canonicalize(home)?;
+    let real = std::fs::canonicalize(&dir)?;
+    if !within(&canon_home, &real) {
+        return Err(io::Error::other(format!(
+            "каталог {} вне ZA_HOME {}",
+            real.display(),
+            canon_home.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// Компоненты имени рабочего каталога: через `/`, без пустых, `.`, `..`, `\`, `:`, NUL.
+fn sub_parts(sub: &str) -> io::Result<Vec<&str>> {
+    let parts: Vec<&str> = sub.split('/').collect();
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains(['\\', ':', '\0']))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("недопустимое имя рабочего каталога: {sub:?}"),
+        ));
+    }
+    Ok(parts)
 }
 
 /// Создаёт каталог, если его нет; путь не ссылка и не junction.

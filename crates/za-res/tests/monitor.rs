@@ -142,14 +142,18 @@ async fn failing_or_slow_exe_is_unavailable() {
         matches!(status, GpuStatus::Unavailable { .. }),
         "{status:?}"
     );
-    // Нулевой таймаут: процесс не успевает ответить, ожидание не вечное.
-    let started = std::time::Instant::now();
-    let status = query_nvidia_smi(&exe, Duration::ZERO, &tmp).await;
+    // Нулевой таймаут: процесс не успевает ответить, ожидание не вечное (предел — защита
+    // от зависания, с запасом на дочитывание `KILL_GRACE` и множитель времени).
+    let status = tokio::time::timeout(
+        Duration::from_secs(20) * time_scale(),
+        query_nvidia_smi(&exe, Duration::ZERO, &tmp),
+    )
+    .await
+    .expect("опрос с нулевым таймаутом завис");
     assert!(
         matches!(status, GpuStatus::Unavailable { .. }),
         "{status:?}"
     );
-    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[test]

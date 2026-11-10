@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use za_core::Access;
 use za_core::paths::{
-    LexPath, PathError, Platform, ResolvedPath, Roots, classify, classify_with, display,
+    LexPath, PathError, Platform, ResolvedPath, Roots, classify, classify_with, display, home_dir,
     open_checked, resolve, within, work_dir,
 };
 
@@ -480,6 +480,25 @@ fn work_dir_refuses_link_and_writes_gitignore() {
     assert_eq!(work_dir(&f.project, "checkpoints/run-1").unwrap(), d);
     for bad in ["", "..", "a/../b", "/abs", "a:b", r"a\b"] {
         assert!(work_dir(&f.project, bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn home_dir_refuses_link_components() {
+    // Ссылка на месте `projects/<id>` (реестр групп процессов D84) — отказ, снаружи пусто.
+    let f = fixture("home_link");
+    std::fs::create_dir_all(f.home.join("projects")).unwrap();
+    dir_link(&f.home.join("projects/p1"), &f.outside);
+    let e = home_dir(&f.home, "projects/p1/procs").unwrap_err();
+    assert!(e.to_string().contains("ссылка"), "{e}");
+    assert!(std::fs::read_dir(&f.outside).unwrap().next().is_none());
+
+    let f = fixture("home_ok");
+    let d = home_dir(&f.home, "projects/p1/procs").unwrap();
+    assert!(d.is_dir() && d.ends_with(Path::new("projects/p1/procs")));
+    assert_eq!(home_dir(&f.home, "projects/p1/procs").unwrap(), d);
+    for bad in ["", "..", "a/../b", "/abs", "a:b", r"a\b"] {
+        assert!(home_dir(&f.home, bad).is_err(), "{bad}");
     }
 }
 

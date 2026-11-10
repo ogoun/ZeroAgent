@@ -4,6 +4,9 @@
 //! процесс запускается деревом (Windows — Job Object с `KILL_ON_JOB_CLOSE`, Unix — своя
 //! группа процессов), тайм-аут и бросок future убивают всё дерево, вывод читается потоково
 //! и ограничен [`CAPTURE_LIMIT`], окружение — разрешённый набор ([`child_env`]).
+//! На Linux агент — subreaper, а дерево помечено маркером, поэтому потомки, ушедшие из
+//! группы (`setpgid`, `setsid`), тоже убиваются. Остатки деревьев после смерти агента
+//! убирает [`DirectRunner::reap_leftovers`] по реестру групп в `ZA_HOME`.
 //!
 //! Ненулевой код выхода — данные ([`Exit::Code`]), а не ошибка: [`RunnerError`] — только
 //! сбой запуска или ввода-вывода.
@@ -12,8 +15,11 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod decode;
 mod direct;
 mod env;
+#[cfg(target_os = "linux")]
+mod linux;
 mod reap;
 
 pub use direct::DirectRunner;
@@ -37,8 +43,18 @@ pub enum EnvMode {
     Clear,
 }
 
+/// Запись реестра групп процессов (D84, Unix): куда и от какого run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Leftover {
+    /// Файл в реестре `ZA_HOME/projects/<project_id>/procs/<effect_stem>.json`; каталог
+    /// создаёт вызывающий через `za_core::paths::home_dir`.
+    pub file: PathBuf,
+    /// Run, запустивший процесс (для диагностики остатков).
+    pub run: String,
+}
+
 /// Что и как запустить.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CommandSpec {
     pub program: PathBuf,
     pub args: Vec<OsString>,
@@ -50,10 +66,35 @@ pub struct CommandSpec {
     pub tmp_dir: Option<PathBuf>,
     pub timeout: Duration,
     pub capture_limit: usize,
-    /// Unix: файл остатка D84.
-    pub leftover_file: Option<PathBuf>,
+    /// Unix (Linux): запись реестра групп D84; на Windows не используется.
+    pub leftover: Option<Leftover>,
     /// Для тестов: окружение-основа вместо std::env::vars_os().
     pub base_env: Option<Vec<(OsString, OsString)>>,
+}
+
+/// Значения окружения не печатаются: `env_set` — канал секретов инструменту (SEC-041,
+/// SEC-044), `base_env` — всё окружение агента.
+impl std::fmt::Debug for CommandSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = |v: &[(OsString, OsString)]| -> Vec<String> {
+            v.iter()
+                .map(|(k, _)| format!("{}=<redacted>", k.to_string_lossy()))
+                .collect()
+        };
+        f.debug_struct("CommandSpec")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("env_mode", &self.env_mode)
+            .field("env_set", &names(&self.env_set))
+            .field("remove_env", &self.remove_env)
+            .field("tmp_dir", &self.tmp_dir)
+            .field("timeout", &self.timeout)
+            .field("capture_limit", &self.capture_limit)
+            .field("leftover", &self.leftover)
+            .field("base_env", &self.base_env.as_ref().map(|b| b.len()))
+            .finish()
+    }
 }
 
 impl CommandSpec {
@@ -70,7 +111,7 @@ impl CommandSpec {
             tmp_dir: None,
             timeout,
             capture_limit: CAPTURE_LIMIT,
-            leftover_file: None,
+            leftover: None,
             base_env: None,
         }
     }
