@@ -7,7 +7,8 @@
 //! [`first_message`], [`build_request`]: стабильный префикс блоков 1–5), ход модели
 //! ([`model_turn`]: эффект `model`, события журнала D8, сигналы цикла [`Signals`]),
 //! разбор ответа ([`review`], D27) и отображение ошибок в состояние run
-//! ([`exit_for_model_error`], [`exit_for_effect_error`], D11). Модель
+//! ([`exit_for_model_error`], [`exit_for_effect_error`], D11), пакет вызовов
+//! инструментов ([`run_tools`]: гейт режима, одобрение, `ask_user`, `finish`, D14–D17). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod conversation;
@@ -15,6 +16,7 @@ mod exit;
 mod memory;
 mod prompt;
 mod request;
+mod tools;
 mod turn;
 
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted};
@@ -30,6 +32,9 @@ pub use prompt::{
 pub use request::{
     BlockHashes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request,
     first_message, freeze, request_hash,
+};
+pub use tools::{
+    ASK_USER_TOOL, FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, builtin_tools, run_tools,
 };
 pub use turn::{
     CallVerdict, ControlFlags, DELTA_FLUSH_AFTER, DELTA_FLUSH_BYTES, DeltaBuffer,
