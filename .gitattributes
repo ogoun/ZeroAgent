@@ -12,3 +12,5 @@ crates/za-res/tests/fixtures/** -text
 crates/za-agent/tests/golden/*.hash -text
 # Журналы run, записанные кодом R1-B1 (SQLite): байты не трогать.
 crates/za-agent/tests/golden/r1b1_v1/** -text
+# Золотая трасса дрейфа префикса (R1-B2 CTX-002): байты не трогать.
+crates/za-agent/tests/golden/*.json -text
