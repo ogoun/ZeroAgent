@@ -1,0 +1,110 @@
+%%% case: json 100 small objects one line
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+[{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},]
+%%% case: sql insert same x40
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+%%% case: md checklist template x60
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела

@@ -77,38 +77,65 @@ fn repeated_line_detected() {
     assert_eq!(w.on_text(LINE), Some(Degenerate::Repetition));
 }
 
-/// Правило n-грамм (Ruling I-1): 12-словная фраза 8 раз без перекрытия в последних 600
-/// словах, от первого вхождения до конца не меньше 2 КиБ; 7 вставок — не повтор.
+/// Правило n-грамм (Ruling I-1, раунд 2): фраза 8 раз среди разных слов — не петля
+/// (хвост разнообразен); петля с вариациями (абзац в трёх вариантах в неправильном
+/// порядке, точного периода нет) — петля не позже 4 КиБ.
 #[test]
 fn ngram_detected() {
     let phrase = "the build failed again so I will clean the cache and retry now";
-    assert_eq!(phrase.split_whitespace().count(), 13);
     let phrase: Vec<&str> = phrase.split_whitespace().take(12).collect();
-    let text_with = |inserts: usize| {
-        // 600 слов: разные слова-заполнители и вставки фразы.
-        let mut words: Vec<String> = Vec::new();
-        let mut filler = 0;
-        for slot in 0..inserts {
-            let gap = if slot == 0 { 20 } else { 55 };
-            for _ in 0..gap {
-                words.push(format!("w{filler}"));
-                filler += 1;
-            }
-            words.extend(phrase.iter().map(|s| (*s).to_owned()));
-        }
-        while words.len() < 600 {
+    // 600 слов: разные слова-заполнители и 8 вставок фразы.
+    let mut words: Vec<String> = Vec::new();
+    let mut filler = 0;
+    for slot in 0..8 {
+        let gap = if slot == 0 { 20 } else { 55 };
+        for _ in 0..gap {
             words.push(format!("w{filler}"));
             filler += 1;
         }
-        assert_eq!(words.len(), 600);
-        words.join(" ")
-    };
-    let feed = |text: &str| {
-        let mut w = StreamWatch::new(&ReasoningMode::Default);
-        chunks(text, 64).into_iter().find_map(|d| w.on_text(d))
-    };
-    assert_eq!(feed(&text_with(8)), Some(Degenerate::Repetition));
-    assert_eq!(feed(&text_with(7)), None);
+        words.extend(phrase.iter().map(|s| (*s).to_owned()));
+    }
+    let diverse = words.join(" ");
+    let mut w = StreamWatch::new(&ReasoningMode::Default);
+    assert!(
+        chunks(&diverse, 64)
+            .into_iter()
+            .all(|d| w.on_text(d).is_none())
+    );
+
+    let mut w = StreamWatch::new(&ReasoningMode::Default);
+    let (hit, fed) = feed_loop(&mut w, &varied_loop(), 64);
+    assert_eq!(hit, Some(Degenerate::Repetition));
+    assert!(fed <= 4096, "{fed}");
+}
+
+/// Петля с вариациями: фраза из 25 слов с одним меняющимся словом, варианты в
+/// псевдослучайном порядке (детерминированный LCG) — точного периода нет, ловит только
+/// n-грамма. Однообразие (доля разных n-грамм < 0,25 в 2 КиБ) у петли с периодом до
+/// ≈ 60 слов по-английски.
+fn varied_loop() -> String {
+    let variants = ["server", "client", "gateway"];
+    let mut seed = 7u32;
+    (0..60)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let v = variants[(seed >> 16) as usize % variants.len()];
+            format!(
+                "Now I will open the {v} log again and check that every connection setting \
+                 matches the documentation, then run the tests once more and look.\n"
+            )
+        })
+        .collect()
+}
+
+/// Подаёт петлю дельтами по `size` байт; (срабатывание, байт петли до него).
+fn feed_loop(w: &mut StreamWatch, looped: &str, size: usize) -> (Option<Degenerate>, usize) {
+    let mut fed = 0;
+    let hit = chunks(looped, size).into_iter().find_map(|d| {
+        fed += d.len();
+        w.on_text(d)
+    });
+    (hit, fed)
 }
 
 /// Настоящие петли (фраза × N, абзац × N) ловятся не позже 4 КиБ повторов (Ruling I-1),
@@ -130,7 +157,11 @@ fn real_loops_detected_within_4k() {
         "{}",
         paragraph.len()
     );
-    for unit in [phrase, paragraph, LINE] {
+    // ABAB, ABC и короткая фраза из 3 слов (период удваивается до 20 символов).
+    let abab = "Проверяю файл.\nФайл в порядке.\n";
+    let abc = "Сначала проверю тесты. Потом проверю сборку. Потом снова проверю тесты. ";
+    let short = "Да, я понял.\n";
+    for unit in [phrase, paragraph, LINE, abab, abc, short] {
         for size in [64, usize::MAX] {
             let mut w = StreamWatch::new(&ReasoningMode::Default);
             for d in chunks(prefix, 64) {
@@ -161,7 +192,7 @@ fn false_positives_not_detected() {
         .filter(|c| !c.is_empty())
         .map(|c| c.split_once('\n').expect("имя случая"))
         .collect();
-    assert_eq!(cases.len(), 15);
+    assert_eq!(cases.len(), 32);
     for (name, text) in cases {
         for by_lines in [true, false] {
             let mut w = StreamWatch::new(&ReasoningMode::Default);
@@ -174,6 +205,25 @@ fn false_positives_not_detected() {
                 assert_eq!(w.on_text(d), None, "{name}: {d:?}");
             }
         }
+    }
+}
+
+/// Шаблоны вне блока кода, которые правило единицы считает петлёй (Ruling I-1: 8 копий
+/// и 2 КиБ): JSON из 100 одинаковых объектов в строку, `INSERT` × 40, чек-лист × 60. Те же
+/// входы внутри блока кода молчат (`false_positives_not_detected`).
+#[test]
+fn template_loops_outside_code_detected() {
+    let corpus = include_str!("fixtures/stream_template_loops.txt");
+    let cases: Vec<(&str, &str)> = corpus
+        .split("%%% case: ")
+        .filter(|c| !c.is_empty())
+        .map(|c| c.split_once('\n').expect("имя случая"))
+        .collect();
+    assert_eq!(cases.len(), 3);
+    for (name, text) in cases {
+        let mut w = StreamWatch::new(&ReasoningMode::Default);
+        let hit = text.split_inclusive('\n').find_map(|d| w.on_text(d));
+        assert_eq!(hit, Some(Degenerate::Repetition), "{name}");
     }
 }
 

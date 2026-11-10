@@ -1137,3 +1137,1169 @@ fn main() {
 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
+%%% case: json 50 same objects one line in code
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+```json
+[
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+  {"id": 1, "name": "test", "status": "active", "tags": []},
+]
+```
+%%% case: json 50 same objects pretty in code
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+```json
+[
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+  {
+    "name": "worker",
+    "enabled": true,
+    "retries": 3
+  },
+]
+```
+%%% case: json 100 small objects in code
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+```json
+[{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},{"ok": true, "code": 0},]
+```
+%%% case: sql insert same x40 in code
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+```sql
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+INSERT INTO users (name, role) VALUES ('guest', 'viewer');
+```
+%%% case: log 80 lines short changing number
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+2026-11-10 12:00:00 INFO request 1000 ok
+2026-11-10 12:00:01 INFO request 1001 ok
+2026-11-10 12:00:02 INFO request 1002 ok
+2026-11-10 12:00:03 INFO request 1003 ok
+2026-11-10 12:00:04 INFO request 1004 ok
+2026-11-10 12:00:05 INFO request 1005 ok
+2026-11-10 12:00:06 INFO request 1006 ok
+2026-11-10 12:00:07 INFO request 1007 ok
+2026-11-10 12:00:08 INFO request 1008 ok
+2026-11-10 12:00:09 INFO request 1009 ok
+2026-11-10 12:00:10 INFO request 1010 ok
+2026-11-10 12:00:11 INFO request 1011 ok
+2026-11-10 12:00:12 INFO request 1012 ok
+2026-11-10 12:00:13 INFO request 1013 ok
+2026-11-10 12:00:14 INFO request 1014 ok
+2026-11-10 12:00:15 INFO request 1015 ok
+2026-11-10 12:00:16 INFO request 1016 ok
+2026-11-10 12:00:17 INFO request 1017 ok
+2026-11-10 12:00:18 INFO request 1018 ok
+2026-11-10 12:00:19 INFO request 1019 ok
+2026-11-10 12:00:20 INFO request 1020 ok
+2026-11-10 12:00:21 INFO request 1021 ok
+2026-11-10 12:00:22 INFO request 1022 ok
+2026-11-10 12:00:23 INFO request 1023 ok
+2026-11-10 12:00:24 INFO request 1024 ok
+2026-11-10 12:00:25 INFO request 1025 ok
+2026-11-10 12:00:26 INFO request 1026 ok
+2026-11-10 12:00:27 INFO request 1027 ok
+2026-11-10 12:00:28 INFO request 1028 ok
+2026-11-10 12:00:29 INFO request 1029 ok
+2026-11-10 12:00:30 INFO request 1030 ok
+2026-11-10 12:00:31 INFO request 1031 ok
+2026-11-10 12:00:32 INFO request 1032 ok
+2026-11-10 12:00:33 INFO request 1033 ok
+2026-11-10 12:00:34 INFO request 1034 ok
+2026-11-10 12:00:35 INFO request 1035 ok
+2026-11-10 12:00:36 INFO request 1036 ok
+2026-11-10 12:00:37 INFO request 1037 ok
+2026-11-10 12:00:38 INFO request 1038 ok
+2026-11-10 12:00:39 INFO request 1039 ok
+2026-11-10 12:00:40 INFO request 1040 ok
+2026-11-10 12:00:41 INFO request 1041 ok
+2026-11-10 12:00:42 INFO request 1042 ok
+2026-11-10 12:00:43 INFO request 1043 ok
+2026-11-10 12:00:44 INFO request 1044 ok
+2026-11-10 12:00:45 INFO request 1045 ok
+2026-11-10 12:00:46 INFO request 1046 ok
+2026-11-10 12:00:47 INFO request 1047 ok
+2026-11-10 12:00:48 INFO request 1048 ok
+2026-11-10 12:00:49 INFO request 1049 ok
+2026-11-10 12:00:50 INFO request 1050 ok
+2026-11-10 12:00:51 INFO request 1051 ok
+2026-11-10 12:00:52 INFO request 1052 ok
+2026-11-10 12:00:53 INFO request 1053 ok
+2026-11-10 12:00:54 INFO request 1054 ok
+2026-11-10 12:00:55 INFO request 1055 ok
+2026-11-10 12:00:56 INFO request 1056 ok
+2026-11-10 12:00:57 INFO request 1057 ok
+2026-11-10 12:00:58 INFO request 1058 ok
+2026-11-10 12:00:59 INFO request 1059 ok
+2026-11-10 12:00:00 INFO request 1060 ok
+2026-11-10 12:00:01 INFO request 1061 ok
+2026-11-10 12:00:02 INFO request 1062 ok
+2026-11-10 12:00:03 INFO request 1063 ok
+2026-11-10 12:00:04 INFO request 1064 ok
+2026-11-10 12:00:05 INFO request 1065 ok
+2026-11-10 12:00:06 INFO request 1066 ok
+2026-11-10 12:00:07 INFO request 1067 ok
+2026-11-10 12:00:08 INFO request 1068 ok
+2026-11-10 12:00:09 INFO request 1069 ok
+2026-11-10 12:00:10 INFO request 1070 ok
+2026-11-10 12:00:11 INFO request 1071 ok
+2026-11-10 12:00:12 INFO request 1072 ok
+2026-11-10 12:00:13 INFO request 1073 ok
+2026-11-10 12:00:14 INFO request 1074 ok
+2026-11-10 12:00:15 INFO request 1075 ok
+2026-11-10 12:00:16 INFO request 1076 ok
+2026-11-10 12:00:17 INFO request 1077 ok
+2026-11-10 12:00:18 INFO request 1078 ok
+2026-11-10 12:00:19 INFO request 1079 ok
+%%% case: log 80 lines long number at end
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=0
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=1
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=2
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=3
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=4
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=5
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=6
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=7
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=8
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=9
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=10
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=11
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=12
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=13
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=14
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=15
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=16
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=17
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=18
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=19
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=20
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=21
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=22
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=23
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=24
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=25
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=26
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=27
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=28
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=29
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=30
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=31
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=32
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=33
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=34
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=35
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=36
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=37
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=38
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=39
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=40
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=41
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=42
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=43
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=44
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=45
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=46
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=47
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=48
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=49
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=50
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=51
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=52
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=53
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=54
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=55
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=56
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=57
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=58
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=59
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=60
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=61
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=62
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=63
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=64
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=65
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=66
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=67
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=68
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=69
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=70
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=71
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=72
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=73
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=74
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=75
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=76
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=77
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=78
+[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step=79
+%%% case: log 80 lines ru number at start
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+[0000] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0001] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0002] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0003] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0004] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0005] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0006] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0007] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0008] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0009] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0010] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0011] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0012] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0013] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0014] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0015] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0016] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0017] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0018] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0019] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0020] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0021] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0022] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0023] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0024] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0025] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0026] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0027] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0028] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0029] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0030] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0031] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0032] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0033] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0034] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0035] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0036] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0037] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0038] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0039] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0040] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0041] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0042] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0043] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0044] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0045] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0046] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0047] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0048] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0049] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0050] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0051] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0052] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0053] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0054] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0055] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0056] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0057] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0058] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0059] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0060] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0061] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0062] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0063] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0064] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0065] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0066] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0067] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0068] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0069] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0070] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0071] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0072] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0073] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0074] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0075] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0076] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0077] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0078] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+[0079] Обработка запроса завершена успешно, соединение с сервером базы данных закрыто, ожидание следующего запроса
+%%% case: ru answer x2
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+%%% case: ru answer x3
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+%%% case: ru answer x7
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+Итог. Конфигурация сервера проверена полностью: порты, таймауты и пути к журналам совпадают с документацией. Тесты прошли, ошибок в журнале за сутки нет. Рекомендую обновить зависимость tokio до последней версии и включить ротацию журналов, чтобы файл не рос без предела. Других изменений не требуется.
+
+%%% case: zero matrix x50
+Here is the initial state of the grid used by the solver:
+```python
+grid = [
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+]
+```
+%%% case: md table same rows x50
+| name | status | owner |
+|---|---|---|
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+| TBD  | pending | unassigned |
+%%% case: rust println x150
+fn main() {
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+    println!("--------");
+}
+%%% case: csv same row x80
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+id,name,status
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+0,unknown,pending review
+%%% case: md table 60 rows same comment
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+| Модуль | Статус | Комментарий |
+|---|---|---|
+| module_0 | OK | проверено, замечаний нет |
+| module_1 | OK | проверено, замечаний нет |
+| module_2 | OK | проверено, замечаний нет |
+| module_3 | OK | проверено, замечаний нет |
+| module_4 | OK | проверено, замечаний нет |
+| module_5 | OK | проверено, замечаний нет |
+| module_6 | OK | проверено, замечаний нет |
+| module_7 | OK | проверено, замечаний нет |
+| module_8 | OK | проверено, замечаний нет |
+| module_9 | OK | проверено, замечаний нет |
+| module_10 | OK | проверено, замечаний нет |
+| module_11 | OK | проверено, замечаний нет |
+| module_12 | OK | проверено, замечаний нет |
+| module_13 | OK | проверено, замечаний нет |
+| module_14 | OK | проверено, замечаний нет |
+| module_15 | OK | проверено, замечаний нет |
+| module_16 | OK | проверено, замечаний нет |
+| module_17 | OK | проверено, замечаний нет |
+| module_18 | OK | проверено, замечаний нет |
+| module_19 | OK | проверено, замечаний нет |
+| module_20 | OK | проверено, замечаний нет |
+| module_21 | OK | проверено, замечаний нет |
+| module_22 | OK | проверено, замечаний нет |
+| module_23 | OK | проверено, замечаний нет |
+| module_24 | OK | проверено, замечаний нет |
+| module_25 | OK | проверено, замечаний нет |
+| module_26 | OK | проверено, замечаний нет |
+| module_27 | OK | проверено, замечаний нет |
+| module_28 | OK | проверено, замечаний нет |
+| module_29 | OK | проверено, замечаний нет |
+| module_30 | OK | проверено, замечаний нет |
+| module_31 | OK | проверено, замечаний нет |
+| module_32 | OK | проверено, замечаний нет |
+| module_33 | OK | проверено, замечаний нет |
+| module_34 | OK | проверено, замечаний нет |
+| module_35 | OK | проверено, замечаний нет |
+| module_36 | OK | проверено, замечаний нет |
+| module_37 | OK | проверено, замечаний нет |
+| module_38 | OK | проверено, замечаний нет |
+| module_39 | OK | проверено, замечаний нет |
+| module_40 | OK | проверено, замечаний нет |
+| module_41 | OK | проверено, замечаний нет |
+| module_42 | OK | проверено, замечаний нет |
+| module_43 | OK | проверено, замечаний нет |
+| module_44 | OK | проверено, замечаний нет |
+| module_45 | OK | проверено, замечаний нет |
+| module_46 | OK | проверено, замечаний нет |
+| module_47 | OK | проверено, замечаний нет |
+| module_48 | OK | проверено, замечаний нет |
+| module_49 | OK | проверено, замечаний нет |
+| module_50 | OK | проверено, замечаний нет |
+| module_51 | OK | проверено, замечаний нет |
+| module_52 | OK | проверено, замечаний нет |
+| module_53 | OK | проверено, замечаний нет |
+| module_54 | OK | проверено, замечаний нет |
+| module_55 | OK | проверено, замечаний нет |
+| module_56 | OK | проверено, замечаний нет |
+| module_57 | OK | проверено, замечаний нет |
+| module_58 | OK | проверено, замечаний нет |
+| module_59 | OK | проверено, замечаний нет |
+%%% case: list 40 items same long sentence
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+1. Файл src/mod_0.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+2. Файл src/mod_1.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+3. Файл src/mod_2.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+4. Файл src/mod_3.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+5. Файл src/mod_4.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+6. Файл src/mod_5.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+7. Файл src/mod_6.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+8. Файл src/mod_7.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+9. Файл src/mod_8.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+10. Файл src/mod_9.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+11. Файл src/mod_10.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+12. Файл src/mod_11.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+13. Файл src/mod_12.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+14. Файл src/mod_13.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+15. Файл src/mod_14.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+16. Файл src/mod_15.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+17. Файл src/mod_16.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+18. Файл src/mod_17.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+19. Файл src/mod_18.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+20. Файл src/mod_19.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+21. Файл src/mod_20.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+22. Файл src/mod_21.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+23. Файл src/mod_22.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+24. Файл src/mod_23.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+25. Файл src/mod_24.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+26. Файл src/mod_25.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+27. Файл src/mod_26.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+28. Файл src/mod_27.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+29. Файл src/mod_28.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+30. Файл src/mod_29.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+31. Файл src/mod_30.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+32. Файл src/mod_31.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+33. Файл src/mod_32.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+34. Файл src/mod_33.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+35. Файл src/mod_34.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+36. Файл src/mod_35.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+37. Файл src/mod_36.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+38. Файл src/mod_37.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+39. Файл src/mod_38.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+40. Файл src/mod_39.rs: функция не используется и может быть удалена без последствий для сборки проекта.
+%%% case: md checklist template x60 in code
+Ниже приведён результат анализа конфигурации. Я прошёл по всем модулям, сравнил настройки с документацией и проверил журналы запуска за последние сутки. Существенных расхождений не обнаружено, однако есть несколько замечаний.
+
+```markdown
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+- [ ] TODO: заполнить описание раздела
+```

@@ -12,6 +12,12 @@
 //! [`NGRAM_WORDS`]-словная n-грамма с теми же требованиями к единице встречается не меньше
 //! [`MIN_COPIES`] раз без перекрытия в последних [`NGRAM_WINDOW`] словах, и от первого
 //! вхождения до конца текста не меньше [`MIN_REPEAT_BYTES`] байт: петля с вариациями.
+//! N-грамма срабатывает только на однообразном хвосте (Ruling I-1, раунд 2): в последних
+//! [`MONOTONY_BYTES`] байтах доля разных n-грамм меньше [`MONOTONY_SHARE`], и последнее
+//! вхождение кончается в последних [`RECENT_BYTES`] байтах — лог с меняющимся номером и
+//! список с разными элементами разнообразны. Внутри открытого блока кода (нечётное число
+//! ```` ``` ````) n-граммы не действуют, а правилу единицы нужно [`CODE_MIN_COPIES`] копий и
+//! [`CODE_MIN_REPEAT_BYTES`] байт: повторяющиеся данные (JSON, `INSERT`, лог) не петля.
 //!
 //! Бесконечное рассуждение (D59, Ruling I-2): байты рассуждения / 4 больше бюджета × 1,5
 //! (основной предел) или рассуждение дольше дедлайна без текста и вызовов. Дедлайн —
@@ -83,9 +89,24 @@ pub const MIN_REPEAT_BYTES: usize = 2048;
 pub const NGRAM_WORDS: usize = 12;
 /// Окно n-грамм — последние слова текста (D58).
 pub const NGRAM_WINDOW: usize = 600;
-/// Самая длинная единица повтора, символы: предел работы одной проверки. Длиннее —
-/// повтор ловит n-грамма.
+/// Доля разных n-грамм в последних [`MONOTONY_BYTES`] байтах, ниже которой хвост
+/// однообразен (Ruling I-1, раунд 2).
+pub const MONOTONY_SHARE: f64 = 0.25;
+/// Окно однообразия n-грамм — последние байты текста (Ruling I-1, раунд 2).
+pub const MONOTONY_BYTES: usize = 2048;
+/// Последнее вхождение повторённой n-граммы кончается в стольких последних байтах
+/// (Ruling I-1, раунд 2).
+pub const RECENT_BYTES: usize = 256;
+/// Копий единицы подряд внутри открытого блока кода, не меньше (Ruling I-1, раунд 2).
+pub const CODE_MIN_COPIES: usize = 32;
+/// Повторённая часть внутри открытого блока кода, байты, не меньше (Ruling I-1, раунд 2).
+pub const CODE_MIN_REPEAT_BYTES: usize = 8 * 1024;
+/// Самая длинная единица повтора, символы: предел работы одной проверки. Единица длиннее
+/// не ловится (принятый риск, Ruling I-1 раунда 2): n-грамме нужно 8 вхождений в
+/// [`NGRAM_WINDOW`] словах, она видит единицы не длиннее ≈ 75 слов.
 const MAX_UNIT_CHARS: usize = 2048;
+/// Ограждение блока кода Markdown.
+const FENCE: &str = "```";
 /// Хвост текста попытки, который хранит детектор, байты: больше обоих окон проверки.
 const KEEP_BYTES: usize = 64 * 1024;
 
@@ -119,6 +140,9 @@ pub struct StreamWatch {
     reasoning_limit: u64,
     /// Дедлайн рассуждения от его начала (D59).
     timeout: Duration,
+    /// Ограждений блока кода в отброшенном начале текста (`trim`): чётность — открыт ли
+    /// блок кода в конце текста.
+    dropped_fences: usize,
 }
 
 impl StreamWatch {
@@ -136,6 +160,7 @@ impl StreamWatch {
             acted: false,
             reasoning_limit: u64::from(thinking_budget(reasoning)) * 6,
             timeout: THINKING_TIMEOUT,
+            dropped_fences: 0,
         }
     }
 
@@ -163,7 +188,19 @@ impl StreamWatch {
             return None;
         }
         self.since_check = 0;
-        (tail_repeated(&self.text) || ngram_repeated(&self.text)).then_some(Degenerate::Repetition)
+        let in_code = (self.dropped_fences + self.text.matches(FENCE).count()) % 2 == 1;
+        let hit = if in_code {
+            tail_repeated(&self.text, CODE_MIN_COPIES, CODE_MIN_REPEAT_BYTES)
+        } else {
+            // N-граммы — только по тексту после закрытого блока кода: его содержимое
+            // (данные, логи) — не петля и после закрытия.
+            let prose = self
+                .text
+                .rfind(FENCE)
+                .map_or(self.text.as_str(), |i| &self.text[i + FENCE.len()..]);
+            tail_repeated(&self.text, MIN_COPIES, MIN_REPEAT_BYTES) || ngram_repeated(prose)
+        };
+        hit.then_some(Degenerate::Repetition)
     }
 
     /// Дельта рассуждения в момент `now` (D59): предел байт или тайм-аут без текста и
@@ -204,6 +241,7 @@ impl StreamWatch {
         self.reasoning_bytes = 0;
         self.reasoning_since = None;
         self.acted = false;
+        self.dropped_fences = 0;
     }
 
     /// Хвост текста не растёт без предела: окна проверки много меньше `KEEP_BYTES`.
@@ -212,9 +250,11 @@ impl StreamWatch {
             return;
         }
         let mut cut = self.text.len() - KEEP_BYTES;
-        while !self.text.is_char_boundary(cut) {
+        // Разрез не попадает внутрь ограждения: серия обратных кавычек уходит целиком.
+        while !self.text.is_char_boundary(cut) || self.text.as_bytes()[cut] == b'`' {
             cut += 1;
         }
+        self.dropped_fences += self.text[..cut].matches(FENCE).count();
         self.text.drain(..cut);
     }
 }
@@ -235,52 +275,73 @@ fn good_unit<'a>(parts: impl IntoIterator<Item = &'a str>) -> bool {
     words.len() >= MIN_UNIT_WORDS && chars >= MIN_UNIT_CHARS
 }
 
-/// D58, Ruling I-1: хвост текста — не меньше [`MIN_COPIES`] копий одной годной
-/// единицы подряд, повторённая часть не меньше [`MIN_REPEAT_BYTES`] байт.
-fn tail_repeated(text: &str) -> bool {
-    let mut tail: Vec<char> = text
+/// D58, Ruling I-1: хвост текста — не меньше `min_copies` копий одной годной единицы
+/// подряд, повторённая часть не меньше `min_bytes` байт ([`MIN_COPIES`] и
+/// [`MIN_REPEAT_BYTES`]; в блоке кода — [`CODE_MIN_COPIES`] и [`CODE_MIN_REPEAT_BYTES`]).
+fn tail_repeated(text: &str, min_copies: usize, min_bytes: usize) -> bool {
+    // r — хвост текста задом наперёд: суффикс текста длины l — префикс r длины l.
+    let r: Vec<char> = text
         .chars()
         .rev()
-        .take(MIN_COPIES * MAX_UNIT_CHARS)
+        .take(min_copies * MAX_UNIT_CHARS)
         .collect();
-    tail.reverse();
-    let n = tail.len();
-    // suffix_bytes[l] — байты последних l символов.
-    let mut suffix_bytes = Vec::with_capacity(n + 1);
-    suffix_bytes.push(0usize);
-    for c in tail.iter().rev() {
-        let last = suffix_bytes.last().copied().unwrap_or(0);
-        suffix_bytes.push(last + c.len_utf8());
+    let n = r.len();
+    // Префикс-функция r (KMP): у префикса длины l наименьший период l − pi[l − 1].
+    let mut pi = vec![0usize; n];
+    for i in 1..n {
+        let mut k = pi[i - 1];
+        while k > 0 && r[i] != r[k] {
+            k = pi[k - 1];
+        }
+        if r[i] == r[k] {
+            k += 1;
+        }
+        pi[i] = k;
     }
-    // suffix_letters[l] — букв среди последних l символов: дешёвый отсев единиц без слов.
-    let mut suffix_letters = Vec::with_capacity(n + 1);
-    suffix_letters.push(0usize);
-    for c in tail.iter().rev() {
-        let last = suffix_letters.last().copied().unwrap_or(0);
-        suffix_letters.push(last + usize::from(c.is_alphabetic()));
-    }
-    let max = (n / MIN_COPIES).min(MAX_UNIT_CHARS);
+    // Байты, буквы и непробельные символы последних l символов текста.
+    let prefix = |f: &dyn Fn(char) -> usize| {
+        let mut v = Vec::with_capacity(n + 1);
+        v.push(0usize);
+        for &c in &r {
+            let last = v.last().copied().unwrap_or(0);
+            v.push(last + f(c));
+        }
+        v
+    };
+    let bytes = prefix(&|c| c.len_utf8());
+    let letters = prefix(&|c| usize::from(c.is_alphabetic()));
+    let solid = prefix(&|c| usize::from(!c.is_whitespace()));
+    let mut words_ok: HashMap<usize, bool> = HashMap::new();
+    let max = (n / min_copies).min(MAX_UNIT_CHARS);
     (1..=max).any(|p| {
-        if suffix_letters[p] < MIN_UNIT_WORDS {
+        if letters[p] < MIN_UNIT_WORDS || solid[p] < MIN_UNIT_CHARS {
             return false;
         }
-        // Нужная длина повторённой части: кратна p, не меньше 8 копий и 2 КиБ.
-        let mut need = MIN_COPIES * p;
-        while need <= n && suffix_bytes[need] < MIN_REPEAT_BYTES {
+        // Нужная длина повторённой части: кратна p, не меньше min_copies копий и min_bytes.
+        let mut need = min_copies * p;
+        while need <= n && bytes[need] < min_bytes {
             need += p;
         }
         if need > n {
             return false;
         }
-        let periodic = (0..need - p).all(|k| tail[n - 1 - k] == tail[n - 1 - k - p]);
-        periodic && good_cyclic_unit(&tail[n - p..])
+        // Период p у суффикса длины need ⇔ p кратно наименьшему периоду q (Файн — Вильф:
+        // p + q ≤ need). Тогда единица — степень корня длины q, слова у них по кругу те же.
+        let q = need - pi[need - 1];
+        if !p.is_multiple_of(q) {
+            return false;
+        }
+        *words_ok.entry(q).or_insert_with(|| {
+            let root: Vec<char> = r[..q].iter().rev().copied().collect();
+            cyclic_words_ok(&root)
+        })
     })
 }
 
-/// [`good_unit`] для единицы периода: конец текста режет её в произвольном месте
+/// Слова единицы периода (Ruling I-1): конец текста режет её в произвольном месте
 /// (`ln!("--");\n    print`), поэтому слова считаются по кругу — в двух копиях подряд без
 /// обрезков слов на краях. Иначе обрезки дают лишние «слова» (`ln`, `print`).
-fn good_cyclic_unit(unit: &[char]) -> bool {
+fn cyclic_words_ok(unit: &[char]) -> bool {
     let doubled: String = unit.iter().chain(unit).collect();
     let mut words: Vec<&str> = doubled
         .split(|c: char| !c.is_alphanumeric())
@@ -296,25 +357,34 @@ fn good_cyclic_unit(unit: &[char]) -> bool {
         .into_iter()
         .filter(|w| w.chars().any(char::is_alphabetic))
         .collect();
-    let chars = unit.iter().filter(|c| !c.is_whitespace()).count();
-    distinct.len() >= MIN_UNIT_WORDS && chars >= MIN_UNIT_CHARS
+    distinct.len() >= MIN_UNIT_WORDS
 }
 
 /// D58, Ruling I-1: годная [`NGRAM_WORDS`]-словная n-грамма встречается не меньше
 /// [`MIN_COPIES`] раз без перекрытия в последних [`NGRAM_WINDOW`] словах, от первого
-/// вхождения до конца текста — не меньше [`MIN_REPEAT_BYTES`] байт.
+/// вхождения до конца текста — не меньше [`MIN_REPEAT_BYTES`] байт. Только на
+/// однообразном хвосте (Ruling I-1, раунд 2): доля разных n-грамм в последних
+/// [`MONOTONY_BYTES`] байтах меньше [`MONOTONY_SHARE`], последнее вхождение кончается в
+/// последних [`RECENT_BYTES`] байтах.
 fn ngram_repeated(text: &str) -> bool {
     let mut words: Vec<&str> = text.split_whitespace().rev().take(NGRAM_WINDOW).collect();
     words.reverse();
-    // Начало слова в байтах текста: слово — подстрока `text`.
+    // Начало и конец слова в байтах текста: слово — подстрока `text`.
     let base = text.as_ptr() as usize;
     let start = |w: &str| w.as_ptr() as usize - base;
+    let end = |w: &str| start(w) + w.len();
+    let len = text.len();
+    if !monotonous(&words, len, start) {
+        return false;
+    }
     struct Seen {
         good: bool,
         count: usize,
         /// Первый индекс слова, с которого вхождение не перекрывает прошлое.
         free: usize,
         first: usize,
+        /// Конец последнего засчитанного вхождения, байты.
+        last_end: usize,
     }
     let mut seen: HashMap<&[&str], Seen> = HashMap::new();
     for (i, g) in words.windows(NGRAM_WORDS).enumerate() {
@@ -323,17 +393,34 @@ fn ngram_repeated(text: &str) -> bool {
             count: 0,
             free: 0,
             first: start(g[0]),
+            last_end: 0,
         });
         if !s.good || i < s.free {
             continue;
         }
         s.count += 1;
         s.free = i + NGRAM_WORDS;
-        if s.count >= MIN_COPIES && text.len() - s.first >= MIN_REPEAT_BYTES {
-            return true;
-        }
+        s.last_end = end(g[NGRAM_WORDS - 1]);
     }
-    false
+    seen.values().any(|s| {
+        s.count >= MIN_COPIES
+            && len - s.first >= MIN_REPEAT_BYTES
+            && len - s.last_end <= RECENT_BYTES
+    })
+}
+
+/// Хвост однообразен (Ruling I-1, раунд 2): среди n-грамм, начинающихся в последних
+/// [`MONOTONY_BYTES`] байтах, разных меньше [`MONOTONY_SHARE`]. `words` — слова окна,
+/// `start` — их смещение в тексте длины `len`.
+fn monotonous(words: &[&str], len: usize, start: impl Fn(&str) -> usize) -> bool {
+    let from = words.partition_point(|w| start(w) + MONOTONY_BYTES < len);
+    let tail = &words[from..];
+    if tail.len() < NGRAM_WORDS {
+        return false;
+    }
+    let grams: Vec<&[&str]> = tail.windows(NGRAM_WORDS).collect();
+    let distinct: HashSet<&[&str]> = grams.iter().copied().collect();
+    (distinct.len() as f64) < MONOTONY_SHARE * grams.len() as f64
 }
 
 /// D58, D59: параметры повтора хода. Повтор текста — `temperature = max(t − 0,3, 0,1)`,
@@ -368,21 +455,89 @@ mod tests {
         assert!(!good_unit(["a b c"]), "меньше 20 непробельных символов");
         // Единица периода, разрезанная концом текста: слова по кругу.
         let cut: Vec<char> = "ln!(\"--------\");\n    print".chars().collect();
-        assert!(!good_cyclic_unit(&cut), "обрезки слова — не слова");
+        assert!(!cyclic_words_ok(&cut), "обрезки слова — не слова");
         let rotated: Vec<char> = "config.toml ещё раз\nПроверяю файл ".chars().collect();
-        assert!(good_cyclic_unit(&rotated));
+        assert!(cyclic_words_ok(&rotated));
     }
 
     #[test]
     fn tail_needs_copies_and_bytes() {
         let line = "Проверяю файл config.toml ещё раз\n"; // 52 байта
-        assert!(!tail_repeated(&line.repeat(39)), "39 × 52 < 2048");
-        assert!(tail_repeated(&line.repeat(40)));
+        assert!(
+            !tail_repeated(&line.repeat(39), MIN_COPIES, MIN_REPEAT_BYTES),
+            "39 × 52 < 2048"
+        );
+        assert!(tail_repeated(
+            &line.repeat(40),
+            MIN_COPIES,
+            MIN_REPEAT_BYTES
+        ));
         // 8 копий длинной строки: 8 × 300 > 2048.
         let long = format!("{}\n", "word другое слово ".repeat(12));
-        assert!(!tail_repeated(&long.repeat(7)));
-        assert!(tail_repeated(&long.repeat(8)));
-        assert!(!tail_repeated(&"=".repeat(10_000)));
+        assert!(!tail_repeated(
+            &long.repeat(7),
+            MIN_COPIES,
+            MIN_REPEAT_BYTES
+        ));
+        assert!(tail_repeated(&long.repeat(8), MIN_COPIES, MIN_REPEAT_BYTES));
+        assert!(!tail_repeated(
+            &"=".repeat(10_000),
+            MIN_COPIES,
+            MIN_REPEAT_BYTES
+        ));
+    }
+
+    /// Ruling I-1, раунд 2: n-грамма — только на однообразном хвосте, с повтором у конца.
+    #[test]
+    fn ngram_needs_monotonous_recent_tail() {
+        // ABAB: однообразно, повтор до конца.
+        let abab = "Проверяю файл.\nФайл в порядке.\n".repeat(120);
+        assert!(ngram_repeated(&abab));
+        // Лог с меняющимся номером: каждая строка — свои n-граммы.
+        let log: String = (0..80)
+            .map(|i| {
+                format!(
+                    "[INFO] za_agent::driver: model turn finished successfully, waiting for the next boundary of the run step={i}\n"
+                )
+            })
+            .collect();
+        assert!(!ngram_repeated(&log));
+        // Петля, за которой идёт другой текст: последнее вхождение не у конца.
+        let after: String = (0..60).map(|i| format!("w{i} x{i} y{i} z{i} ")).collect();
+        assert!(!ngram_repeated(&format!("{abab}{after}")));
+    }
+
+    #[test]
+    fn code_block_raises_unit_threshold() {
+        let line = "INSERT INTO users (name, role) VALUES ('guest', 'viewer');\n";
+        let mut w = StreamWatch::new(&ReasoningMode::Default);
+        assert_eq!(w.on_text("```sql\n"), None);
+        // 40 копий (≈ 2,4 КиБ) в блоке кода — не петля; 32 копии и 8 КиБ — петля.
+        let hit = (1..=200).find_map(|i| w.on_text(line).map(|d| (i, d)));
+        let (i, d) = hit.expect("петля в коде ловится");
+        assert_eq!(d, Degenerate::Repetition);
+        assert!(
+            i * line.len() >= CODE_MIN_REPEAT_BYTES && i >= CODE_MIN_COPIES,
+            "{i}"
+        );
+        // Вне блока кода та же строка — петля с 2 КиБ.
+        let mut w = StreamWatch::new(&ReasoningMode::Default);
+        let i = (1..=200)
+            .find(|_| w.on_text(line).is_some())
+            .expect("петля");
+        assert!(i * line.len() < 3 * 1024, "{i}");
+    }
+
+    #[test]
+    fn trim_keeps_fence_parity() {
+        let mut w = StreamWatch::new(&ReasoningMode::Default);
+        w.on_text("```\n");
+        let filler: String = (0..800).map(|i| format!("w{i} ")).collect();
+        for _ in 0..(3 * KEEP_BYTES / filler.len()) {
+            w.on_text(&filler);
+        }
+        assert!(!w.text.contains(FENCE), "ограждение отброшено");
+        assert_eq!(w.dropped_fences, 1);
     }
 
     #[test]
