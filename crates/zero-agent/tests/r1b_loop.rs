@@ -284,6 +284,11 @@ impl Env {
     /// и ключи окружения тестов не наследуются. Кэши cargo и uv (категории монитора
     /// ресурсов) — пустые каталоги теста.
     fn run(&self, args: &[&str]) -> Out {
+        self.run_with(args, &[])
+    }
+
+    /// [`Env::run`] с дополнительными переменными окружения.
+    fn run_with(&self, args: &[&str], vars: &[(&str, &str)]) -> Out {
         let caches = self.home.with_extension("caches");
         let _ = std::fs::create_dir_all(caches.join("cargo"));
         let _ = std::fs::create_dir_all(caches.join("uv"));
@@ -302,6 +307,9 @@ impl Env {
             if k.starts_with("ZA_SECRET_") {
                 cmd.env_remove(k);
             }
+        }
+        for (k, v) in vars {
+            cmd.env(k, v);
         }
         let mut child = cmd.spawn().unwrap();
         let out = read_all(child.stdout.take().unwrap());
@@ -524,10 +532,51 @@ fn resume_reads_budget_from_flags() {
     assert_eq!(exceeded.len(), 1, "{exceeded:?}");
     assert_eq!(exceeded[0], json!({"kind": "steps", "used": 1, "limit": 1}));
     let id = run.to_string();
+    // Resume без флагов сохраняет бюджет run; `[budgets.run]` при resume не перечитывается
+    // (решение контроллера, I2 ревью задачи 16): предел из нового раздела не действует.
+    let cfg = format!("{}\n[budgets.run]\nsteps = 100\n", llama_config(&srv.base));
+    std::fs::write(e.home.join("config.toml"), cfg).unwrap();
+    let again = e.run_cmd(&["--resume", &id]);
+    assert_eq!(again.code(), Some(4), "{again:?}");
+    assert!(again.stderr.contains("budget"), "{again:?}");
+    assert_eq!(count(&e.events(run), EventKind::BudgetExceeded), 2);
+    assert_eq!(srv.bodies().len(), 1, "модель после бюджета не вызывается");
+    // С флагом — флаг поверх текущего бюджета run.
     let r = e.run_cmd(&["--resume", &id, "--max-steps", "5"]);
     assert_eq!(r.code(), Some(0), "{r:?}");
     assert_eq!(r.stdout, "ок\n", "{r:?}");
-    assert_eq!(count(&e.events(run), EventKind::BudgetExceeded), 1);
+    assert_eq!(count(&e.events(run), EventKind::BudgetExceeded), 2);
+}
+
+/// Первая строка stderr — `run <id>` раньше любых предупреждений (D28): `--agents-md`
+/// без файла предупреждает уже после неё.
+#[test]
+fn run_line_precedes_warnings() {
+    let srv = Fake::start(paris);
+    let e = env("first_line", &llama_config(&srv.base));
+    let o = e.run_cmd(&["--agents-md", "Столица Франции?"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert!(o.stderr.starts_with("run "), "{o:?}");
+    assert!(o.stderr.contains("AGENTS.md"), "{o:?}");
+    // Resume к недоступному эндпоинту: логи шлюза — после `run <id>`.
+    let id = run_id(&o).to_string();
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", dead.local_addr().unwrap());
+    drop(dead);
+    std::fs::write(e.home.join("config.toml"), llama_config(&base)).unwrap();
+    // `ZA_LOG=debug`: логи шлюза и зонда идут в stderr до продолжения run.
+    let r = e.run_with(
+        &["run", "--project", e.project_arg(), "--resume", &id],
+        &[("ZA_LOG", "debug")],
+    );
+    assert!(r.stderr.lines().count() > 2, "логов шлюза нет: {r:?}");
+    // Run уже `done`: resume — ошибка, но первая строка — `run <id>`.
+    assert_eq!(r.code(), Some(1), "{r:?}");
+    assert_eq!(
+        r.stderr.lines().next(),
+        Some(format!("run {id}").as_str()),
+        "{r:?}"
+    );
 }
 
 #[test]

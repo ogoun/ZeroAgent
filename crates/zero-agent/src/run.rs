@@ -31,11 +31,11 @@ use za_core::{
 };
 use za_llm::{EndpointId, SelectError, Selection};
 use za_protocol::{
-    Budget, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Tier, pause_reason,
+    Budget, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Seq, Tier, pause_reason,
 };
 use za_store::{INTERRUPT_OPEN, ProjectStore, StoreError};
 
-use crate::config::{AgentConfig, load_config};
+use crate::config::load_config;
 use crate::home;
 use crate::journal::open_retrying;
 use crate::models::{CommandError, PROBE_WAIT, start_gateway, state_text, wait_endpoint};
@@ -154,9 +154,10 @@ pub enum Answer {
     NotDone,
 }
 
-/// Бюджет run: `[budgets.run]`, поверх него флаги `--max-steps`, `--max-tokens`.
-pub fn run_budget(cfg: &AgentConfig, max_steps: Option<u32>, max_tokens: Option<u64>) -> Budget {
-    let mut b = cfg.budgets.run.clone();
+/// Бюджет `base` (у нового run — `[budgets.run]`, у resume — текущий бюджет run), поверх
+/// него флаги `--max-steps`, `--max-tokens`.
+pub fn run_budget(base: &Budget, max_steps: Option<u32>, max_tokens: Option<u64>) -> Budget {
+    let mut b = base.clone();
     if max_steps.is_some() {
         b.steps = max_steps;
     }
@@ -164,6 +165,44 @@ pub fn run_budget(cfg: &AgentConfig, max_steps: Option<u32>, max_tokens: Option<
         b.tokens = max_tokens;
     }
     b
+}
+
+/// Текущий бюджет run — поле `budget` последнего снимка; снимка нет — без пределов
+/// (`resume_run` такой run всё равно не продолжит).
+async fn current_budget(store: &ProjectStore, run: RunId) -> Result<Budget, RunError> {
+    let Some((_, v)) = store.latest_snapshot(run).await? else {
+        return Ok(Budget::default());
+    };
+    match v.get("budget") {
+        Some(b) => serde_json::from_value(b.clone())
+            .map_err(|e| StoreError::Corrupt(format!("бюджет в снимке run {run}: {e}")).into()),
+        None => Ok(Budget::default()),
+    }
+}
+
+/// Путь для человека и модели: без префикса `\\?\` канонического пути Windows
+/// (`\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` → `\\srv\share`).
+pub fn display_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        s.into_owned()
+    }
+}
+
+/// Канонический путь проекта без префикса `\\?\` (`display_path`): им пользуются
+/// `<env>`, подсказки и `RunSpec.project_dir`; `project_id` канонизирует путь сам.
+fn canonical_project(p: &Path) -> Result<PathBuf, RunError> {
+    std::fs::canonicalize(p)
+        .map(|c| PathBuf::from(display_path(&c)))
+        .map_err(|source| RunError::Io {
+            what: "каталог проекта",
+            path: p.to_path_buf(),
+            source,
+        })
 }
 
 /// Каталог журнала проекта в `ZA_HOME`.
@@ -179,11 +218,16 @@ fn journal_dir(home: &Path, project: &Path) -> Result<PathBuf, RunError> {
 /// `ProjectStore::open` создал бы пустой журнал. Открытие — с повтором на `Locked`
 /// (Windows снимает блокировку убитого процесса не сразу).
 fn open_existing(home: &Path, project: &Path) -> Result<ProjectStore, RunError> {
+    Ok(open_retrying(&existing_journal(home, project)?)?)
+}
+
+/// Каталог журнала проекта, если `journal.db` в нём есть; иначе [`RunError::NoJournal`].
+fn existing_journal(home: &Path, project: &Path) -> Result<PathBuf, RunError> {
     let dir = journal_dir(home, project)?;
     if !dir.join(JOURNAL_FILE).is_file() {
         return Err(RunError::NoJournal(dir));
     }
-    Ok(open_retrying(&dir)?)
+    Ok(dir)
 }
 
 /// Оболочка для `<env>`: `powershell` на Windows, иначе имя из `$SHELL` без пути или `sh`.
@@ -215,7 +259,7 @@ fn env_info(project: &Path) -> EnvInfo {
     EnvInfo {
         os: std::env::consts::OS.into(),
         shell: shell_name(),
-        project_dir: project.display().to_string(),
+        project_dir: display_path(project),
         date: today_utc(),
         tier: Tier::Small,
         n_ctx: 0,
@@ -246,33 +290,39 @@ fn read_agents_md(project: &Path) -> Result<Option<String>, RunError> {
 
 /// Строка аргумента для подсказок: путь в кавычках.
 fn quoted(p: &Path) -> String {
-    format!("\"{}\"", p.display())
+    format!("\"{}\"", display_path(p))
 }
 
 /// `zero-agent run`.
 pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
-    let project = std::fs::canonicalize(&args.project).map_err(|source| RunError::Io {
-        what: "каталог проекта",
-        path: args.project.clone(),
-        source,
-    })?;
-    // Resume: журнал проверяется раньше конфигурации и моделей, неизвестный run не
-    // создаёт журнал проекта (R0 progress:114).
+    let project = canonical_project(&args.project)?;
+    // Первая строка stderr — `run <id>` (D28), раньше любых предупреждений и логов
+    // (открытие журнала уже пишет `info`). Resume: наличие журнала проверяется до его
+    // открытия, конфигурации и моделей; нет журнала — код 1 без `run` и без создания
+    // каталога (R0 progress:114).
+    let run = match &args.action {
+        RunAction::Resume(r) => {
+            existing_journal(home, &project)?;
+            r.run
+        }
+        RunAction::New(_) => RunId::new(),
+    };
+    announce(run);
     let resume_store = match &args.action {
-        RunAction::Resume(_) => Some(open_existing(home, &project)?),
+        RunAction::Resume(r) => {
+            let store = open_existing(home, &project)?;
+            if store.get_run(r.run).await?.is_none() {
+                return Err(StoreError::UnknownRun(r.run).into());
+            }
+            Some(store)
+        }
         RunAction::New(_) => None,
     };
-    if let (Some(store), RunAction::Resume(r)) = (&resume_store, &args.action)
-        && store.get_run(r.run).await?.is_none()
-    {
-        return Err(StoreError::UnknownRun(r.run).into());
-    }
 
     let cfg = load_config(home).map_err(CommandError::from)?;
     if cfg.models.as_ref().is_none_or(|m| m.endpoints.is_empty()) {
         return Err(CommandError::NoModels.into());
     }
-    let budget = run_budget(&cfg, args.max_steps, args.max_tokens);
     let started = start_gateway(home, &cfg, true).await?;
     let gateway = Arc::new(started.gateway);
     let select = |model: Option<String>| -> Result<EndpointId, SelectError> {
@@ -307,6 +357,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             }
             let dir = journal_dir(home, &project)?;
             let store = ProjectStore::open(&dir)?;
+            // Бюджет нового run: `[budgets.run]`, поверх него флаги.
+            let budget = run_budget(&cfg.budgets.run, args.max_steps, args.max_tokens);
             let project_id = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -332,8 +384,6 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 agents_md,
                 env: env_info(&project),
             };
-            let run = RunId::new();
-            announce(run);
             let (deps, bus) = deps(&store, &gateway, tools);
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
@@ -351,16 +401,22 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             // Зонды до продолжения: размер контекста и состояние эндпоинта. Неготовый
             // эндпоинт run не останавливает — ошибка модели посреди run ставит паузу (D11).
             gateway.wait_probed(PROBE_WAIT).await;
-            announce(r.run);
+            // Бюджет resume: без флагов — бюджет run сохраняется; с флагами — флаги поверх
+            // текущего бюджета run из последнего снимка. `[budgets.run]` применён при старте
+            // и не перечитывается (решение контроллера, I2 ревью задачи 16).
+            let budget = if args.max_steps.is_some() || args.max_tokens.is_some() {
+                let current = current_budget(&store, r.run).await?;
+                Some(run_budget(&current, args.max_steps, args.max_tokens))
+            } else {
+                None
+            };
             let (deps, bus) = deps(&store, &gateway, tools);
             // Новый канал управления на каждый resume: `start_run` и `resume_run` забирают
             // `ControlRx`, а Ctrl+C управляет этим `RunControl` (Carry M2 задачи 12).
             let (ctl, rx) = control_channel(store.clone(), r.run);
             let change = ResumeChange {
                 endpoint,
-                // Бюджет перечитывается из `[budgets.run]` и флагов: иначе run в
-                // `blocked_on_budget` из CLI не продолжить (D19).
-                budget: Some(budget),
+                budget,
                 input: r.input,
                 run_mode: None,
             };
@@ -572,6 +628,31 @@ fn answer_flags(kind: &str) -> &'static str {
     }
 }
 
+/// Имя статуса, как в журнале (`snake_case`).
+fn status_name(s: RunStatus) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{s:?}"))
+}
+
+/// Причина `failed`: `reason` последнего `run.status` в `failed`; run не в `failed` — `None`.
+async fn failed_reason(store: &ProjectStore, run: RunId) -> Result<Option<String>, RunError> {
+    match store.get_run(run).await? {
+        Some(r) if r.status == RunStatus::Failed => {}
+        _ => return Ok(None),
+    }
+    let events = store.read_run(run, Seq(0), usize::MAX).await?;
+    let reason = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::RunStatus && e.payload.get("to") == Some(&json!("failed")))
+        .and_then(|e| e.payload.get("reason").and_then(Value::as_str))
+        .unwrap_or("-")
+        .to_owned();
+    Ok(Some(reason))
+}
+
 /// Итог run: сообщения в stderr и код выхода (D28).
 async fn report(
     store: &ProjectStore,
@@ -585,7 +666,19 @@ async fn report(
             quoted(project)
         );
     };
-    let code = match outcome? {
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            // Цикл записал `failed` с кодом причины (`fail_reason`): он и показывается.
+            if let Some(reason) = failed_reason(store, run).await? {
+                eprintln!("zero-agent: run завершился ошибкой: {reason}");
+                eprintln!("zero-agent: подробность: {e}");
+                return Ok(ExitCode::from(EXIT_ERROR));
+            }
+            return Err(e.into());
+        }
+    };
+    let code = match outcome {
         LoopOutcome::Finished { status, .. } => match status {
             RunStatus::Done | RunStatus::Partial => EXIT_DONE,
             RunStatus::Blocked => {
@@ -593,7 +686,7 @@ async fn report(
                 EXIT_BLOCKED
             }
             other => {
-                eprintln!("zero-agent: run завершён в статусе {other:?}");
+                eprintln!("zero-agent: run завершён в статусе {}", status_name(other));
                 EXIT_ERROR
             }
         },
@@ -664,11 +757,7 @@ pub async fn cmd_answer(
     interrupt: &str,
     answer: Answer,
 ) -> Result<ExitCode, RunError> {
-    let project = std::fs::canonicalize(project).map_err(|source| RunError::Io {
-        what: "каталог проекта",
-        path: project.to_path_buf(),
-        source,
-    })?;
+    let project = canonical_project(project)?;
     let store = open_existing(home, &project)?;
     let Some(row) = store.interrupt(interrupt).await? else {
         return Err(RunError::UnknownInterrupt(interrupt.to_owned()));
@@ -737,16 +826,32 @@ mod tests {
     }
 
     #[test]
-    fn budget_flags_override_config() {
-        let mut cfg = AgentConfig::default();
-        cfg.budgets.run.steps = Some(10);
-        cfg.budgets.run.usd = Some(1.5);
-        let b = run_budget(&cfg, Some(3), None);
+    fn budget_flags_override_base() {
+        let base = Budget {
+            steps: Some(10),
+            usd: Some(1.5),
+            ..Budget::default()
+        };
+        let b = run_budget(&base, Some(3), None);
         assert_eq!(b.steps, Some(3));
         assert_eq!(b.usd, Some(1.5));
         assert_eq!(b.tokens, None);
-        let b = run_budget(&cfg, None, Some(500));
+        let b = run_budget(&base, None, Some(500));
         assert_eq!((b.steps, b.tokens), (Some(10), Some(500)));
+    }
+
+    #[test]
+    fn display_path_strips_verbatim_prefix() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\H:\Проект\a b")),
+            r"H:\Проект\a b"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\srv\share\x")),
+            r"\\srv\share\x"
+        );
+        assert_eq!(display_path(Path::new(r"\\srv\share")), r"\\srv\share");
+        assert_eq!(display_path(Path::new("/home/u/p")), "/home/u/p");
     }
 
     #[test]
