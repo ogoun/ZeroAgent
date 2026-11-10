@@ -35,6 +35,6 @@ fn open_gives_up_after_bounded_retries() {
     let start = Instant::now();
     assert!(matches!(open_retrying(&d), Err(StoreError::Locked)));
     let spent = start.elapsed();
-    assert!(spent >= Duration::from_millis(900), "{spent:?}");
-    assert!(spent < Duration::from_secs(5), "{spent:?}");
+    assert!(spent >= Duration::from_millis(2900), "{spent:?}");
+    assert!(spent < Duration::from_secs(20), "{spent:?}");
 }

@@ -11,7 +11,9 @@ use std::time::Duration;
 use za_store::{ProjectStore, StoreError};
 
 /// Сколько раз повторить открытие после `Locked`.
-pub const OPEN_RETRIES: u32 = 10;
+/// Окно около 3 с: на Windows закрытие журнала (потоки, контрольная точка WAL)
+/// и снятие блокировки убитого процесса под нагрузкой занимают больше секунды.
+pub const OPEN_RETRIES: u32 = 30;
 /// Пауза между попытками открытия.
 pub const OPEN_RETRY_DELAY: Duration = Duration::from_millis(100);
 
