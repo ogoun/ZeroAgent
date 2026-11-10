@@ -12,7 +12,9 @@
 //! бюджеты run ([`check_budget`], [`Spent`], D19),
 //! драйвер цикла ([`start_run`]: граница шага, ходы, завершение и пауза, снимки
 //! [`Snapshot`], D4, D5, D18, D31–D33) и управление run ([`RunControl`]: пауза,
-//! отмена, ввод [`InputMode`] и поправка, D25, D26, D36). Модель
+//! отмена, ввод [`InputMode`] и поправка, D25, D26, D36), продолжение run
+//! ([`resume_run`]: реплей после сбоя, выход из паузы и бюджета, блок [`state_block`],
+//! D4–D6, CORE-006, CORE-110). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod budget;
@@ -23,6 +25,7 @@ mod exit;
 mod memory;
 mod prompt;
 mod request;
+mod resume;
 mod state;
 mod tools;
 mod turn;
@@ -44,7 +47,8 @@ pub use request::{
     BlockHashes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request,
     first_message, freeze, request_hash,
 };
-pub use state::{Counters, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};
+pub use resume::{ResumeChange, resume_run, state_block};
+pub use state::{AtBoundary, Counters, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};
 pub use tools::{
     ASK_USER_TOOL, FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, builtin_tools, run_tools,
 };

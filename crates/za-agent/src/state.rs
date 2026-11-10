@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use za_core::RunCtx;
 use za_llm::ToolSchema;
-use za_protocol::{BlobHash, Budget, BudgetKind, EffectClass, RunId, RunStatus, Seq};
+use za_protocol::{BlobHash, Budget, BudgetKind, EffectClass, RunId, RunMode, RunStatus, Seq};
 
 use crate::conversation::Conversation;
 use crate::exit::LoopExit;
@@ -83,6 +83,18 @@ impl Counters {
     }
 }
 
+/// Отложенное resume до ближайшей границы шага (задача 15). Не входит в снимок: после
+/// сбоя до этой границы resume с прежнего снимка получает изменения заново.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AtBoundary {
+    /// Бюджет resume со снимка `Model`: до конца шага не применяется (D6).
+    pub budget: Option<Budget>,
+    /// Режим resume со снимка `Model`: до конца шага не применяется (D6).
+    pub run_mode: Option<RunMode>,
+    /// После ввода — управляющее сообщение `resume` с блоком `<state>` (эффект `state`).
+    pub resume_note: bool,
+}
+
 /// Состояние цикла в памяти; узлы графа работают над ним (S в Graph<S, LoopError>).
 pub struct LoopState {
     pub run: RunId,
@@ -117,6 +129,8 @@ pub struct LoopState {
     /// `Pausing` или `Cancelling`, уже записанный драйвером в момент наблюдения флага
     /// (D26); `None` — run в `running`. Не входит в снимок: resume читает статус run.
     pub stopping: Option<RunStatus>,
+    /// Изменения resume, ждущие ближайшей границы шага.
+    pub at_boundary: AtBoundary,
 }
 
 impl LoopState {

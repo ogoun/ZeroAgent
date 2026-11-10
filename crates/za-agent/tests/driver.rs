@@ -546,6 +546,7 @@ async fn final_snapshot_follows_final_status() {
     assert_eq!(
         *points.lock().unwrap(),
         [
+            CrashPoint::AfterBoundary { step: 1 },
             CrashPoint::AfterModelEffect { step: 1 },
             CrashPoint::AfterFinalStatus { step: 1 },
         ]

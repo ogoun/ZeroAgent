@@ -49,11 +49,13 @@ use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
 use crate::prompt::{
     ControlAction, ControlFrom, EnvInfo, WorkMode, escape_untrusted, reasoning_for, render_control,
+    render_control_trusted,
 };
 use crate::request::{
     FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message, freeze,
 };
-use crate::state::{Counters, LoopState, Next, PendingExit};
+use crate::resume::state_block;
+use crate::state::{AtBoundary, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools};
 use crate::turn::{
     CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, RequestRefs, Reviewed, Signal, TurnError,
@@ -65,6 +67,8 @@ use crate::turn::{
 pub enum CrashPoint {
     /// эффект model шага вернулся (квитанция записана), до turn.finished и снимка
     AfterModelEffect { step: u64 },
+    /// эффект boundary шага записан, снимок Model ещё нет (задача 15)
+    AfterBoundary { step: u64 },
     /// снимок чистой паузы записан, статус ещё нет
     AfterExitSnapshot { step: u64 },
     /// конечный статус (done, partial, blocked, cancelled) записан, конечного снимка ещё нет
@@ -185,18 +189,20 @@ fn effect_err(e: EffectError) -> LoopError {
 
 // ---- Имена и тексты ----
 
-const BOUNDARY: NodeId = "boundary";
-const MODEL: NodeId = "model";
+pub(crate) const BOUNDARY: NodeId = "boundary";
+pub(crate) const MODEL: NodeId = "model";
 const TOOLS: NodeId = "tools";
 
 /// Имя эффекта границы шага (D9).
 const BOUNDARY_EFFECT: &str = "boundary";
+/// Имя эффекта блока `<state>` сообщения `resume` (задача 15).
+const STATE_EFFECT: &str = "state";
 /// Имя эффекта снимка памяти шага 0 (D24).
 const MEMORY_EFFECT: &str = "memory.snapshot";
 /// Префикс квитанции-отказа эффекта, у которого внутри не прочитался журнал.
 const STORE_ERROR: &str = "store_error:";
 /// `n_ctx`, если эндпоинт не сообщает размер контекста (D37).
-const DEFAULT_N_CTX: u32 = 8192;
+pub(crate) const DEFAULT_N_CTX: u32 = 8192;
 /// Пустых ходов подряд до `blocked` (D18).
 const EMPTY_TURNS_LIMIT: u32 = 3;
 /// Страница чтения ввода на границе.
@@ -358,13 +364,14 @@ async fn step_zero(
         finish: None,
         exit: None,
         stopping: None,
+        at_boundary: AtBoundary::default(),
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
 }
 
 /// Реестр run: `deps.tools` и инструменты capability. Повтор имени — ошибка префикса.
-fn run_registry(deps: &LoopDeps) -> Result<Arc<ToolRegistry>, LoopError> {
+pub(crate) fn run_registry(deps: &LoopDeps) -> Result<Arc<ToolRegistry>, LoopError> {
     if deps.capabilities.iter().all(|c| c.tools.is_empty()) {
         return Ok(Arc::clone(&deps.tools));
     }
@@ -379,7 +386,7 @@ fn run_registry(deps: &LoopDeps) -> Result<Arc<ToolRegistry>, LoopError> {
 }
 
 /// Описания и классы инструментов роли и тира (CTX-003: от режима не зависят).
-fn run_tools_of(
+pub(crate) fn run_tools_of(
     reg: &ToolRegistry,
     role: RunRole,
     tier: Tier,
@@ -541,6 +548,11 @@ async fn apply_exit(
             }
         }
         LoopExit::Paused(reason) => {
+            if st.stopping == Some(RunStatus::Pausing) {
+                // `pausing` записан, а run встаёт в `paused` по другой причине: пауза
+                // по команде поглощена этим выходом, флаг снимается (ревью задачи 14, M2).
+                st.sig.clear_pause();
+            }
             st.generation = j
                 .set_status(run, RunStatus::Paused, st.generation, Some(reason))
                 .await?;
@@ -601,7 +613,7 @@ async fn apply_exit(
 
 /// Ошибка цикла после старта (решение R0): попытка `failed` с причиной и `finish_run`;
 /// не вышло — `error!`, статус остаётся для resume. `Halted` ничего не пишет (D33).
-async fn fail(deps: &LoopDeps, run: RunId, generation: u64, e: LoopError) -> LoopError {
+pub(crate) async fn fail(deps: &LoopDeps, run: RunId, generation: u64, e: LoopError) -> LoopError {
     let Some(reason) = e.code() else {
         return e;
     };
@@ -700,6 +712,13 @@ async fn read_boundary(
 /// Узел `boundary` (D32).
 async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopError> {
     let deps = &sh.deps;
+    // Изменения resume со снимка `Model` вступают с первой границы после шага (D6).
+    if let Some(b) = st.at_boundary.budget.take() {
+        st.budget = b;
+    }
+    if let Some(m) = st.at_boundary.run_mode.take() {
+        st.setup.run_mode = m;
+    }
     // (1) Сигналы до шага (D9): Input отброшен — ввод прочитает сама граница.
     // `pausing`/`cancelling`, записанные во время пакета, доводятся до конца, даже
     // если сам пакет флаг не прочитал (кончился раньше).
@@ -750,6 +769,9 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
         st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
         LoopError::Store(e)
     })?;
+    if crashed(deps, CrashPoint::AfterBoundary { step }) {
+        return Err(LoopError::Halted);
+    }
     // (4) Активное время (D19).
     st.counters.tick(b.now_ms);
     // (5) Проверка бюджета до приёма ввода (D32): ввод остаётся непрочитанным,
@@ -790,6 +812,18 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
         }
     }
     st.inbox_after = b.inbox_after;
+    // (6') Первая граница resume со снимка `Boundary`: после ввода — `resume` с блоком
+    // `<state>` (A.6). Блок — эффект: реплей границы получает тот же текст.
+    if st.at_boundary.resume_note {
+        let text = state_effect(deps, st).await?;
+        st.conv.push_user(render_control_trusted(
+            ControlFrom::Runtime,
+            ControlAction::Resume,
+            "",
+            &text,
+        ))?;
+        st.at_boundary.resume_note = false;
+    }
     // (7) Напоминания хуков: чистые функции позиции, реплей зовёт их снова.
     let info = za_core::BoundaryInfo {
         run: st.run,
@@ -822,6 +856,47 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     .await?;
     save_snapshot(&store_of(deps), st, Next::Model, None).await?;
     Ok(Transition::Goto(MODEL))
+}
+
+/// Эффект `state` (ReadOnly): текст блока `<state>` для сообщения `resume`.
+async fn state_effect(deps: &LoopDeps, st: &mut LoopState) -> Result<String, LoopError> {
+    let store = store_of(deps);
+    let run = st.run;
+    let mut failure: Option<StoreError> = None;
+    let fref = &mut failure;
+    let r = st
+        .ctx
+        .effect(
+            EffectSpec {
+                class: EffectClass::ReadOnly,
+                name: STATE_EFFECT.into(),
+                args: json!({}),
+            },
+            move || async move {
+                match state_block(&store, run).await {
+                    Ok(text) => Ok(json!({ "text": text })),
+                    Err(e) => {
+                        let msg = format!("{STORE_ERROR} {e}");
+                        *fref = Some(e);
+                        Err(msg)
+                    }
+                }
+            },
+        )
+        .await;
+    if let Some(e) = failure {
+        st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
+        return Err(LoopError::Store(e));
+    }
+    let v = r.map_err(effect_err)?;
+    v.get("text")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            let e = StoreError::Corrupt("квитанция state без text".into());
+            st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
+            LoopError::Store(e)
+        })
 }
 
 // ---- Узел model ----

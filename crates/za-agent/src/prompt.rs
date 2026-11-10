@@ -303,7 +303,19 @@ pub fn render_control(
     command: &str,
     note: &str,
 ) -> String {
-    let note = escape_untrusted(note);
+    render_control_trusted(from, action, command, &escape_untrusted(note))
+}
+
+/// Как [`render_control`], но `note` не экранируется: вызывающий сам экранировал в нём
+/// недоверенные части. Нужен блоку `<state>` сообщения `resume` (задача 15, A.6:
+/// «resume means continue from <state>»): тег `<state>` — разметка рантайма, а имена и
+/// аргументы вызовов внутри блока экранированы [`escape_untrusted`].
+pub(crate) fn render_control_trusted(
+    from: ControlFrom,
+    action: ControlAction,
+    command: &str,
+    note: &str,
+) -> String {
     let command = attr_id(command);
     fill(
         CONTROL,
@@ -311,7 +323,7 @@ pub fn render_control(
             ("runtime|parent|user", from.as_str()),
             ("correct|resume", action.as_str()),
             ("command_id", &command),
-            ("note", &note),
+            ("note", note),
         ],
     )
 }
