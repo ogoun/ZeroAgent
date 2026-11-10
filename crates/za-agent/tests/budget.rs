@@ -88,6 +88,30 @@ impl Tool for Echo {
     }
 }
 
+/// Инструмент `nap`: спит [`NAP`]. Задаёт нижнюю границу активного времени шага —
+/// не порог: тест только требует, чтобы прошло не меньше.
+struct Nap {
+    spec: ToolSpec,
+}
+
+const NAP: Duration = Duration::from_millis(20);
+
+impl Tool for Nap {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        Box::pin(async move {
+            tokio::time::sleep(NAP).await;
+            ToolOutput {
+                content: "slept".into(),
+                is_error: false,
+            }
+        })
+    }
+}
+
 /// Инструмент `inject`: во время хода пишет `turn.input {text: "ещё", mode: "queue"}`
 /// прямо через `store.append` (без сигнала `Input`: `submit_input` — задача 14).
 struct Inject {
@@ -142,6 +166,10 @@ fn fx(name: &str) -> Fx {
     reg.register(Arc::new(Inject {
         spec: tool_spec("inject"),
         store: store.clone(),
+    }))
+    .unwrap();
+    reg.register(Arc::new(Nap {
+        spec: tool_spec("nap"),
     }))
     .unwrap();
     let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
@@ -525,4 +553,88 @@ fn check_gpu_and_usd() {
         Some((BudgetKind::Usd, 0.75, 0.5))
     );
     assert_eq!(check_budget(&Budget::default(), &at(u64::MAX, 1e9)), None);
+}
+
+// ---- Бюджеты через драйвер: gpu_ms, usd, duration_ms (ревью задачи 13, M6) ----
+
+/// Один ход с вызовом `tool` и расходом `usage`, затем ещё ходы про запас: регрессия
+/// упадёт на утверждении, а не повиснет.
+async fn blocked_after_one_turn(
+    name: &str,
+    tool: &str,
+    usage: Usage,
+    budget: Budget,
+) -> (Fx, Event) {
+    let f = fx(name);
+    f.model.push(call_turn("c0", tool, usage));
+    for i in 1..4 {
+        f.model
+            .push(call_turn(&format!("c{i}"), "echo", Usage::default()));
+    }
+    let out = start(&f, spec(budget)).await.unwrap();
+    assert!(
+        matches!(out, LoopOutcome::BlockedOnBudget { .. }),
+        "{out:?}"
+    );
+    assert_eq!(f.model.calls().len(), 1, "второй ход не должен начаться");
+    assert_eq!(status(&f.store, f.run).await, RunStatus::BlockedOnBudget);
+    let evs = events(&f.store, f.run).await;
+    let ex = of_kind(&evs, EventKind::BudgetExceeded);
+    assert_eq!(ex.len(), 1, "budget.exceeded: {ex:?}");
+    let ev = ex[0].clone();
+    (f, ev)
+}
+
+#[tokio::test]
+async fn loop_blocks_on_gpu_ms() {
+    let usage = Usage {
+        gpu_ms: Some(150),
+        ..Usage::default()
+    };
+    let budget = Budget {
+        gpu_ms: Some(100),
+        ..Budget::default()
+    };
+    let (_, ev) = blocked_after_one_turn("loop_gpu", "echo", usage, budget).await;
+    assert_eq!(
+        ev.payload,
+        json!({"kind": "gpu_ms", "used": 150, "limit": 100})
+    );
+}
+
+#[tokio::test]
+async fn loop_blocks_on_usd() {
+    let usage = Usage {
+        cost_usd: Some(0.75),
+        ..Usage::default()
+    };
+    let budget = Budget {
+        usd: Some(0.5),
+        ..Budget::default()
+    };
+    let (_, ev) = blocked_after_one_turn("loop_usd", "echo", usage, budget).await;
+    assert_eq!(
+        ev.payload,
+        json!({"kind": "usd", "used": 0.75, "limit": 0.5})
+    );
+}
+
+/// Активное время: первая граница ничего не считает (`last_boundary_ms` нет), вторая
+/// прибавляет время шага, а шаг держит инструмент `nap` не меньше [`NAP`]. Порога
+/// настенного времени нет: предел 0, нужно лишь `used > 0`.
+#[tokio::test]
+async fn loop_blocks_on_duration() {
+    let budget = Budget {
+        duration_ms: Some(0),
+        ..Budget::default()
+    };
+    let (f, ev) = blocked_after_one_turn("loop_duration", "nap", Usage::default(), budget).await;
+    assert_eq!(ev.payload["kind"], "duration");
+    assert_eq!(ev.payload["limit"], 0);
+    let used = ev.payload["used"].as_u64().expect("used — целое");
+    assert!(used >= 1, "used = {used}");
+    let snaps = snapshots(&f.store, f.run).await;
+    let (_, snap) = snaps.last().expect("нет снимков");
+    assert_eq!(snap.counters.active_ms, used);
+    assert!(snap.counters.last_boundary_ms.is_some());
 }

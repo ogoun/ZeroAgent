@@ -62,6 +62,12 @@ pub enum AppConfigError {
     Models(ConfigError),
     #[error("{file}: {0}", file = CONFIG_FILE)]
     Resources(ResourcesConfigError),
+    /// Недопустимое значение предела `[budgets.run]`.
+    #[error("{file}: budgets.run.{field}: {reason}", file = CONFIG_FILE)]
+    Budget {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 /// Читает `home/config.toml`; `LLAMA_URL` — из окружения.
@@ -102,16 +108,37 @@ pub fn parse_config(src: &str) -> Result<AgentConfig, AppConfigError> {
     })
 }
 
-/// Проверка значений: `[models]` (ссылки, D24, D25) и `[resources]`.
+/// Проверка значений: `[models]` (ссылки, D24, D25), `[resources]` и `[budgets.run]`.
 pub fn validate(cfg: &AgentConfig) -> Result<(), AppConfigError> {
     cfg.resources
         .validate()
         .map_err(AppConfigError::Resources)?;
+    validate_budget(&cfg.budgets.run)?;
     if let Some(m) = &cfg.models {
         // Предупреждения (D34) печатает `Gateway::start` и показывают `models`, `doctor`.
         m.validate().map_err(AppConfigError::Models)?;
     }
     Ok(())
+}
+
+/// Пределы `[budgets.run]`: дробный `usd` — конечный и не отрицательный (NaN молча
+/// снял бы предел: `x > NaN` всегда ложно). Нулевой предел допустим — «запрещено
+/// сразу». Целые поля отрицательными быть не могут: их отвергает разбор.
+fn validate_budget(b: &Budget) -> Result<(), AppConfigError> {
+    let Some(usd) = b.usd else {
+        return Ok(());
+    };
+    let reason = if !usd.is_finite() {
+        "должно быть конечным числом"
+    } else if usd < 0.0 {
+        "не может быть отрицательным"
+    } else {
+        return Ok(());
+    };
+    Err(AppConfigError::Budget {
+        field: "usd",
+        reason,
+    })
 }
 
 /// Один локальный эндпоинт llama.cpp по `LLAMA_URL`.
@@ -178,6 +205,58 @@ mod tests {
 
     #[test]
     fn unknown_top_level_section_is_error() {
+        // Опечатка раздела молча сняла бы все пределы: `deny_unknown_fields` у `AgentConfig`.
+        const SRC: &str = "[budget.run]\nsteps = 2\n";
+        let e = parse_config(SRC).unwrap_err();
+        assert!(matches!(e, AppConfigError::Parse(_)), "{e}");
+        let shown = format!("{e} {e:?}");
+        assert!(!shown.contains("steps = 2"), "{shown}");
+        assert!(matches!(
+            parse_config("[nosuch]\nx = 1\n"),
+            Err(AppConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn budget_values_are_validated() {
+        for (src, ok) in [
+            ("[budgets.run]\nusd = nan\n", false),
+            ("[budgets.run]\nusd = inf\n", false),
+            ("[budgets.run]\nusd = -0.5\n", false),
+            ("[budgets.run]\nusd = 0.0\nsteps = 0\ntokens = 0\n", true),
+            ("[budgets.run]\nusd = 1.5\n", true),
+        ] {
+            let r = parse_config(src).and_then(|c| validate(&c));
+            assert_eq!(r.is_ok(), ok, "{src}: {r:?}");
+            if let Err(e) = r {
+                assert!(
+                    matches!(e, AppConfigError::Budget { field: "usd", .. }),
+                    "{e}"
+                );
+                assert!(e.to_string().contains("budgets.run.usd"), "{e}");
+            }
+        }
+        // Отрицательный целый предел отвергает разбор.
+        assert!(matches!(
+            parse_config("[budgets.run]\nsteps = -1\n"),
+            Err(AppConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn budget_field_named_in_parse_error() {
+        // Имя поля бюджета — в белом списке: ошибка разбора называет его (здесь предел
+        // стоит в `[budgets]`, а не в `[budgets.run]`).
+        let e = parse_config("[budgets]\nsteps = 2\n").unwrap_err();
+        let AppConfigError::Parse(p) = &e else {
+            panic!("{e}");
+        };
+        assert_eq!(p.field, Some("steps"), "{e}");
+    }
+
+    #[test]
+    fn unknown_budgets_field_is_error() {
+        // `[budgets]` известен с задачи 13: незнакомый ключ в нём — тоже ошибка разбора.
         assert!(matches!(
             parse_config("[budgets]\nx = 1\n"),
             Err(AppConfigError::Parse(_))

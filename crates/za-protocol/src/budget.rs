@@ -17,7 +17,7 @@ pub struct Budget {
     pub usd: Option<f64>,
     /// Число шагов run.
     pub steps: Option<u32>,
-    /// Длительность run по настенным часам, мс.
+    /// Длительность run, мс: активное время run (D19), без времени в паузе и между процессами.
     pub duration_ms: Option<u64>,
 }
 
