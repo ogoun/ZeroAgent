@@ -71,6 +71,18 @@ pub struct Counters {
     pub last_boundary_ms: Option<u64>,
 }
 
+impl Counters {
+    /// D19: active_ms += now_ms − last_boundary_ms (если есть); last_boundary_ms = Some(now_ms).
+    ///
+    /// Часы назад (now_ms меньше прошлой границы) дают прибавку 0.
+    pub fn tick(&mut self, now_ms: u64) {
+        if let Some(last) = self.last_boundary_ms {
+            self.active_ms = self.active_ms.saturating_add(now_ms.saturating_sub(last));
+        }
+        self.last_boundary_ms = Some(now_ms);
+    }
+}
+
 /// Состояние цикла в памяти; узлы графа работают над ним (S в Graph<S, LoopError>).
 pub struct LoopState {
     pub run: RunId,

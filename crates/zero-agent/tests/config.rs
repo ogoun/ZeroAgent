@@ -79,3 +79,42 @@ fn readme_models_example_is_valid() {
             .any(|e| e.daily_budget_usd.is_some())
     );
 }
+
+#[test]
+fn budgets_section_parsed() {
+    let cfg =
+        zero_agent::config::parse_config("[budgets.run]\ntokens = 1000\nsteps = 20\n").unwrap();
+    assert_eq!(
+        cfg.budgets.run,
+        za_protocol::Budget {
+            tokens: Some(1000),
+            steps: Some(20),
+            ..Default::default()
+        }
+    );
+    // Опечатка в имени предела — ошибка разбора, а не молча снятый предел; текст
+    // ошибки без строки исходника (SEC-044).
+    const SRC: &str = "[budgets.run]\nfoo = 1\n";
+    let e = zero_agent::config::parse_config(SRC).unwrap_err();
+    assert!(
+        matches!(e, zero_agent::config::AppConfigError::Parse(_)),
+        "{e}"
+    );
+    let shown = format!("{e} {e:?}");
+    assert!(!shown.contains("foo = 1"), "{shown}");
+    assert!(!shown.contains("foo"), "{shown}");
+}
+
+#[test]
+fn readme_budgets_example_is_valid() {
+    // Пример раздела `[budgets.run]` в README проходит разбор.
+    let readme = include_str!("../../../README.md");
+    let start = readme
+        .find("```toml\n[budgets.run]")
+        .expect("пример [budgets.run] в README");
+    let body = &readme[start + "```toml\n".len()..];
+    let end = body.find("```").expect("конец примера");
+    let cfg = zero_agent::config::parse_config(&body[..end]).unwrap();
+    zero_agent::config::validate(&cfg).unwrap();
+    assert_ne!(cfg.budgets.run, za_protocol::Budget::default());
+}

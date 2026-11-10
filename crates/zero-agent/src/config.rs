@@ -1,4 +1,5 @@
-//! Конфигурация агента: `ZA_HOME/config.toml`, разделы `[models]` и `[resources]` (D23).
+//! Конфигурация агента: `ZA_HOME/config.toml`, разделы `[models]`, `[resources]` (D23)
+//! и `[budgets.run]` (бюджет run по умолчанию, R1-B1 D19).
 //!
 //! Текст ошибки разбора наружу — только [`ConfigParseError`] (белый список: место,
 //! категория, имя известного поля). `Display` ошибки `toml` печатает строку исходника,
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use za_llm::config::{ConfigError, ConfigParseError, EndpointConfig, ModelsConfig};
 use za_llm::{BackendKind, EndpointId};
+use za_protocol::Budget;
 use za_res::{ResourcesConfig, ResourcesConfigError};
 
 use crate::doctor::LLAMA_URL_ENV;
@@ -21,16 +23,29 @@ pub const CONFIG_FILE: &str = "config.toml";
 /// id эндпоинта, который создаётся из `LLAMA_URL` без раздела `[models]`.
 pub const LLAMA_URL_ENDPOINT: &str = "local";
 
-/// Конфигурация агента R1-A.
+/// Конфигурация агента (R1-A, R1-B1).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub models: Option<ModelsConfig>,
     #[serde(default)]
     pub resources: ResourcesConfig,
+    /// `[budgets.run]`: пределы run по умолчанию (R1-B1 D19).
+    #[serde(default)]
+    pub budgets: BudgetsConfig,
     /// `models` — запасной эндпоинт `local` из `LLAMA_URL`, а не раздел файла.
     #[serde(skip)]
     pub llama_url_fallback: bool,
+}
+
+/// Раздел `[budgets]`. Незнакомый ключ — ошибка разбора: `deny_unknown_fields`
+/// здесь и у `Budget` (атрибут внешней структуры на вложенную не действует).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetsConfig {
+    /// `[budgets.run]`: `tokens`, `gpu_ms`, `usd`, `steps`, `duration_ms`; всё необязательно.
+    #[serde(default)]
+    pub run: Budget,
 }
 
 /// Ошибка чтения конфигурации. Текст не содержит фрагментов исходника.

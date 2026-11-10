@@ -7,7 +7,7 @@
 //!
 //! Граница шага (D32), по порядку: сигналы ([`Signals::drain`]), `next_step`, эффект
 //! `boundary` (ввод, настенное время, расход — D9), активное время (D19), проверка
-//! бюджета (задача 13), ввод → история, напоминания хуков, `persist`,
+//! бюджета (D19, [`check_budget`]), ввод → история, напоминания хуков, `persist`,
 //! `turn.started`, снимок `Model` на его `seq`.
 //!
 //! Чистая пауза (D5): событие шага, снимок `{next: Boundary, exit: Some}` на `seq`
@@ -33,6 +33,7 @@ use za_protocol::{
 };
 use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
+use crate::budget::{Spent, budget_number, check_budget};
 use crate::control::ControlRx;
 use crate::conversation::{Conversation, HistoryError};
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
@@ -694,11 +695,13 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
         LoopError::Store(e)
     })?;
     // (4) Активное время (D19).
-    if let Some(last) = st.counters.last_boundary_ms {
-        st.counters.active_ms += b.now_ms.saturating_sub(last);
+    st.counters.tick(b.now_ms);
+    // (5) Проверка бюджета до приёма ввода (D32): ввод остаётся непрочитанным,
+    // `inbox_after` не сдвигается, следующая граница прочитает его ровно один раз.
+    let spent = Spent::from_totals(&b.usage, st.counters.steps, st.counters.active_ms);
+    if let Some((kind, used, limit)) = check_budget(&st.budget, &spent) {
+        return budget_exceeded(deps, st, kind, used, limit).await;
     }
-    st.counters.last_boundary_ms = Some(b.now_ms);
-    // (5) Проверка бюджета — задача 13 (до приёма ввода, D32).
     // (6) Ввод в историю.
     for i in &b.inputs {
         match i {
@@ -994,6 +997,31 @@ async fn command_pause(sh: &Shared, st: &mut LoopState) -> Result<Transition, Lo
     .await?;
     st.sig.clear_pause();
     clean_pause(&sh.deps, st, LoopExit::Paused(pause_reason::COMMAND)).await
+}
+
+/// Выход по бюджету (D19, D5): `budget.exceeded {kind, used, limit}`, снимок
+/// `{next: Boundary, exit: Some(BlockedOnBudget)}` на его seq, `blocked_on_budget`.
+async fn budget_exceeded(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    kind: BudgetKind,
+    used: f64,
+    limit: f64,
+) -> Result<Transition, LoopError> {
+    tracing::warn!(run = %st.run, ?kind, used, limit, "бюджет run исчерпан");
+    st.last_seq = append(
+        &deps.journal,
+        st.run,
+        Actor::Runtime,
+        EventKind::BudgetExceeded,
+        json!({
+            "kind": kind,
+            "used": budget_number(kind, used),
+            "limit": budget_number(kind, limit),
+        }),
+    )
+    .await?;
+    clean_pause(deps, st, LoopExit::BlockedOnBudget(kind)).await
 }
 
 /// Чистая пауза (D5): событие шага уже записано (`last_seq`); снимок

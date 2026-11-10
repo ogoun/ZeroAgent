@@ -9,10 +9,12 @@
 //! разбор ответа ([`review`], D27) и отображение ошибок в состояние run
 //! ([`exit_for_model_error`], [`exit_for_effect_error`], D11), пакет вызовов
 //! инструментов ([`run_tools`]: гейт режима, одобрение, `ask_user`, `finish`, D14–D17),
+//! бюджеты run ([`check_budget`], [`Spent`], D19),
 //! драйвер цикла ([`start_run`]: граница шага, ходы, завершение и пауза, снимки
 //! [`Snapshot`], D4, D5, D18, D31–D33) и управление run ([`RunControl`], D26). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
+mod budget;
 mod control;
 mod conversation;
 mod driver;
@@ -24,6 +26,7 @@ mod state;
 mod tools;
 mod turn;
 
+pub use budget::{Spent, check_budget};
 pub use control::{ControlRx, RunControl, control_channel};
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted};
 pub use driver::{CrashHook, CrashPoint, LoopDeps, LoopError, LoopOutcome, RunSpec, start_run};
