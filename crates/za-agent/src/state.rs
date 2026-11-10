@@ -69,6 +69,10 @@ pub struct Snapshot {
     /// Вводы пользователя по порядку (D47, D48).
     #[serde(default)]
     pub user_inputs: Vec<UserInput>,
+    /// Эпоха истории: растёт при каждом переписывании — удалении старых результатов
+    /// (D45) и компакции (D46).
+    #[serde(default)]
+    pub epoch: u32,
 }
 
 /// Счётчики цикла, переживающие resume.
@@ -153,6 +157,8 @@ pub struct LoopState {
     pub env_text: String,
     /// Вводы пользователя по порядку; дописываются на шаге (6) границы (D66).
     pub user_inputs: Vec<UserInput>,
+    /// Эпоха истории (D45, D46).
+    pub epoch: u32,
 }
 
 impl LoopState {
@@ -176,6 +182,7 @@ impl LoopState {
             task: self.task.clone(),
             env_text: self.env_text.clone(),
             user_inputs: self.user_inputs.clone(),
+            epoch: self.epoch,
         }
     }
 }

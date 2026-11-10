@@ -15,7 +15,8 @@
 //! отмена, ввод [`InputMode`] и поправка, D25, D26, D36), продолжение run
 //! ([`resume_run`]: реплей после сбоя, выход из паузы и бюджета, блок [`state_block`],
 //! D4–D6, CORE-006, CORE-110), контекст модели ([`ContextBudget`], [`output_plan`],
-//! [`ContextMeter`], раздел [`ContextConfig`], R1-B2 D40–D43, D65, D66). Модель
+//! [`ContextMeter`], раздел [`ContextConfig`], выгрузка вывода [`spill`] и удаление
+//! старых результатов [`prune`], R1-B2 D40–D45, D65, D66). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod budget;
@@ -35,7 +36,8 @@ mod turn;
 pub use budget::{Spent, check_budget};
 pub use context::{
     ANSWER_RESERVE, ContextBudget, ContextConfig, ContextConfigError, ContextMeter, Estimate,
-    OutputPlan, UserInput, output_plan, thinking_budget, truncation_suspected,
+    OutputPlan, SPILL_DIR, SpillCfg, SpillResult, UserInput, output_plan, prune, spill,
+    spill_limit_bytes, spill_name, thinking_budget, truncation_suspected,
 };
 pub use control::{ControlRx, InputMode, RunControl, control_channel, submit_input};
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted};

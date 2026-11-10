@@ -12,6 +12,17 @@
 //! последнего успешного хода, дельта — сообщения после базы, точно через
 //! `ModelPort::count_tokens` или оценкой байты / 4 вверх. Оценку на границе шага
 //! получает эффект `context` драйвера (D42), поэтому реплей принимает те же решения.
+//!
+//! [`spill`] выгружает большой вывод инструмента в файл (D44), [`prune`] удаляет старые
+//! результаты инструментов из истории (D45).
+
+mod prune;
+mod spill;
+
+pub use prune::prune;
+pub(crate) use prune::{PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES};
+pub(crate) use spill::{NOT_SAVED as SPILL_NOT_SAVED, cut as spill_cut};
+pub use spill::{SPILL_DIR, SpillCfg, SpillResult, spill, spill_limit_bytes, spill_name};
 
 use serde::{Deserialize, Serialize};
 use za_llm::{

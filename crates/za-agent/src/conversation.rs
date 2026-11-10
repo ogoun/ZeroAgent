@@ -217,6 +217,50 @@ impl Conversation {
         n
     }
 
+    /// Новая эпоха (R1-B2 D45): результаты, для которых `f` вернул `Some`, заменены;
+    /// прочее без изменений. `f` получает каждый результат по порядку: индекс хода
+    /// (номер ответа ассистента, которому отвечает результат, с 0), `call_id` и
+    /// `content`. Неизменённые сообщения сохраняют ссылки на блобы, изменённые
+    /// сохраняются заново при `persist`. Ошибка — нарушенный инвариант.
+    pub fn rewrite_results(
+        &self,
+        f: &mut dyn FnMut(usize, &str, &str) -> Option<String>,
+    ) -> Result<Conversation, HistoryError> {
+        let mut out = self.clone();
+        let mut turn: Option<usize> = None;
+        let mut turns = 0;
+        for (m, r) in out.msgs.iter_mut().zip(out.refs.iter_mut()) {
+            match m.role {
+                Role::Assistant => {
+                    turn = Some(turns);
+                    turns += 1;
+                }
+                Role::Tool => {
+                    let mut changed = false;
+                    for p in &mut m.parts {
+                        let Part::ToolResult {
+                            call_id, content, ..
+                        } = p
+                        else {
+                            return Err(HistoryError::NotToolResult);
+                        };
+                        let t = turn.ok_or_else(|| HistoryError::UnknownCallId(call_id.clone()))?;
+                        if let Some(new) = f(t, call_id, content) {
+                            *content = new;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        *r = None;
+                    }
+                }
+                Role::User | Role::System => {}
+            }
+        }
+        out.validate()?;
+        Ok(out)
+    }
+
     /// Проверка инвариантов всей истории: повтор операций добавления с начала.
     ///
     /// Ждущие вызовы в конце допустимы (история посреди пакета инструментов). Формы,

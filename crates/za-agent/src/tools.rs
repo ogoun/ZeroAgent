@@ -15,6 +15,9 @@
 //! данные, исход `ok`); в результат для модели текст идёт через
 //! [`escape_untrusted`] (D23, TOOL-005). События `tool.started` и `tool.finished`
 //! пишутся только вживую, внутри замыкания слота: реплей их не повторяет.
+//!
+//! Вывод длиннее лимита (R1-B2 D44, `ToolEnv::spill`) выгружается в файл тоже внутри
+//! замыкания: квитанция хранит голову, строку пропуска и хвост экранированного текста.
 
 use std::path::PathBuf;
 use std::pin::pin;
@@ -36,6 +39,7 @@ use za_protocol::{
 };
 use za_store::StoreError;
 
+use crate::context::{SPILL_NOT_SAVED, SpillCfg, spill, spill_cut, spill_limit_bytes, spill_name};
 use crate::prompt::escape_untrusted;
 use crate::turn::{CallVerdict, PlannedCall, Signal, Signals};
 
@@ -48,6 +52,8 @@ const FINISH_OK: &str = "ok";
 /// Текст квитанции-отказа при ошибке журнала внутри слота: при реплее он уходит
 /// модели, поэтому по-английски и без подробностей (они — в `tracing`).
 const JOURNAL_FAILED: &str = "internal error: journal write failed";
+/// Квитанция вызова, вывод которого потерян при остановке рантайма во время выгрузки.
+const OUTPUT_LOST: &str = "internal error: tool output lost";
 /// Результат вызовов пакета после принятого `finish`: они не исполняются.
 const AFTER_FINISH: &str = "not executed: run finished by finish";
 
@@ -90,6 +96,15 @@ pub struct ToolEnv {
     pub mode: RunMode,
     /// Чтения одновременно: `capabilities(endpoint).parallel_tools` (исключение D30).
     pub parallel: bool,
+    /// Выгрузка большого вывода (R1-B2 D44); `None` — без выгрузки, как в R1-B1.
+    pub spill: Option<SpillCfg>,
+}
+
+/// Выгрузка вывода одного вызова (D44): файл `<project>/.zero-agent/work/spill/{name}.txt`.
+struct SpillJob {
+    project_dir: PathBuf,
+    name: String,
+    limit: usize,
 }
 
 /// Что делает слот вызова вживую.
@@ -99,6 +114,7 @@ enum Action {
         args: Value,
         cx: ToolCx,
         timeout: Duration,
+        spill: Option<SpillJob>,
     },
     /// Ответ пользователя на `ask_user`.
     Answer(String),
@@ -350,6 +366,11 @@ fn tool_action(
     env: &ToolEnv,
     key: &za_protocol::EffectKey,
 ) -> Action {
+    let spill = env.spill.map(|c| SpillJob {
+        project_dir: env.project_dir.clone(),
+        name: spill_name(key),
+        limit: spill_limit_bytes(c.n_ctx, c.share, tool.spec().output_limit),
+    });
     Action::Tool {
         tool: Arc::clone(tool),
         args: call.arguments.clone(),
@@ -360,6 +381,7 @@ fn tool_action(
             effect_key: key.clone(),
         },
         timeout: tool.spec().timeout,
+        spill,
     }
 }
 
@@ -588,13 +610,20 @@ async fn call_action(action: Action) -> ToolOutput {
             args,
             cx,
             timeout,
-        } => match tokio::time::timeout(timeout, tool.call(args, cx)).await {
-            Ok(o) => o,
-            Err(_) => ToolOutput {
-                content: timeout_text(timeout),
-                is_error: true,
-            },
-        },
+            spill,
+        } => {
+            let out = match tokio::time::timeout(timeout, tool.call(args, cx)).await {
+                Ok(o) => o,
+                Err(_) => ToolOutput {
+                    content: timeout_text(timeout),
+                    is_error: true,
+                },
+            };
+            match spill {
+                Some(job) => spill_output(out, job).await,
+                None => out,
+            }
+        }
         Action::Answer(a) => ToolOutput {
             content: a,
             is_error: false,
@@ -603,6 +632,40 @@ async fn call_action(action: Action) -> ToolOutput {
             content: FINISH_OK.to_owned(),
             is_error: false,
         },
+    }
+}
+
+/// Выгрузка вывода (D44) внутри замыкания слота: квитанция хранит уже урезанный
+/// экранированный текст, поэтому реплей возвращает его без нового вызова и без записи
+/// файла. Вывод в лимите (после экранирования) остаётся как вернул инструмент. Не
+/// записался файл — `error!` и тот же разрез с пометкой `full output not saved`.
+/// Экранирование и запись (до десятков МиБ) — в `spawn_blocking`.
+async fn spill_output(out: ToolOutput, job: SpillJob) -> ToolOutput {
+    let ToolOutput { content, is_error } = out;
+    let work = tokio::task::spawn_blocking(move || {
+        let escaped = escape_untrusted(&content);
+        if escaped.len() <= job.limit {
+            return content;
+        }
+        match spill(&job.project_dir, &job.name, &escaped, &content, job.limit) {
+            Ok(r) => r.content,
+            Err(e) => {
+                tracing::error!(name = %job.name, error = %e, "вывод инструмента не выгружен в файл");
+                spill_cut(&escaped, job.limit, SPILL_NOT_SAVED).content
+            }
+        }
+    });
+    match work.await {
+        Ok(content) => ToolOutput { content, is_error },
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => {
+            // Рантайм останавливается: вывода нет, но квитанция должна быть.
+            tracing::error!(error = %e, "выгрузка вывода прервана");
+            ToolOutput {
+                content: OUTPUT_LOST.to_owned(),
+                is_error: true,
+            }
+        }
     }
 }
 

@@ -318,6 +318,7 @@ async fn restore(
         task,
         env_text,
         user_inputs,
+        epoch: snap.epoch,
     })
 }
 

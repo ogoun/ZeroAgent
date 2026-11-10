@@ -8,7 +8,8 @@
 //! Граница шага (D32), по порядку: сигналы ([`Signals::drain`]), `next_step`, эффект
 //! `boundary` (ввод, настенное время, расход — D9), активное время (D19), проверка
 //! бюджета (D19, [`check_budget`]), ввод → история (и `user_inputs`, R1-B2 D66),
-//! напоминания хуков, эффект `context` — оценка запроса хода (R1-B2 D42), `persist`,
+//! напоминания хуков, эффект `context` — оценка запроса хода (R1-B2 D42) и по порогу
+//! удаление старых результатов (новая эпоха, R1-B2 D45), `persist`,
 //! `turn.started`, снимок `Model` на его `seq`. Ход получает лимит вывода из
 //! [`crate::output_plan`] (R1-B2 D40); после хода — проверка тихой обрезки (R1-B2 D43).
 //!
@@ -46,7 +47,8 @@ use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
 use crate::budget::{Spent, budget_number, check_budget};
 use crate::context::{
-    ContextBudget, ContextConfig, Estimate, UserInput, output_plan, truncation_suspected,
+    ContextBudget, ContextConfig, Estimate, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES, SpillCfg, UserInput,
+    output_plan, prune, truncation_suspected,
 };
 use crate::control::ControlRx;
 use crate::conversation::{Conversation, HistoryError};
@@ -384,6 +386,7 @@ async fn step_zero(
         task: spec.task,
         env_text,
         user_inputs: Vec::new(),
+        epoch: 0,
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
@@ -881,7 +884,7 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     }
     // (7') Оценка запроса хода (R1-B2 D42): ввод и напоминания уже в истории.
     let est = context_effect(deps, st, step, 0).await?;
-    context_thresholds(deps, st, est).await?;
+    context_thresholds(deps, st, step, est).await?;
     // (8)–(10) persist, turn.started, снимок `Model` на его seq.
     persist(&store_of(deps), st).await?;
     st.turn += 1;
@@ -1015,23 +1018,29 @@ async fn context_effect(
 }
 
 /// Пороги по одной мере `оценка + резерв` (D43, D45, D46), резерв — лимит вывода хода.
-/// Удаление старых результатов (задача 2) и компакция (задача 3) ещё не подключены:
-/// превышение порога или ждущая компакция пишут `context.alert {kind: "threshold"}`.
+/// Порядок (D46): удаление старых результатов при `≥ prune_at × n_ctx` (D45), затем
+/// `reset` и эффект `context` следующего прохода; решение о компакции — по новой
+/// оценке. Компакция (задача 3) ещё не подключена: порог компакции или ждущая
+/// компакция пишут `context.alert {kind: "threshold"}`.
 async fn context_thresholds(
     deps: &LoopDeps,
     st: &mut LoopState,
-    est: Estimate,
-) -> Result<(), StoreError> {
+    step: u64,
+    mut est: Estimate,
+) -> Result<(), LoopError> {
     let reserve = turn_options(st).max_output_tokens.unwrap_or(0);
-    let measure = u64::from(est.tokens) + u64::from(reserve);
     let n_ctx = st.setup.n_ctx;
-    let cfg = &st.setup.context;
-    let at = |share: f32| measure as f64 >= f64::from(share) * f64::from(n_ctx);
-    let prune = at(cfg.prune_at);
-    let compact = at(cfg.compact_at) || st.meter.compact_pending;
-    if prune || compact {
-        tracing::debug!(run = %st.run, measure, n_ctx, prune, compact,
-            "порог контекста достигнут, разгрузка ещё не подключена");
+    let over = |est: Estimate, share: f32| {
+        (u64::from(est.tokens) + u64::from(reserve)) as f64 >= f64::from(share) * f64::from(n_ctx)
+    };
+    if over(est, st.setup.context.prune_at) {
+        est = prune_results(deps, st, step, est).await?;
+    }
+    let prune = over(est, st.setup.context.prune_at);
+    let compact = over(est, st.setup.context.compact_at) || st.meter.compact_pending;
+    if compact {
+        tracing::debug!(run = %st.run, estimate = est.tokens, reserve, n_ctx,
+            "порог компакции достигнут, компакция ещё не подключена");
         st.last_seq = context_alert(
             &deps.journal,
             st.run,
@@ -1048,6 +1057,58 @@ async fn context_thresholds(
         .await?;
     }
     Ok(())
+}
+
+/// Удаление старых результатов (D45): новая эпоха истории, `meter.reset()`, эффект
+/// `context {pass: 1}` и событие `context.pruned {epoch, count, before, after}`
+/// (`before`, `after` — оценки до и после, токены); возвращает новую оценку. Нечего
+/// удалять — история, эпоха и оценка прежние, события нет. Файлы выгрузки пишутся вне
+/// эффекта (исключение D30: имя и содержимое детерминированы историей); ошибка записи
+/// — `warn` и удаление пропускается: run продолжается с полной историей.
+async fn prune_results(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    step: u64,
+    before: Estimate,
+) -> Result<Estimate, LoopError> {
+    let pruned = prune(
+        &st.conv,
+        st.run,
+        &st.setup.project_dir,
+        PRUNE_KEEP_TURNS,
+        PRUNE_MIN_BYTES,
+    );
+    let (conv, count) = match pruned {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(run = %st.run, step, error = %e,
+                "старые результаты не удалены: файл выгрузки не записан");
+            return Ok(before);
+        }
+    };
+    if count == 0 {
+        return Ok(before);
+    }
+    st.conv = conv;
+    st.epoch += 1;
+    st.meter.reset();
+    let after = context_effect(deps, st, step, 1).await?;
+    tracing::info!(run = %st.run, step, epoch = st.epoch, count,
+        before = before.tokens, after = after.tokens, "старые результаты инструментов удалены");
+    st.last_seq = append(
+        &deps.journal,
+        st.run,
+        Actor::Runtime,
+        EventKind::ContextPruned,
+        json!({
+            "epoch": st.epoch,
+            "count": count,
+            "before": before.tokens,
+            "after": after.tokens,
+        }),
+    )
+    .await?;
+    Ok(after)
 }
 
 /// D43: расход хода меньше половины оценки его запроса — сервер, вероятно, срезал
@@ -1266,6 +1327,10 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         project_dir: st.setup.project_dir.clone(),
         mode: st.setup.run_mode,
         parallel: sh.parallel,
+        spill: Some(SpillCfg {
+            n_ctx: st.setup.n_ctx,
+            share: st.setup.context.spill_share,
+        }),
     };
     // Флаги наблюдаются рядом с пакетом (D26): `pausing`/`cancelling` пишутся сразу,
     // не дожидаясь конца идущего инструмента. На сигналы пакет реагирует сам.

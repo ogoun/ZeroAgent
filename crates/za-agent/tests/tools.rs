@@ -236,6 +236,7 @@ fn env(run: RunId, mode: RunMode, parallel: bool) -> ToolEnv {
         project_dir: PathBuf::from("."),
         mode,
         parallel,
+        spill: None,
     }
 }
 
