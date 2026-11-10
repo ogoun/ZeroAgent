@@ -14,6 +14,15 @@
 //! этого события, затем статус. Конечные состояния после записи статуса вызывают
 //! `ModelPort::finish_run`. Ошибка цикла после старта — попытка записать `failed`;
 //! не вышло (например, журнал полон) — `error!`, статус остаётся для resume.
+//!
+//! Управление (D25, D26, D36): `running → pausing` и `running → cancelling` пишутся в
+//! момент наблюдения флага — по обрыву стрима в узле `model`, через `select!` по флагам
+//! рядом с пакетом в узле `tools` (идущий инструмент не ждётся), сигналом на границе.
+//! Пауза дожидается идущего инструмента и становится чистой паузой `paused`
+//! (`command`) после `control.applied {action: "pause"}`; отмена бросает стрим и
+//! инструменты, пишет `control.applied {action: "cancel"}` и `cancelled`. Поправка
+//! `correct` применяется на границе: управляющее сообщение в историю и
+//! `control.applied {action: "correct", command}` с тем же `command`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,7 +47,9 @@ use crate::control::ControlRx;
 use crate::conversation::{Conversation, HistoryError};
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
-use crate::prompt::{ControlAction, ControlFrom, EnvInfo, WorkMode, reasoning_for, render_control};
+use crate::prompt::{
+    ControlAction, ControlFrom, EnvInfo, WorkMode, escape_untrusted, reasoning_for, render_control,
+};
 use crate::request::{
     FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message, freeze,
 };
@@ -346,6 +357,7 @@ async fn step_zero(
         answer: None,
         finish: None,
         exit: None,
+        stopping: None,
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
@@ -500,8 +512,25 @@ async fn apply_exit(
 ) -> Result<LoopOutcome, LoopError> {
     let j = &deps.journal;
     let run = st.run;
+    let exit = match (exit, st.stopping) {
+        // `cancelling` уже записан: из него есть только `cancelled` (часть 01, 4.3).
+        // Итог `finish`, исполненного до наблюдения отмены, остаётся в истории.
+        (LoopExit::Finished(status), Some(RunStatus::Cancelling)) => {
+            tracing::info!(run = %run, ?status, "отмена записана раньше итога finish: run cancelled");
+            LoopExit::Cancelled
+        }
+        (exit, _) => exit,
+    };
     let outcome = match exit {
         LoopExit::Finished(status) => {
+            if st.stopping == Some(RunStatus::Pausing) {
+                // Пауза, наблюдённая во время `finish`, снимается: `finish` важнее
+                // (решение контроллера к задаче 11), `pausing → running → status`.
+                st.generation = j
+                    .set_status(run, RunStatus::Running, st.generation, None)
+                    .await?;
+                st.stopping = None;
+            }
             st.generation = j.set_status(run, status, st.generation, None).await?;
             final_snapshot(deps, st).await?;
             deps.model.finish_run(run);
@@ -515,15 +544,21 @@ async fn apply_exit(
             st.generation = j
                 .set_status(run, RunStatus::Paused, st.generation, Some(reason))
                 .await?;
+            st.stopping = None;
             LoopOutcome::Paused {
                 reason: reason.into(),
                 interrupt: None,
             }
         }
         LoopExit::Suspended { reason, interrupt } => {
+            if st.stopping == Some(RunStatus::Pausing) {
+                // Пауза по команде исполнена прерыванием: run и так встаёт в `paused`.
+                st.sig.clear_pause();
+            }
             st.generation = j
                 .set_status(run, RunStatus::Paused, st.generation, Some(reason))
                 .await?;
+            st.stopping = None;
             LoopOutcome::Paused {
                 reason: reason.into(),
                 interrupt: Some(interrupt),
@@ -536,9 +571,22 @@ async fn apply_exit(
             LoopOutcome::BlockedOnBudget { kind }
         }
         LoopExit::Cancelled => {
-            st.generation = j
-                .set_status(run, RunStatus::Cancelling, st.generation, None)
-                .await?;
+            mark_stop(
+                j,
+                run,
+                &mut st.generation,
+                &mut st.stopping,
+                RunStatus::Cancelling,
+            )
+            .await?;
+            st.last_seq = append(
+                j,
+                run,
+                Actor::Runtime,
+                EventKind::ControlApplied,
+                json!({ "action": "cancel", "command": "" }),
+            )
+            .await?;
             st.generation = j
                 .set_status(run, RunStatus::Cancelled, st.generation, None)
                 .await?;
@@ -653,12 +701,15 @@ async fn read_boundary(
 async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopError> {
     let deps = &sh.deps;
     // (1) Сигналы до шага (D9): Input отброшен — ввод прочитает сама граница.
+    // `pausing`/`cancelling`, записанные во время пакета, доводятся до конца, даже
+    // если сам пакет флаг не прочитал (кончился раньше).
     match st.sig.drain() {
+        Some(Signal::Cancel) => return command_cancel(deps, st).await,
         Some(Signal::Pause) => return command_pause(sh, st).await,
-        Some(Signal::Cancel) => {
-            st.exit = Some(LoopExit::Cancelled);
-            return Ok(Transition::Done);
+        _ if st.stopping == Some(RunStatus::Cancelling) => {
+            return command_cancel(deps, st).await;
         }
+        _ if st.stopping == Some(RunStatus::Pausing) => return command_pause(sh, st).await,
         _ => {}
     }
     // (2), (3) Новый шаг и его эффект `boundary`.
@@ -715,7 +766,9 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
                     tracing::warn!(seq, "пустой ввод пользователя пропущен");
                     continue;
                 }
-                st.conv.push_user(text.clone())?;
+                // Текст пользователя — как есть, только управляющий тег экранируется:
+                // ввод не выдаёт себя за голос рантайма (D23).
+                st.conv.push_user(escape_untrusted(text))?;
             }
             Inbox::Correct { note, command, .. } => {
                 st.conv.push_user(render_control(
@@ -724,6 +777,15 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
                     command,
                     note,
                 ))?;
+                // D36: тот же `command`, что в `control.requested`.
+                st.last_seq = append(
+                    &deps.journal,
+                    st.run,
+                    Actor::Runtime,
+                    EventKind::ControlApplied,
+                    json!({ "action": "correct", "command": command }),
+                )
+                .await?;
             }
         }
     }
@@ -833,11 +895,9 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
                     st.conv.close_interrupted();
                     Ok(Transition::Goto(BOUNDARY))
                 }
+                // Флаг наблюдён обрывом стрима: `pausing`/`cancelling` пишутся сейчас (D26).
                 (Signal::Pause, za_core::EffectSource::Live) => command_pause(sh, st).await,
-                (Signal::Cancel, za_core::EffectSource::Live) => {
-                    st.exit = Some(LoopExit::Cancelled);
-                    Ok(Transition::Done)
-                }
+                (Signal::Cancel, za_core::EffectSource::Live) => command_cancel(deps, st).await,
             }
         }
         Err(TurnError::Request(e)) => Err(LoopError::Request(e)),
@@ -925,16 +985,53 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         mode: st.setup.run_mode,
         parallel: sh.parallel,
     };
-    let out = match run_tools(
-        &mut st.ctx,
-        &deps.journal,
-        &sh.registry,
-        &env,
-        &rev.calls,
-        &mut st.sig,
-    )
-    .await
-    {
+    // Флаги наблюдаются рядом с пакетом (D26): `pausing`/`cancelling` пишутся сразу,
+    // не дожидаясь конца идущего инструмента. На сигналы пакет реагирует сам.
+    let mut flags = st.sig.flags();
+    let r = {
+        let batch = run_tools(
+            &mut st.ctx,
+            &deps.journal,
+            &sh.registry,
+            &env,
+            &rev.calls,
+            &mut st.sig,
+        );
+        tokio::pin!(batch);
+        let mut watching = true;
+        loop {
+            // Флаг, поднятый до пакета, — тоже наблюдение.
+            let f = *flags.borrow_and_update();
+            let to = if f.cancel {
+                Some(RunStatus::Cancelling)
+            } else if f.pause {
+                Some(RunStatus::Pausing)
+            } else {
+                None
+            };
+            if let Some(to) = to {
+                mark_stop(
+                    &deps.journal,
+                    st.run,
+                    &mut st.generation,
+                    &mut st.stopping,
+                    to,
+                )
+                .await?;
+            }
+            tokio::select! {
+                biased;
+                r = &mut batch => break r,
+                ch = flags.changed(), if watching => {
+                    // Отправитель живёт в `Signals`; закрытый канал — больше не следим.
+                    if ch.is_err() {
+                        watching = false;
+                    }
+                }
+            }
+        }
+    };
+    let out = match r {
         Ok(o) => o,
         Err(e) => {
             st.exit = Some(effect_exit(e)?);
@@ -963,8 +1060,7 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         }
         ToolsVerdict::Cancel => {
             st.conv.close_interrupted();
-            st.exit = Some(LoopExit::Cancelled);
-            Ok(Transition::Done)
+            command_cancel(deps, st).await
         }
         // Снимка нет (D5): resume реплеит шаг до прерывания и читает решение.
         ToolsVerdict::Suspend => match suspend {
@@ -1047,9 +1143,58 @@ fn effect_exit(e: EffectError) -> Result<LoopExit, LoopError> {
     exit_for_effect_error(&e).ok_or_else(|| effect_err(e))
 }
 
-/// Чистая пауза по команде (D5, D26): `control.applied {action: "pause"}`, снимок,
-/// статус `paused` (`command`). Флаг паузы снимается: следующая пауза — новый сигнал.
+/// `running → pausing` или `→ cancelling` в момент наблюдения флага (D26); повтор
+/// безвреден. Отмена важнее паузы: после `cancelling` пауза не пишется, из `pausing`
+/// отмена допустима (часть 01, 4.3).
+async fn mark_stop(
+    j: &Journal,
+    run: RunId,
+    generation: &mut u64,
+    stopping: &mut Option<RunStatus>,
+    to: RunStatus,
+) -> Result<(), StoreError> {
+    if *stopping == Some(to) || *stopping == Some(RunStatus::Cancelling) {
+        return Ok(());
+    }
+    let reason = (to == RunStatus::Pausing).then_some(pause_reason::COMMAND);
+    *generation = j.set_status(run, to, *generation, reason).await?;
+    *stopping = Some(to);
+    tracing::info!(run = %run, status = ?to, "команда управления наблюдена");
+    Ok(())
+}
+
+/// Отмена по команде (D26): `cancelling` сразу; выход `Cancelled` пишет
+/// `control.applied {action: "cancel"}`, `cancelled` и `finish_run`.
+async fn command_cancel(deps: &LoopDeps, st: &mut LoopState) -> Result<Transition, LoopError> {
+    mark_stop(
+        &deps.journal,
+        st.run,
+        &mut st.generation,
+        &mut st.stopping,
+        RunStatus::Cancelling,
+    )
+    .await?;
+    st.exit = Some(LoopExit::Cancelled);
+    Ok(Transition::Done)
+}
+
+/// Чистая пауза по команде (D5, D26): `pausing` (если ещё не записан),
+/// `control.applied {action: "pause"}`, снимок, статус `paused` (`command`). Флаг
+/// паузы снимается: следующая пауза — новый сигнал.
 async fn command_pause(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopError> {
+    mark_stop(
+        &sh.deps.journal,
+        st.run,
+        &mut st.generation,
+        &mut st.stopping,
+        RunStatus::Pausing,
+    )
+    .await?;
+    if st.stopping == Some(RunStatus::Cancelling) {
+        // Отмена пришла раньше: пауза поглощена.
+        st.exit = Some(LoopExit::Cancelled);
+        return Ok(Transition::Done);
+    }
     st.last_seq = append(
         &sh.deps.journal,
         st.run,

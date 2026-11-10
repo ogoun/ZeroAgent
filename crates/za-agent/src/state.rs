@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use za_core::RunCtx;
 use za_llm::ToolSchema;
-use za_protocol::{BlobHash, Budget, BudgetKind, EffectClass, RunId, Seq};
+use za_protocol::{BlobHash, Budget, BudgetKind, EffectClass, RunId, RunStatus, Seq};
 
 use crate::conversation::Conversation;
 use crate::exit::LoopExit;
@@ -114,6 +114,9 @@ pub struct LoopState {
     pub finish: Option<FinishArgs>,
     /// Выход, положенный узлом (D31).
     pub exit: Option<LoopExit>,
+    /// `Pausing` или `Cancelling`, уже записанный драйвером в момент наблюдения флага
+    /// (D26); `None` — run в `running`. Не входит в снимок: resume читает статус run.
+    pub stopping: Option<RunStatus>,
 }
 
 impl LoopState {

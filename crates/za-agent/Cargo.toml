@@ -22,6 +22,9 @@ blake3.workspace = true
 jiff.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# `Uuid::now_v7` — идентификатор команды `control.requested` (D36); функция `v7`
+# уже включена в `[workspace.dependencies]`.
+uuid.workspace = true
 # `sync` — каналы управления, `time` — таймауты инструментов и склейка дельт,
 # `rt` — `JoinSet` параллельных чтений, `macros` — `select!`.
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }

@@ -1773,6 +1773,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
  "za-core",
  "za-llm",
  "za-protocol",
