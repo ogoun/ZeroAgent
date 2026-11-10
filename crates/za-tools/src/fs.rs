@@ -73,7 +73,7 @@ const TOO_LARGE: &str = "[file is larger than 4 MiB; only the first 4 MiB are re
 const EMPTY: &str = "[file is empty]";
 const NO_MATCHES: &str = "no matches";
 const NO_FILES: &str = "no files matched";
-const INTERNAL: &str = "internal error: file tool failed";
+pub(crate) const INTERNAL: &str = "internal error: file tool failed";
 
 // ---- тексты с подстановкой: одна функция и для вывода, и для образца в `texts` ----
 
@@ -89,7 +89,7 @@ fn binary_text(size: u64, mime: &str) -> String {
     format!("binary file, {size} bytes, type {mime}")
 }
 
-fn directory_text(shown: &str) -> String {
+pub(crate) fn directory_text(shown: &str) -> String {
     format!("not a regular file: {shown} is a directory")
 }
 
@@ -109,7 +109,7 @@ fn invisible_text(n: usize) -> String {
     format!("[file contains {n} invisible or bidi control characters]")
 }
 
-fn invalid_args_text(e: &str) -> String {
+pub(crate) fn invalid_args_text(e: &str) -> String {
     format!("invalid arguments: {e}")
 }
 
@@ -207,7 +207,7 @@ fn spec(schema: ToolSchema, tier: Tier, secs: u64, limit: usize) -> ToolSpec {
     }
 }
 
-fn parse<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolOutput> {
+pub(crate) fn parse<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolOutput> {
     serde_json::from_value(args).map_err(|e| ToolOutput::error(invalid_args_text(&e.to_string())))
 }
 
@@ -223,7 +223,7 @@ fn read_subject(arg: &str) -> Subjects {
 
 /// Работа с ФС вне потоков tokio. Весь вызов — одна область [`DriveScope`] (I5): перечень
 /// локальных томов строится один раз на вызов, а у `search` и `glob` — на весь обход.
-async fn blocking<F>(f: F) -> ToolOutput
+pub(crate) async fn blocking<F>(f: F) -> ToolOutput
 where
     F: FnOnce() -> ToolOutput + Send + 'static,
 {
@@ -259,7 +259,7 @@ fn resolve_in(project: &Path, lex: &LexPath) -> Result<(PathBuf, ResolvedPath), 
 
 /// Нет такого пути: подсказка похожих имён того же каталога. Только внутри проекта (M2):
 /// одобрено чтение одного внешнего пути, а не список его соседей.
-fn not_found(root: &Path, r: &ResolvedPath) -> ToolOutput {
+pub(crate) fn not_found(root: &Path, r: &ResolvedPath) -> ToolOutput {
     let similar = match (r.inside, r.path.parent(), r.path.file_name()) {
         (true, Some(dir), Some(name)) => {
             let dir_r = ResolvedPath {
@@ -285,7 +285,7 @@ fn not_found(root: &Path, r: &ResolvedPath) -> ToolOutput {
     ToolOutput::error(not_found_text(&display(root, &r.path), &similar))
 }
 
-fn is_missing(e: &io::Error) -> bool {
+pub(crate) fn is_missing(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
@@ -294,7 +294,7 @@ fn is_missing(e: &io::Error) -> bool {
 
 /// Ошибка открытия для модели. Системные ошибки — по виду (английский текст вида, а не
 /// локализованное сообщение ОС); отказы `open_checked` — их собственный текст.
-fn open_error(root: &Path, r: &ResolvedPath, e: &io::Error) -> ToolOutput {
+pub(crate) fn open_error(root: &Path, r: &ResolvedPath, e: &io::Error) -> ToolOutput {
     if is_missing(e) {
         not_found(root, r)
     } else {
@@ -303,7 +303,7 @@ fn open_error(root: &Path, r: &ResolvedPath, e: &io::Error) -> ToolOutput {
 }
 
 /// Текст ошибки ввода-вывода: системная — по виду, своя — её текст.
-fn error_text(shown: &str, e: &io::Error) -> String {
+pub(crate) fn error_text(shown: &str, e: &io::Error) -> String {
     if e.raw_os_error().is_some() {
         io_text(shown, e.kind())
     } else {
@@ -472,7 +472,9 @@ pub fn read_at(r: &ResolvedPath, start: usize, limit: usize) -> io::Result<ToolO
     read_file(r, start, limit).map(|(o, _)| o)
 }
 
-/// [`read_at`] и BLAKE3 (hex) сырых байт файла — если текстовый файл прочитан целиком.
+/// [`read_at`] и BLAKE3 (hex) сырых байт файла — если файл прочитан целиком и это текст
+/// в UTF-8 (Carry задачи 6 в задачу 7): правку файла не в UTF-8 `edit` отвергает, и
+/// трекер его не отмечает.
 fn read_file(
     r: &ResolvedPath,
     start: usize,
@@ -491,7 +493,8 @@ fn read_file(
     if capped {
         bytes.truncate(READ_MAX_BYTES);
     }
-    let hash = (!capped).then(|| blake3::hash(&bytes).to_hex().to_string());
+    let hash = (!capped && std::str::from_utf8(&bytes).is_ok())
+        .then(|| blake3::hash(&bytes).to_hex().to_string());
     let text = bytes.strip_prefix(BOM).unwrap_or(&bytes);
     Ok((render(text, start, limit, capped), hash))
 }

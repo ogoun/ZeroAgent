@@ -997,3 +997,167 @@ fn refuse_link(p: &Path) -> io::Error {
 fn same_path(a: &Path, b: &Path) -> bool {
     a.components().count() == b.components().count() && within(a, b)
 }
+
+/// Текст отказа при подмене цели между проверкой и заменой.
+const PATH_CHANGED_WRITE: &str = "path changed while writing";
+/// Сколько раз повторяется `rename` занятого файла на Windows (D88, Ruling 5.29).
+#[cfg(windows)]
+const RENAME_RETRIES: u32 = 3;
+/// Пауза между повторами `rename` на Windows.
+#[cfg(windows)]
+const RENAME_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Атомарная замена файла `target` готовым файлом `tmp` (D88, D98). Блокирующая.
+///
+/// `tmp` и `target` лежат в одном каталоге (иначе `rename` не атомарен).
+/// 1. `tmp` — обычный файл, не ссылка, одна жёсткая ссылка.
+/// 2. `target`, если есть, — не ссылка и не junction (ссылка не подменяется файлом,
+///    Ruling 7.14), обычный файл с одной жёсткой ссылкой (I3).
+/// 3. `rename`; на Windows занятый файл (отказ в доступе, нарушение совместного доступа) —
+///    до трёх повторов с паузой 50 мс.
+/// 4. После `rename` цель канонизируется ещё раз и должна совпасть с `target.path`, а файл
+///    по ней — быть тем самым `tmp`. Расхождение — `error!` и отказ `path changed while
+///    writing`.
+///
+/// Записанный риск — тот же, что у [`open_checked`]: подмена между проверкой и `rename`
+/// процессом вне Job или группы (до SEC-100).
+pub fn replace_checked(tmp: &ResolvedPath, target: &ResolvedPath) -> io::Result<()> {
+    let _drives = DriveScope::enter();
+    if tmp.path.parent() != target.path.parent() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "временный файл {} не рядом с {}",
+                tmp.path.display(),
+                target.path.display()
+            ),
+        ));
+    }
+    #[cfg(windows)]
+    check_drive(&target.path, &|| target.path.display().to_string()).map_err(io::Error::other)?;
+    let t = open_checked(tmp, false)?;
+    if hard_links(&t, &t.metadata()?)? > 1 {
+        return Err(io::Error::other(format!(
+            "{HARD_LINKS}: {}",
+            tmp.path.display()
+        )));
+    }
+    let ours = same_file::Handle::from_file(t)?;
+    match open_checked(target, false) {
+        Ok(f) => {
+            if hard_links(&f, &f.metadata()?)? > 1 {
+                return Err(io::Error::other(format!(
+                    "{HARD_LINKS}: {}",
+                    target.path.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    rename_retry(&tmp.path, &target.path)?;
+    let shown = || target.path.display().to_string();
+    let now = canonicalize_local(&target.path)
+        .and_then(|c| strip_canonical(c, &shown).map_err(io::Error::other));
+    let same = match &now {
+        Ok(p) => {
+            same_path(p, &target.path) && same_file::Handle::from_path(p).is_ok_and(|h| h == ours)
+        }
+        Err(_) => false,
+    };
+    if !same {
+        tracing::error!(path = %target.path.display(), "цель подменена во время замены файла");
+        return Err(io::Error::other(format!(
+            "{PATH_CHANGED_WRITE}: {}",
+            target.path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn rename_retry(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut tries = 0;
+        loop {
+            match std::fs::rename(from, to) {
+                Ok(()) => return Ok(()),
+                // Отказ в доступе (5), нарушение совместного доступа (32) или блокировки
+                // (33): файл держит другой процесс (антивирус, индексатор, редактор).
+                Err(e)
+                    if tries < RENAME_RETRIES
+                        && (e.kind() == io::ErrorKind::PermissionDenied
+                            || matches!(e.raw_os_error(), Some(5 | 32 | 33))) =>
+                {
+                    tries += 1;
+                    std::thread::sleep(RENAME_PAUSE);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    std::fs::rename(from, to)
+}
+
+/// Удаление файла `r` (блокирующая): только обычный файл и не ссылка (ссылка — отказ,
+/// её цель не трогается).
+pub fn remove_checked(r: &ResolvedPath) -> io::Result<()> {
+    let _drives = DriveScope::enter();
+    let m = stat_checked(r)?;
+    if !m.is_file() {
+        return Err(io::Error::other(format!(
+            "{NOT_REGULAR}: {}",
+            r.path.display()
+        )));
+    }
+    std::fs::remove_file(&r.path)
+}
+
+/// Создаёт недостающие каталоги над файлом `r` (блокирующая) по одному, как
+/// [`work_dir`]: ни один не может оказаться ссылкой или junction. Итоговый каталог
+/// канонизируется и должен совпасть с родителем `r.path`, иначе — отказ `path changed
+/// while writing`.
+pub fn create_parents_checked(r: &ResolvedPath) -> io::Result<()> {
+    let _drives = DriveScope::enter();
+    let Some(parent) = r.path.parent() else {
+        return Ok(());
+    };
+    #[cfg(windows)]
+    check_drive(parent, &|| parent.display().to_string()).map_err(io::Error::other)?;
+    let mut missing = Vec::new();
+    let mut cur = parent;
+    loop {
+        match std::fs::symlink_metadata(cur) {
+            Ok(m) if m.file_type().is_symlink() => return Err(refuse_link(cur)),
+            Ok(m) if m.is_dir() => break,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("not a directory: {}", cur.display()),
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing.push(cur);
+                match cur.parent() {
+                    Some(p) => cur = p,
+                    None => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    for dir in missing.into_iter().rev() {
+        make_dir(dir)?;
+    }
+    let shown = || parent.display().to_string();
+    let now = strip_canonical(canonicalize_local(parent)?, &shown).map_err(io::Error::other)?;
+    if !same_path(&now, parent) {
+        tracing::error!(path = %parent.display(), "каталог подменён при создании");
+        return Err(io::Error::other(format!(
+            "{PATH_CHANGED_WRITE}: {}",
+            parent.display()
+        )));
+    }
+    Ok(())
+}

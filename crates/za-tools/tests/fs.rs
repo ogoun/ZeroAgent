@@ -12,7 +12,7 @@ use za_core::{Access, Approval, RiskClass, Tool, ToolCx, ToolKind, ToolOutput};
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier};
 use za_tools::{
     GLOB_MAX, READ_DEFAULT_LIMIT, READ_MAX_BYTES, ReadTracker, SEARCH_MAX, TrackError, WalkLimits,
-    glob_split, glob_tool, nearest, read_tool, search_in, search_tool,
+    edit_tool, glob_split, glob_tool, multi_edit_tool, nearest, read_tool, search_in, search_tool,
 };
 
 #[path = "../../../test-support/unique_dir.rs"]
@@ -821,11 +821,23 @@ fn texts_match_golden() {
     // D94: тексты для модели входят в хэш промптов; golden пишется только с
     // ZA_UPDATE_GOLDEN=1.
     let mut all = serde_json::Map::new();
-    for tool in [read(), search_tool(), glob_tool()] {
+    // Один golden на все нативные инструменты: `read`, `search`, `glob` (задача 6) и
+    // `edit`, `multi_edit` (задача 7, D88).
+    let tools = [
+        read(),
+        search_tool(),
+        glob_tool(),
+        edit_tool(ReadTracker::new()),
+        multi_edit_tool(ReadTracker::new()),
+    ];
+    for tool in tools {
         let texts = tool.texts();
         assert!(!texts.is_empty(), "{}", tool.spec().schema.name);
         for (name, text) in texts {
-            assert!(name.starts_with("runtime/fs."), "{name}");
+            assert!(
+                name.starts_with("runtime/fs.") || name.starts_with("runtime/edit."),
+                "{name}"
+            );
             assert!(text.is_ascii(), "{name}: {text}");
             assert!(
                 all.insert(name.to_owned(), Value::String(text)).is_none(),

@@ -15,16 +15,29 @@
 //!
 //! [`ReadTracker`] помнит, какие файлы прочитаны в run (раздел 4.1 ТЗ 02), [`nearest`]
 //! подсказывает похожие имена несуществующего пути (таблица 3.4).
+//!
+//! `edit` и `multi_edit` ([`edit_tool`], [`multi_edit_tool`], D88): вид `Edit`, класс
+//! `Idempotent`, риск `LocalWrite`. Правят только прочитанный и не изменившийся файл
+//! (трекер по каноническому пути), толерантный патчер [`apply`] и защита от перезаписи
+//! [`shrink_guard`], запись — атомарная, по каноническому пути, через `za_core::paths`;
+//! повтор после сбоя — по маркеру `work_dir("edits")/<file_stem>.json`.
 
+mod edit;
 mod fs;
 mod nearest;
+mod patch;
 mod rules;
 mod tracker;
+
+pub use edit::{
+    EditHook, EditPoint, edit_tool, edit_tool_with_hook, multi_edit_tool, multi_edit_tool_with_hook,
+};
 
 pub use fs::{
     WalkLimits, glob_in, glob_split, glob_tool, read_at, read_tool, search_in, search_tool,
 };
 pub use nearest::nearest;
+pub use patch::{MatchLevel, PatchError, apply, shrink_guard};
 pub use tracker::{ReadTracker, TrackError};
 
 /// Сколько строк `read` показывает по умолчанию.
