@@ -19,14 +19,13 @@ use za_store::{ProjectStore, StoreError};
 /// Сколько ждать первого подтверждения: запуск процесса и миграции.
 const FIRST_ACK_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
+#[path = "../../../test-support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_dir;
+
+/// Чистый каталог теста `CARGO_TARGET_TMPDIR/za-store/<name>-<pid>-<n>`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("za-store")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("za-store", name)
 }
 
 /// Запущенный писатель и поток, читающий его stdout.

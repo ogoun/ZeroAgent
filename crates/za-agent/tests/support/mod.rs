@@ -6,9 +6,7 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
@@ -44,49 +42,9 @@ pub async fn within_for<T>(base: Duration, what: &str, f: impl Future<Output = T
         .unwrap_or_else(|_| panic!("не дождались в срок: {what}"))
 }
 
-/// Чистый каталог теста `CARGO_TARGET_TMPDIR/<suite>/<name>-<pid>-<n>`: свой у каждого
-/// вызова и у каждого процесса, поэтому параллельные прогоны одного тестового
-/// бинарника не делят журнал.
-///
-/// Каталоги прошлых прогонов (старше [`STALE_RUN`], другого процесса) удаляются первым
-/// вызовом процесса для набора, как `run_dir` тестов шлюза `za-llm`: каталог теста идущего
-/// соседнего прогона моложе и не трогается.
-pub fn unique_dir(suite: &str, name: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    static CLEANED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(suite);
-    let pid = std::process::id();
-    {
-        let mut done = CLEANED.lock().unwrap_or_else(|e| e.into_inner());
-        if !done.iter().any(|s| s == suite) {
-            done.push(suite.to_owned());
-            remove_stale(&root, &format!("-{pid}-"));
-        }
-    }
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let d = root.join(format!("{name}-{pid}-{n}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
+#[path = "../../../../test-support/unique_dir.rs"]
+mod unique;
 
-/// Каталог прогона старше этого считается брошенным: прогон бинарника длится минуты.
-pub const STALE_RUN: Duration = Duration::from_secs(30 * 60);
-
-/// Удаляет подкаталоги `root` старше [`STALE_RUN`], в имени которых нет `own`.
-fn remove_stale(root: &std::path::Path, own: &str) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let stale = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > STALE_RUN);
-        if stale && !e.file_name().to_string_lossy().contains(own) {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
-}
+/// Чистый каталог теста `CARGO_TARGET_TMPDIR/<suite>/<name>-<pid>-<n>` — общий помощник
+/// workspace (`test-support/unique_dir.rs`).
+pub use unique::unique_dir;

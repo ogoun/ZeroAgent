@@ -172,6 +172,15 @@ pub async fn resume_run(
     if next == Next::Model && change.endpoint.is_some() {
         return Err(LoopError::ChangeMidStep);
     }
+    // Шаг после снимка `Boundary` уже начат без блока `<state>` (Ruling I1): его эффекты
+    // реплеятся, а пороги по новому окну могли бы разойтись с журналом (m-new1).
+    let late = match next {
+        Next::Boundary => state_late(&store, run, snap.step + 1).await?,
+        Next::Model => None,
+    };
+    if late.is_some() && change.endpoint.is_some() {
+        return Err(LoopError::ChangeMidStep);
+    }
     let mut st = match restore(deps, run, seq, snap, ctl).await {
         Ok(st) => st,
         Err(e @ LoopError::Snapshot(_)) => {
@@ -223,7 +232,7 @@ pub async fn resume_run(
                 st.setup.run_mode = m;
             }
             st.at_boundary.resume_note = true;
-            st.at_boundary.state_late = state_late(&store, run, st.ctx.step() + 1).await?;
+            st.at_boundary.state_late = late;
             BOUNDARY
         }
     };

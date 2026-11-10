@@ -4,7 +4,6 @@
 //! junction, `\\?\`, UNC, device-пути, 8.3, регистр, ADS, хвостовая точка, гонка подмены.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use za_core::Access;
 use za_core::paths::{
@@ -12,16 +11,13 @@ use za_core::paths::{
     open_checked, resolve, within, work_dir,
 };
 
-/// Чистый каталог теста `CARGO_TARGET_TMPDIR/za-core-paths/<name>-<pid>-<n>`.
+#[path = "../../../test-support/unique_dir.rs"]
+mod shared_dir;
+
+/// Чистый каталог теста `CARGO_TARGET_TMPDIR/za-core-paths/<name>-<pid>-<n>` (общий
+/// помощник workspace).
 fn unique_dir(name: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("za-core-paths")
-        .join(format!("{name}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    shared_dir::unique_dir("za-core-paths", name)
 }
 
 /// Проект, `ZA_HOME` и чужой каталог рядом (вне проекта).

@@ -16,6 +16,9 @@
 //! `echo` есть — нативный или извлечённый нормализацией из текста (MDL-005); `usage.input
 //! > 0`. Для llama.cpp второй такой же запрос даёт `usage.cached > 0` (MDL-011).
 
+#[path = "../../../test-support/unique_dir.rs"]
+mod unique_dir;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,9 +78,7 @@ fn request() -> ChatRequest {
 /// Gateway с одним эндпоинтом `live`; ждёт зонда и требует `ready`.
 async fn gateway(name: &str, endpoint: Value, keys: &[(&str, String)]) -> Gateway {
     let cfg: ModelsConfig = serde_json::from_value(json!({"endpoints": [endpoint]})).unwrap();
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("live")
-        .join(name);
+    let dir = unique_dir::unique_dir("live", name);
     let secrets = MapSecrets(
         keys.iter()
             .map(|(k, v)| ((*k).to_owned(), v.clone()))

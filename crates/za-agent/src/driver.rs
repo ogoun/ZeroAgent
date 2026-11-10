@@ -255,11 +255,13 @@ impl LoopError {
 }
 
 /// Сбой среды, который может пройти при повторе (`za_store::StoreError`, «сбой среды»):
-/// нет места, ввод-вывод, журнал занят, ошибка SQLite (занято, I/O).
+/// нет места, ввод-вывод (`SQLITE_IOERR*`), журнал открыт другим процессом, занят другим
+/// соединением (`SQLITE_BUSY`, `SQLITE_LOCKED`). Прочие коды SQLite (`StoreError::Sqlite`)
+/// постоянны: `failed` (Ruling I3).
 fn transient_store(e: &StoreError) -> bool {
     matches!(
         e,
-        StoreError::Full | StoreError::Io(_) | StoreError::Locked | StoreError::Sqlite(_)
+        StoreError::Full | StoreError::Io(_) | StoreError::Locked | StoreError::Busy(_)
     )
 }
 
@@ -2954,6 +2956,35 @@ mod tests {
         );
     }
 
+    /// Ruling I3: пауза `store` — только временные сбои журнала и `Transient`.
+    #[test]
+    fn store_fault_only_for_transient() {
+        let store = |e: StoreError| LoopError::Store(e).is_store_fault();
+        let effect = |e: StoreError| LoopError::Effect(EffectError::Store(e)).is_store_fault();
+        for e in [
+            StoreError::Full,
+            StoreError::Io("x".into()),
+            StoreError::Locked,
+            StoreError::Busy("x".into()),
+        ] {
+            assert!(store(e.clone()) && effect(e.clone()), "{e:?}");
+        }
+        for e in [
+            StoreError::Sqlite("constraint".into()),
+            StoreError::Corrupt("x".into()),
+            StoreError::Serde("x".into()),
+            StoreError::Closed,
+            StoreError::SchemaTooNew {
+                found: 9,
+                supported: 1,
+            },
+        ] {
+            assert!(!store(e.clone()) && !effect(e.clone()), "{e:?}");
+        }
+        assert!(LoopError::Effect(EffectError::Transient("x".into())).is_store_fault());
+        assert!(!LoopError::Effect(EffectError::Poisoned).is_store_fault());
+    }
+
     #[test]
     fn halted_has_no_fail_reason() {
         assert_eq!(LoopError::Halted.code(), None);
@@ -3000,14 +3031,11 @@ mod tests {
     /// Свой каталог на процесс и вызов `.tmp/za-agent-unit/<name>-<pid>-<n>` (R1-C1,
     /// Global Constraints): параллельные прогоны тестов не делят журнал.
     fn unit_dir(name: &str) -> PathBuf {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.tmp/za-agent-unit")
-            .join(format!("{name}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        // Общий помощник workspace (`test-support/unique_dir.rs`).
+        crate::test_unique_dir::unique_dir_in(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/za-agent-unit"),
+            name,
+        )
     }
 
     /// Модульная обвязка `apply_exit`: run после шага 0 на `ScriptedModel`, канал

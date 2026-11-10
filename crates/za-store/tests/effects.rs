@@ -6,13 +6,13 @@ use serde_json::json;
 use za_protocol::{Actor, EffectClass, EffectKey, EventKind, RunId, RunRole, Seq};
 use za_store::{BLOB_THRESHOLD, NewRun, ProjectStore, StoreError};
 
+#[path = "../../../test-support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_dir;
+
+/// Чистый каталог теста `CARGO_TARGET_TMPDIR/za-store-effects/<name>-<pid>-<n>`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("za-store-effects")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("za-store-effects", name)
 }
 
 async fn setup(name: &str) -> (ProjectStore, RunId) {

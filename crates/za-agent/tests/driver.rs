@@ -1218,3 +1218,37 @@ async fn corrupt_journal_fails_not_pauses() {
         .clone();
     assert_eq!(last["reason"], "store");
 }
+
+/// m-new1: шаг после снимка `Boundary` начат без блока `<state>` — смена эндпоинта при
+/// resume отвергается (`ChangeMidStep`), resume без смены доводит run.
+#[tokio::test]
+async fn endpoint_change_refused_on_started_step() {
+    let mut f = fx("endpoint_started_step", scripted());
+    f.deps.crash = Some(crash_once(CrashPoint::AfterContext { step: 1 }));
+    f.model.push(answer("готово"));
+    assert!(matches!(
+        start(&mut f, spec(RunRole::Top)).await,
+        Err(LoopError::Halted)
+    ));
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let change = ResumeChange {
+        endpoint: Some(EndpointId("local".into())),
+        ..ResumeChange::default()
+    };
+    let r = within("resume_run", resume_run(&f.deps, f.run, change, rx)).await;
+    assert!(matches!(r, Err(LoopError::ChangeMidStep)), "{r:?}");
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let out = within(
+        "resume_run",
+        resume_run(&f.deps, f.run, ResumeChange::default(), rx),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        out,
+        LoopOutcome::Finished {
+            status: RunStatus::Done,
+            ..
+        }
+    ));
+}

@@ -9,22 +9,13 @@ use za_core::{DemoConfig, DemoOutcome, EffectError, replay_hash, run_demo};
 use za_protocol::{EffectClass, EffectKey, EventKind, RunId, RunRole, RunStatus, Seq};
 use za_store::{NewRun, ProjectStore};
 
-/// Имя каталога теста `<name>-<pid>-<n>`: свой у каждого вызова и процесса, одновременные
-/// прогоны одного бинарника не делят каталог (R1-C1, гигиена тестов).
-fn unique(name: &str) -> String {
-    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{name}-{}-{n}", std::process::id())
-}
+#[path = "../../../test-support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_dir;
 
 /// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("za-core-demo")
-        .join(unique(name));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("za-core-demo", name)
 }
 
 fn cfg(steps: u32, workdir: &Path) -> DemoConfig {

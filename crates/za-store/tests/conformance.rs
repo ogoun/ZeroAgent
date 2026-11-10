@@ -10,19 +10,13 @@ use za_store::{
     UsageRow, UsageTotals,
 };
 
-/// Путь каталога теста внутри `CARGO_TARGET_TMPDIR` без очистки.
-fn dir_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("za-store")
-        .join(name)
-}
+#[path = "../../../test-support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_dir;
 
-/// Чистый каталог теста внутри `CARGO_TARGET_TMPDIR`.
+/// Чистый каталог теста `CARGO_TARGET_TMPDIR/za-store/<name>-<pid>-<n>`.
 fn dir(name: &str) -> PathBuf {
-    let d = dir_path(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    unique_dir("za-store", name)
 }
 
 fn open(name: &str) -> ProjectStore {
@@ -329,7 +323,8 @@ fn new_run(parent: Option<RunId>) -> NewRun {
 
 #[tokio::test]
 async fn large_payload_goes_to_blob_and_reads_back() {
-    let s = open("blob-payload");
+    let d = dir("blob-payload");
+    let s = ProjectStore::open(&d).unwrap();
     let run = RunId::new();
     let mut e = ev_for(run);
     e.payload = json!({ "data": "y".repeat(100 * 1024) });
@@ -347,7 +342,7 @@ async fn large_payload_goes_to_blob_and_reads_back() {
     assert!(s.get_blob(&h).await.unwrap().unwrap().len() > BLOB_THRESHOLD);
     drop(s);
     // В строке события вместо payload лежит `null`.
-    let c = rusqlite::Connection::open(dir_path("blob-payload").join("journal.db")).unwrap();
+    let c = rusqlite::Connection::open(d.join("journal.db")).unwrap();
     let raw: String = c
         .query_row(
             "SELECT payload FROM events WHERE seq = ?1",

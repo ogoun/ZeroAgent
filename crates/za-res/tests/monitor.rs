@@ -17,14 +17,13 @@ fn fixture(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// Чистый каталог внутри `CARGO_TARGET_TMPDIR` (системный `%TEMP%` запрещён).
+#[path = "../../../test-support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_dir;
+
+/// Чистый каталог `CARGO_TARGET_TMPDIR/za-res/<name>-<pid>-<n>` (системный `%TEMP%` запрещён).
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("za-res")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    unique_dir("za-res", name)
 }
 
 /// Множитель времени тестов в реальном времени: `ZA_TEST_TIME_SCALE` (целое 1–6,

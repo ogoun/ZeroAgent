@@ -40,6 +40,11 @@ mod state;
 mod tools;
 mod turn;
 
+/// Уникальный каталог unit-тестов — общий помощник workspace.
+#[cfg(test)]
+#[path = "../../../test-support/unique_dir.rs"]
+mod test_unique_dir;
+
 pub use budget::{Spent, check_budget};
 pub use context::{
     ANSWER_RESERVE, COMPACT_RUBRIC, CompactInput, Compacted, ContextBudget, ContextConfig,

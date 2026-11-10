@@ -55,8 +55,11 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ошибки хранилища.
 ///
-/// Варианты различают, что делать вызывающему: [`StoreError::Sqlite`] и
-/// [`StoreError::Io`] — сбой среды, который может пройти при повторе;
+/// Варианты различают, что делать вызывающему: [`StoreError::Busy`],
+/// [`StoreError::Io`], [`StoreError::Full`] и [`StoreError::Locked`] — сбой среды,
+/// который может пройти при повторе; [`StoreError::Sqlite`] — прочие коды SQLite и
+/// ошибки rusqlite (ограничение, схема, несовпадение типа, нет строки): нарушение
+/// инварианта, повтор не поможет;
 /// [`StoreError::Corrupt`] и [`StoreError::SchemaTooNew`] — журнал нельзя
 /// читать этой версией, нужен человек. Новые варианты не ломают вызывающих.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -71,7 +74,11 @@ pub enum StoreError {
     /// Встроенная SQLite старше требуемой.
     #[error("SQLite {0} старше требуемой 3.51.3")]
     SqliteTooOld(String),
-    /// Ошибка SQLite.
+    /// Журнал занят другим соединением дольше `busy_timeout` (`SQLITE_BUSY`,
+    /// `SQLITE_LOCKED`): временный сбой.
+    #[error("журнал занят: {0}")]
+    Busy(String),
+    /// Прочая ошибка SQLite или rusqlite: постоянная (нарушение инварианта).
     #[error("ошибка SQLite: {0}")]
     Sqlite(String),
     /// Данные журнала повреждены: не разбираются, не сходятся с хешем, нет
@@ -114,6 +121,9 @@ impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
         match e.sqlite_error_code() {
             Some(ErrorCode::DiskFull) => Self::Full,
+            // Временные: занято другим соединением, сбой ввода-вывода ОС (`SQLITE_IOERR*`).
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => Self::Busy(e.to_string()),
+            Some(ErrorCode::SystemIoFailure) => Self::Io(e.to_string()),
             // Файл журнала повреждён или вовсе не база SQLite: повтор не поможет.
             Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => {
                 Self::Corrupt(e.to_string())
@@ -317,5 +327,40 @@ impl ProjectStore {
             .send(job)
             .map_err(|_| StoreError::Closed)?;
         rx.await.map_err(|_| StoreError::Closed)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::ffi;
+
+    fn code(c: i32) -> StoreError {
+        rusqlite::Error::SqliteFailure(ffi::Error::new(c), None).into()
+    }
+
+    /// Ruling I3 (R1-C1): временные коды SQLite отделены от постоянных.
+    #[test]
+    fn sqlite_codes_are_classified() {
+        assert!(matches!(code(ffi::SQLITE_BUSY), StoreError::Busy(_)));
+        assert!(matches!(code(ffi::SQLITE_LOCKED), StoreError::Busy(_)));
+        assert!(matches!(code(ffi::SQLITE_IOERR), StoreError::Io(_)));
+        assert!(matches!(code(ffi::SQLITE_IOERR_WRITE), StoreError::Io(_)));
+        assert!(matches!(code(ffi::SQLITE_IOERR_FSYNC), StoreError::Io(_)));
+        assert_eq!(code(ffi::SQLITE_FULL), StoreError::Full);
+        assert!(matches!(code(ffi::SQLITE_CORRUPT), StoreError::Corrupt(_)));
+        assert!(matches!(code(ffi::SQLITE_NOTADB), StoreError::Corrupt(_)));
+        for c in [
+            ffi::SQLITE_CONSTRAINT,
+            ffi::SQLITE_CONSTRAINT_UNIQUE,
+            ffi::SQLITE_SCHEMA,
+            ffi::SQLITE_MISMATCH,
+            ffi::SQLITE_ERROR,
+            ffi::SQLITE_READONLY,
+        ] {
+            assert!(matches!(code(c), StoreError::Sqlite(_)), "код {c}");
+        }
+        let none: StoreError = rusqlite::Error::QueryReturnedNoRows.into();
+        assert!(matches!(none, StoreError::Sqlite(_)));
     }
 }
