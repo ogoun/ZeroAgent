@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use za_agent::{
-    ControlRx, Conversation, EnvInfo, HistoryError, LoopDeps, LoopError, LoopOutcome, Next,
-    NoMemory, PendingExit, RunSpec, Signal, Snapshot, builtin_tools, control_channel, start_run,
+    ControlRx, Conversation, CrashPoint, EnvInfo, HistoryError, LoopDeps, LoopError, LoopOutcome,
+    Next, NoMemory, PendingExit, RunSpec, Signal, Snapshot, builtin_tools, control_channel,
+    start_run,
 };
 use za_core::{
     Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
@@ -416,6 +417,122 @@ async fn worker_finishes_only_by_finish_tool() {
     ));
     assert_eq!(h.validate(), Ok(()));
     assert_eq!(f.model.finished_runs(), vec![f.run]);
+}
+
+fn truncated(t: &str) -> Vec<Result<StreamEvent, ModelError>> {
+    vec![
+        Ok(StreamEvent::TextDelta(t.into())),
+        Ok(StreamEvent::Finished {
+            message: text_msg(Role::Assistant, t),
+            finish: FinishReason::Length,
+            usage: Usage::default(),
+        }),
+    ]
+}
+
+/// I2: текст без вызовов с `finish = Length` — исход `truncated`, nudge про обрезку,
+/// без `Required`; ход считается к лимиту пустых ходов.
+#[tokio::test]
+async fn truncated_reply_nudges_to_continue() {
+    const NUDGE: &str = "Your previous reply was cut off by the output limit. Continue more briefly or split the answer into parts.";
+    let mut f = fx("truncated", scripted());
+    f.model.push(truncated("Столица Франции — Па"));
+    f.model.push(answer("Париж"));
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert_eq!(
+        out,
+        LoopOutcome::Finished {
+            status: RunStatus::Done,
+            answer: Some("Париж".into()),
+            finish: None,
+        }
+    );
+    let calls = f.model.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].request.tool_choice, ToolChoice::Auto);
+    let last = calls[1].request.messages.last().unwrap();
+    assert_eq!(last.role, Role::User);
+    let text = text_of(last);
+    assert!(
+        text.starts_with("<control from=\"runtime\" action=\"nudge\""),
+        "{text}"
+    );
+    assert!(text.contains(NUDGE), "{text}");
+    let evs = events(&f.store, f.run).await;
+    let outcomes: Vec<&str> = of_kind(&evs, EventKind::TurnFinished)
+        .iter()
+        .map(|e| e.payload["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, ["truncated", "answer"]);
+
+    // Три обрезанных подряд — `blocked`, как пустые ходы.
+    let mut f = fx("truncated_block", scripted());
+    for t in ["а", "б", "в"] {
+        f.model.push(truncated(t));
+    }
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert!(
+        matches!(
+            out,
+            LoopOutcome::Finished {
+                status: RunStatus::Blocked,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_eq!(f.model.calls().len(), 3);
+}
+
+/// I1: конечный снимок пишется после конечного статуса. Сбой между статусом и
+/// снимком оставляет run `done` (не resumable) с последним снимком `Model`; сбой до
+/// статуса оставляет `running` и снимок `Model` — resume реплеит шаг по квитанциям.
+#[tokio::test]
+async fn final_snapshot_follows_final_status() {
+    let points = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut f = fx("final_after_status", scripted());
+    f.model.push(answer("Париж"));
+    let seen = Arc::clone(&points);
+    f.deps.crash = Some(Arc::new(move |p: CrashPoint| {
+        seen.lock().unwrap().push(p);
+        matches!(p, CrashPoint::AfterFinalStatus { .. })
+    }));
+    let err = start(&mut f, spec(RunRole::Top)).await.unwrap_err();
+    assert!(matches!(err, LoopError::Halted), "{err:?}");
+    assert_eq!(
+        *points.lock().unwrap(),
+        [
+            CrashPoint::AfterModelEffect { step: 1 },
+            CrashPoint::AfterFinalStatus { step: 1 },
+        ]
+    );
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Done);
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.next, Next::Model);
+    assert!(f.model.finished_runs().is_empty());
+
+    // Сбой до статуса: квитанция модели записана, статуса и конечного снимка нет.
+    let mut f = fx("final_before_status", scripted());
+    f.model.push(answer("Париж"));
+    f.deps.crash = Some(Arc::new(|p: CrashPoint| {
+        matches!(p, CrashPoint::AfterModelEffect { .. })
+    }));
+    let err = start(&mut f, spec(RunRole::Top)).await.unwrap_err();
+    assert!(matches!(err, LoopError::Halted), "{err:?}");
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Running);
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.next, Next::Model);
+
+    // Без сбоя конечный снимок есть и держит итоговую историю.
+    let mut f = fx("final_snapshot", scripted());
+    f.model.push(answer("Париж"));
+    start(&mut f, spec(RunRole::Top)).await.unwrap();
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!((snap.next, snap.exit.clone()), (Next::Boundary, None));
+    assert_eq!(
+        roles(&history(&f.store, &snap).await),
+        [Role::User, Role::Assistant]
+    );
 }
 
 #[tokio::test]

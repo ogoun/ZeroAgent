@@ -61,6 +61,35 @@ pub mod pause_reason {
     pub const REFUSAL: &str = "refusal";
 }
 
+/// Причины ошибки run: поле `reason` события `run.status` при переходе в `failed`.
+///
+/// Короткий машинный код класса ошибки цикла; подробность — в логах. Значения —
+/// часть протокола (их читают CLI и UI), менять строки нельзя.
+pub mod fail_reason {
+    /// Ошибка журнала, после которой статус удалось записать.
+    pub const STORE: &str = "store";
+    /// Контекст run отравлен прежней ошибкой.
+    pub const POISONED: &str = "poisoned";
+    /// Прочая ошибка протокола эффектов (квитанция-отказ там, где её быть не должно).
+    pub const EFFECT: &str = "effect";
+    /// Нарушен инвариант истории диалога.
+    pub const HISTORY: &str = "history";
+    /// Снимок run не пишется или не читается.
+    pub const SNAPSHOT: &str = "snapshot";
+    /// Нарушен инвариант графа цикла.
+    pub const GRAPH: &str = "graph";
+    /// Run в статусе, из которого продолжить нельзя.
+    pub const NOT_RESUMABLE: &str = "not_resumable";
+    /// Эндпоинт модели неизвестен.
+    pub const UNKNOWN_ENDPOINT: &str = "unknown_endpoint";
+    /// Смена модели посреди шага.
+    pub const CHANGE_MID_STEP: &str = "change_mid_step";
+    /// Префикс промпта не собирается (конфигурация run).
+    pub const PREFIX: &str = "prefix";
+    /// Запрос хода не сериализуется.
+    pub const REQUEST: &str = "request";
+}
+
 impl RunStatus {
     /// Допустим ли переход `self -> to` (схема ТЗ, часть 01, раздел 4.3).
     pub fn can_transition(self, to: RunStatus) -> bool {

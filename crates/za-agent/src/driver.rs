@@ -29,7 +29,7 @@ use za_core::{
 use za_llm::{BoxFuture, EndpointId, FinishReason, ModelCall, ModelPort, RequestMeta, ToolChoice};
 use za_protocol::{
     Actor, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId, RunMode, RunRole,
-    RunStatus, Seq, Tier, canonical_json, pause_reason,
+    RunStatus, Seq, Tier, canonical_json, fail_reason, pause_reason,
 };
 use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
@@ -43,9 +43,9 @@ use crate::request::{
     FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message, freeze,
 };
 use crate::state::{Counters, LoopState, Next, PendingExit};
-use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, run_tools};
+use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools};
 use crate::turn::{
-    CallVerdict, RequestRefs, Reviewed, Signal, TurnError, TurnOutput, model_turn,
+    CallVerdict, ControlFlags, RequestRefs, Reviewed, Signal, TurnError, TurnOutput, model_turn,
     report_parse_errors, review,
 };
 
@@ -56,6 +56,8 @@ pub enum CrashPoint {
     AfterModelEffect { step: u64 },
     /// снимок чистой паузы записан, статус ещё нет
     AfterExitSnapshot { step: u64 },
+    /// конечный статус (done, partial, blocked, cancelled) записан, конечного снимка ещё нет
+    AfterFinalStatus { step: u64 },
 }
 
 /// true — драйвер немедленно возвращает Err(LoopError::Halted) без единой записи.
@@ -143,22 +145,22 @@ pub enum LoopError {
 
 impl LoopError {
     /// Причина в `run.status` при переходе в `failed`.
-    fn code(&self) -> &'static str {
-        match self {
-            LoopError::Store(_) => "store",
-            LoopError::Effect(EffectError::Store(_)) => "store",
-            LoopError::Effect(EffectError::Poisoned) => "poisoned",
-            LoopError::Effect(_) => "effect",
-            LoopError::History(_) => "history",
-            LoopError::Snapshot(_) => "snapshot",
-            LoopError::Graph(_) => "graph",
-            LoopError::NotResumable(_) => "not_resumable",
-            LoopError::UnknownEndpoint(_) => "unknown_endpoint",
-            LoopError::ChangeMidStep => "change_mid_step",
-            LoopError::Prefix(_) => "prefix",
-            LoopError::Request(_) => "request",
-            LoopError::Halted => "halted",
-        }
+    /// `None` — у `Halted`: точка сбоя ничего не пишет (D33).
+    fn code(&self) -> Option<&'static str> {
+        Some(match self {
+            LoopError::Store(_) | LoopError::Effect(EffectError::Store(_)) => fail_reason::STORE,
+            LoopError::Effect(EffectError::Poisoned) => fail_reason::POISONED,
+            LoopError::Effect(_) => fail_reason::EFFECT,
+            LoopError::History(_) => fail_reason::HISTORY,
+            LoopError::Snapshot(_) => fail_reason::SNAPSHOT,
+            LoopError::Graph(_) => fail_reason::GRAPH,
+            LoopError::NotResumable(_) => fail_reason::NOT_RESUMABLE,
+            LoopError::UnknownEndpoint(_) => fail_reason::UNKNOWN_ENDPOINT,
+            LoopError::ChangeMidStep => fail_reason::CHANGE_MID_STEP,
+            LoopError::Prefix(_) => fail_reason::PREFIX,
+            LoopError::Request(_) => fail_reason::REQUEST,
+            LoopError::Halted => return None,
+        })
     }
 }
 
@@ -191,6 +193,8 @@ const INBOX_PAGE: usize = 512;
 
 /// Nudge пустого хода top (D18, D23).
 const EMPTY_NUDGE_TOP: &str = "Your last response had no text and no tool calls. Continue the task: answer the user or call a tool.";
+/// Nudge обрезанного ответа: текст без вызовов с `finish = Length` (решение контроллера, I2).
+const TRUNCATED_NUDGE: &str = "Your previous reply was cut off by the output limit. Continue more briefly or split the answer into parts.";
 /// Nudge пустого хода worker и orchestrator (D18, D23).
 const EMPTY_NUDGE_SUBAGENT: &str = "Your last response made no tool calls. Continue the task with tool calls; when the work is done, partly done or blocked, call finish.";
 
@@ -499,6 +503,7 @@ async fn apply_exit(
     let outcome = match exit {
         LoopExit::Finished(status) => {
             st.generation = j.set_status(run, status, st.generation, None).await?;
+            final_snapshot(deps, st).await?;
             deps.model.finish_run(run);
             LoopOutcome::Finished {
                 status,
@@ -537,6 +542,7 @@ async fn apply_exit(
             st.generation = j
                 .set_status(run, RunStatus::Cancelled, st.generation, None)
                 .await?;
+            final_snapshot(deps, st).await?;
             deps.model.finish_run(run);
             LoopOutcome::Cancelled
         }
@@ -548,10 +554,9 @@ async fn apply_exit(
 /// Ошибка цикла после старта (решение R0): попытка `failed` с причиной и `finish_run`;
 /// не вышло — `error!`, статус остаётся для resume. `Halted` ничего не пишет (D33).
 async fn fail(deps: &LoopDeps, run: RunId, generation: u64, e: LoopError) -> LoopError {
-    if matches!(e, LoopError::Halted) {
+    let Some(reason) = e.code() else {
         return e;
-    }
-    let reason = e.code();
+    };
     match deps
         .journal
         .set_status(run, RunStatus::Failed, generation, Some(reason))
@@ -877,23 +882,30 @@ async fn model_output(
     {
         turn_finished(deps, st, "answer", Some(&rev)).await?;
         st.answer = Some(rev.text);
-        return finish_with(deps, st, RunStatus::Done).await;
+        return finish_with(st, RunStatus::Done);
     }
+    // Обрезанный ответ (решение контроллера, I2): текст есть, вызовов нет, `Length`.
+    // Ответом не считается и идёт в счёт пустых ходов D18, но без `Required`: модели
+    // нужно продолжить текст, а не вызвать инструмент.
+    let truncated = out.finish == FinishReason::Length && !rev.text.trim().is_empty();
     // Пустой ход (D18): нет вызовов и, у top, нет ответа.
-    turn_finished(deps, st, "empty", Some(&rev)).await?;
+    let outcome = if truncated { "truncated" } else { "empty" };
+    turn_finished(deps, st, outcome, Some(&rev)).await?;
     push_nudges(st, &rev.nudges)?;
     st.counters.empty_turns += 1;
     if st.counters.empty_turns >= EMPTY_TURNS_LIMIT {
         tracing::warn!(run = %st.run, "пустые ходы подряд: run blocked");
-        return finish_with(deps, st, RunStatus::Blocked).await;
+        return finish_with(st, RunStatus::Blocked);
     }
-    let nudge = if st.setup.role == RunRole::Top {
+    let nudge = if truncated {
+        TRUNCATED_NUDGE
+    } else if st.setup.role == RunRole::Top {
         EMPTY_NUDGE_TOP
     } else {
         EMPTY_NUDGE_SUBAGENT
     };
     push_nudges(st, &[nudge.to_owned()])?;
-    if st.counters.empty_turns == EMPTY_TURNS_LIMIT - 1 {
+    if !truncated && st.counters.empty_turns == EMPTY_TURNS_LIMIT - 1 {
         st.counters.forced_required = true;
     }
     Ok(Transition::Goto(BOUNDARY))
@@ -929,11 +941,73 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             return Ok(Transition::Done);
         }
     };
-    st.conv.push_results(out.results)?;
-    // `finish` важнее обрыва пакета: run завершён (решение контроллера к задаче 11).
-    if let Some(f) = out.finish {
-        // Синтетические результаты — только вызовам без результата (CORE-105).
-        st.conv.close_interrupted();
+    // `ToolsOutcome` не различает Pause и Input: решают флаги (Carry к задаче 12/14).
+    let flags = *st.sig.flags().borrow();
+    let verdict = tools_verdict(&out, flags)?;
+    let ToolsOutcome {
+        results,
+        suspend,
+        finish,
+        ..
+    } = out;
+    st.conv.push_results(results)?;
+    match verdict {
+        ToolsVerdict::Finish(status) => {
+            // Синтетические результаты — только вызовам без результата (CORE-105).
+            st.conv.close_interrupted();
+            if let Some(f) = finish {
+                st.answer = Some(f.result.clone());
+                st.finish = Some(f);
+            }
+            finish_with(st, status)
+        }
+        ToolsVerdict::Cancel => {
+            st.conv.close_interrupted();
+            st.exit = Some(LoopExit::Cancelled);
+            Ok(Transition::Done)
+        }
+        // Снимка нет (D5): resume реплеит шаг до прерывания и читает решение.
+        ToolsVerdict::Suspend => match suspend {
+            Some(int) => Ok(Transition::Suspend(int)),
+            None => Err(LoopError::Graph("прерывание пакета без прерывания".into())),
+        },
+        ToolsVerdict::Next { aborted } => {
+            if aborted {
+                st.conv.close_interrupted();
+            }
+            // Nudge — отдельными сообщениями после результатов (D23).
+            push_nudges(st, &rev.nudges)?;
+            Ok(Transition::Goto(BOUNDARY))
+        }
+        ToolsVerdict::Pause => {
+            st.conv.close_interrupted();
+            push_nudges(st, &rev.nudges)?;
+            command_pause(sh, st).await
+        }
+    }
+}
+
+/// Что делать после пакета вызовов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolsVerdict {
+    /// Принят `finish`: run завершается с этим статусом.
+    Finish(RunStatus),
+    Cancel,
+    /// Пакет остановился на прерывании.
+    Suspend,
+    /// Пакет оборван паузой по команде.
+    Pause,
+    /// К следующей границе; `aborted` — пакет оборван вводом.
+    Next {
+        aborted: bool,
+    },
+}
+
+/// Решение по итогу пакета. Приоритет: `finish` важнее отмены и обрыва (решения
+/// контроллера к задачам 11 и 12: вызов `finish` исполнен и записан), затем отмена,
+/// прерывание, обрыв; Pause и Input различаются по флагам.
+fn tools_verdict(out: &ToolsOutcome, flags: ControlFlags) -> Result<ToolsVerdict, LoopError> {
+    if let Some(f) = &out.finish {
         let status = match f.status.as_str() {
             "done" => RunStatus::Done,
             "partial" => RunStatus::Partial,
@@ -944,36 +1018,25 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
                 )));
             }
         };
-        st.answer = Some(f.result.clone());
-        st.finish = Some(f);
-        return finish_with(deps, st, status).await;
+        return Ok(ToolsVerdict::Finish(status));
     }
     if out.cancelled {
-        st.conv.close_interrupted();
-        st.exit = Some(LoopExit::Cancelled);
-        return Ok(Transition::Done);
+        return Ok(ToolsVerdict::Cancel);
     }
-    if let Some(int) = out.suspend {
-        // Снимка нет (D5): resume реплеит шаг до прерывания и читает решение.
-        return Ok(Transition::Suspend(int));
+    if out.suspend.is_some() {
+        return Ok(ToolsVerdict::Suspend);
     }
     if out.aborted {
-        st.conv.close_interrupted();
-    }
-    // Nudge — отдельными сообщениями после результатов (D23).
-    push_nudges(st, &rev.nudges)?;
-    if out.aborted {
-        // `ToolsOutcome` не различает Pause и Input: решают флаги (Carry к задаче 12/14).
-        let flags = *st.sig.flags().borrow();
         if flags.cancel {
-            st.exit = Some(LoopExit::Cancelled);
-            return Ok(Transition::Done);
+            return Ok(ToolsVerdict::Cancel);
         }
         if flags.pause {
-            return command_pause(sh, st).await;
+            return Ok(ToolsVerdict::Pause);
         }
     }
-    Ok(Transition::Goto(BOUNDARY))
+    Ok(ToolsVerdict::Next {
+        aborted: out.aborted,
+    })
 }
 
 // ---- Выходы ----
@@ -1055,18 +1118,37 @@ async fn clean_pause(
     Ok(Transition::Done)
 }
 
-/// Конечное состояние: история сохранена, снимок `{next: Boundary, exit: None}` на
-/// `last_seq` (D17: история конечного снимка валидна), выход.
-async fn finish_with(
-    deps: &LoopDeps,
-    st: &mut LoopState,
-    status: RunStatus,
-) -> Result<Transition, LoopError> {
-    let store = store_of(deps);
-    persist(&store, st).await?;
-    save_snapshot(&store, st, Next::Boundary, None).await?;
+/// Конечное состояние: только выход. Снимок до статуса не пишется (решение
+/// контроллера, I1): сбой до записи статуса оставляет последним снимок `Model` шага,
+/// и resume реплеит шаг по квитанциям к тому же итогу.
+fn finish_with(st: &mut LoopState, status: RunStatus) -> Result<Transition, LoopError> {
     st.exit = Some(LoopExit::Finished(status));
     Ok(Transition::Done)
+}
+
+/// Конечный снимок `{next: Boundary, exit: None}` на `last_seq` — после записи
+/// конечного статуса и до `finish_run` (решение контроллера, I1; D17: история снимка
+/// валидна). Run в конечном статусе не продолжается (`NotResumable`): снимок — для
+/// чтения итоговой истории. Ошибка его записи итог не меняет (статус в журнале —
+/// источник истины), пишется `error!`.
+async fn final_snapshot(deps: &LoopDeps, st: &mut LoopState) -> Result<(), LoopError> {
+    if crashed(
+        deps,
+        CrashPoint::AfterFinalStatus {
+            step: st.ctx.step(),
+        },
+    ) {
+        return Err(LoopError::Halted);
+    }
+    let store = store_of(deps);
+    let r = match persist(&store, st).await {
+        Ok(()) => save_snapshot(&store, st, Next::Boundary, None).await,
+        Err(e) => Err(e.into()),
+    };
+    if let Err(e) = r {
+        tracing::error!(run = %st.run, error = %e, "конечный снимок не записан, статус уже конечный");
+    }
+    Ok(())
 }
 
 // ---- Помощники ----
@@ -1180,6 +1262,76 @@ async fn last_event_seq(store: &ProjectStore, run: RunId) -> Result<Seq, StoreEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finish_args(status: &str) -> FinishArgs {
+        FinishArgs {
+            status: status.into(),
+            result: "r".into(),
+            evidence: Vec::new(),
+            open_issues: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn finish_wins_over_cancel_and_abort() {
+        let pause = ControlFlags {
+            pause: true,
+            cancel: false,
+        };
+        let cancel = ControlFlags {
+            pause: false,
+            cancel: true,
+        };
+        // M5: `finish` и `cancelled` в одном пакете — итог по `finish`.
+        let out = ToolsOutcome {
+            finish: Some(finish_args("done")),
+            cancelled: true,
+            ..ToolsOutcome::default()
+        };
+        assert_eq!(
+            tools_verdict(&out, cancel).unwrap(),
+            ToolsVerdict::Finish(RunStatus::Done)
+        );
+        // Решение к задаче 11: `finish` и `aborted` — тоже по `finish`.
+        let out = ToolsOutcome {
+            finish: Some(finish_args("partial")),
+            aborted: true,
+            ..ToolsOutcome::default()
+        };
+        assert_eq!(
+            tools_verdict(&out, pause).unwrap(),
+            ToolsVerdict::Finish(RunStatus::Partial)
+        );
+        // Без `finish`: отмена, затем обрыв по флагам.
+        let out = ToolsOutcome {
+            cancelled: true,
+            ..ToolsOutcome::default()
+        };
+        assert_eq!(tools_verdict(&out, pause).unwrap(), ToolsVerdict::Cancel);
+        let out = ToolsOutcome {
+            aborted: true,
+            ..ToolsOutcome::default()
+        };
+        assert_eq!(tools_verdict(&out, pause).unwrap(), ToolsVerdict::Pause);
+        assert_eq!(tools_verdict(&out, cancel).unwrap(), ToolsVerdict::Cancel);
+        assert_eq!(
+            tools_verdict(&out, ControlFlags::default()).unwrap(),
+            ToolsVerdict::Next { aborted: true }
+        );
+        assert_eq!(
+            tools_verdict(&ToolsOutcome::default(), pause).unwrap(),
+            ToolsVerdict::Next { aborted: false }
+        );
+    }
+
+    #[test]
+    fn halted_has_no_fail_reason() {
+        assert_eq!(LoopError::Halted.code(), None);
+        assert_eq!(
+            LoopError::Store(StoreError::Full).code(),
+            Some(fail_reason::STORE)
+        );
+    }
 
     #[test]
     fn budget_text_lists_limits() {
