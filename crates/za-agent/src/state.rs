@@ -123,6 +123,10 @@ pub struct AtBoundary {
     pub run_mode: Option<RunMode>,
     /// После ввода — управляющее сообщение `resume` с блоком `<state>` (эффект `state`).
     pub resume_note: bool,
+    /// Шаг, начатый до resume без блока `<state>` (у него уже есть эффекты после
+    /// `boundary`): блок — в конце границы этого шага, ключ после записанных эффектов
+    /// (R1-C1, Ruling I1).
+    pub state_late: Option<u64>,
 }
 
 /// Состояние цикла в памяти; узлы графа работают над ним (S в Graph<S, LoopError>).

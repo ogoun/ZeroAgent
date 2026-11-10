@@ -19,6 +19,14 @@ use axum::response::{IntoResponse, Response};
 use http_body::Frame;
 use serde_json::{Value, json};
 
+/// Имя каталога теста `<name>-<pid>-<n>`: свой у каждого вызова и процесса, одновременные
+/// прогоны одного бинарника не делят каталог (R1-C1, гигиена тестов).
+fn unique(name: &str) -> String {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{name}-{}-{n}", std::process::id())
+}
+
 /// Ключ, который не должен появиться ни в одном выводе.
 const KEY: &str = "sk-test-xyz";
 
@@ -196,7 +204,7 @@ struct Env {
 fn env(name: &str, config: &str) -> Env {
     let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("r1a-models")
-        .join(name);
+        .join(unique(name));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
     if !config.is_empty() {

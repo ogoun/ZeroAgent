@@ -20,10 +20,10 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, broadcast};
 use za_agent::{
     COMPACT_RUBRIC, CompactInput, ContextConfig, ContextMeter, Conversation, CrashPoint, EnvInfo,
-    InputMode, LoopDeps, LoopError, LoopOutcome, MemoryLevel, MemoryPort, NoMemory, Recall,
-    ResumeChange, RunSetup, RunSpec, Snapshot, builtin_tools, compact, control_channel, cut_points,
-    freeze, memory_budget, reasoning_for, resume_run, signal_channel, split_tail, start_run,
-    state_block, submit_input, summary_block,
+    FaultPoint, InputMode, LoopDeps, LoopError, LoopOutcome, MemoryLevel, MemoryPort, NoMemory,
+    Recall, ResumeChange, RunSetup, RunSpec, Snapshot, builtin_tools, compact, control_channel,
+    cut_points, freeze, memory_budget, reasoning_for, resume_run, signal_channel, split_tail,
+    start_run, state_block, submit_input, summary_block,
 };
 use za_core::{
     AgentEvent, Approval, EventBus, Journal, RiskClass, RunCtx, Tool, ToolCx, ToolKind, ToolOutput,
@@ -1583,4 +1583,92 @@ async fn recitation_is_clipped_to_window_share() {
     assert!(last.contains("…[truncated]"));
     // 8192 / 4 = 2048 токенов ≈ 8192 байт текста ввода.
     assert!(last.len() < 8192 + 200, "{}", last.len());
+}
+
+// ---- Resume с границы шага 1 без вклинивания `state` (R1-C1, Ruling I1) ----
+
+/// Хук сбоя, который перед чтением границы шага 1 кладёт в журнал большой ввод
+/// пользователя (запись из отдельного потока: хук синхронный), а в точке `at` один раз
+/// даёт сбой журнала. Граница шага 1 читает ввод, и компакция по порогу идёт уже на ней
+/// (эффекты `boundary`, `context`, `compact`, `inbox`, `context`); последний снимок до
+/// неё — `Boundary` шага 0. Ввод кладётся один раз: реплей границы берёт его из квитанции.
+fn input_at_step1(f: &Fx, b0: u32, at: Option<FaultPoint>) -> za_agent::FaultHook {
+    let (store, run) = (f.store.clone(), f.run);
+    // ≈ 4 байта ASCII на токен оценки: первая оценка шага 1 выше порога 3072.
+    let text = "x ".repeat(((THRESHOLD_8K - b0 + 400) * 2) as usize);
+    let input = Arc::new(AtomicBool::new(true));
+    let armed = Arc::new(AtomicBool::new(true));
+    Arc::new(move |p| {
+        if p == (FaultPoint::BeforeReadBoundary { step: 1 }) && input.swap(false, Ordering::SeqCst)
+        {
+            let (store, text) = (store.clone(), text.clone());
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(submit_input(&store, run, &text, InputMode::Queue))
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+        Some(p) == at && armed.swap(false, Ordering::SeqCst)
+    })
+}
+
+fn script_big(model: &ScriptedModel) {
+    model.push(summary("n"));
+    model.push(answer("готово"));
+}
+
+#[tokio::test]
+async fn step1_crash_after_inbox_resumes() {
+    let b0 = probe("step1_inbox", 8192).await;
+    let mut f = fx("step1_inbox_crash", scripted(8192));
+    script_big(&f.model);
+    f.deps.fault = Some(input_at_step1(&f, b0, None));
+    let fired = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&fired);
+    let at = CrashPoint::AfterInbox { step: 1 };
+    f.deps.crash = Some(Arc::new(move |p: CrashPoint| {
+        p == at && !flag.swap(true, Ordering::SeqCst)
+    }));
+    assert!(matches!(start(&f).await, Err(LoopError::Halted)));
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "компакции на границе шага 1 не было"
+    );
+    let out = resume_with(&f, &f.deps, ResumeChange::default()).await;
+    assert_eq!(out, done("готово"));
+    assert_eq!(
+        compactions(&f.model),
+        1,
+        "сводка не запрашивается второй раз"
+    );
+}
+
+#[tokio::test]
+async fn step1_fault_after_inbox_resumes() {
+    let b0 = probe("step1_inbox_f", 8192).await;
+    let mut f = fx("step1_inbox_fault", scripted(8192));
+    script_big(&f.model);
+    f.deps.fault = Some(input_at_step1(
+        &f,
+        b0,
+        Some(FaultPoint::AfterInbox { step: 1 }),
+    ));
+    assert_eq!(start(&f).await.unwrap(), paused("store"));
+    let evs = events(&f.store, f.run).await;
+    assert_eq!(
+        of_kind(&evs, EventKind::ContextCompacted)[0].payload["step"],
+        1
+    );
+    let mut deps = f.deps.clone();
+    deps.fault = None;
+    assert_eq!(
+        resume_with(&f, &deps, ResumeChange::default()).await,
+        done("готово")
+    );
+    assert_eq!(compactions(&f.model), 1);
 }

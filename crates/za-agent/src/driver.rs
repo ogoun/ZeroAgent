@@ -101,6 +101,12 @@ pub enum CrashPoint {
     /// история, `context.compacted` и снимок `Model` — нет (R1-B2 D68): компакция по
     /// порогу на границе и аварийная в узле `model`
     AfterCompact { step: u64 },
+    /// эффект `context` первой оценки шага на границе записан, снимка `Model` ещё нет
+    /// (R1-C1, Ruling I1)
+    AfterContext { step: u64 },
+    /// эффект `inbox` шага (ввод после компакции на границе) записан, снимка `Model`
+    /// ещё нет (R1-C1, Ruling I1)
+    AfterInbox { step: u64 },
 }
 
 /// true — драйвер немедленно возвращает Err(LoopError::Halted) без единой записи.
@@ -111,13 +117,20 @@ pub type CrashHook = Arc<dyn Fn(CrashPoint) -> bool + Send + Sync>;
 pub enum FaultPoint {
     /// внутри замыкания эффекта `boundary` шага, до чтения ввода
     BeforeReadBoundary { step: u64 },
-    /// внутри замыкания слота вызова инструмента шага: вызов исполнен, `tool.finished` ещё нет
+    /// внутри замыкания слота вызова шага (инструмент, `ask_user`, `finish`): вызов
+    /// исполнен, `tool.finished` ещё нет
     BeforeToolFinished { step: u64 },
+    /// эффект `boundary` шага записан: следующая запись журнала не удалась (Ruling I1)
+    AfterBoundary { step: u64 },
+    /// эффект `context` первой оценки шага записан: следующая запись не удалась
+    AfterContext { step: u64 },
+    /// эффект `inbox` шага записан: следующая запись не удалась
+    AfterInbox { step: u64 },
 }
 
 /// true — в точке случается сбой журнала: замыкание `boundary` возвращает
-/// `EffectFailure::Transient`, слот инструмента — ошибку записи `tool.finished`, как
-/// настоящая (D72).
+/// `EffectFailure::Transient`, слот вызова — ошибку записи `tool.finished`, точки
+/// `After*` — ошибку записи журнала после эффекта (`StoreError::Io`), как настоящая (D72).
 pub type FaultHook = Arc<dyn Fn(FaultPoint) -> bool + Send + Sync>;
 
 /// Зависимости цикла.
@@ -206,14 +219,16 @@ pub enum LoopError {
 }
 
 impl LoopError {
-    /// Сбой журнала после старта цикла: `LoopError::Store`, `EffectError::Store` и
-    /// `EffectError::Transient` дают паузу `store` статусом, а не `failed` (R1-C1 D72).
+    /// Временный сбой журнала после старта цикла — пауза `store` статусом, а не
+    /// `failed` (R1-C1 D72): `EffectError::Transient` и временные [`StoreError`]
+    /// ([`transient_store`]). Повреждение журнала и нарушенные инварианты (`Corrupt`,
+    /// `UnknownEffect`, переходы статуса и прочие) ведут в `failed` (Ruling, сомнение 2).
     fn is_store_fault(&self) -> bool {
-        matches!(
-            self,
-            LoopError::Store(_)
-                | LoopError::Effect(EffectError::Store(_) | EffectError::Transient(_))
-        )
+        match self {
+            LoopError::Store(e) | LoopError::Effect(EffectError::Store(e)) => transient_store(e),
+            LoopError::Effect(EffectError::Transient(_)) => true,
+            _ => false,
+        }
     }
 
     /// Причина в `run.status` при переходе в `failed`.
@@ -239,6 +254,15 @@ impl LoopError {
     }
 }
 
+/// Сбой среды, который может пройти при повторе (`za_store::StoreError`, «сбой среды»):
+/// нет места, ввод-вывод, журнал занят, ошибка SQLite (занято, I/O).
+fn transient_store(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::Full | StoreError::Io(_) | StoreError::Locked | StoreError::Sqlite(_)
+    )
+}
+
 /// Ошибка эффекта в ошибку цикла: ошибка журнала — `LoopError::Store` (D11).
 fn effect_err(e: EffectError) -> LoopError {
     match e {
@@ -256,7 +280,7 @@ const TOOLS: NodeId = "tools";
 /// Имя эффекта границы шага (D9).
 const BOUNDARY_EFFECT: &str = "boundary";
 /// Имя эффекта блока `<state>` сообщения `resume` (задача 15).
-const STATE_EFFECT: &str = "state";
+pub(crate) const STATE_EFFECT: &str = "state";
 /// Имя эффекта снимка памяти шага 0 (D24).
 const MEMORY_EFFECT: &str = "memory.snapshot";
 /// Имя эффекта оценки контекста на границе шага (R1-B2 D42).
@@ -559,6 +583,11 @@ async fn store_pause(
     e: LoopError,
 ) -> Result<LoopOutcome, LoopError> {
     let run = st.run;
+    if st.stopping == Some(RunStatus::Cancelling) {
+        // Из `cancelling` перехода в `paused` нет (часть 01, 4.3): resume доведёт отмену.
+        tracing::error!(run = %run, error = %e, "сбой журнала во время отмены: run остаётся для resume");
+        return Err(e);
+    }
     match deps
         .journal
         .set_status(
@@ -902,9 +931,11 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
         st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
         LoopError::Store(e)
     })?;
-    if crashed(deps, CrashPoint::AfterBoundary { step }) {
-        return Err(LoopError::Halted);
-    }
+    after_effect(
+        deps,
+        CrashPoint::AfterBoundary { step },
+        FaultPoint::AfterBoundary { step },
+    )?;
     // (4) Активное время (D19). Реплей границы из журнала (после resume) время не
     // считает: `now_ms` квитанции записан до простоя между процессами, и `tick` с ним
     // засчитал бы простой следующей живой границей. Теряется один интервал (решение
@@ -923,16 +954,11 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     push_inbox(deps, st, &b.inputs).await?;
     st.inbox_after = b.inbox_after;
     // (6') Первая граница resume со снимка `Boundary`: после ввода — `resume` с блоком
-    // `<state>` (A.6). Блок — эффект: реплей границы получает тот же текст.
-    if st.at_boundary.resume_note {
-        let text = state_effect(deps, st).await?;
-        st.conv.push_user(render_control_trusted(
-            ControlFrom::Runtime,
-            ControlAction::Resume,
-            "",
-            &text,
-        ))?;
-        st.at_boundary.resume_note = false;
+    // `<state>` (A.6). Блок — эффект: реплей границы получает тот же текст. Шаг, начатый
+    // до resume без блока (Ruling I1), получает его в конце границы: ключ — после уже
+    // записанных эффектов шага, реплей не расходится с журналом.
+    if st.at_boundary.resume_note && st.at_boundary.state_late != Some(step) {
+        push_resume_note(deps, st).await?;
     }
     boundary_tail(sh, st, step).await
 }
@@ -1010,7 +1036,11 @@ async fn reread_inbox(deps: &LoopDeps, st: &mut LoopState, step: u64) -> Result<
     })?;
     push_inbox(deps, st, &b.inputs).await?;
     st.inbox_after = b.inbox_after;
-    Ok(())
+    after_effect(
+        deps,
+        CrashPoint::AfterInbox { step },
+        FaultPoint::AfterInbox { step },
+    )
 }
 
 /// Граница после ввода: напоминания (7), `context` и пороги (7'), `persist`,
@@ -1041,8 +1071,17 @@ async fn boundary_tail(
     }
     // (7') Оценка запроса хода (R1-B2 D42): ввод и напоминания уже в истории.
     let est = context_effect(deps, st, step, 0).await?;
+    after_effect(
+        deps,
+        CrashPoint::AfterContext { step },
+        FaultPoint::AfterContext { step },
+    )?;
     if let Some(t) = context_thresholds(sh, st, step, est).await? {
         return Ok(t);
+    }
+    // Отложенный блок `<state>` (Ruling I1): все эффекты границы уже взяли свои ключи.
+    if st.at_boundary.resume_note {
+        push_resume_note(deps, st).await?;
     }
     // (8)–(10) persist, turn.started, снимок `Model` на его seq.
     persist(&store_of(deps), st).await?;
@@ -1058,6 +1097,20 @@ async fn boundary_tail(
     .await?;
     save_snapshot(&store_of(deps), st, Next::Model, None).await?;
     Ok(Transition::Goto(MODEL))
+}
+
+/// Сообщение `resume` с блоком `<state>` (эффект `state`); снимает флаг resume.
+async fn push_resume_note(deps: &LoopDeps, st: &mut LoopState) -> Result<(), LoopError> {
+    let text = state_effect(deps, st).await?;
+    st.conv.push_user(render_control_trusted(
+        ControlFrom::Runtime,
+        ControlAction::Resume,
+        "",
+        &text,
+    ))?;
+    st.at_boundary.resume_note = false;
+    st.at_boundary.state_late = None;
+    Ok(())
 }
 
 /// Эффект `state` (ReadOnly): текст блока `<state>` для сообщения `resume`.
@@ -2683,6 +2736,18 @@ fn store_of(deps: &LoopDeps) -> ProjectStore {
 
 fn crashed(deps: &LoopDeps, p: CrashPoint) -> bool {
     deps.crash.as_ref().is_some_and(|h| h(p))
+}
+
+/// Точка после эффекта (Ruling I1): `CrashHook` — `Halted` без записи, `FaultHook` —
+/// ошибка журнала `StoreError::Io`, как у следующей записи (тест).
+fn after_effect(deps: &LoopDeps, crash: CrashPoint, fault: FaultPoint) -> Result<(), LoopError> {
+    if crashed(deps, crash) {
+        return Err(LoopError::Halted);
+    }
+    if deps.fault.as_ref().is_some_and(|h| h(fault)) {
+        return Err(LoopError::Store(StoreError::Io(INJECTED_FAULT.into())));
+    }
+    Ok(())
 }
 
 /// Nudge рантайма — отдельными user-сообщениями (D23).

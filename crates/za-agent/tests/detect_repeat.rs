@@ -571,11 +571,7 @@ struct Fx {
 }
 
 fn fx(name: &str) -> Fx {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("detect_repeat")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+    let d = unique_dir("detect_repeat", name);
     let store = ProjectStore::open(&d).unwrap();
     let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
     let count = Arc::new(AtomicUsize::new(0));

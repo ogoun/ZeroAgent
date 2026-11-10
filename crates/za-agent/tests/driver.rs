@@ -530,6 +530,7 @@ async fn final_snapshot_follows_final_status() {
         *points.lock().unwrap(),
         [
             CrashPoint::AfterBoundary { step: 1 },
+            CrashPoint::AfterContext { step: 1 },
             CrashPoint::AfterModelEffect { step: 1 },
             CrashPoint::AfterFinalStatus { step: 1 },
         ]
@@ -1048,4 +1049,172 @@ async fn tool_finished_fault_keeps_history_valid() {
     // Квитанция инструмента записана до сбоя: реплей не вызывает его снова.
     let evs = events(&f.store, f.run).await;
     assert_eq!(of_kind(&evs, EventKind::ToolStarted).len(), 1);
+}
+
+// ---- Resume с границы шага 1 без вклинивания `state` (R1-C1, Ruling I1) ----
+
+/// Сбой один раз в точке `at`.
+fn crash_once(at: CrashPoint) -> za_agent::CrashHook {
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    Arc::new(move |p| p == at && armed.swap(false, std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Ход с вызовом и ответ; после resume история проходит `validate()`, `replay_mismatch` нет.
+async fn resume_after_step1(name: &str, crash: Option<CrashPoint>, fault: Option<FaultPoint>) {
+    let mut f = fx(name, scripted());
+    f.deps.crash = crash.map(crash_once);
+    f.deps.fault = fault.map(fault_once);
+    f.model
+        .push(vec![calls(vec![call_part("c1", "echo", json!({"x": 1}))])]);
+    f.model.push(answer("готово"));
+    let first = start(&mut f, spec(RunRole::Top)).await;
+    match (crash, &first) {
+        (Some(_), Err(LoopError::Halted)) => {}
+        (None, Ok(o)) if *o == store_paused() => {}
+        other => panic!("первая попытка: {other:?}"),
+    }
+    // Последний снимок — `Boundary` шага 0: resume взводит блок `<state>`.
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!((snap.step, snap.next), (0, Next::Boundary));
+    let mut deps = f.deps.clone();
+    deps.crash = None;
+    deps.fault = None;
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let out = within(
+        "resume_run",
+        resume_run(&deps, f.run, ResumeChange::default(), rx),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            out,
+            LoopOutcome::Finished {
+                status: RunStatus::Done,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    let evs = events(&f.store, f.run).await;
+    assert_ne!(
+        pause_reason_of(&evs).as_deref(),
+        Some(pause_reason::REPLAY_MISMATCH)
+    );
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let h = history(&f.store, &snap).await;
+    h.validate().unwrap();
+    // Блок `<state>` resume есть в истории ровно один раз.
+    let notes = h
+        .messages()
+        .iter()
+        .filter(|m| text_of(m).contains("action=\"resume\""))
+        .count();
+    assert_eq!(notes, 1, "{:?}", roles(&h));
+}
+
+#[tokio::test]
+async fn step1_crash_after_boundary_resumes() {
+    resume_after_step1(
+        "s1_crash_boundary",
+        Some(CrashPoint::AfterBoundary { step: 1 }),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn step1_crash_after_context_resumes() {
+    resume_after_step1(
+        "s1_crash_context",
+        Some(CrashPoint::AfterContext { step: 1 }),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn step1_fault_after_boundary_resumes() {
+    resume_after_step1(
+        "s1_fault_boundary",
+        None,
+        Some(FaultPoint::AfterBoundary { step: 1 }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn step1_fault_after_context_resumes() {
+    resume_after_step1(
+        "s1_fault_context",
+        None,
+        Some(FaultPoint::AfterContext { step: 1 }),
+    )
+    .await;
+}
+
+// ---- Повреждение журнала — failed, а не пауза store (Ruling, сомнение 2) ----
+
+/// Инструмент записывает под ключом `boundary` следующего шага квитанцию чужой формы:
+/// реплей границы шага 2 разбирает её как `StoreError::Corrupt`.
+struct Corrupter {
+    spec: ToolSpec,
+    store: ProjectStore,
+}
+
+impl Tool for Corrupter {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, _args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let key = EffectKey::derive(cx.run, 2, 0);
+            store
+                .record_intent(
+                    cx.run,
+                    &key,
+                    EffectClass::ReadOnly,
+                    "boundary",
+                    json!({ "step": 2 }),
+                )
+                .await
+                .unwrap();
+            store
+                .record_receipt(
+                    cx.run,
+                    &key,
+                    json!({"outcome": "ok", "value": {"bogus": 1}}),
+                )
+                .await
+                .unwrap();
+            ToolOutput::ok("corrupted")
+        })
+    }
+}
+
+#[tokio::test]
+async fn corrupt_journal_fails_not_pauses() {
+    let store = ProjectStore::open(&dir("corrupt")).unwrap();
+    let t: Arc<dyn Tool> = Arc::new(Corrupter {
+        spec: tool_spec("corrupt", ToolKind::Read, EffectClass::ReadOnly),
+        store: store.clone(),
+    });
+    let mut f = fx_on(store, scripted(), vec![t]);
+    f.model
+        .push(vec![calls(vec![call_part("c1", "corrupt", json!({}))])]);
+    let err = start(&mut f, spec(RunRole::Top)).await.unwrap_err();
+    assert!(
+        matches!(err, LoopError::Store(StoreError::Corrupt(_))),
+        "{err:?}"
+    );
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Failed);
+    let evs = events(&f.store, f.run).await;
+    let last = of_kind(&evs, EventKind::RunStatus)
+        .last()
+        .unwrap()
+        .payload
+        .clone();
+    assert_eq!(last["reason"], "store");
 }

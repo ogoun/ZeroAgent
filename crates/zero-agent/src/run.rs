@@ -740,6 +740,13 @@ async fn report(
                 eprintln!("zero-agent: подробность: {e}");
                 return Ok(ExitCode::from(EXIT_ERROR));
             }
+            // Статус не записался (сбой журнала, R1-C1 D72): run не конечный, resume
+            // дорабатывает шаг.
+            if let Ok(Some(r)) = store.get_run(run).await
+                && !r.status.is_terminal()
+            {
+                resume_hint();
+            }
             return Err(e.into());
         }
     };

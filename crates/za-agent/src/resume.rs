@@ -29,8 +29,8 @@ use crate::context::UserInput;
 use crate::control::{ControlRx, InputMode, submit_input};
 use crate::conversation::{Conversation, LoadError};
 use crate::driver::{
-    BOUNDARY, DEFAULT_N_CTX, LoopDeps, LoopError, LoopOutcome, MODEL, fail, n_ctx_changed,
-    n_ctx_unknown, run_graph, run_registry, run_tools_of,
+    BOUNDARY, DEFAULT_N_CTX, LoopDeps, LoopError, LoopOutcome, MODEL, STATE_EFFECT, fail,
+    n_ctx_changed, n_ctx_unknown, run_graph, run_registry, run_tools_of,
 };
 use crate::prompt::escape_untrusted;
 use crate::state::{AtBoundary, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};
@@ -188,6 +188,7 @@ pub async fn resume_run(
                 budget: change.budget,
                 run_mode: change.run_mode,
                 resume_note: false,
+                state_late: None,
             };
             MODEL
         }
@@ -222,6 +223,7 @@ pub async fn resume_run(
                 st.setup.run_mode = m;
             }
             st.at_boundary.resume_note = true;
+            st.at_boundary.state_late = state_late(&store, run, st.ctx.step() + 1).await?;
             BOUNDARY
         }
     };
@@ -236,6 +238,19 @@ pub async fn resume_run(
     };
     tracing::info!(run = %run, step = st.ctx.step(), ?next, "resume run");
     run_graph(deps, &mut st, at).await
+}
+
+/// Шаг `step`, начатый до resume без блока `<state>` (Ruling I1): после `boundary`
+/// (ключ `{step}:0`) у него уже есть эффект и это не `state` — первая попытка шага шла
+/// без блока. Тогда блок встаёт в конец границы, его ключ — после записанных эффектов.
+/// Чтение журнала до цикла, как `step_has_effects` в (4).
+async fn state_late(
+    store: &ProjectStore,
+    run: RunId,
+    step: u64,
+) -> Result<Option<u64>, StoreError> {
+    let row = store.effect(run, &EffectKey::derive(run, step, 1)).await?;
+    Ok(row.filter(|r| r.name != STATE_EFFECT).map(|_| step))
 }
 
 /// Снимка нет или он испорчен: `failed` с причиной `snapshot` (D4, D11). Из `paused` и
