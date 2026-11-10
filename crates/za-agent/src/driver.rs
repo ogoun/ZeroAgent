@@ -1943,7 +1943,9 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
 #[derive(Debug, Default)]
 struct Screened {
     /// Вызовы под детектором (класс по имени). Вызовы `Control` (`finish`, `ask_user`)
-    /// под детектор не идут: повтор вопроса — новый вопрос пользователю.
+    /// идут как меняющие состояние: в окно повтора не попадают (повтор вопроса — новый
+    /// вопрос пользователю), их ответ — факт хода и ввод пользователя, он сбрасывает
+    /// окно (Ruling N-1, N-2 ревью задачи 6).
     subjects: BTreeMap<String, ToolKind>,
     /// Вызовы, перехваченные детектором (повтор, отказ): результат без исполнения.
     intercepted: BTreeSet<String>,
@@ -1977,9 +1979,13 @@ async fn screen_calls(
         let (kind, class) = spec.map_or((ToolKind::Read, EffectClass::ReadOnly), |s| {
             (s.kind, s.class)
         });
-        if kind == ToolKind::Control {
-            continue;
-        }
+        // Ответ пользователя может изменить мир, как правка: для детектора `Control` —
+        // меняющий состояние класс (окно сбрасывается, решения о повторе нет).
+        let class = if kind == ToolKind::Control {
+            EffectClass::NonIdempotent
+        } else {
+            class
+        };
         idx.push(i);
         out.subjects.insert(c.call.id.clone(), kind);
         input.push((

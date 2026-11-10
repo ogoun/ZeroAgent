@@ -1120,3 +1120,137 @@ async fn stall_blocks_run() {
         vec![("stall".to_owned(), "block".to_owned(), 9)]
     );
 }
+
+// ---- Раунд исправлений 2 (повторное ревью задачи 6) ----
+
+fn ask(id: &str) -> Vec<Result<StreamEvent, ModelError>> {
+    calls_turn(&[(id, "ask_user", json!({"question": "Какой файл?"}))])
+}
+
+/// Run с `ask_user`: инструмент есть у top с тира standard.
+async fn start_standard(f: &Fx) -> LoopOutcome {
+    let mut s = spec();
+    s.tier = Some(Tier::Standard);
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    within("start_run", start_run(&f.deps, f.run, s, rx))
+        .await
+        .unwrap()
+}
+
+/// Отвечает на открытое прерывание `ask_user` и продолжает run до следующего выхода.
+async fn answer_and_resume(f: &Fx, out: LoopOutcome, text: &str) -> LoopOutcome {
+    let LoopOutcome::Paused {
+        interrupt: Some(id),
+        ..
+    } = out
+    else {
+        panic!("ожидалась пауза на ask_user: {out:?}");
+    };
+    assert!(
+        f.store
+            .resolve_interrupt(&id, json!({ "answer": text }))
+            .await
+            .unwrap()
+    );
+    resume(f).await.unwrap()
+}
+
+/// N-1: ответы на `ask_user` — прогресс (D56): девять вопросов подряд с одинаковым
+/// ответом не дают `blocked (stall)`.
+#[tokio::test]
+async fn answered_ask_user_is_progress() {
+    let f = fx("ask_progress");
+    for n in 1..=9 {
+        f.model.push(ask(&format!("q{n}")));
+    }
+    f.model.push(answer("готово"));
+    let mut out = start_standard(&f).await;
+    for _ in 1..=9 {
+        out = answer_and_resume(&f, out, "да").await;
+    }
+    assert_eq!(out, done("готово"));
+    assert!(detected(&f).await.is_empty(), "{:?}", detected(&f).await);
+}
+
+/// N-2: ответ на `ask_user` — ввод пользователя: сбрасывает окно повтора.
+#[tokio::test]
+async fn ask_user_answer_resets_repeat() {
+    let f = fx("ask_resets");
+    f.model.push(read_turn("c1", "a"));
+    f.model.push(ask("q1"));
+    f.model.push(read_turn("c2", "a"));
+    f.model.push(answer("готово"));
+    let out = start_standard(&f).await;
+    let out = answer_and_resume(&f, out, "я поправил a").await;
+    assert_eq!(out, done("готово"));
+    assert_eq!(
+        f.count.load(Ordering::SeqCst),
+        2,
+        "чтение после ответа исполнено"
+    );
+    assert!(detected(&f).await.is_empty());
+}
+
+/// I-1 на пути паузы по команде: не начатый вызов — не появление.
+#[tokio::test]
+async fn paused_call_repeat_executes() {
+    let f = fx("paused_repeat");
+    f.model.push(calls_turn(&[
+        ("c1", "hold", json!({"id": 1})),
+        ("c2", "read", json!({"p": "a"})),
+    ]));
+    let out = start_with(&f, |ctl, release| {
+        Box::pin(async move {
+            ctl.pause();
+            release.add_permits(1);
+        })
+    })
+    .await;
+    assert_eq!(
+        out,
+        LoopOutcome::Paused {
+            reason: "command".into(),
+            interrupt: None,
+        }
+    );
+    f.model.push(read_turn("c3", "a"));
+    f.model.push(answer("готово"));
+    assert_eq!(resume(&f).await.unwrap(), done("готово"));
+    let conv = history(&f).await;
+    assert_eq!(
+        result_of(&conv, "c2"),
+        ("interrupted: call not executed".to_owned(), true)
+    );
+    assert_eq!(
+        result_of(&conv, "c3"),
+        (r#"content of "a""#.to_owned(), false)
+    );
+    assert_eq!(f.count.load(Ordering::SeqCst), 1);
+}
+
+/// I-1: вызов, отклонённый гейтом режима, — не появление: повтор снова получает отказ
+/// гейта, а не отказ повтора.
+#[tokio::test]
+async fn gate_denied_call_is_not_an_appearance() {
+    let f = fx("gate_denied");
+    for n in 1..=3 {
+        f.model
+            .push(calls_turn(&[(&format!("c{n}"), "edit", json!({"p": "a"}))]));
+    }
+    f.model.push(answer("готово"));
+    let mut s = spec();
+    s.run_mode = RunMode::ReadOnly;
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let out = within("start_run", start_run(&f.deps, f.run, s, rx))
+        .await
+        .unwrap();
+    assert_eq!(out, done("готово"));
+    let conv = history(&f).await;
+    for n in 1..=3 {
+        let (text, is_error) = result_of(&conv, &format!("c{n}"));
+        assert!(text.starts_with("denied:"), "c{n}: {text}");
+        assert!(is_error);
+    }
+    assert_eq!(started(&f, "edit").await, 0);
+    assert!(detected(&f).await.is_empty());
+}

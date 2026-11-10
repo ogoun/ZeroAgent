@@ -14,7 +14,8 @@
 //! `ReadOnly` и не `Pure`), — успешный или с ошибкой: состояние могло измениться и
 //! частично. Сброс действует на последующие вызовы того же пакета (они исполняются,
 //! решение о повторе для них не принимается) и на следующие ходы (Ruling I-2, I-3).
-//! Ввод пользователя тоже сбрасывает окно ([`RepeatState::on_user_input`]).
+//! Ввод пользователя тоже сбрасывает окно ([`RepeatState::on_user_input`]); ответ на
+//! `ask_user` драйвер передаёт как вызов, меняющий состояние (Ruling N-2).
 //!
 //! «Новый факт» — хэш содержимого исполненного результата, которого нет среди
 //! результатов последних [`SEEN_WINDOW`] ходов. Цикл ABAB — повтор пары ходов, вторая
@@ -251,10 +252,15 @@ impl RepeatState {
         hashes.dedup();
         self.seen.push(SeenTurn { turn, hashes });
 
-        // Застой (D56): прогресс — новый факт, успешный `Edit` или `Exec`, ответ top.
-        let changed = executed
-            .iter()
-            .any(|(_, kind, err, _)| matches!(kind, ToolKind::Edit | ToolKind::Exec) && !err);
+        // Застой (D56): прогресс — новый факт, успешный `Edit` или `Exec`, ответ
+        // пользователя на `ask_user`, ответ top.
+        // Исполненный `Control` (`ask_user` отвечен) — тоже прогресс: ход пользователя
+        // (Ruling N-1 ревью задачи 6).
+        let changed = executed.iter().any(|(_, kind, err, _)| match kind {
+            ToolKind::Edit | ToolKind::Exec => !err,
+            ToolKind::Control => true,
+            ToolKind::Read => false,
+        });
         if fresh || changed || answered {
             self.stall = 0;
         } else {
