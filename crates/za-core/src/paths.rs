@@ -98,6 +98,7 @@ impl Roots {
     /// Корни разрешаются так же, как пути вызовов ([`resolve`]): проект на сетевом диске
     /// или за ссылкой на UNC — ошибка, а не корень `\\?\UNC\…` (M5 ревью).
     pub fn canonical(project: &Path, za_home: &Path) -> io::Result<Roots> {
+        let _drives = DriveScope::enter();
         let p = std::path::absolute(project)?;
         let (_, missing) = walk(&p, &mut 0).map_err(io::Error::other)?;
         if !missing.is_empty() {
@@ -368,10 +369,43 @@ fn strip_canonical(canon: PathBuf, shown: &dyn Fn() -> String) -> Result<PathBuf
     }
 }
 
-/// Буквы локальных томов (фиксированных и съёмных) с корнем `X:\`; `None` — ещё не
-/// перечислены. Обновляется, если буквы нет в списке: новый локальный том виден.
 #[cfg(windows)]
-static LOCAL_DRIVES: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+thread_local! {
+    /// Буквы локальных томов на время одного разрешения ([`DriveScope`], N1): тип диска
+    /// проверяется заново на каждый вызов `resolve`, `Roots::canonical`, `open_checked`.
+    /// Буква, бывшая локальной (флешка), а затем подключённая как сетевой диск, не
+    /// проходит по устаревшему списку.
+    static LOCAL_DRIVES: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+    /// Подменённый перечень томов (тесты; [`set_local_drives_for_tests`]).
+    static DRIVES_OVERRIDE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Подменяет перечень локальных томов в этом потоке (`Some(буквы)`), `None` — настоящий
+/// перечень. Только для тестов: так моделируется буква, переставшая быть локальной.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn set_local_drives_for_tests(letters: Option<Vec<u8>>) {
+    DRIVES_OVERRIDE.with(|o| *o.borrow_mut() = letters);
+}
+
+/// Область кэша букв: создаётся в начале публичного вызова и сбрасывает кэш при входе
+/// и выходе, поэтому список томов не переживает один вызов.
+struct DriveScope;
+
+impl DriveScope {
+    fn enter() -> Self {
+        #[cfg(windows)]
+        LOCAL_DRIVES.with(|c| *c.borrow_mut() = None);
+        Self
+    }
+}
+
+impl Drop for DriveScope {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        LOCAL_DRIVES.with(|c| *c.borrow_mut() = None);
+    }
+}
 
 /// Перечисляет локальные тома (`FindFirstVolumeW` и `GetDriveTypeW` внутри `sysinfo`,
 /// без `unsafe` у нас). Сетевые диски и `subst` томами не являются и в список не входят.
@@ -413,15 +447,15 @@ fn check_drive(p: &Path, shown: &dyn Fn() -> String) -> Result<(), PathError> {
         },
         _ => return Err(PathError::Invalid(shown())),
     };
-    let mut cache = LOCAL_DRIVES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if cache.as_ref().is_some_and(|l| l.contains(&letter)) {
-        return Ok(());
-    }
-    let fresh = list_local_drives();
-    let local = fresh.contains(&letter);
-    *cache = Some(fresh);
+    let local = LOCAL_DRIVES.with(|c| {
+        let mut c = c.borrow_mut();
+        let list = c.get_or_insert_with(|| {
+            DRIVES_OVERRIDE
+                .with(|o| o.borrow().clone())
+                .unwrap_or_else(list_local_drives)
+        });
+        list.contains(&letter)
+    });
     if local {
         Ok(())
     } else {
@@ -477,7 +511,14 @@ fn walk(path: &Path, hops: &mut u32) -> Result<(PathBuf, Vec<std::ffi::OsString>
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     for name in names {
         if !tail.is_empty() {
-            tail.push(name);
+            // `..` после несуществующего компонента снимает его лексически (N3): на Unix
+            // `std::path::absolute` не нормализует `..`, и `ZA_HOME=/u/missing/../zah`
+            // иначе остался бы с `..` и не защищал бы настоящий `/u/zah`.
+            if name == ".." {
+                tail.pop();
+            } else {
+                tail.push(name);
+            }
             continue;
         }
         if name == ".." {
@@ -537,6 +578,7 @@ fn is_missing(e: &io::Error) -> bool {
 /// созданный `.ZERO-AGENT` — тот же каталог NTFS). Сверяются канонические пути, поэтому
 /// защита действует и через ссылку, junction, короткое имя 8.3 и другой регистр.
 pub fn resolve(roots: &Roots, lex: &LexPath, access: Access) -> Result<ResolvedPath, PathError> {
+    let _drives = DriveScope::enter();
     let path = canonical_prefix(lex.as_path())?;
     let inside = within(&roots.project, &path);
     let za = roots.project.join(ZA_DIR);
@@ -749,6 +791,7 @@ const HARD_LINKS: &str = "refusing to write a file with several hard links";
 /// открытием (открытие пойдёт по ней, Windows не даёт `openat`), подмена между сверкой и
 /// использованием процессом вне Job или группы — до SEC-100.
 pub fn open_checked(r: &ResolvedPath, write: bool) -> io::Result<File> {
+    let _drives = DriveScope::enter();
     if std::fs::symlink_metadata(&r.path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(refuse_link(&r.path));
     }

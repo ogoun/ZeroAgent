@@ -99,13 +99,25 @@ fn file_link(link: &Path, target: &Path) -> Option<()> {
     }
 }
 
-/// Пропуск проверки, которой нужны права или свойство тома, — с сообщением. При
-/// `ZA_REQUIRE_LINK_TESTS=1` (CI с правами) пропуск — падение: доказательство обязательно.
-fn skip(why: &str) {
-    if std::env::var("ZA_REQUIRE_LINK_TESTS").as_deref() == Ok("1") {
-        panic!("ZA_REQUIRE_LINK_TESTS=1, а проверка пропущена: {why}");
+/// Пропуск проверки с сообщением; если переменная `require` равна `1`, пропуск — падение:
+/// доказательство обязательно.
+fn skip_unless(require: &str, why: &str) {
+    if std::env::var(require).as_deref() == Ok("1") {
+        panic!("{require}=1, а проверка пропущена: {why}");
     }
     eprintln!("ПРОПУСК: {why}");
+}
+
+/// Пропуск теста ссылок (symlink, junction) без прав. `ZA_REQUIRE_LINK_TESTS=1` — в CI:
+/// раннер Windows — администратор, на Linux прав не нужно.
+fn skip(why: &str) {
+    skip_unless("ZA_REQUIRE_LINK_TESTS", why);
+}
+
+/// Пропуск теста 8.3: том не создаёт короткие имена. `ZA_REQUIRE_8DOT3=1` — только там,
+/// где том их точно создаёт; в CI не задаётся (том раннера может их не создавать).
+fn skip_8dot3(why: &str) {
+    skip_unless("ZA_REQUIRE_8DOT3", why);
 }
 
 // ---- Лексический этап: обе ОС через classify_with ----
@@ -402,7 +414,7 @@ fn short_names_are_resolved() {
     std::fs::create_dir_all(f.project.join("averyverylongdirectoryname")).unwrap();
     dir_link(&f.project.join("averyverylonglinkname"), &f.outside);
     let Some(za) = short_name(&f.project, ".zero-agent") else {
-        skip("том не создаёт короткие имена 8.3 (fsutil 8dot3name)");
+        skip_8dot3("том не создаёт короткие имена 8.3 (fsutil 8dot3name)");
         return;
     };
     let r = res(&f, &format!(r"{za}\config.toml"), Access::Write);
@@ -642,7 +654,7 @@ fn non_local_drive_is_network() {
         .rev()
         .find(|c| !Path::new(&format!(r"{c}:\")).exists())
     else {
-        skip("все буквы дисков заняты");
+        eprintln!("ПРОПУСК: все буквы дисков заняты");
         return;
     };
     let arg = format!(r"{letter}:\share\x");
@@ -807,4 +819,61 @@ fn open_checked_swap_does_not_leave_created_file() {
     let e = open_checked(&r, true).unwrap_err();
     assert!(e.to_string().contains("path changed while opening"), "{e}");
     assert!(!f.outside.join("new.txt").exists(), "файл остался снаружи");
+}
+
+/// N1: тип диска проверяется на каждое разрешение пути. Буква, локальная в первом
+/// вызове, в следующем уже не локальная (перечень томов подменён) — `Network`, а не
+/// проход по устаревшему кэшу.
+#[cfg(windows)]
+#[test]
+fn drive_type_is_checked_on_every_resolve() {
+    use za_core::paths::set_local_drives_for_tests;
+    let f = fixture("drive_stale");
+    let letter = match f.roots.project.components().next() {
+        Some(std::path::Component::Prefix(p)) => match p.kind() {
+            std::path::Prefix::Disk(d) | std::path::Prefix::VerbatimDisk(d) => {
+                d.to_ascii_uppercase()
+            }
+            other => panic!("корень проекта не на диске: {other:?}"),
+        },
+        other => panic!("корень проекта без префикса: {other:?}"),
+    };
+    set_local_drives_for_tests(Some(vec![letter]));
+    assert!(res(&f, "x", Access::Read).inside);
+    // Та же буква «стала сетевой»: перечень без неё.
+    set_local_drives_for_tests(Some(Vec::new()));
+    let lex = classify(&f.project, "x").unwrap();
+    let e = resolve(&f.roots, &lex, Access::Read).unwrap_err();
+    assert!(matches!(e, PathError::Network(_)), "{e}");
+    std::fs::write(f.project.join("a.txt"), "a").unwrap();
+    set_local_drives_for_tests(Some(vec![letter]));
+    let r = res(&f, "a.txt", Access::Read);
+    set_local_drives_for_tests(Some(Vec::new()));
+    assert!(open_checked(&r, false).is_err());
+    set_local_drives_for_tests(None);
+    assert!(res(&f, "x", Access::Read).inside);
+}
+
+/// N3: `..` в `ZA_HOME` после несуществующего компонента снимается: `home/missing/../zah`
+/// — это `home/zah`, и запись туда защищена.
+#[test]
+fn za_home_dotdot_after_missing_is_normalized() {
+    let base = unique_dir("home_dotdot");
+    let project = base.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(base.join("u")).unwrap();
+    let home = base.join("u").join("missing").join("..").join("zah");
+    let roots = Roots::canonical(&project, &home).unwrap();
+    assert!(
+        roots
+            .za_home
+            .components()
+            .all(|c| c != std::path::Component::ParentDir),
+        "{}",
+        roots.za_home.display()
+    );
+    assert!(roots.za_home.ends_with(Path::new("u").join("zah")));
+    let target = base.join("u").join("zah").join("config.toml");
+    let lex = classify(&project, &target.to_string_lossy()).unwrap();
+    assert!(resolve(&roots, &lex, Access::Write).unwrap().protected);
 }
