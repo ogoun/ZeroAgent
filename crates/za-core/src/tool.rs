@@ -81,7 +81,6 @@ pub struct RawPath {
 
 /// Предметы вызова (D77): что вызов затронет. Строит [`Tool::subjects`] без ввода-вывода;
 /// пути разрешает пакет вызовов непосредственно перед решением (D98).
-// Поле `segments` (разобранная команда, `za_core::shell`) добавит задача 3 R1-C1.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Subjects {
     pub paths: Vec<RawPath>,
@@ -89,6 +88,9 @@ pub struct Subjects {
     pub cwd: Option<String>,
     /// Текст команды.
     pub command: Option<String>,
+    /// Разобранная команда (D81, D99): сегменты [`crate::shell::segments`]; политика
+    /// решает по ним без второго лексера.
+    pub segments: Vec<crate::shell::Segment>,
     /// Метки необратимости (`za_protocol::irreversible`).
     pub irreversible: Vec<&'static str>,
     /// Вызов обращается к сети.
