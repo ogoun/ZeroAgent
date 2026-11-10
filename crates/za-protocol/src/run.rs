@@ -121,6 +121,10 @@ pub mod irreversible {
     pub const OVERWRITE: &str = "overwrite";
     /// Команда не разобрана: неизвестное считается необратимым.
     pub const UNPARSED: &str = "unparsed";
+    /// Интерпретатор исполняет код из stdin или конвейера; запуск процесса методом .NET.
+    pub const EXEC_UNTRUSTED: &str = "exec_untrusted";
+    /// `git config` с ключом, исполняющим код или меняющим поведение git.
+    pub const GIT_CONFIG_EXEC: &str = "git_config_exec";
 }
 
 /// Происхождения недоверенного содержимого (R1-C1 D82): `LoopState.taint` и первая

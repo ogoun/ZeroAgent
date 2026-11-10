@@ -18,8 +18,8 @@
 //! события и публикует их после COMMIT в [`EventBus`] (D34, D35).
 //!
 //! Для границы проекта (R1-C1) модуль [`paths`] разбирает и разрешает пути вызовов
-//! (D76, D98), модуль [`shell`] разбирает команды оболочки и классифицирует
-//! необратимые и сетевые (D77, D81), [`Checkpointer`] — контракт чекпоинта рабочей
+//! (D76, D98), модуль [`shell`] (крейт `za-shell`) разбирает команды оболочки
+//! и классифицирует необратимые и сетевые (D77, D81), [`Checkpointer`] — контракт чекпоинта рабочей
 //! копии (D89).
 //!
 //! [`run_demo`] — детерминированный демонстрационный run для сквозной проверки
@@ -34,7 +34,6 @@ pub mod interrupt;
 pub mod paths;
 mod recovery;
 mod runtime;
-pub mod shell;
 mod tool;
 
 pub use bus::{AgentEvent, EventBus, Journal};
@@ -53,3 +52,5 @@ pub use tool::{
 };
 /// Прежнее имя причины паузы; значение живёт в [`za_protocol::pause_reason`].
 pub use za_protocol::pause_reason::NEEDS_DECISION;
+/// Разбор команд оболочки (D81, D99) — крейт `za-shell`.
+pub use za_shell as shell;

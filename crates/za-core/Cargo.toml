@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 za-protocol = { path = "../za-protocol" }
+# Разбор команд оболочки (D99): реэкспорт `za_core::shell`.
+za-shell = { path = "../za-shell" }
 za-store = { path = "../za-store" }
 # Только префикс и его хэш: без зонда и HTTP-клиента.
 za-llm = { path = "../za-llm", default-features = false }

@@ -1912,6 +1912,7 @@ dependencies = [
  "winapi-util",
  "za-llm",
  "za-protocol",
+ "za-shell",
  "za-store",
 ]
 
@@ -1962,6 +1963,10 @@ dependencies = [
  "tracing",
  "za-protocol",
 ]
+
+[[package]]
+name = "za-shell"
+version = "0.0.1"
 
 [[package]]
 name = "za-store"

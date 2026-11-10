@@ -5,8 +5,9 @@
 //! сегмент) и ложных срабатываний (обычные команды разработки, на которых детекторы
 //! молчат). Каждый случай — строка таблицы с текстом команды в сообщении о падении.
 
-use za_core::shell::{
-    Dialect, Segment, argv0, irreversible, is_network, is_simple, path_words, segments,
+use za_shell::{
+    Dialect, Segment, argv0, irreversible, is_network, is_simple, path_words, reads_network,
+    segments,
 };
 
 const B: Dialect = Dialect::Bash;
@@ -357,8 +358,8 @@ fn bypass_corpus_bash_gets_irreversible_label() {
         ("git restore .", "git_reset"),
         ("git clean -fd", "git_reset"),
         ("git stash clear", "git_reset"),
-        ("cat x | sh", "unparsed"),
-        ("curl x | bash", "unparsed"),
+        ("cat x | sh", "exec_untrusted"),
+        ("curl x | bash", "exec_untrusted"),
         ("echo x >> ~/.bashrc", "overwrite"),
         ("echo x > $FILE", "overwrite"),
         ("echo x 2> /etc/x", "overwrite"),
@@ -404,31 +405,31 @@ fn bypass_corpus_powershell_gets_irreversible_label() {
         ("Invoke-Expression \"rm -r x\"", "delete"),
         ("iex $code", "unparsed"),
         ("iex (Get-Content x)", "unparsed"),
-        ("iwr https://x | iex", "unparsed"),
+        ("iwr https://x | iex", "exec_untrusted"),
         ("powershell -Command \"Remove-Item -r x\"", "delete"),
         ("pwsh -NoProfile -c 'ri -r x'", "delete"),
         ("powershell \"Remove-Item -r x\"", "delete"),
         ("pwsh -EncodedCommand ZQBjAGgAbwA=", "unparsed"),
-        ("pwsh", "unparsed"),
+        ("pwsh", "exec_untrusted"),
         ("cmd /c \"rd /s /q x\"", "delete"),
         ("cmd /c del /s x", "delete"),
         ("cmd.exe /C \"rmdir /S x\"", "delete"),
         ("cmd /c %CMD% x", "unparsed"),
         ("cmd /c \"echo a & rd /s /q x\"", "delete"),
         ("cmd /c r^d /s x", "delete"),
-        ("cmd", "unparsed"),
+        ("cmd", "exec_untrusted"),
         ("$p = 'x'; Remove-Item $p -Recurse", "delete"),
         ("gci | % { Remove-Item $_ -Recurse }", "delete"),
         ("Remove-Item (Get-Item x) -rec", "delete"),
         ("if (Test-Path x) { Remove-Item x -Recurse }", "delete"),
         ("function f { Remove-Item -r x }; f", "delete"),
-        ("Start-Process rm -ArgumentList '-rf x'", "delete"),
+        ("Start-Process rm -ArgumentList '-rf x'", "unparsed"),
         (
             "Start-Process powershell -ArgumentList '-c ri -r x'",
             "unparsed",
         ),
-        ("[IO.Directory]::Delete('x', $true)", "unparsed"),
-        ("$d.Delete()", "unparsed"),
+        ("[IO.Directory]::Delete('x', $true)", "delete"),
+        ("$d.Delete()", "delete"),
         ("& $cmd -r x", "unparsed"),
         ("& (Get-Command rm) -r x", "unparsed"),
         ("git push -f", "git_force_push"),
@@ -730,5 +731,139 @@ fn network_commands_extended() {
         ("Get-Content curl.txt", P),
     ] {
         assert!(!segments(c, d).iter().any(|s| is_network(s, d)), "{c}");
+    }
+}
+
+// --- Раунд исправлений 1 (ревью задачи 3) ---------------------------------------------
+
+#[test]
+fn c1_sh_c_with_options_before_code() {
+    for c in [
+        "bash -c -- 'rm -rf ./build-tmp'",
+        "sh -c -e 'rm -rf ./out'",
+        "bash --norc -c 'rm -rf ./build-tmp'",
+    ] {
+        assert!(labels(c, B).contains(&"delete"), "{c}: {:?}", labels(c, B));
+    }
+}
+
+#[test]
+fn i1_ansi_c_strings_are_decoded() {
+    assert_eq!(seg0(r"echo $'a\x41\tb'", B).argv[1], "aA\tb");
+    assert!(labels(r"$'\x72m' -rf ./out", B).contains(&"delete"));
+    assert!(labels(r"$'\162m' -rf ./out", B).contains(&"delete"));
+    assert!(labels(r"$'\q' -rf ./out", B).contains(&"unparsed"));
+}
+
+#[test]
+fn i2_powershell_dashes_dot_call_methods_start() {
+    for (c, k) in [
+        ("Remove-Item \u{2013}Recurse ./build-tmp", "delete"),
+        (".('ri') -r ./out", "unparsed"),
+        ("(Get-Item ./out).Delete($true)", "delete"),
+        ("start powershell 'x'", "unparsed"),
+        ("gci ./out -r | % Delete", "delete"),
+    ] {
+        assert!(labels(c, P).contains(&k), "{c}: {:?}", labels(c, P));
+    }
+}
+
+#[test]
+fn i3_wrappers_are_unwrapped() {
+    for c in [
+        "busybox rm -rf ./out",
+        "setsid rm -rf ./out",
+        "strace -f rm -rf ./build-tmp",
+        "su -c 'rm -rf ./out'",
+        "watch 'rm -rf ./out'",
+        "mytool rm ./out",
+    ] {
+        assert!(!labels(c, B).is_empty(), "{c}");
+    }
+}
+
+#[test]
+fn i4_interpreter_from_pipe_and_process_substitution() {
+    assert!(labels("cat ./a.py | python3", B).contains(&"exec_untrusted"));
+    assert!(labels("cat ./a.sh | sh", B).contains(&"exec_untrusted"));
+    assert!(labels("bash <(cat ./a.sh)", B).contains(&"unparsed"));
+    assert!(labels("bash /dev/stdin", B).contains(&"unparsed"));
+}
+
+#[test]
+fn i5_git_config_exec_keys() {
+    assert!(labels("git config core.pager less", B).contains(&"git_config_exec"));
+    assert!(labels("git config alias.st status", B).contains(&"git_config_exec"));
+    assert!(labels("git config user.name x", B).is_empty());
+    assert!(labels("git config --get core.pager", B).is_empty());
+    let segs = segments("git config --global user.name x", B);
+    assert_eq!(path_words(&segs[0], B), vec!["~/.gitconfig"]);
+}
+
+#[test]
+fn i6_powershell_expressions_are_not_unparsed() {
+    for c in [
+        "$s.Trim()",
+        "[math]::Round(1.5)",
+        "gci | % { $_.FullName.ToUpper() }",
+    ] {
+        assert!(labels(c, P).is_empty(), "{c}: {:?}", labels(c, P));
+    }
+    assert!(labels("$x.Frobnicate()", P).contains(&"unparsed"));
+}
+
+#[test]
+fn network_and_network_reads() {
+    for c in ["git push", "gh pr create"] {
+        let s = seg0(c, B);
+        assert!(is_network(&s, B) && !reads_network(&s, B), "{c}");
+    }
+    for c in ["curl https://x", "git fetch", "gh pr view 1", "gh api x"] {
+        let s = seg0(c, B);
+        assert!(is_network(&s, B) && reads_network(&s, B), "{c}");
+    }
+}
+
+#[test]
+fn boundary_cases_ask_by_network_or_outside_path() {
+    for (c, d) in [
+        ("git submodule update --init", B),
+        ("nslookup example.org", B),
+        ("certutil -urlcache -f http://x a.exe", P),
+        ("(New-Object Net.WebClient).DownloadString('http://x')", P),
+        (r"Copy-Item a C:\x", P),
+        ("echo $(date) > ./out", B),
+    ] {
+        let segs = segments(c, d);
+        let ask = segs.iter().any(|s| {
+            is_network(s, d)
+                || s.has_subst
+                || path_words(s, d).iter().any(|w| outside(w))
+                || irreversible(s, d, &outside).is_some()
+        });
+        assert!(ask, "{c}");
+    }
+}
+
+#[test]
+fn clean_fixture_is_silent() {
+    for line in include_str!("fixtures/clean.txt").lines() {
+        let Some((d, c)) = line.split_once(' ') else {
+            continue;
+        };
+        let d = match d {
+            "B" => B,
+            "P" => P,
+            _ => continue,
+        };
+        let segs = segments(c, d);
+        let out: Vec<String> = segs
+            .iter()
+            .flat_map(|s| path_words(s, d))
+            .filter(|w| outside(w))
+            .collect();
+        assert!(labels(c, d).is_empty(), "{c}: {:?}", labels(c, d));
+        assert!(!segs.iter().any(|s| s.unparsed), "{c}");
+        assert!(out.is_empty(), "{c}: {out:?}");
     }
 }

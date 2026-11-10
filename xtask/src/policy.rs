@@ -183,6 +183,20 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     pkg.name, dep.name
                 )));
             }
+            // `za-shell` — чистый разбор без зависимостей; продукт видит его только
+            // через `za_core::shell` (R1-C1 D99).
+            if pkg.name == "za-shell" && dep.kind.as_deref() != Some("dev") {
+                out.push(Violation(format!(
+                    "za-shell не должен иметь зависимостей ({})",
+                    dep.name
+                )));
+            }
+            if dep.name == "za-shell" && pkg.name != "za-core" {
+                out.push(Violation(format!(
+                    "{} не должен зависеть от za-shell (только za-core, D99)",
+                    pkg.name
+                )));
+            }
             if pkg.name == "za-protocol" && dep.name.starts_with("za-") {
                 out.push(Violation(format!(
                     "za-protocol не должен зависеть от {}",
@@ -259,7 +273,21 @@ fn is_workspace_crate(name: &str) -> bool {
 
 /// Проверяет, что размер `za-core` в строках не превышает лимит.
 pub fn check_core_size(lines: usize, limit: usize) -> Option<Violation> {
-    (lines > limit).then(|| Violation(format!("za-core: {lines} строк при лимите {limit}")))
+    check_size("za-core", lines, limit)
+}
+
+/// Проверяет, что размер крейта в строках не превышает лимит.
+pub fn check_size(krate: &str, lines: usize, limit: usize) -> Option<Violation> {
+    (lines > limit).then(|| Violation(format!("{krate}: {lines} строк при лимите {limit}")))
+}
+
+/// Лимит строк из файла `xtask/<file>`.
+fn read_limit(root: &Path, file: &str) -> Result<usize, String> {
+    std::fs::read_to_string(root.join("xtask").join(file))
+        .map_err(|e| format!("{file}: {e}"))?
+        .trim()
+        .parse()
+        .map_err(|e| format!("{file}: {e}"))
 }
 
 fn count_lines(dir: &Path) -> std::io::Result<usize> {
@@ -311,15 +339,14 @@ fn collect(root: &Path) -> Result<Vec<Violation>, String> {
         out.extend(check_resolved_llm_features(pkg, &features));
     }
 
-    let limit_text = std::fs::read_to_string(root.join("xtask/core-size-limit.txt"))
-        .map_err(|e| format!("core-size-limit.txt: {e}"))?;
-    let limit: usize = limit_text
-        .trim()
-        .parse()
-        .map_err(|e| format!("core-size-limit.txt: {e}"))?;
+    let limit = read_limit(root, "core-size-limit.txt")?;
     let lines =
         count_lines(&root.join("crates/za-core/src")).map_err(|e| format!("za-core: {e}"))?;
     out.extend(check_core_size(lines, limit));
+    let limit = read_limit(root, "shell-size-limit.txt")?;
+    let lines =
+        count_lines(&root.join("crates/za-shell/src")).map_err(|e| format!("za-shell: {e}"))?;
+    out.extend(check_size("za-shell", lines, limit));
     Ok(out)
 }
 
@@ -540,6 +567,11 @@ version = \"0.0.1\"
     }
     #[test]
     fn core_must_not_depend_on_res_or_http() {
+        assert_eq!(check_direction(&meta("za-shell", "serde")).len(), 1);
+        assert_eq!(check_direction(&meta("za-agent", "za-shell")).len(), 2);
+        assert!(check_direction(&meta("za-core", "za-shell")).is_empty());
+        assert!(check_size("za-shell", 10, 10).is_none());
+        assert!(check_size("za-shell", 11, 10).is_some());
         assert_eq!(check_direction(&meta("za-core", "za-res")).len(), 1);
         assert_eq!(check_direction(&meta("za-core", "reqwest")).len(), 1);
     }

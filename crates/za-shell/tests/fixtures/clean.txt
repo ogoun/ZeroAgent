@@ -1,0 +1,59 @@
+# Корпус ложных срабатываний: обычные команды разработки. Классификатор молчит:
+# нет меток, нет неразобранных сегментов, нет внешних путей.
+# Формат: `B ` (bash) или `P ` (PowerShell), затем команда.
+B cargo test
+B cargo build --release
+B cargo test -- --test-threads=1
+B cargo +nightly fmt
+B cargo build 2>&1 | tee build.log
+B cargo test 2>&1 >/dev/null
+B npm ci
+B npm run build
+B git status
+B git log --format='%H %s' -- src
+B git log -n 3
+B git push --force-if-includes
+B ls -la
+B ls *.rs | xargs wc -l
+B grep -r TODO src
+B python -m pytest
+B python -c "print(1)"
+B time cargo test
+B echo $((1+2))
+B rm -- -rf
+B kubectl delete -f x.yaml --dry-run=server
+P cargo test 2>&1 | Tee-Object -FilePath out.log
+P cargo test 2>&1 | Out-File test.log
+P Get-ChildItem -Path . -Recurse | Where-Object { $_.Extension -eq '.rs' }
+P Get-Content .\Cargo.toml | Select-Object -First 5
+P gci | % { $_.FullName.ToUpper() }
+P Write-Host ([IO.Path]::Combine('a','b'))
+P "Value: $x" | Out-File f.txt
+P $s.Trim()
+P [math]::Round(1.5)
+P [string]::IsNullOrEmpty($x)
+P [datetime]::Now.ToString('yyyy')
+P [regex]::Match($s, 'a').Value
+P [Convert]::ToBase64String($b)
+P [char]::IsDigit('1')
+P [int]::Parse('5')
+P $items | ForEach-Object { $_.Name.Trim() }
+P $p = [IO.Path]::GetFileName($f)
+P "a,b".Split(',')
+P (Get-Date).AddDays(-1)
+P $list.Count
+P $x -replace '/', '\'
+P $env:PATH += ';C:\x'
+P & .\target\debug\app.exe
+P Remove-Item -Recurse -WhatIf src
+P Get-ChildItem -Recurse | Remove-Item -WhatIf
+P dotnet build /p:Configuration=Release
+P dotnet build -c Release /p:TreatWarningsAsErrors=true
+P dotnet test /p:CollectCoverage=true
+P dotnet test --logger "trx;LogFileName=/r.trx"
+P dotnet publish /p:PublishSingleFile=true
+P msbuild /p:Configuration=Release /m
+P ipconfig /all
+P ipconfig /all | Select-String IPv4
+P findstr /s /i foo *.cs
+P git log -n 3

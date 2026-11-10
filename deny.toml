@@ -30,6 +30,8 @@ deny = [
     # ни напрямую, ни транзитивно (полный граф; `cargo xtask policy` видит только
     # прямые зависимости).
     { name = "tiktoken-rs", wrappers = ["xtask"] },
+    # Разбор команд оболочки (R1-C1 D99): продукт видит его только через `za_core::shell`.
+    { name = "za-shell", wrappers = ["za-core"] },
 ]
 
 [sources]
