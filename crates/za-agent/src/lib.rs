@@ -8,18 +8,25 @@
 //! ([`model_turn`]: эффект `model`, события журнала D8, сигналы цикла [`Signals`]),
 //! разбор ответа ([`review`], D27) и отображение ошибок в состояние run
 //! ([`exit_for_model_error`], [`exit_for_effect_error`], D11), пакет вызовов
-//! инструментов ([`run_tools`]: гейт режима, одобрение, `ask_user`, `finish`, D14–D17). Модель
+//! инструментов ([`run_tools`]: гейт режима, одобрение, `ask_user`, `finish`, D14–D17),
+//! драйвер цикла ([`start_run`]: граница шага, ходы, завершение и пауза, снимки
+//! [`Snapshot`], D4, D5, D18, D31–D33) и управление run ([`RunControl`], D26). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
+mod control;
 mod conversation;
+mod driver;
 mod exit;
 mod memory;
 mod prompt;
 mod request;
+mod state;
 mod tools;
 mod turn;
 
+pub use control::{ControlRx, RunControl, control_channel};
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted};
+pub use driver::{CrashHook, CrashPoint, LoopDeps, LoopError, LoopOutcome, RunSpec, start_run};
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};
 pub use prompt::{
@@ -33,6 +40,7 @@ pub use request::{
     BlockHashes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request,
     first_message, freeze, request_hash,
 };
+pub use state::{Counters, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};
 pub use tools::{
     ASK_USER_TOOL, FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, builtin_tools, run_tools,
 };

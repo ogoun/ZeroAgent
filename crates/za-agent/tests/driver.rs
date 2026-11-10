@@ -1,0 +1,770 @@
+//! Драйвер цикла (задача 12): граница шага, ходы, завершение (D18), чистая пауза
+//! (D5), снимки (D4), ошибки цикла (D11), управление (D26).
+
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use za_agent::{
+    ControlRx, Conversation, EnvInfo, HistoryError, LoopDeps, LoopError, LoopOutcome, Next,
+    NoMemory, PendingExit, RunSpec, Signal, Snapshot, builtin_tools, control_channel, start_run,
+};
+use za_core::{
+    Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
+};
+use za_llm::{
+    BackendKind, BoxFuture, EndpointId, ErrorClass, FinishReason, Message, ModelError, Part, Role,
+    ScriptedModel, StreamEvent, ToolCall, ToolChoice, ToolSchema, Usage, default_caps,
+};
+use za_protocol::{
+    Actor, Budget, EffectClass, Event, EventKind, NewEvent, Priority, RunId, RunMode, RunRole,
+    RunStatus, Seq, Tier,
+};
+use za_store::{ProjectStore, StoreError, StoreOptions};
+
+// ---- Помощники ----
+
+/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
+fn time_scale() -> u32 {
+    static SCALE: OnceLock<u32> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("ZA_TEST_TIME_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(1, |n| n.clamp(1, 6))
+    })
+}
+
+/// Предел ожиданий, которые при регрессии повисли бы.
+fn limit() -> Duration {
+    Duration::from_secs(10) * time_scale()
+}
+
+fn dir(name: &str) -> PathBuf {
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("driver")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Инструмент чтения `echo`: результат — канонический JSON аргументов.
+struct Echo {
+    spec: ToolSpec,
+}
+
+impl Tool for Echo {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        Box::pin(async move {
+            ToolOutput {
+                content: format!("echo {args}"),
+                is_error: false,
+            }
+        })
+    }
+}
+
+/// Инструмент, который на вызове заполняет журнал до отказа (`StoreError::Full`).
+struct Filler {
+    spec: ToolSpec,
+    store: ProjectStore,
+}
+
+impl Tool for Filler {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, _args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let ev = || NewEvent {
+                run_id: cx.run,
+                parent_seq: None,
+                actor: Actor::Tool,
+                kind: EventKind::Unknown("test.fill".into()),
+                payload: json!({}),
+                tainted: false,
+            };
+            // Пачками, пока влезает, затем по одному: место кончается и для
+            // маленьких записей.
+            while store
+                .append_batch((0..200).map(|_| ev()).collect())
+                .await
+                .is_ok()
+            {}
+            while store.append(ev()).await.is_ok() {}
+            ToolOutput {
+                content: "filled".into(),
+                is_error: false,
+            }
+        })
+    }
+}
+
+fn tool_spec(name: &str, kind: ToolKind, class: EffectClass) -> ToolSpec {
+    ToolSpec {
+        schema: ToolSchema {
+            name: name.into(),
+            description: "t".into(),
+            parameters: json!({"type": "object"}),
+        },
+        class,
+        kind,
+        approval: Approval::Mode,
+        roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
+        min_tier: Tier::Small,
+        timeout: Duration::from_secs(60),
+        output_limit: None,
+        tainted: false,
+    }
+}
+
+fn registry(extra: Vec<Arc<dyn Tool>>) -> ToolRegistry {
+    let mut r = ToolRegistry::default();
+    for t in builtin_tools() {
+        r.register(t).unwrap();
+    }
+    r.register(Arc::new(Echo {
+        spec: tool_spec("echo", ToolKind::Read, EffectClass::ReadOnly),
+    }))
+    .unwrap();
+    r.register(Arc::new(Echo {
+        spec: tool_spec("edit", ToolKind::Edit, EffectClass::Idempotent),
+    }))
+    .unwrap();
+    for t in extra {
+        r.register(t).unwrap();
+    }
+    r
+}
+
+struct Fx {
+    store: ProjectStore,
+    model: Arc<ScriptedModel>,
+    deps: LoopDeps,
+    run: RunId,
+    ctl_rx: Option<ControlRx>,
+    ctl: za_agent::RunControl,
+    bus: EventBus,
+}
+
+fn fx_with(name: &str, model: ScriptedModel, opts: StoreOptions, extra: Vec<Arc<dyn Tool>>) -> Fx {
+    let store = ProjectStore::open_with(&dir(name), opts).unwrap();
+    fx_on(store, model, extra)
+}
+
+fn fx_on(store: ProjectStore, model: ScriptedModel, extra: Vec<Arc<dyn Tool>>) -> Fx {
+    let model = Arc::new(model);
+    let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
+    let journal = Journal::new(store.clone(), bus.clone());
+    let deps = LoopDeps {
+        journal,
+        model: model.clone(),
+        tools: Arc::new(registry(extra)),
+        capabilities: Vec::new(),
+        memory: Arc::new(NoMemory),
+        crash: None,
+    };
+    let run = RunId::new();
+    let (ctl, rx) = control_channel(store.clone(), run);
+    Fx {
+        store,
+        model,
+        deps,
+        run,
+        ctl_rx: Some(rx),
+        ctl,
+        bus,
+    }
+}
+
+fn fx(name: &str, model: ScriptedModel) -> Fx {
+    fx_with(name, model, StoreOptions::default(), Vec::new())
+}
+
+fn scripted() -> ScriptedModel {
+    ScriptedModel::new(default_caps(BackendKind::LlamaCpp))
+}
+
+fn spec(role: RunRole) -> RunSpec {
+    RunSpec {
+        project_id: "p".into(),
+        project_dir: PathBuf::from("H:/p"),
+        role,
+        parent: None,
+        endpoint: EndpointId("local".into()),
+        run_mode: RunMode::Ask,
+        work_mode: None,
+        tier: None,
+        budget: Budget::default(),
+        priority: Priority::Top,
+        max_wait: None,
+        task: "Столица Франции?".into(),
+        agents_md: None,
+        env: EnvInfo {
+            os: "windows".into(),
+            shell: "powershell".into(),
+            project_dir: "H:/p".into(),
+            date: "2026-11-10".into(),
+            tier: Tier::Full,
+            n_ctx: 1,
+            budget: "x".into(),
+            branch: "main".into(),
+        },
+    }
+}
+
+async fn start(f: &mut Fx, s: RunSpec) -> Result<LoopOutcome, LoopError> {
+    let rx = f.ctl_rx.take().expect("ControlRx уже взят");
+    tokio::time::timeout(limit(), start_run(&f.deps, f.run, s, rx))
+        .await
+        .expect("start_run не завершился в срок")
+}
+
+fn text_msg(role: Role, t: &str) -> Message {
+    Message {
+        role,
+        parts: vec![Part::Text(t.into())],
+    }
+}
+
+fn answer(t: &str) -> Vec<Result<StreamEvent, ModelError>> {
+    vec![
+        Ok(StreamEvent::TextDelta(t.into())),
+        Ok(StreamEvent::Finished {
+            message: text_msg(Role::Assistant, t),
+            finish: FinishReason::Stop,
+            usage: Usage::default(),
+        }),
+    ]
+}
+
+fn call_part(id: &str, name: &str, args: Value) -> Part {
+    Part::ToolCall(ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args,
+        raw_arguments: None,
+    })
+}
+
+fn calls(parts: Vec<Part>) -> Result<StreamEvent, ModelError> {
+    Ok(StreamEvent::Finished {
+        message: Message {
+            role: Role::Assistant,
+            parts,
+        },
+        finish: FinishReason::ToolCalls,
+        usage: Usage::default(),
+    })
+}
+
+async fn events(s: &ProjectStore, run: RunId) -> Vec<Event> {
+    s.read_run(run, Seq(0), 100_000).await.unwrap()
+}
+
+fn of_kind(evs: &[Event], k: EventKind) -> Vec<&Event> {
+    evs.iter().filter(|e| e.kind == k).collect()
+}
+
+async fn snapshots(s: &ProjectStore, run: RunId) -> Vec<(Seq, Snapshot)> {
+    s.snapshots(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(seq, v)| (seq, serde_json::from_value(v).unwrap()))
+        .collect()
+}
+
+async fn last_snapshot(s: &ProjectStore, run: RunId) -> (Seq, Snapshot) {
+    let (seq, v) = s.latest_snapshot(run).await.unwrap().expect("нет снимка");
+    (seq, serde_json::from_value(v).unwrap())
+}
+
+async fn history(s: &ProjectStore, snap: &Snapshot) -> Conversation {
+    Conversation::load(s, &snap.messages).await.unwrap()
+}
+
+async fn status(s: &ProjectStore, run: RunId) -> RunStatus {
+    s.get_run(run).await.unwrap().unwrap().status
+}
+
+fn roles(c: &Conversation) -> Vec<Role> {
+    c.messages().iter().map(|m| m.role).collect()
+}
+
+fn text_of(m: &Message) -> String {
+    m.parts
+        .iter()
+        .filter_map(|p| match p {
+            Part::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+// ---- Тесты брифа ----
+
+#[tokio::test]
+async fn top_answers_and_finishes() {
+    let mut f = fx("top_answers", scripted());
+    f.model.push(answer("Париж"));
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert_eq!(
+        out,
+        LoopOutcome::Finished {
+            status: RunStatus::Done,
+            answer: Some("Париж".into()),
+            finish: None,
+        }
+    );
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Done);
+    let evs = events(&f.store, f.run).await;
+    let st: Vec<&str> = of_kind(&evs, EventKind::RunStatus)
+        .iter()
+        .map(|e| e.payload["to"].as_str().unwrap())
+        .collect();
+    assert_eq!(st, ["running", "done"]);
+    let fin = of_kind(&evs, EventKind::TurnFinished);
+    assert_eq!(fin.len(), 1);
+    assert_eq!(fin[0].payload["outcome"], "answer");
+    assert_eq!(f.model.finished_runs(), vec![f.run]);
+}
+
+#[tokio::test]
+async fn tool_turn_then_answer() {
+    let mut f = fx("tool_turn", scripted());
+    f.model
+        .push(vec![calls(vec![call_part("c1", "echo", json!({"x": 1}))])]);
+    f.model.push(answer("готово"));
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert!(matches!(
+        out,
+        LoopOutcome::Finished {
+            status: RunStatus::Done,
+            ..
+        }
+    ));
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let h = history(&f.store, &snap).await;
+    assert_eq!(
+        roles(&h),
+        [Role::User, Role::Assistant, Role::Tool, Role::Assistant]
+    );
+    let calls = f.model.calls();
+    assert_eq!(calls.len(), 2);
+    let tool_msg = &calls[1].request.messages[2];
+    assert_eq!(tool_msg.role, Role::Tool);
+    assert!(matches!(
+        &tool_msg.parts[0],
+        Part::ToolResult { call_id, content, is_error: false }
+            if call_id == "c1" && content == "echo {\"x\":1}"
+    ));
+    let model_snaps = snapshots(&f.store, f.run)
+        .await
+        .into_iter()
+        .filter(|(_, s)| s.next == Next::Model)
+        .count();
+    assert!(model_snaps >= 2, "снимков Model: {model_snaps}");
+}
+
+#[tokio::test]
+async fn worker_finishes_only_by_finish_tool() {
+    let mut f = fx("worker_finish", scripted());
+    f.model.push(answer("думаю"));
+    f.model.push(answer("ещё думаю"));
+    f.model.push(vec![calls(vec![call_part(
+        "f1",
+        "finish",
+        json!({"status": "done", "result": "сделано"}),
+    )])]);
+    let out = start(&mut f, spec(RunRole::Worker)).await.unwrap();
+    let LoopOutcome::Finished {
+        status,
+        finish: Some(fin),
+        ..
+    } = out
+    else {
+        panic!("ожидался Finished с finish: {out:?}");
+    };
+    assert_eq!(status, RunStatus::Done);
+    assert_eq!(fin.status, "done");
+    let calls = f.model.calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].request.tool_choice, ToolChoice::Auto);
+    assert_eq!(calls[1].request.tool_choice, ToolChoice::Auto);
+    assert_eq!(calls[2].request.tool_choice, ToolChoice::Required);
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let h = history(&f.store, &snap).await;
+    let nudges = h
+        .messages()
+        .iter()
+        .filter(|m| text_of(m).contains("<control from=\"runtime\" action=\"nudge\""))
+        .count();
+    assert_eq!(nudges, 2);
+    let last = h.messages().last().unwrap();
+    assert!(matches!(
+        &last.parts[..],
+        [Part::ToolResult { call_id, content, is_error: false }] if call_id == "f1" && content == "ok"
+    ));
+    assert_eq!(h.validate(), Ok(()));
+    assert_eq!(f.model.finished_runs(), vec![f.run]);
+}
+
+#[tokio::test]
+async fn three_empty_turns_block() {
+    let mut f = fx("three_empty", scripted());
+    for t in ["a", "b", "c"] {
+        f.model.push(answer(t));
+    }
+    let out = start(&mut f, spec(RunRole::Worker)).await.unwrap();
+    assert!(
+        matches!(
+            out,
+            LoopOutcome::Finished {
+                status: RunStatus::Blocked,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Blocked);
+    assert_eq!(f.model.finished_runs(), vec![f.run]);
+    assert_eq!(f.model.calls().len(), 3);
+}
+
+#[tokio::test]
+async fn provider_error_pauses_not_hangs() {
+    let mut f = fx("provider_error", scripted());
+    f.model.push(vec![Err(ModelError::new(
+        ErrorClass::Unreachable,
+        "нет связи",
+    ))]);
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert_eq!(
+        out,
+        LoopOutcome::Paused {
+            reason: "provider".into(),
+            interrupt: None,
+        }
+    );
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
+    let evs = events(&f.store, f.run).await;
+    let st = of_kind(&evs, EventKind::RunStatus);
+    assert_eq!(st.last().unwrap().payload["reason"], "provider");
+    let fin = of_kind(&evs, EventKind::TurnFinished);
+    assert_eq!(fin.len(), 1);
+    assert_eq!(fin[0].payload["outcome"], "error");
+    let (seq, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.next, Next::Boundary);
+    assert_eq!(snap.step, 1);
+    assert_eq!(
+        snap.exit,
+        Some(PendingExit::Paused {
+            reason: "provider".into()
+        })
+    );
+    assert_eq!(seq, fin[0].seq);
+    assert!(f.model.finished_runs().is_empty());
+}
+
+#[tokio::test]
+async fn step0_snapshot_and_memory_unavailable() {
+    let mut f = fx("step0", scripted());
+    f.model.push(answer("Париж"));
+    start(&mut f, spec(RunRole::Top)).await.unwrap();
+    let snaps = snapshots(&f.store, f.run).await;
+    let (seq0, s0) = &snaps[0];
+    assert_eq!(s0.step, 0);
+    assert_eq!(s0.next, Next::Boundary);
+    assert_eq!(s0.exit, None);
+    assert_eq!(s0.setup.n_ctx, 8192);
+    assert_eq!(s0.setup.tier, Tier::Small);
+    let evs = events(&f.store, f.run).await;
+    let mem = of_kind(&evs, EventKind::MemoryUnavailable);
+    assert_eq!(mem.len(), 1);
+    assert_eq!(mem[0].seq, *seq0);
+    // До первого хода: снимок шага 0 раньше turn.started.
+    let started = of_kind(&evs, EventKind::TurnStarted);
+    assert!(*seq0 < started[0].seq);
+
+    let mut f = fx("step0_ctx", scripted().with_context(32768));
+    f.model.push(answer("Париж"));
+    start(&mut f, spec(RunRole::Top)).await.unwrap();
+    let (_, s0) = &snapshots(&f.store, f.run).await[0];
+    assert_eq!(s0.setup.n_ctx, 32768);
+    assert_eq!(s0.setup.tier, Tier::Standard);
+}
+
+#[tokio::test]
+async fn refusal_pauses_without_commit() {
+    let mut f = fx("refusal", scripted());
+    f.model.push(vec![
+        Ok(StreamEvent::TextDelta("частич".into())),
+        Ok(StreamEvent::Finished {
+            message: text_msg(Role::Assistant, "частич"),
+            finish: FinishReason::Refusal,
+            usage: Usage::default(),
+        }),
+    ]);
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert_eq!(
+        out,
+        LoopOutcome::Paused {
+            reason: "refusal".into(),
+            interrupt: None,
+        }
+    );
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let h = history(&f.store, &snap).await;
+    assert_eq!(roles(&h), [Role::User]);
+}
+
+#[tokio::test]
+async fn invariant_violation_fails_run() {
+    let mut f = fx("invariant", scripted());
+    let mut evs = vec![Ok(StreamEvent::ServiceMessage(text_msg(Role::User, "x")))];
+    evs.extend(answer("a"));
+    f.model.push(evs);
+    let err = start(&mut f, spec(RunRole::Top)).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            LoopError::History(HistoryError::SystemNotBeforeAssistant)
+        ),
+        "{err:?}"
+    );
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Failed);
+    assert_eq!(f.model.finished_runs(), vec![f.run]);
+}
+
+#[tokio::test]
+async fn full_journal_returns_store_error() {
+    let mut opts = StoreOptions::default();
+    opts.max_page_count = Some(256);
+    let store = ProjectStore::open_with(&dir("full"), opts).unwrap();
+    let filler: Arc<dyn Tool> = Arc::new(Filler {
+        spec: tool_spec("fill", ToolKind::Read, EffectClass::ReadOnly),
+        store: store.clone(),
+    });
+    let mut f = fx_on(store, scripted(), vec![filler]);
+    f.model
+        .push(vec![calls(vec![call_part("c1", "fill", json!({}))])]);
+    let err = start(&mut f, spec(RunRole::Top)).await.unwrap_err();
+    assert!(matches!(err, LoopError::Store(StoreError::Full)), "{err:?}");
+    // Статус записать нельзя: run остаётся `running` для resume.
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Running);
+    assert!(f.model.finished_runs().is_empty());
+}
+
+#[tokio::test]
+async fn approval_suspends_run() {
+    let mut f = fx("approval", scripted());
+    f.model.push(vec![calls(vec![call_part(
+        "c1",
+        "edit",
+        json!({"path": "a"}),
+    )])]);
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    let LoopOutcome::Paused {
+        reason,
+        interrupt: Some(id),
+    } = out
+    else {
+        panic!("ожидалась пауза с прерыванием: {out:?}");
+    };
+    assert_eq!(reason, "needs_approval");
+    assert!(id.starts_with("appr-"), "{id}");
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
+    assert!(f.model.finished_runs().is_empty());
+}
+
+#[tokio::test]
+async fn service_message_committed_with_turn() {
+    let mut f = fx("service", scripted());
+    f.model.push(vec![
+        Ok(StreamEvent::ServiceMessage(text_msg(Role::System, "x"))),
+        calls(vec![call_part("c1", "echo", json!({}))]),
+    ]);
+    f.model.push(answer("готово"));
+    start(&mut f, spec(RunRole::Top)).await.unwrap();
+    let calls = f.model.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].request.messages[1].role, Role::System);
+    assert_eq!(calls[1].request.messages[2].role, Role::Assistant);
+}
+
+#[tokio::test]
+async fn first_request_matches_frozen_prefix() {
+    let mut f = fx("first_request", scripted());
+    f.model.push(answer("Париж"));
+    let mut s = spec(RunRole::Top);
+    s.max_wait = Some(Duration::from_secs(1));
+    start(&mut f, s).await.unwrap();
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let c = &f.model.calls()[0];
+    assert_eq!(c.request.system, snap.frozen.system);
+    assert!(text_of(&c.request.messages[0]).starts_with("<env>\n"));
+    assert_eq!(c.meta.session, Some(f.run.to_string()));
+    assert_eq!(c.meta.max_wait, Some(Duration::from_secs(1)));
+}
+
+// ---- Управление и решения контроллера ----
+
+/// Пауза до первого шага применяется на границе: `control.applied`, снимок, `paused`.
+#[tokio::test]
+async fn pause_at_boundary_is_clean_pause() {
+    let mut f = fx("pause_boundary", scripted());
+    f.ctl.pause();
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert_eq!(
+        out,
+        LoopOutcome::Paused {
+            reason: "command".into(),
+            interrupt: None,
+        }
+    );
+    assert!(f.model.calls().is_empty());
+    let evs = events(&f.store, f.run).await;
+    let applied = of_kind(&evs, EventKind::ControlApplied);
+    assert_eq!(applied.len(), 1);
+    assert_eq!(
+        applied[0].payload,
+        json!({"action": "pause", "command": ""})
+    );
+    let (seq, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(seq, applied[0].seq);
+    assert_eq!(snap.step, 0);
+    assert_eq!(
+        snap.exit,
+        Some(PendingExit::Paused {
+            reason: "command".into()
+        })
+    );
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
+}
+
+/// Отмена до первого шага: cancelling → cancelled, `finish_run`.
+#[tokio::test]
+async fn cancel_at_boundary_cancels() {
+    let mut f = fx("cancel_boundary", scripted());
+    f.ctl.cancel();
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert_eq!(out, LoopOutcome::Cancelled);
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Cancelled);
+    assert_eq!(f.model.finished_runs(), vec![f.run]);
+}
+
+/// Carry задачи 10: снятая пауза не мешает следующей паузе в том же процессе.
+#[tokio::test]
+async fn cleared_pause_signals_again() {
+    let store = ProjectStore::open(&dir("clear_pause")).unwrap();
+    let (ctl, mut rx) = control_channel(store, RunId::new());
+    ctl.pause();
+    assert_eq!(rx.signals().drain(), Some(Signal::Pause));
+    assert_eq!(rx.signals().drain(), None);
+    rx.clear_pause();
+    assert_eq!(rx.signals().drain(), None);
+    ctl.pause();
+    assert_eq!(rx.signals().drain(), Some(Signal::Pause));
+    // Пауза сразу после снятия, до чтения, тоже не теряется.
+    rx.clear_pause();
+    ctl.pause();
+    assert_eq!(rx.signals().drain(), Some(Signal::Pause));
+}
+
+/// Неизвестный эндпоинт: ошибка до создания run.
+#[tokio::test]
+async fn unknown_endpoint_creates_no_run() {
+    struct NoCaps;
+    impl za_llm::ModelPort for NoCaps {
+        fn stream(
+            &self,
+            _call: za_llm::ModelCall,
+        ) -> BoxFuture<'_, Result<za_llm::ModelStream, ModelError>> {
+            Box::pin(async { Err(ModelError::new(ErrorClass::Inactive, "нет")) })
+        }
+        fn capabilities(&self, _e: &EndpointId) -> Option<za_llm::ProviderCapabilities> {
+            None
+        }
+        fn context_tokens(&self, _e: &EndpointId) -> Option<u32> {
+            None
+        }
+        fn record_parse_error(&self, _run: RunId, _call: &za_llm::ModelCall) {}
+    }
+    let mut f = fx("unknown_endpoint", scripted());
+    f.deps.model = Arc::new(NoCaps);
+    let err = start(&mut f, spec(RunRole::Top)).await.unwrap_err();
+    assert!(matches!(err, LoopError::UnknownEndpoint(_)), "{err:?}");
+    assert!(f.store.get_run(f.run).await.unwrap().is_none());
+}
+
+/// Повтор имени инструмента в префиксе — ошибка конфигурации: `failed`, `finish_run`.
+#[tokio::test]
+async fn duplicate_tool_fails_run() {
+    let mut f = fx("duplicate_tool", scripted());
+    f.deps.capabilities = vec![za_core::Capability {
+        name: "c".into(),
+        tools: vec![Arc::new(Echo {
+            spec: tool_spec("echo", ToolKind::Read, EffectClass::ReadOnly),
+        })],
+        ..Default::default()
+    }];
+    let err = start(&mut f, spec(RunRole::Top)).await.unwrap_err();
+    assert!(matches!(err, LoopError::Prefix(_)), "{err:?}");
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Failed);
+    assert_eq!(f.model.finished_runs(), vec![f.run]);
+}
+
+/// Решение контроллера к задаче 11: пауза, пришедшая во время `finish`, не мешает
+/// завершению — `finish` важнее обрыва пакета. Пауза посылается по событию
+/// `tool.started` вызова `finish`; попадёт ли она внутрь вызова или после пакета,
+/// зависит от планировщика, но исход один: `done`, без `control.applied`.
+#[tokio::test]
+async fn finish_wins_over_pause_during_finish() {
+    let mut f = fx("finish_wins", scripted());
+    f.model.push(vec![calls(vec![call_part(
+        "f1",
+        "finish",
+        json!({"status": "done", "result": "r"}),
+    )])]);
+    let mut bus = f.bus.subscribe();
+    let ctl = f.ctl.clone();
+    let watcher = tokio::spawn(async move {
+        loop {
+            let ev = bus.recv().await.expect("шина закрыта");
+            if ev.event.kind == EventKind::ToolStarted {
+                ctl.pause();
+                return;
+            }
+        }
+    });
+    let out = start(&mut f, spec(RunRole::Worker)).await.unwrap();
+    tokio::time::timeout(limit(), watcher)
+        .await
+        .expect("tool.started не пришёл")
+        .unwrap();
+    assert!(
+        matches!(
+            out,
+            LoopOutcome::Finished {
+                status: RunStatus::Done,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    let evs = events(&f.store, f.run).await;
+    assert!(of_kind(&evs, EventKind::ControlApplied).is_empty());
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let h = history(&f.store, &snap).await;
+    assert_eq!(h.validate(), Ok(()));
+    assert!(h.pending_calls().is_empty());
+}

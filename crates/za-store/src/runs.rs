@@ -236,6 +236,30 @@ impl ProjectStore {
     }
 }
 
+impl ProjectStore {
+    /// Все снимки run по возрастанию `seq` (проверки и диагностика; resume берёт
+    /// [`Self::latest_snapshot`]).
+    pub async fn snapshots(&self, id: RunId) -> Result<Vec<(Seq, Value)>, StoreError> {
+        self.read(move |c| {
+            let mut stmt =
+                c.prepare("SELECT seq, state FROM snapshots WHERE run_id = ?1 ORDER BY seq")?;
+            let rows = stmt
+                .query_map([id_sql(id)], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(seq, state)| {
+                    let state = serde_json::from_str(&state)
+                        .map_err(|e| corrupt(&format!("снимок: {e}")))?;
+                    Ok((seq_from(seq)?, state))
+                })
+                .collect()
+        })
+        .await
+    }
+}
+
 /// Проверяет, что run существует; иначе [`StoreError::UnknownRun`].
 pub(crate) fn ensure_run(c: &Connection, id: RunId) -> Result<(), StoreError> {
     current_status(c, id).map(|_| ())

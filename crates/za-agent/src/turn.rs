@@ -113,6 +113,8 @@ pub struct Signals {
     input: mpsc::Receiver<()>,
     /// Флаги, уже отданные циклу.
     seen: ControlFlags,
+    /// Отправитель тех же флагов: цикл снимает применённую паузу ([`Signals::clear_pause`]).
+    flags_tx: Arc<watch::Sender<ControlFlags>>,
 }
 
 impl Signals {
@@ -177,21 +179,32 @@ impl Signals {
     pub fn flags(&self) -> watch::Receiver<ControlFlags> {
         self.flags.clone()
     }
+
+    /// Снимает флаг паузы и отметку о нём: пауза применена (или run продолжен), и
+    /// следующая `pause()` в том же процессе снова сигнал. Флаг отмены не трогается.
+    /// `pause()`, пришедшая после этого вызова, не теряется: флаг снова поднят, а
+    /// отметки нет.
+    pub fn clear_pause(&mut self) {
+        self.flags_tx.send_modify(|f| f.pause = false);
+        self.seen.pause = false;
+    }
 }
 
 /// Канал сигналов цикла: флаги в `watch` (D26), ввод — `mpsc` ёмкостью 1.
 pub fn signal_channel() -> (SignalTx, Signals) {
     let (flags_tx, flags_rx) = watch::channel(ControlFlags::default());
+    let flags_tx = Arc::new(flags_tx);
     let (input_tx, input_rx) = mpsc::channel(1);
     (
         SignalTx {
-            flags: Arc::new(flags_tx),
+            flags: Arc::clone(&flags_tx),
             input: input_tx,
         },
         Signals {
             flags: flags_rx,
             input: input_rx,
             seen: ControlFlags::default(),
+            flags_tx,
         },
     )
 }
