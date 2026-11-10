@@ -1363,7 +1363,7 @@ async fn direct_compact(
     name: &str,
     n_ctx: u32,
     conv: &Conversation,
-    inputs: &[&str],
+    inputs: &[(&str, Option<usize>)],
     emergency: bool,
 ) -> za_agent::Compacted {
     let d = dir(name);
@@ -1396,11 +1396,11 @@ async fn direct_compact(
     let frozen = freeze(&setup, &[], &[], None).unwrap();
     let frozen_ref = store.put_blob(b"frozen").await.unwrap();
     let mut user_inputs = Vec::new();
-    for t in inputs {
+    for (t, at) in inputs {
         user_inputs.push(za_agent::UserInput {
             text: store.put_blob(t.as_bytes()).await.unwrap(),
             correct: false,
-            at: None,
+            at: *at,
         });
     }
     let model = ScriptedModel::new(default_caps(BackendKind::LlamaCpp));
@@ -1473,7 +1473,7 @@ async fn summary_user_messages_are_limited() {
     let inputs: Vec<String> = (1..=3)
         .map(|i| format!("{i}{}", "x".repeat(3999)))
         .collect();
-    let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+    let refs: Vec<(&str, Option<usize>)> = inputs.iter().map(|s| (s.as_str(), None)).collect();
     let c = direct_compact("users_limited", 8192, &conv, &refs, false).await;
     assert!(
         c.summary.starts_with(
@@ -1482,4 +1482,134 @@ async fn summary_user_messages_are_limited() {
     );
     assert!(c.summary.contains(&format!("\n{}\n", inputs[2])));
     assert!(!c.summary.contains(&inputs[0]));
+}
+
+// ---- Исправления после ревью (раунд 2) ----
+
+/// Ruling fix round 2: ввод во время аварийной компакции в узле model читается до
+/// повтора хода (эффект `inbox`), повтор не обрывается.
+#[tokio::test]
+async fn interrupt_input_during_overflow_compaction_is_read() {
+    let f = fx("interrupt_overflow", scripted(8192));
+    let mut bus = f.bus.subscribe();
+    f.model.push(overflow());
+    let mut s = summary("n");
+    s.insert(0, Ok(StreamEvent::TextDelta("## ".into())));
+    f.model.push_paced(s, Duration::from_millis(300));
+    f.model.push(answer("готово"));
+    let (ctl, rx) = control_channel(f.store.clone(), f.run);
+    let (deps, run) = (f.deps.clone(), f.run);
+    let h = tokio::spawn(async move { start_run(&deps, run, spec(), rx).await });
+    nth_of(&mut bus, EventKind::ModelRequest, 1, |p| {
+        p["kind"] == "compact"
+    })
+    .await;
+    ctl.input("и проверь Z", InputMode::Interrupt)
+        .await
+        .unwrap();
+    let out = within("run", h).await.unwrap().unwrap();
+    assert_eq!(out, done("готово"));
+    let evs = events(&f.store, f.run).await;
+    let outcomes: Vec<&Value> = of_kind(&evs, EventKind::TurnFinished)
+        .iter()
+        .map(|e| &e.payload["outcome"])
+        .collect();
+    assert_eq!(outcomes, [&json!("overflow"), &json!("answer")]);
+    assert_eq!(intents(&evs, "inbox").len(), 1);
+    let retry = turn_requests(&f.model).pop().unwrap();
+    let texts: Vec<String> = retry.messages.iter().map(text_of).collect();
+    assert_eq!(texts.last().map(String::as_str), Some("и проверь Z"));
+}
+
+/// Ruling fix round 2: реплей квитанции обрыва компакции на границе (сбой между
+/// квитанцией `interrupted:pause` и снимком паузы) — новая граница без хода; компакция
+/// выполняется на ней заново.
+#[tokio::test]
+async fn replayed_interrupted_compaction_starts_new_boundary() {
+    let b0 = probe("skipped", 8192).await;
+    let d = THRESHOLD_8K - b0;
+    let mut f = fx("skipped", scripted(8192));
+    let mut bus = f.bus.subscribe();
+    f.model.push(note("c1", d - 400));
+    f.model.push(note("c2", 800));
+    f.model.push_open(vec![]);
+    let fired = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&fired);
+    let at = CrashPoint::AfterCompact { step: 3 };
+    f.deps.crash = Some(Arc::new(move |p: CrashPoint| {
+        p == at && !flag.swap(true, Ordering::SeqCst)
+    }));
+    let (ctl, rx) = control_channel(f.store.clone(), f.run);
+    let (deps, run) = (f.deps.clone(), f.run);
+    let h = tokio::spawn(async move { start_run(&deps, run, spec(), rx).await });
+    nth_of(&mut bus, EventKind::ModelRequest, 1, |p| {
+        p["kind"] == "compact"
+    })
+    .await;
+    ctl.pause();
+    let r = within("run", h).await.unwrap();
+    assert!(matches!(r, Err(LoopError::Halted)), "{r:?}");
+    let evs = events(&f.store, f.run).await;
+    let comp = intents(&evs, "compact");
+    assert_eq!(comp.len(), 1);
+    assert!(
+        receipt_of(&evs, comp[0])
+            .payload
+            .to_string()
+            .contains("interrupted:pause")
+    );
+    // Resume: шаг 3 реплеится до квитанции обрыва, затем граница 4 вживую.
+    f.model.push(summary("n"));
+    f.model.push(answer("готово"));
+    let out = resume_with(&f, &f.deps, ResumeChange::default()).await;
+    assert_eq!(out, done("готово"));
+    let evs = events(&f.store, f.run).await;
+    assert_eq!(intents(&evs, "compact").len(), 2);
+    let compacted = of_kind(&evs, EventKind::ContextCompacted);
+    assert_eq!(compacted.len(), 1);
+    assert_eq!(compacted[0].payload["step"], 4);
+    // На шаге 3 хода не было: ход 3 начат на шаге 4.
+    let started: Vec<(&Value, &Value)> = of_kind(&evs, EventKind::TurnStarted)
+        .iter()
+        .map(|e| (&e.payload["turn"], &e.payload["step"]))
+        .collect();
+    assert_eq!(started.last().copied(), Some((&json!(3), &json!(4))));
+}
+
+/// m-B: ввод, целиком попавший в хвост, в рецитации не повторяется.
+#[tokio::test]
+async fn recitation_skips_input_in_tail() {
+    let mut conv = Conversation::default();
+    conv.push_user("<env>\n</env>\n\nЗадача".into()).unwrap();
+    conv.commit_turn(vec![], assistant_call("c1")).unwrap();
+    conv.push_results(result("c1")).unwrap();
+    let input = format!("большой ввод {}", "y".repeat(2000));
+    conv.push_user(input.clone()).unwrap();
+    let c = direct_compact("recite_tail", 8192, &conv, &[(&input, Some(3))], false).await;
+    let texts: Vec<String> = c.conv.messages().iter().map(text_of).collect();
+    // Ввод — в сводке (раздел вводов) и в хвосте, но не в рецитации.
+    assert!(!texts.last().unwrap().contains(&input));
+    assert_eq!(texts[1], input);
+    assert!(
+        texts
+            .last()
+            .unwrap()
+            .contains("Current task: the latest user message above."),
+        "{texts:?}"
+    );
+    assert_eq!(c.user_inputs[0].at, Some(1));
+}
+
+/// m-B: ввод вне хвоста повторяется в пределах 25 % окна.
+#[tokio::test]
+async fn recitation_is_clipped_to_window_share() {
+    let mut conv = Conversation::default();
+    conv.push_user("<env>\n</env>\n\nЗадача".into()).unwrap();
+    let input = "ж".repeat(10_000);
+    let c = direct_compact("recite_clip", 8192, &conv, &[(&input, None)], false).await;
+    let last = text_of(c.conv.messages().last().unwrap());
+    assert!(last.contains("Current task: жж"), "{last}");
+    assert!(last.contains("…[truncated]"));
+    // 8192 / 4 = 2048 токенов ≈ 8192 байт текста ввода.
+    assert!(last.len() < 8192 + 200, "{}", last.len());
 }

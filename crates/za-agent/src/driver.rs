@@ -83,8 +83,9 @@ pub enum CrashPoint {
     AfterExitSnapshot { step: u64 },
     /// конечный статус (done, partial, blocked, cancelled) записан, конечного снимка ещё нет
     AfterFinalStatus { step: u64 },
-    /// квитанция `compact` шага записана; новая история, `context.compacted` и снимок
-    /// `Model` — нет (R1-B2 D68): компакция по порогу на границе и аварийная в узле `model`
+    /// квитанция `compact` шага записана (сводка или обрыв `interrupted:*`); новая
+    /// история, `context.compacted` и снимок `Model` — нет (R1-B2 D68): компакция по
+    /// порогу на границе и аварийная в узле `model`
     AfterCompact { step: u64 },
 }
 
@@ -893,9 +894,11 @@ async fn push_inbox(
 
 /// Повторное чтение ввода после компакции на границе (Ruling I-2): эффект `inbox`
 /// (`ReadOnly`, `{step}`) — ввод, пришедший во время компакции, попадает в историю до
-/// хода модели. Эффект есть после каждой компакции на границе, поэтому реплей
-/// повторяет те же ключи; сигнал ввода после него устарел.
+/// хода модели. Эффект есть после каждой компакции (на границе и аварийной в узле
+/// `model`), поэтому реплей повторяет те же ключи. Сигнал ввода снимается до чтения
+/// (m-A): ввод, записанный после чтения, оставит новый сигнал, а не потеряет его.
 async fn reread_inbox(deps: &LoopDeps, st: &mut LoopState, step: u64) -> Result<(), LoopError> {
+    st.sig.discard_input();
     let store = store_of(deps);
     let (run, after) = (st.run, st.inbox_after);
     let mut failure: Option<StoreError> = None;
@@ -933,7 +936,6 @@ async fn reread_inbox(deps: &LoopDeps, st: &mut LoopState, step: u64) -> Result<
     })?;
     push_inbox(deps, st, &b.inputs).await?;
     st.inbox_after = b.inbox_after;
-    st.sig.discard_input();
     Ok(())
 }
 
@@ -1307,7 +1309,9 @@ async fn run_compaction(
         &mut st.sig,
     )
     .await;
-    if r.is_ok() && crashed(deps, CrashPoint::AfterCompact { step }) {
+    if matches!(r, Ok(_) | Err(TurnError::Aborted { .. }))
+        && crashed(deps, CrashPoint::AfterCompact { step })
+    {
         return Err(LoopError::Halted);
     }
     match r {
@@ -1591,6 +1595,8 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
                     CompactStep::Skipped => return Ok(Transition::Goto(BOUNDARY)),
                     CompactStep::Exit(t) => return Ok(t),
                 }
+                // Ввод, пришедший во время компакции, — в историю до повтора (Ruling I-2).
+                reread_inbox(deps, st, step).await?;
                 persist(&store_of(deps), st).await?;
                 // Оценка прежнего запроса к новому не относится: проверки обрезки у
                 // повтора нет (D43).

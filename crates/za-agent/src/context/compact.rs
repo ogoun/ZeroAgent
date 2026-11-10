@@ -46,6 +46,10 @@ const NEXT_STEP: &str = "## Next step";
 const TAIL_DIVISOR: u32 = 5;
 /// Начало текста рецитации (CTX-014, D48).
 const RECITATION: &str = "Current task: ";
+/// Рецитация, когда активный запрос целиком в хвосте (m-B): текст не повторяется.
+const RECITE_IN_TAIL: &str = "the latest user message above.";
+/// Пометка обрезанной рецитации.
+const CLIPPED: &str = " …[truncated]";
 /// Раздел `## User messages` без вводов.
 const NO_USER_MESSAGES: &str = "none";
 /// Вводы пользователя в сводке — не больше `n_ctx / 4` токенов (25 %, Ruling minor).
@@ -83,6 +87,20 @@ pub fn summary_block(
     s.push_str(&escape_untrusted(model_part.trim()));
     s.push_str("\n</summary>");
     s
+}
+
+/// Текст в пределах `budget` токенов (байты / 4): длиннее — срез по границе символа и
+/// пометка `…[truncated]`.
+fn clip(text: &str, budget: u32) -> String {
+    let max = budget as usize * 4;
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{CLIPPED}", &text[..end])
 }
 
 /// Вводы для сводки в пределах `budget` токенов (байты / 4): с новых к старым, пока
@@ -175,7 +193,8 @@ pub struct CompactInput<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Compacted {
     pub conv: Conversation,
-    /// Блок `<summary>` первого сообщения.
+    /// Сводка первого сообщения: разделы рантайма (`## Goal`, `## User messages`) и блок
+    /// модели `<summary from="model">` (D47).
     pub summary: String,
     /// Раздел `## Next step` сводки (пусто — раздела нет).
     pub next_step: String,
@@ -299,13 +318,6 @@ pub async fn compact(
     let recovery = v.get("text").and_then(Value::as_str);
 
     // Новая эпоха: первое сообщение, хвост, рецитация (D46, D48).
-    let current = users.last().map_or(input.goal, |(t, _)| t.as_str());
-    let recitation = render_control(
-        ControlFrom::Runtime,
-        ControlAction::Reminder,
-        "",
-        &format!("{RECITATION}{current}"),
-    );
     let shown = limit_user_messages(users.clone(), n_ctx / USER_MESSAGES_DIVISOR);
     let summary = summary_block(input.goal, &shown, &model_part);
     let next_step = next_step_of(&model_part).unwrap_or_default();
@@ -315,6 +327,21 @@ pub async fn compact(
     } else {
         split_tail(input.conv, request_at, n_ctx / TAIL_DIVISOR)
     };
+    // Рецитация (m-B): ввод, целиком попавший в хвост, не повторяется; иначе — ввод
+    // (или задача) в пределах 25 % окна.
+    let in_tail = request_at.is_some_and(|at| at >= split);
+    let current = if in_tail {
+        RECITE_IN_TAIL.to_owned()
+    } else {
+        let text = users.last().map_or(input.goal, |(t, _)| t.as_str());
+        clip(text, n_ctx / USER_MESSAGES_DIVISOR)
+    };
+    let recitation = render_control(
+        ControlFrom::Runtime,
+        ControlAction::Reminder,
+        "",
+        &format!("{RECITATION}{current}"),
+    );
     let conv = input
         .conv
         .rebased(
@@ -474,7 +501,7 @@ fn compaction_call(
 }
 
 /// Первое сообщение новой эпохи (D46): `<env>` run, recovery памяти (как снимок в
-/// первом сообщении run, экранирован), блок `<summary>`.
+/// первом сообщении run, экранирован), сводка (D47: разделы рантайма и блок модели).
 fn new_first(env: &str, recovery: Option<&str>, summary: &str) -> String {
     let mut out = env.to_owned();
     if let Some(r) = recovery.filter(|r| !r.trim().is_empty()) {
