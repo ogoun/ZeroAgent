@@ -8,8 +8,10 @@
 //! управляющего сообщения `resume` (A.6) для модели, по-английски (D23).
 //!
 //! Снимок версии 1 (R1-B1) читается (R1-B2 D66): со снимка `boundary` run продолжается,
-//! а `task`, `env_text` и `user_inputs` восстанавливаются разбором истории; снимок версии 1
-//! посреди шага не продолжается — запрос хода R1-B2 другой (`request_hash`).
+//! а `task`, `env_text` и `user_inputs` восстанавливаются разбором истории. Со снимка
+//! версии 1 посреди шага (сбой, пауза на одобрении или `ask_user`) шаг доигрывается с
+//! параметрами хода R1-B1 (`LoopState::legacy_step`): `request_hash` и ключи эффектов
+//! совпадают с журналом (`effect_seq` из снимка, эффект `context` — только на границе).
 
 use serde_json::Value;
 use za_core::{Recovery, RunCtx, recover};
@@ -139,11 +141,6 @@ pub async fn resume_run(
             return Err(fail_broken(deps, run, status, generation, e).await);
         }
     };
-    // D66: снимок R1-B1 посреди шага — запрос хода R1-B2 другой (лимит вывода, `options`),
-    // реплей дал бы `ReplayMismatch`. Статус не меняется (Ruling M2 R1-B1).
-    if snap.v == SNAPSHOT_V1 && snap.next == Next::Model {
-        return Err(LoopError::Snapshot("снимок R1-B1 посреди шага".into()));
-    }
 
     // (4) D5: процесс упал между снимком чистой паузы и её статусом.
     if status == RunStatus::Running
@@ -315,6 +312,8 @@ async fn restore(
         stopping: None,
         at_boundary: AtBoundary::default(),
         meter: snap.meter,
+        // D66: шаг R1-B1 посреди хода доигрывается с параметрами хода R1-B1.
+        legacy_step: snap.v == SNAPSHOT_V1 && snap.next == Next::Model,
         task,
         env_text,
         user_inputs,

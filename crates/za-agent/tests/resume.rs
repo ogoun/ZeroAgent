@@ -188,7 +188,11 @@ struct Fx {
 }
 
 fn fx(name: &str) -> Fx {
-    let store = ProjectStore::open(&dir(name)).unwrap();
+    fx_in(&dir(name))
+}
+
+fn fx_in(d: &std::path::Path) -> Fx {
+    let store = ProjectStore::open(d).unwrap();
     let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
     let incr = Arc::new(AtomicUsize::new(0));
@@ -1165,29 +1169,84 @@ async fn snapshot_v1_boundary_continues() {
     assert_eq!(u, &snap.user_inputs[0]);
 }
 
-/// D66, Ruling M2 R1-B1: снимок v1 посреди шага не продолжается, статус тот же.
+/// Журнал run, записанный кодом R1-B1 (2b30f84, генератор — раунд 1 задачи 1): копия
+/// фикстуры `tests/golden/r1b1_v1/<name>` в каталог теста, run и снимок v1.
+async fn golden_v1(name: &str) -> (Fx, Value) {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/r1b1_v1")
+        .join(name);
+    let d = dir(&format!("golden_{name}"));
+    std::fs::copy(src.join("store/journal.db"), d.join("journal.db")).unwrap();
+    let mut f = fx_in(&d);
+    let run = std::fs::read_to_string(src.join("run.txt")).unwrap();
+    f.run = serde_json::from_value(json!(run.trim())).unwrap();
+    let golden: Value =
+        serde_json::from_str(&std::fs::read_to_string(src.join("snapshot.json")).unwrap()).unwrap();
+    // Фикстура — настоящий снимок R1-B1: версия 1, посреди шага, без полей R1-B2.
+    let (_, v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    assert_eq!(v, golden, "снимок журнала не совпадает с golden");
+    assert_eq!(golden["v"], 1);
+    assert_eq!(golden["next"], "model");
+    assert!(golden.get("meter").is_none() && golden["setup"].get("context").is_none());
+    (f, golden)
+}
+
+/// I2 ревью задачи 1 (D66): run R1-B1, упавший посреди хода, продолжается: шаг
+/// доигрывается с параметрами хода R1-B1 (тот же `request_hash`, тот же ключ эффекта).
 #[tokio::test]
-async fn snapshot_v1_model_is_rejected() {
-    let f = fx("v1_model");
-    f.model.push_open(Vec::new());
-    let mut bus = f.bus.subscribe();
-    let (h, _ctl) = spawn_start(&f, ask());
-    nth_of(&mut bus, EventKind::ModelRequest, 1, |_| true).await;
-    crash(h).await;
-    let (_, snap) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(snap.next, Next::Model);
-    let last = events(&f.store, f.run).await.last().unwrap().seq;
-    f.store
-        .save_snapshot(f.run, last, as_v1(&snap))
-        .await
-        .unwrap();
-    let err = resume(&f, ResumeChange::default()).await.unwrap_err();
-    assert!(
-        matches!(&err, LoopError::Snapshot(s) if s == "снимок R1-B1 посреди шага"),
-        "{err:?}"
-    );
+async fn snapshot_v1_mid_step_continues() {
+    let (f, _) = golden_v1("mid_step").await;
     assert_eq!(status(&f.store, f.run).await, RunStatus::Running);
-    assert_eq!(f.model.calls().len(), 1);
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    let cs = f.model.calls();
+    assert_eq!(cs.len(), 1);
+    // Параметры хода R1-B1: без лимита вывода.
+    assert_eq!(cs[0].request.max_output_tokens, None);
+    let evs = events(&f.store, f.run).await;
+    let reqs = of_kind(&evs, EventKind::ModelRequest);
+    // Запрос R1-B1 и повтор после сбоя — один эффект, один `request_hash`.
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].payload["effect_key"], reqs[1].payload["effect_key"]);
+    assert_eq!(reqs[0].payload["request"], reqs[1].payload["request"]);
+    assert_eq!(
+        reqs[1].payload["effect_key"],
+        EffectKey::derive(f.run, 1, 1).0
+    );
+    let (_, after) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(after.v, 2);
+    assert_eq!(after.task, "Задача");
+}
+
+/// I2 ревью задачи 1 (D66): run R1-B1 на паузе одобрения после обновления продолжается
+/// после ответа: квитанция хода R1-B1 реплеится, вызов исполняется один раз, следующий
+/// ход — с параметрами R1-B2.
+#[tokio::test]
+async fn snapshot_v1_approval_continues() {
+    let (f, _) = golden_v1("approval").await;
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/r1b1_v1/approval");
+    let id = std::fs::read_to_string(src.join("interrupt.txt")).unwrap();
+    assert!(
+        f.store
+            .resolve_interrupt(id.trim(), json!({"approved": true}))
+            .await
+            .unwrap()
+    );
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    assert_eq!(f.incr.load(Ordering::SeqCst), 1);
+    let cs = f.model.calls();
+    assert_eq!(cs.len(), 1, "ход R1-B1 вызван заново");
+    assert!(cs[0].request.max_output_tokens.is_some());
+    let (_, after) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(after.v, 2);
 }
 
 /// D65: `[context]` замораживается на run: снимок хранит `setup.context`, resume

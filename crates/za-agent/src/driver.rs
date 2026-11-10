@@ -383,6 +383,7 @@ async fn step_zero(
         stopping: None,
         at_boundary: AtBoundary::default(),
         meter: Default::default(),
+        legacy_step: false,
         task: spec.task,
         env_text,
         user_inputs: Vec::new(),
@@ -748,6 +749,8 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     if let Some(m) = st.at_boundary.run_mode.take() {
         st.setup.run_mode = m;
     }
+    // Шаг R1-B1 доработан: следующие ходы — с параметрами R1-B2 (D66).
+    st.legacy_step = false;
     // (1) Сигналы до шага (D9): Input отброшен — ввод прочитает сама граница.
     // `pausing`/`cancelling`, записанные во время пакета, доводятся до конца, даже
     // если сам пакет флаг не прочитал (кончился раньше).
@@ -946,7 +949,21 @@ async fn state_effect(deps: &LoopDeps, st: &mut LoopState) -> Result<String, Loo
 
 /// Параметры хода: `Required` после второго пустого хода (D18), лимит вывода и
 /// мышление — [`output_plan`] (D40). Одни и те же для оценки на границе и для хода.
+///
+/// Шаг R1-B1, начатый до обновления (`legacy_step`, снимок версии 1 посреди шага), —
+/// с параметрами R1-B1: без лимита вывода и с мышлением run. Тогда `request_hash`
+/// реплея совпадает с записанным в журнале (D66).
 fn turn_options(st: &LoopState) -> TurnOptions {
+    if st.legacy_step {
+        return TurnOptions {
+            tool_choice: if st.counters.forced_required {
+                ToolChoice::Required
+            } else {
+                ToolChoice::Auto
+            },
+            ..TurnOptions::default()
+        };
+    }
     let plan = output_plan(
         &ContextBudget::for_context(st.setup.n_ctx),
         &st.setup.reasoning,
@@ -1014,6 +1031,7 @@ async fn context_effect(
         LoopError::Store(e)
     })?;
     st.meter.last_estimate = Some(est.tokens);
+    st.meter.last_floor = Some(est.floor());
     Ok(est)
 }
 
@@ -1119,7 +1137,9 @@ async fn check_truncation(
     st: &mut LoopState,
     out: &TurnOutput,
 ) -> Result<(), StoreError> {
-    let Some(estimate) = st.meter.last_estimate else {
+    // Нижняя оценка — без рассуждений прошлых ходов: шаблоны llama.cpp их выбрасывают,
+    // и полная оценка дала бы ложное подозрение после длинного рассуждения.
+    let Some(estimate) = st.meter.last_floor.or(st.meter.last_estimate) else {
         return Ok(());
     };
     let input = out.usage.input;
@@ -1260,7 +1280,8 @@ async fn model_output(
     report_parse_errors(deps.model.as_ref(), st.run, call, rev.parse_errors);
     st.conv.commit_turn(out.service, rev.assistant.clone())?;
     // База счётчика (D41): ход принят, история включает его ответ.
-    st.meter.after_turn(st.conv.messages().len(), &out.usage);
+    st.meter
+        .after_reply(st.conv.messages().len(), &out.usage, Some(&rev.assistant));
 
     if !rev.calls.is_empty() {
         st.counters.empty_turns = 0;

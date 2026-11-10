@@ -1,0 +1,189 @@
+//! Генератор фикстур R1-B2 (раунд 1 задачи 1): журналы run, записанные кодом R1-B1
+//! (2b30f84), со снимком версии 1 посреди шага. Запуск: GEN_V1_DIR=<каталог>.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use za_agent::{
+    EnvInfo, LoopDeps, LoopOutcome, NoMemory, RunSpec, builtin_tools, control_channel, start_run,
+};
+use za_core::{
+    Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec,
+};
+use za_llm::{
+    BackendKind, BoxFuture, EndpointId, FinishReason, Message, Part, Role, ScriptedModel,
+    StreamEvent, ToolCall, ToolSchema, Usage, default_caps,
+};
+use za_protocol::{Budget, EffectClass, EventKind, Priority, RunId, RunMode, RunRole, Tier};
+use za_store::ProjectStore;
+
+struct Incr {
+    spec: ToolSpec,
+    count: Arc<AtomicUsize>,
+}
+
+impl Tool for Incr {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        Box::pin(async move {
+            ToolOutput {
+                content: format!("incr {n}"),
+                is_error: false,
+            }
+        })
+    }
+}
+
+fn deps(store: &ProjectStore, model: Arc<ScriptedModel>, bus: EventBus) -> LoopDeps {
+    let mut reg = ToolRegistry::default();
+    for t in builtin_tools() {
+        reg.register(t).unwrap();
+    }
+    reg.register(Arc::new(Incr {
+        spec: ToolSpec {
+            schema: ToolSchema {
+                name: "incr".into(),
+                description: "t".into(),
+                parameters: json!({"type": "object"}),
+            },
+            class: EffectClass::NonIdempotent,
+            kind: ToolKind::Exec,
+            approval: Approval::Mode,
+            roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
+            min_tier: Tier::Small,
+            timeout: Duration::from_secs(600),
+            output_limit: None,
+            tainted: false,
+        },
+        count: Arc::new(AtomicUsize::new(0)),
+    }))
+    .unwrap();
+    LoopDeps {
+        journal: Journal::new(store.clone(), bus),
+        model,
+        tools: Arc::new(reg),
+        capabilities: Vec::new(),
+        memory: Arc::new(NoMemory),
+        crash: None,
+    }
+}
+
+fn spec() -> RunSpec {
+    RunSpec {
+        project_id: "p".into(),
+        project_dir: PathBuf::from("H:/p"),
+        role: RunRole::Top,
+        parent: None,
+        endpoint: EndpointId("a".into()),
+        run_mode: RunMode::Ask,
+        work_mode: None,
+        tier: None,
+        budget: Budget::default(),
+        priority: Priority::Top,
+        max_wait: None,
+        task: "Задача".into(),
+        agents_md: None,
+        env: EnvInfo {
+            os: "windows".into(),
+            shell: "powershell".into(),
+            project_dir: "H:/p".into(),
+            date: "2026-11-10".into(),
+            tier: Tier::Full,
+            n_ctx: 1,
+            budget: "x".into(),
+            branch: "main".into(),
+        },
+    }
+}
+
+fn root() -> PathBuf {
+    PathBuf::from(std::env::var("GEN_V1_DIR").expect("GEN_V1_DIR"))
+}
+
+fn fresh(name: &str) -> PathBuf {
+    let d = root().join(name);
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[tokio::test]
+async fn gen_mid_step() {
+    if std::env::var("GEN_V1_DIR").is_err() {
+        return;
+    }
+    let d = fresh("mid_step");
+    let store = ProjectStore::open(&d.join("store")).unwrap();
+    let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
+    model.push_open(Vec::new());
+    let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
+    let mut rx = bus.subscribe();
+    let deps = deps(&store, model.clone(), bus);
+    let run = RunId::new();
+    let (_ctl, crx) = control_channel(store.clone(), run);
+    let h = tokio::spawn(async move { start_run(&deps, run, spec(), crx).await });
+    loop {
+        let ev = rx.recv().await.unwrap();
+        if ev.event.kind == EventKind::ModelRequest {
+            break;
+        }
+    }
+    h.abort();
+    let _ = h.await;
+    let (_, snap) = store.latest_snapshot(run).await.unwrap().unwrap();
+    std::fs::write(d.join("run.txt"), run.to_string()).unwrap();
+    std::fs::write(
+        d.join("snapshot.json"),
+        serde_json::to_string_pretty(&snap).unwrap() + "\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn gen_approval() {
+    if std::env::var("GEN_V1_DIR").is_err() {
+        return;
+    }
+    let d = fresh("approval");
+    let store = ProjectStore::open(&d.join("store")).unwrap();
+    let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
+    model.push(vec![Ok(StreamEvent::Finished {
+        message: Message {
+            role: Role::Assistant,
+            parts: vec![Part::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "incr".into(),
+                arguments: json!({"n": 1}),
+                raw_arguments: None,
+            })],
+        },
+        finish: FinishReason::ToolCalls,
+        usage: Usage::default(),
+    })]);
+    let deps = deps(&store, model.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY));
+    let run = RunId::new();
+    let (_ctl, crx) = control_channel(store.clone(), run);
+    let out = start_run(&deps, run, spec(), crx).await.unwrap();
+    let LoopOutcome::Paused {
+        reason,
+        interrupt: Some(id),
+    } = out
+    else {
+        panic!("{out:?}");
+    };
+    assert_eq!(reason, "needs_approval");
+    let (_, snap) = store.latest_snapshot(run).await.unwrap().unwrap();
+    std::fs::write(d.join("run.txt"), run.to_string()).unwrap();
+    std::fs::write(d.join("interrupt.txt"), id).unwrap();
+    std::fs::write(
+        d.join("snapshot.json"),
+        serde_json::to_string_pretty(&snap).unwrap() + "\n",
+    )
+    .unwrap();
+}

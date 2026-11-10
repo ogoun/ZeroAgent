@@ -194,6 +194,19 @@ impl ContextConfig {
 pub struct Estimate {
     pub tokens: u32,
     pub exact: bool,
+    /// Доля рассуждений модели в `tokens`: рассуждение базы и частей `Reasoning`
+    /// посчитанных сообщений (байты / 4). Шаблоны llama.cpp выбрасывают прошлое
+    /// рассуждение, поэтому `tokens − reasoning` — нижняя оценка для D43. У квитанций
+    /// задачи 1 поля нет — 0.
+    #[serde(default)]
+    pub reasoning: u32,
+}
+
+impl Estimate {
+    /// Нижняя оценка запроса (D43): без рассуждений прошлых ходов.
+    pub fn floor(&self) -> u32 {
+        self.tokens.saturating_sub(self.reasoning)
+    }
 }
 
 /// Токенов шаблона чата на сообщение (D41): приближение, `/apply-template` не
@@ -210,8 +223,15 @@ pub struct ContextMeter {
     pub base_len: usize,
     /// `usage.input + usage.output` последнего успешного хода; `None` — базы нет.
     pub base_tokens: Option<u64>,
+    /// Рассуждение в базе: `usage.reasoning`, а без него — байты / 4 частей
+    /// `Reasoning` ответа хода (D43: нижняя оценка).
+    pub base_reasoning: u64,
     /// Оценка последнего запроса хода (для D43).
     pub last_estimate: Option<u32>,
+    /// Нижняя оценка последнего запроса хода — без рассуждений ([`Estimate::floor`]);
+    /// с ней сравнивает детектор обрезки (D43). `None` — снимок задачи 1: берётся
+    /// `last_estimate`.
+    pub last_floor: Option<u32>,
     /// D43: компакция на ближайшей границе; ход последней компакции по подозрению на обрезку.
     pub compact_pending: bool,
     pub truncation_turn: Option<u32>,
@@ -223,19 +243,31 @@ impl ContextMeter {
     /// База после успешного хода: `input + output` и длина истории после фиксации хода.
     /// `usage.input == 0` (провайдер не сообщил расход) — базы нет.
     pub fn after_turn(&mut self, history_len: usize, usage: &Usage) {
+        self.after_reply(history_len, usage, None);
+    }
+
+    /// [`ContextMeter::after_turn`] с ответом хода: рассуждение базы — `usage.reasoning`
+    /// (не больше `output`), а если провайдер его не сообщил — байты / 4 частей
+    /// `Reasoning` ответа.
+    pub fn after_reply(&mut self, history_len: usize, usage: &Usage, reply: Option<&Message>) {
         if usage.input == 0 {
-            self.base_len = 0;
-            self.base_tokens = None;
-        } else {
-            self.base_len = history_len;
-            self.base_tokens = Some(usage.input.saturating_add(usage.output));
+            self.reset();
+            return;
         }
+        self.base_len = history_len;
+        self.base_tokens = Some(usage.input.saturating_add(usage.output));
+        self.base_reasoning = if usage.reasoning > 0 {
+            usage.reasoning.min(usage.output)
+        } else {
+            reply.map_or(0, reasoning_tokens)
+        };
     }
 
     /// После переписывания истории (удаление, компакция): базы нет.
     pub fn reset(&mut self) {
         self.base_len = 0;
         self.base_tokens = None;
+        self.base_reasoning = 0;
     }
 
     /// Оценка запроса (D41): с базой — база плюс сообщения после неё; без базы —
@@ -257,8 +289,12 @@ impl ContextMeter {
         let base = self
             .base_tokens
             .filter(|_| self.base_len <= req.messages.len());
+        let mut reasoning = 0u64;
         let (mut total, msgs) = match base {
-            Some(b) => (b, &req.messages[self.base_len..]),
+            Some(b) => {
+                reasoning = self.base_reasoning.min(b);
+                (b, &req.messages[self.base_len..])
+            }
             None => {
                 let tools = render_tools(&PromptBlocks {
                     tools: req.tools.clone(),
@@ -272,10 +308,13 @@ impl ContextMeter {
             total = total
                 .saturating_add(c.count(&message_text(m)).await)
                 .saturating_add(TEMPLATE_TOKENS);
+            reasoning = reasoning.saturating_add(reasoning_tokens(m));
         }
+        let tokens = u32::try_from(total).unwrap_or(u32::MAX);
         Estimate {
-            tokens: u32::try_from(total).unwrap_or(u32::MAX),
+            tokens,
             exact: c.exact,
+            reasoning: u32::try_from(reasoning).unwrap_or(u32::MAX).min(tokens),
         }
     }
 }
@@ -323,6 +362,17 @@ pub(crate) fn message_text(m: &Message) -> String {
         }
     }
     parts.join("\n")
+}
+
+/// Рассуждение сообщения: байты / 4 вверх частей `Reasoning`.
+fn reasoning_tokens(m: &Message) -> u64 {
+    m.parts
+        .iter()
+        .map(|p| match p {
+            Part::Reasoning { text, .. } => u64::from(approx_tokens(text)),
+            _ => 0,
+        })
+        .sum()
 }
 
 /// D43: подозрение на тихую обрезку — оценка запроса больше 1024 и расход меньше

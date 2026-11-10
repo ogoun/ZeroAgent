@@ -10,3 +10,5 @@ crates/za-llm/tests/fixtures/** -text
 crates/za-res/tests/fixtures/** -text
 # Золотой хэш текстов промптов: байты не трогать.
 crates/za-agent/tests/golden/*.hash -text
+# Журналы run, записанные кодом R1-B1 (SQLite): байты не трогать.
+crates/za-agent/tests/golden/r1b1_v1/** -text

@@ -290,7 +290,8 @@ async fn estimate_uses_base_plus_delta() {
         m.estimate(&req, &model, &ep).await,
         Estimate {
             tokens: 1258,
-            exact: false
+            exact: false,
+            reasoning: 0
         }
     );
     let counting = scripted().with_token_counter(|s| s.len() as u32 / 2);
@@ -298,7 +299,8 @@ async fn estimate_uses_base_plus_delta() {
         m.estimate(&req, &counting, &ep).await,
         Estimate {
             tokens: 1458,
-            exact: true
+            exact: true,
+            reasoning: 0
         }
     );
 }
@@ -314,6 +316,7 @@ async fn estimate_without_base_counts_whole_request() {
     let want = Estimate {
         tokens: 1105,
         exact: false,
+        reasoning: 0,
     };
     let mut m = ContextMeter::default();
     assert_eq!(m.estimate(&req, &model, &ep).await, want);
@@ -509,4 +512,104 @@ async fn truncation_alert_sets_compact_pending() {
             .iter()
             .all(|e| e.payload["kind"] != "truncation_suspected")
     );
+}
+
+/// I1 ревью задачи 1 (D43): шаблоны llama.cpp выбрасывают рассуждение прошлых ходов,
+/// поэтому `input` следующего хода меньше полной оценки на объём рассуждения. Детектор
+/// обрезки сравнивает с нижней оценкой — без рассуждения: ложного подозрения нет, а
+/// настоящая обрезка подозрение даёт.
+#[tokio::test]
+async fn long_reasoning_is_not_truncation() {
+    async fn run_with(name: &str, second_input: u64) -> Vec<Value> {
+        let f = fx(name, scripted().with_context(131072));
+        // Ход 1: ответ обрезан пределом вывода после длинного рассуждения.
+        f.model.push(vec![Ok(StreamEvent::Finished {
+            message: text_msg(Role::Assistant, "часть"),
+            finish: FinishReason::Length,
+            usage: Usage {
+                input: 1000,
+                output: 20100,
+                reasoning: 20000,
+                ..Usage::default()
+            },
+        })]);
+        f.model.push(vec![Ok(StreamEvent::Finished {
+            message: text_msg(Role::Assistant, "Париж"),
+            finish: FinishReason::Stop,
+            usage: usage(second_input, 5),
+        })]);
+        start(&f, spec()).await.unwrap();
+        let evs = events(&f.store, f.run).await;
+        // Полная оценка хода 2 включает рассуждение (база 21100), нижняя — без него.
+        let snaps = snapshots(&f.store, f.run).await;
+        let (_, s2) = snaps
+            .iter()
+            .find(|(_, s)| s.turn == 2 && s.next == za_agent::Next::Model)
+            .expect("нет снимка Model хода 2");
+        assert!(s2.meter.last_estimate.unwrap() > 21_000, "{:?}", s2.meter);
+        let floor = s2.meter.last_floor.unwrap();
+        assert!((1024..2000).contains(&floor), "{:?}", s2.meter);
+        of_kind(&evs, EventKind::ContextAlert)
+            .into_iter()
+            .filter(|e| e.payload["kind"] == "truncation_suspected" && e.payload["turn"] == 2)
+            .map(|e| e.payload.clone())
+            .collect()
+    }
+    // `input` хода 2 — промпт без рассуждения: подозрения нет.
+    assert_eq!(
+        run_with("reasoning_honest", 1200).await,
+        Vec::<Value>::new()
+    );
+    // Сервер срезал промпт: подозрение есть, с нижней оценкой.
+    let t = run_with("reasoning_truncated", 100).await;
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert_eq!(t[0]["input"], 100);
+}
+
+/// I1: без `usage.reasoning` рассуждение базы — байты / 4 частей `Reasoning` ответа;
+/// рассуждение в посчитанных сообщениях тоже входит в `Estimate.reasoning`.
+#[tokio::test]
+async fn reasoning_share_of_estimate() {
+    let reply = Message {
+        role: Role::Assistant,
+        parts: vec![
+            Part::Reasoning {
+                text: "r".repeat(4000),
+                replay: None,
+            },
+            Part::Text("ok".into()),
+        ],
+    };
+    let mut m = ContextMeter::default();
+    m.after_reply(2, &usage(1000, 1100), Some(&reply));
+    assert_eq!(m.base_reasoning, 1000);
+    let ep = EndpointId("local".into());
+    let req = request(
+        "s",
+        vec![
+            text_msg(Role::User, "q"),
+            reply.clone(),
+            text_msg(Role::User, "дальше"),
+        ],
+    );
+    let e = m.estimate(&req, &scripted(), &ep).await;
+    assert_eq!(e.reasoning, 1000);
+    assert_eq!(e.floor(), e.tokens - 1000);
+    // Без базы рассуждение считается по частям сообщений.
+    m.reset();
+    assert_eq!(m.base_reasoning, 0);
+    let e = m.estimate(&req, &scripted(), &ep).await;
+    assert_eq!(e.reasoning, 1000);
+    // Провайдер сообщил рассуждение — берётся оно (не больше output).
+    m.after_reply(
+        2,
+        &Usage {
+            input: 10,
+            output: 50,
+            reasoning: 70,
+            ..Usage::default()
+        },
+        Some(&reply),
+    );
+    assert_eq!(m.base_reasoning, 50);
 }
