@@ -545,6 +545,35 @@ fn open_checked_refuses_final_link() {
     assert!(e.to_string().contains("refusing to follow a link"), "{e}");
 }
 
+/// I3 задачи 6: метаданные и список каталога без перехода по ссылке на последнем
+/// компоненте; внутри внешней области `DriveScope` вложенные вызовы работают так же.
+#[test]
+fn stat_and_read_dir_checked_refuse_links() {
+    use za_core::paths::{DriveScope, read_dir_checked, stat_checked};
+    let f = fixture("stat_checked");
+    std::fs::create_dir_all(f.project.join("d")).unwrap();
+    std::fs::write(f.project.join("d/a.txt"), "x").unwrap();
+    std::fs::write(f.outside.join("o.txt"), "x").unwrap();
+    let _outer = DriveScope::enter();
+    let d = res(&f, "d", Access::Read);
+    assert!(stat_checked(&d).unwrap().is_dir());
+    let names = read_dir_checked(&d).unwrap();
+    assert_eq!(names, vec![std::ffi::OsString::from("a.txt")]);
+    let file = res(&f, "d/a.txt", Access::Read);
+    assert!(stat_checked(&file).unwrap().is_file());
+    assert_eq!(
+        read_dir_checked(&file).unwrap_err().kind(),
+        std::io::ErrorKind::NotADirectory
+    );
+    // Разрешение до подмены, затем на месте каталога — ссылка наружу.
+    let l = res(&f, "l", Access::Read);
+    dir_link(&f.project.join("l"), &f.outside);
+    let e = stat_checked(&l).unwrap_err();
+    assert!(e.to_string().contains("refusing to follow a link"), "{e}");
+    let e = read_dir_checked(&l).unwrap_err();
+    assert!(e.to_string().contains("refusing to follow a link"), "{e}");
+}
+
 /// Гонка подмены (TOCTOU): после разрешения промежуточный каталог заменён ссылкой
 /// наружу, где лежит файл с тем же именем. Открытие сверяет канонический путь и
 /// дескриптор — отказ, чужой файл не тронут.

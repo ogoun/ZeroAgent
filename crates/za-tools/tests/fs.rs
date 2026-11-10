@@ -564,6 +564,142 @@ async fn walk_does_not_follow_dir_links() {
     assert_eq!(o.content, "a.rs");
 }
 
+/// C1 ревью: файлы правил читаются только через `open_checked`. Файл правил — ссылка (на
+/// устройство, на сетевой путь), FIFO или файл больше 1 МиБ — пропускается: обход не
+/// виснет, память не растёт, к цели ссылки обращения нет, а правила этого файла не
+/// действуют.
+#[tokio::test]
+async fn unsafe_rule_files_are_skipped() {
+    let search = search_tool();
+    let glob = glob_tool();
+    // Больше предела: первая строка `ignored/` не действует.
+    let root = unique_dir("rules_big");
+    write(&root, "ignored/x.rs", "hit\n");
+    // Строки-комментарии: сам файл ищется как обычный, без строки длиннее предела.
+    let big = format!("ignored/\n{}", "#\n".repeat(1 << 20));
+    write(&root, ".gitignore", &big);
+    let o = call(&search, &root, json!({"pattern": "hit"})).await;
+    assert_eq!(o.content, "ignored/x.rs:1:hit");
+    let o = call(&glob, &root, json!({"pattern": "**/*.rs"})).await;
+    assert_eq!(o.content, "ignored/x.rs");
+
+    // Ссылка `.gitignore` на устройство: Unix — `/dev/zero` (раньше — OOM), Windows —
+    // `\\.\NUL`.
+    let root = unique_dir("rules_device");
+    write(&root, "a.rs", "hit\n");
+    let device = if cfg!(windows) {
+        r"\\.\NUL"
+    } else {
+        "/dev/zero"
+    };
+    if file_link(&root.join(".gitignore"), Path::new(device)).is_some() {
+        let o = call(&search, &root, json!({"pattern": "hit"})).await;
+        assert_eq!(o.content, "a.rs:1:hit");
+    }
+
+    // Windows: ссылка `.ignore` на UNC — без SMB-запроса (ссылка не открывается).
+    #[cfg(windows)]
+    {
+        let root = unique_dir("rules_unc");
+        write(&root, "a.rs", "hit\n");
+        if file_link(
+            &root.join(".ignore"),
+            Path::new(r"\\127.0.0.1\nonexistent\x"),
+        )
+        .is_some()
+        {
+            let o = call(&search, &root, json!({"pattern": "hit"})).await;
+            assert_eq!(o.content, "a.rs:1:hit");
+        }
+    }
+
+    // Unix: `.gitignore` — FIFO без писателя (раньше — вечная блокировка потока).
+    #[cfg(unix)]
+    {
+        let root = unique_dir("rules_fifo");
+        write(&root, "sub/a.rs", "hit\n");
+        let st = std::process::Command::new("mkfifo")
+            .arg(root.join("sub/.gitignore"))
+            .status()
+            .expect("mkfifo не запустился");
+        assert!(st.success());
+        let o = call(&search, &root, json!({"pattern": "hit"})).await;
+        assert_eq!(o.content, "sub/a.rs:1:hit");
+    }
+}
+
+/// I1 ревью: правила от корня проекта действуют, когда поиск идёт по подкаталогу; `!` в
+/// более глубоком `.gitignore` открывает путь.
+#[tokio::test]
+async fn root_gitignore_applies_to_subdir_search() {
+    let root = unique_dir("rules_subdir");
+    write(&root, ".gitignore", "sub/gen/\n*.log\n");
+    write(&root, "sub/gen/x.rs", "hit\n");
+    write(&root, "sub/a.rs", "hit\n");
+    write(&root, "sub/drop.log", "hit\n");
+    write(&root, "sub/.gitignore", "!keep.log\n");
+    write(&root, "sub/keep.log", "hit\n");
+    let search = search_tool();
+    let o = call(&search, &root, json!({"pattern": "hit", "path": "sub"})).await;
+    assert_eq!(o.content, "sub/a.rs:1:hit\nsub/keep.log:1:hit");
+    let glob = glob_tool();
+    let o = call(&glob, &root, json!({"pattern": "sub/**/*.rs"})).await;
+    assert_eq!(o.content, "sub/a.rs");
+    let o = call(&glob, &root, json!({"pattern": "sub/**"})).await;
+    assert_eq!(o.content, "sub/.gitignore\nsub/a.rs\nsub/keep.log");
+}
+
+/// I2 ревью: строка длиннее предела памяти — файл пропускается с пометкой, а явно указанный
+/// файл даёт ошибку (I4); отмена действует внутри файла без совпадений.
+#[tokio::test]
+async fn search_line_limit_and_cancel_inside_file() {
+    let root = unique_dir("search_heap");
+    let mut long = vec![b'x'; 2 << 20];
+    long.extend_from_slice(b"hit\n");
+    write(&root, "long.txt", &long);
+    write(&root, "ok.txt", "hit\n");
+    let search = search_tool();
+    let o = call(&search, &root, json!({"pattern": "hit"})).await;
+    assert_eq!(
+        o.content,
+        "ok.txt:1:hit\n[1 files skipped: a line is longer than 1 MiB]"
+    );
+    let o = call(
+        &search,
+        &root,
+        json!({"pattern": "hit", "path": "long.txt"}),
+    )
+    .await;
+    assert!(o.is_error);
+    assert_eq!(
+        o.content,
+        "cannot search long.txt: a line is longer than 1 MiB"
+    );
+    // Отмена до первого блока явно указанного файла: обхода нет, остановку видит чтение.
+    write(&root, "many.txt", "line\n".repeat(200_000));
+    let file = resolved(&root, "many.txt");
+    let limits = WalkLimits::new(Instant::now() + Duration::from_secs(3600));
+    limits.cancel();
+    let o = search_in(&roots(&root).project, &file, "hit", None, &limits);
+    assert_eq!(o.content, "no matches\n... search stopped after 0 s");
+    assert!(!o.is_error);
+}
+
+/// I4 ревью (Unix): явно указанный FIFO — ошибка с причиной, а не `no matches`.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_explicit_unreadable_file_is_error() {
+    let root = unique_dir("search_fifo");
+    let st = std::process::Command::new("mkfifo")
+        .arg(root.join("p"))
+        .status()
+        .expect("mkfifo не запустился");
+    assert!(st.success());
+    let o = call(&search_tool(), &root, json!({"pattern": "x", "path": "p"})).await;
+    assert!(o.is_error);
+    assert!(o.content.contains("not a regular file"), "{}", o.content);
+}
+
 // ---- glob ----
 
 #[tokio::test]

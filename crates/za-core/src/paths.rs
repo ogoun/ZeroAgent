@@ -388,22 +388,45 @@ pub fn set_local_drives_for_tests(letters: Option<Vec<u8>>) {
     DRIVES_OVERRIDE.with(|o| *o.borrow_mut() = letters);
 }
 
-/// Область кэша букв: создаётся в начале публичного вызова и сбрасывает кэш при входе
-/// и выходе, поэтому список томов не переживает один вызов.
-struct DriveScope;
+thread_local! {
+    /// Глубина вложенных [`DriveScope`] этого потока.
+    static DRIVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Область кэша перечня локальных томов (N1, Ruling I5 задачи 6). Каждый публичный вызов
+/// модуля входит в свою область. Внешняя область сбрасывает кэш при входе и выходе, а
+/// вложенные его не трогают. Поэтому перечень живёт не дольше самой внешней области: одного
+/// вызова, а у обхода `search` и `glob` — одного обхода, который держит область сам
+/// ([`DriveScope::enter`]). Область привязана к потоку и не передаётся между потоками.
+pub struct DriveScope {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
 
 impl DriveScope {
-    fn enter() -> Self {
-        #[cfg(windows)]
-        LOCAL_DRIVES.with(|c| *c.borrow_mut() = None);
-        Self
+    /// Вход в область; перечень томов строится при первой проверке диска внутри неё.
+    pub fn enter() -> Self {
+        DRIVE_DEPTH.with(|d| {
+            if d.get() == 0 {
+                #[cfg(windows)]
+                LOCAL_DRIVES.with(|c| *c.borrow_mut() = None);
+            }
+            d.set(d.get() + 1);
+        });
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 
 impl Drop for DriveScope {
     fn drop(&mut self) {
-        #[cfg(windows)]
-        LOCAL_DRIVES.with(|c| *c.borrow_mut() = None);
+        DRIVE_DEPTH.with(|d| {
+            d.set(d.get().saturating_sub(1));
+            if d.get() == 0 {
+                #[cfg(windows)]
+                LOCAL_DRIVES.with(|c| *c.borrow_mut() = None);
+            }
+        });
     }
 }
 
@@ -789,6 +812,39 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     r
+}
+
+/// Метаданные разрешённого пути без перехода по ссылке на последнем компоненте
+/// (`symlink_metadata`). Блокирующая. Ссылка или junction — отказ `refusing to follow a
+/// link`. На Windows диск пути должен быть локальным томом (Ruling C1). Это нужно для
+/// проверок «каталог или файл» у инструментов вместо `std::fs::metadata`, который идёт по
+/// ссылке (I3 задачи 6). Записанный риск — тот же, что у [`open_checked`]: подмена
+/// промежуточного каталога после [`resolve`].
+pub fn stat_checked(r: &ResolvedPath) -> io::Result<std::fs::Metadata> {
+    let _drives = DriveScope::enter();
+    #[cfg(windows)]
+    check_drive(&r.path, &|| r.path.display().to_string()).map_err(io::Error::other)?;
+    let m = std::fs::symlink_metadata(&r.path)?;
+    if m.file_type().is_symlink() {
+        return Err(refuse_link(&r.path));
+    }
+    Ok(m)
+}
+
+/// Имена записей каталога `r` (блокирующая). Сам каталог проходит [`stat_checked`]:
+/// ссылка на каталог — отказ, файл — `NotADirectory`.
+pub fn read_dir_checked(r: &ResolvedPath) -> io::Result<Vec<std::ffi::OsString>> {
+    let _drives = DriveScope::enter();
+    if !stat_checked(r)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("not a directory: {}", r.path.display()),
+        ));
+    }
+    Ok(std::fs::read_dir(&r.path)?
+        .flatten()
+        .map(|e| e.file_name())
+        .collect())
 }
 
 /// Текст отказа открыть не обычный файл (FIFO, устройство, сокет, каталог).

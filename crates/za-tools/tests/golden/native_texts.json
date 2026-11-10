@@ -27,5 +27,8 @@
   "runtime/fs.search.more": "... 1 more matches",
   "runtime/fs.search.no_matches": "no matches",
   "runtime/fs.search.not_found": "not found: src/mian.rs; similar: src/main.rs",
-  "runtime/fs.search.stopped": "... search stopped after 1 s"
+  "runtime/fs.search.skipped_long": "[1 files skipped: a line is longer than 1 MiB]",
+  "runtime/fs.search.skipped_unreadable": "[1 files skipped: cannot read]",
+  "runtime/fs.search.stopped": "... search stopped after 1 s",
+  "runtime/fs.search.too_long": "cannot search a.json: a line is longer than 1 MiB"
 }

@@ -3,12 +3,15 @@
 //! Вызов: разбор аргументов → [`classify`] (без ввода-вывода: сетевые и device-пути
 //! отвергаются здесь) → в `spawn_blocking` канонизация корня, [`resolve`] и работа с ФС.
 //! Файлы открываются только через [`open_checked`] (без следования ссылке на последнем
-//! компоненте, со сверкой дескриптора). Обход ([`ignore::WalkBuilder`]) — в одном потоке,
-//! по именам, без перехода по ссылкам и junction (они пропускаются целиком), без смены
-//! файловой системы, без `.gitignore` родительских каталогов и глобальных правил git;
-//! `.gitignore`, `.ignore` и `.git/info/exclude` действуют и без git. Каталоги `.git` и
-//! `.zero-agent` пропускаются на любой глубине. Обход останавливают флаг отмены (бросок
-//! future вызова) и дедлайн `timeout − 1 с`.
+//! компоненте, со сверкой дескриптора), метаданные и списки каталогов — через
+//! [`stat_checked`] и [`read_dir_checked`]. Обход ([`ignore::WalkBuilder`]) идёт в одном
+//! потоке, по именам. Он не переходит по ссылкам и junction (они пропускаются целиком) и не
+//! меняет файловую систему. Собственное чтение файлов правил у `ignore` выключено: правила
+//! `.gitignore`, `.ignore` и `.git/info/exclude` читает [`crate::rules`] от корня проекта
+//! до каталога поиска, только через `open_checked`. Каталоги `.git` и `.zero-agent`
+//! пропускаются на любой глубине. Обход и чтение внутри файла останавливают флаг отмены
+//! (бросок future вызова) и дедлайн `timeout − 1 с`. Перечень локальных томов строится
+//! один раз на вызов ([`DriveScope`]).
 //!
 //! Пути в выводе — [`display`]: внутри проекта относительные через `/`, снаружи абсолютные.
 //! Экранирование и предел размера результата — на стороне пакета (D94, D44).
@@ -23,12 +26,15 @@ use std::time::{Duration, Instant};
 
 use globset::{GlobBuilder, GlobMatcher};
 use grep_matcher::LineTerminator;
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{DirEntry, WalkBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use za_core::paths::{LexPath, ResolvedPath, Roots, classify, display, open_checked, resolve};
+use za_core::paths::{
+    DriveScope, LexPath, ResolvedPath, Roots, classify, display, open_checked, read_dir_checked,
+    resolve, stat_checked,
+};
 use za_core::{
     Access, Approval, BoxFuture, RawPath, RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput,
     ToolSchema, ToolSpec,
@@ -36,6 +42,7 @@ use za_core::{
 use za_protocol::{EffectClass, RunId, RunRole, Tier};
 
 use crate::nearest::nearest;
+use crate::rules::Rules;
 use crate::tracker::ReadTracker;
 use crate::{GLOB_MAX, READ_DEFAULT_LIMIT, READ_MAX_BYTES, SEARCH_MAX};
 
@@ -53,6 +60,11 @@ const WALK_MARGIN: Duration = Duration::from_secs(1);
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// Каталоги, в которые обход не заходит (D87): репозиторий и служебные файлы агента.
 const SKIP_DIRS: &[&str] = &[".git", ".zero-agent"];
+/// Предел памяти `search` на строку (I2): файл со строкой длиннее пропускается.
+pub(crate) const SEARCH_LINE_HEAP: usize = 1 << 20;
+/// Пределы регулярного выражения `search` (M1): скомпилированная программа и кэш DFA.
+const REGEX_SIZE_LIMIT: usize = 10 << 20;
+const REGEX_DFA_LIMIT: usize = 64 << 20;
 
 // Тексты для модели (D23, D94): английский, только ASCII-пунктуация.
 const LINE_CUT: &str = "... [line cut]";
@@ -115,6 +127,18 @@ fn more_matches_text(n: u64) -> String {
 
 fn more_files_text(n: u64) -> String {
     format!("... {n} more files")
+}
+
+fn too_long_text(shown: &str) -> String {
+    format!("cannot search {shown}: a line is longer than 1 MiB")
+}
+
+fn skipped_long_text(n: u64) -> String {
+    format!("[{n} files skipped: a line is longer than 1 MiB]")
+}
+
+fn skipped_unreadable_text(n: u64) -> String {
+    format!("[{n} files skipped: cannot read]")
 }
 
 fn stopped_text(secs: u64) -> String {
@@ -197,12 +221,17 @@ fn read_subject(arg: &str) -> Subjects {
     }
 }
 
-/// Работа с ФС вне потоков tokio.
+/// Работа с ФС вне потоков tokio. Весь вызов — одна область [`DriveScope`] (I5): перечень
+/// локальных томов строится один раз на вызов, а у `search` и `glob` — на весь обход.
 async fn blocking<F>(f: F) -> ToolOutput
 where
     F: FnOnce() -> ToolOutput + Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    let scoped = move || {
+        let _drives = DriveScope::enter();
+        f()
+    };
+    match tokio::task::spawn_blocking(scoped).await {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(error = %e, "задача файлового инструмента упала");
@@ -228,14 +257,21 @@ fn resolve_in(project: &Path, lex: &LexPath) -> Result<(PathBuf, ResolvedPath), 
     Ok((roots.project, r))
 }
 
-/// Нет такого пути: подсказка похожих имён того же каталога.
-fn not_found(root: &Path, path: &Path) -> ToolOutput {
-    let similar = match (path.parent(), path.file_name()) {
-        (Some(dir), Some(name)) => {
-            let names: Vec<String> = std::fs::read_dir(dir)
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| e.file_name().to_string_lossy().into_owned())
+/// Нет такого пути: подсказка похожих имён того же каталога. Только внутри проекта (M2):
+/// одобрено чтение одного внешнего пути, а не список его соседей.
+fn not_found(root: &Path, r: &ResolvedPath) -> ToolOutput {
+    let similar = match (r.inside, r.path.parent(), r.path.file_name()) {
+        (true, Some(dir), Some(name)) => {
+            let dir_r = ResolvedPath {
+                path: dir.to_path_buf(),
+                inside: true,
+                protected: false,
+            };
+            let names: Vec<String> = read_dir_checked(&dir_r)
+                .map(|names| {
+                    names
+                        .into_iter()
+                        .map(|n| n.to_string_lossy().into_owned())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -246,7 +282,7 @@ fn not_found(root: &Path, path: &Path) -> ToolOutput {
         }
         _ => Vec::new(),
     };
-    ToolOutput::error(not_found_text(&display(root, path), &similar))
+    ToolOutput::error(not_found_text(&display(root, &r.path), &similar))
 }
 
 fn is_missing(e: &io::Error) -> bool {
@@ -258,13 +294,20 @@ fn is_missing(e: &io::Error) -> bool {
 
 /// Ошибка открытия для модели. Системные ошибки — по виду (английский текст вида, а не
 /// локализованное сообщение ОС); отказы `open_checked` — их собственный текст.
-fn open_error(root: &Path, path: &Path, e: &io::Error) -> ToolOutput {
+fn open_error(root: &Path, r: &ResolvedPath, e: &io::Error) -> ToolOutput {
     if is_missing(e) {
-        not_found(root, path)
-    } else if e.raw_os_error().is_some() {
-        ToolOutput::error(io_text(&display(root, path), e.kind()))
+        not_found(root, r)
     } else {
-        ToolOutput::error(e.to_string())
+        ToolOutput::error(error_text(&display(root, &r.path), e))
+    }
+}
+
+/// Текст ошибки ввода-вывода: системная — по виду, своя — её текст.
+fn error_text(shown: &str, e: &io::Error) -> String {
+    if e.raw_os_error().is_some() {
+        io_text(shown, e.kind())
+    } else {
+        e.to_string()
     }
 }
 
@@ -398,17 +441,22 @@ fn read_blocking(
         Ok(x) => x,
         Err(o) => return o,
     };
-    if r.path.is_dir() {
-        return ToolOutput::error(directory_text(&display(&root, &r.path)));
+    match stat_checked(&r) {
+        Ok(m) if m.is_dir() => {
+            return ToolOutput::error(directory_text(&display(&root, &r.path)));
+        }
+        Ok(_) => {}
+        Err(e) => return open_error(&root, &r, &e),
     }
     match read_file(&r, start, limit) {
         Ok((out, hash)) => {
-            if let Some(h) = hash {
+            // Ошибка (`start` за концом) — файл модель не видела, трекер не отмечается (M3).
+            if let Some(h) = hash.filter(|_| !out.is_error) {
                 tracker.mark(run, &r.path, &h);
             }
             out
         }
-        Err(e) => open_error(&root, &r.path, &e),
+        Err(e) => open_error(&root, &r, &e),
     }
 }
 
@@ -534,24 +582,25 @@ fn mime(head: &[u8]) -> &'static str {
 // ---- обход ----
 
 /// Обход `base` (D87). Ссылки и junction не обходятся и не выдаются; `.git` и
-/// `.zero-agent` пропускаются.
-fn walker(base: &Path) -> ignore::Walk {
+/// `.zero-agent` пропускаются. `ignore` сам файлы правил не читает (C1): все его
+/// источники правил выключены, правила применяет `rules` в `filter_entry`.
+fn walker(base: &Path, rules: Arc<Rules>) -> ignore::Walk {
     let mut wb = WalkBuilder::new(base);
     wb.hidden(false)
         .parents(false)
         .require_git(false)
         .git_global(false)
-        .git_exclude(true)
-        .git_ignore(true)
-        .ignore(true)
+        .git_exclude(false)
+        .git_ignore(false)
+        .ignore(false)
         .follow_links(false)
         .same_file_system(true)
         .sort_by_file_name(|a, b| a.cmp(b))
-        .filter_entry(keep);
+        .filter_entry(move |e| keep(e, &rules));
     wb.build()
 }
 
-fn keep(e: &DirEntry) -> bool {
+fn keep(e: &DirEntry, rules: &Rules) -> bool {
     if e.depth() == 0 {
         return true;
     }
@@ -561,12 +610,32 @@ fn keep(e: &DirEntry) -> bool {
     if ft.is_symlink() {
         return false;
     }
-    !(ft.is_dir() && SKIP_DIRS.iter().any(|d| e.file_name() == *d))
+    if ft.is_dir() && SKIP_DIRS.iter().any(|d| same_name(e.file_name(), d)) {
+        return false;
+    }
+    !rules.ignored(e.path(), ft.is_dir())
 }
 
-/// Обычные файлы обхода по порядку. Возвращает, остановлен ли обход пределами.
-fn walk_files(base: &Path, limits: &WalkLimits, mut f: impl FnMut(&Path)) -> bool {
-    for entry in walker(base) {
+/// Имя служебного каталога: на Windows без учёта ASCII-регистра (`.GIT` — тот же каталог,
+/// M5).
+fn same_name(name: &std::ffi::OsStr, skip: &str) -> bool {
+    if cfg!(windows) {
+        name.to_str().is_some_and(|n| n.eq_ignore_ascii_case(skip))
+    } else {
+        name == skip
+    }
+}
+
+/// Обычные файлы обхода `base` по порядку; `root` — канонический корень проекта (от него
+/// собираются правила игнорирования). Возвращает, остановлен ли обход пределами.
+fn walk_files(
+    root: &Path,
+    base: &ResolvedPath,
+    limits: &WalkLimits,
+    mut f: impl FnMut(&Path),
+) -> bool {
+    let rules = Arc::new(Rules::new(root, &base.path, base.inside));
+    for entry in walker(&base.path, rules) {
         if limits.stopped() {
             return true;
         }
@@ -695,7 +764,13 @@ impl Tool for SearchTool {
                 "runtime/fs.search.not_found",
                 not_found_text("src/mian.rs", &["src/main.rs".to_owned()]),
             ),
+            ("runtime/fs.search.skipped_long", skipped_long_text(1)),
+            (
+                "runtime/fs.search.skipped_unreadable",
+                skipped_unreadable_text(1),
+            ),
             ("runtime/fs.search.stopped", stopped_text(1)),
+            ("runtime/fs.search.too_long", too_long_text("a.json")),
         ]
     }
 }
@@ -728,12 +803,42 @@ impl Sink for Hits<'_> {
     }
 }
 
+/// Итог поиска в одном файле.
+enum FileOutcome {
+    Done,
+    /// Остановлен пределами (дедлайн, отмена) посреди файла.
+    Stopped,
+    /// Строка длиннее [`SEARCH_LINE_HEAP`].
+    TooLong,
+    /// Не открылся или не прочитался.
+    Failed(io::Error),
+}
+
+/// Чтение файла с проверкой пределов на каждом блоке (I2): отмена и дедлайн действуют и
+/// внутри большого файла без совпадений.
+struct Watched<'a> {
+    file: &'a File,
+    limits: &'a WalkLimits,
+}
+
+impl Read for Watched<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.limits.stopped() {
+            // Не `Interrupted`: читатели повторяют чтение после него.
+            return Err(io::Error::other("search stopped"));
+        }
+        self.file.read(buf)
+    }
+}
+
 /// Поиск `pattern` в `base` (файл или каталог) — блокирующая, только в `spawn_blocking`.
 ///
-/// `root` — канонический корень проекта (для путей вывода). `glob` с `/` сопоставляется с
-/// путём от `base`, без `/` — с именем файла; на Windows без учёта регистра. Явно
-/// указанный файл ищется, даже если он игнорируется. Двоичные файлы (NUL) пропускаются,
-/// строки не в UTF-8 показываются с заменой.
+/// `root` — канонический корень проекта (для путей вывода и правил игнорирования). `glob`
+/// с `/` сопоставляется с путём от `base`, без `/` — с именем файла; на Windows без учёта
+/// регистра. Явно указанный файл ищется, даже если он игнорируется; его ошибка открытия или
+/// чтения — результат-ошибка (I4). В обходе нечитаемые файлы и файлы со строкой длиннее
+/// [`SEARCH_LINE_HEAP`] пропускаются и считаются в пометках. Двоичные файлы (NUL)
+/// пропускаются, строки не в UTF-8 показываются с заменой.
 pub fn search_in(
     root: &Path,
     base: &ResolvedPath,
@@ -744,6 +849,8 @@ pub fn search_in(
     let matcher = match RegexMatcherBuilder::new()
         .line_terminator(Some(b'\n'))
         .crlf(true)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_LIMIT)
         .build(pattern)
     {
         Ok(m) => m,
@@ -754,56 +861,77 @@ pub fn search_in(
         Err(e) => return ToolOutput::error(invalid_glob_text(&e.to_string())),
     };
     let by_path = glob.is_some_and(|g| g.contains('/'));
-    let meta = match std::fs::metadata(&base.path) {
+    let meta = match stat_checked(base) {
         Ok(m) => m,
-        Err(e) => return open_error(root, &base.path, &e),
+        Err(e) => return open_error(root, base, &e),
     };
     // Терминатор строки у поиска и у выражения один: CRLF (`$` и перед `\r\n`).
     let mut searcher = SearcherBuilder::new()
         .line_terminator(LineTerminator::crlf())
         .line_number(true)
         .binary_detection(BinaryDetection::quit(0))
+        .heap_limit(Some(SEARCH_LINE_HEAP))
         .build();
     let mut out = Vec::new();
     let mut more = 0u64;
-    let mut search_file = |path: &Path| {
-        let r = ResolvedPath {
-            path: path.to_path_buf(),
-            inside: base.inside,
-            protected: false,
-        };
-        let file = match open_checked(&r, false) {
+    let mut search_file = |r: &ResolvedPath| -> FileOutcome {
+        let file = match open_checked(r, false) {
             Ok(f) => f,
-            Err(e) => {
-                tracing::debug!(path = %path.display(), error = %e, "файл поиска пропущен");
-                return;
-            }
+            Err(e) => return FileOutcome::Failed(e),
         };
-        search_one(
-            &mut searcher,
-            &matcher,
-            &file,
-            Hits {
-                shown: display(root, path),
-                out: &mut out,
-                more: &mut more,
-                limits,
-            },
-        );
+        let hits = Hits {
+            shown: display(root, &r.path),
+            out: &mut out,
+            more: &mut more,
+            limits,
+        };
+        let reader = Watched {
+            file: &file,
+            limits,
+        };
+        match searcher.search_reader(&matcher, reader, hits) {
+            Ok(()) if limits.stopped() => FileOutcome::Stopped,
+            Ok(()) => FileOutcome::Done,
+            Err(_) if limits.stopped() => FileOutcome::Stopped,
+            // `grep-searcher`: «configured allocation limit (N) exceeded» — строка длиннее
+            // `heap_limit`.
+            Err(e) if e.to_string().contains("allocation limit") => FileOutcome::TooLong,
+            Err(e) => FileOutcome::Failed(e),
+        }
     };
+    let (mut unreadable, mut too_long) = (0u64, 0u64);
     let stopped = if meta.is_dir() {
-        walk_files(&base.path, limits, |p| {
+        walk_files(root, base, limits, |p| {
             let keep = match &filter {
                 None => true,
                 Some(m) if by_path => m.is_match(rel(&base.path, p)),
                 Some(m) => p.file_name().is_some_and(|n| m.is_match(n)),
             };
-            if keep {
-                search_file(p);
+            if !keep {
+                return;
+            }
+            let r = ResolvedPath {
+                path: p.to_path_buf(),
+                inside: base.inside,
+                protected: false,
+            };
+            match search_file(&r) {
+                FileOutcome::Done | FileOutcome::Stopped => {}
+                FileOutcome::TooLong => too_long += 1,
+                FileOutcome::Failed(e) => {
+                    tracing::debug!(path = %p.display(), error = %e, "файл поиска пропущен");
+                    unreadable += 1;
+                }
             }
         })
     } else {
-        search_file(&base.path);
+        match search_file(base) {
+            FileOutcome::Done | FileOutcome::Stopped => {}
+            FileOutcome::TooLong => {
+                return ToolOutput::error(too_long_text(&display(root, &base.path)));
+            }
+            FileOutcome::Failed(e) => return open_error(root, base, &e),
+        }
         limits.stopped()
     };
     let mut text = if out.is_empty() {
@@ -815,18 +943,19 @@ pub fn search_in(
         text.push('\n');
         text.push_str(&more_matches_text(more));
     }
+    if too_long > 0 {
+        text.push('\n');
+        text.push_str(&skipped_long_text(too_long));
+    }
+    if unreadable > 0 {
+        text.push('\n');
+        text.push_str(&skipped_unreadable_text(unreadable));
+    }
     if stopped {
         text.push('\n');
         text.push_str(&limits.note());
     }
     ToolOutput::ok(text)
-}
-
-fn search_one(searcher: &mut Searcher, matcher: &RegexMatcher, file: &File, hits: Hits<'_>) {
-    let shown = hits.shown.clone();
-    if let Err(e) = searcher.search_file(matcher, file, hits) {
-        tracing::debug!(path = %shown, error = %e, "ошибка чтения при поиске");
-    }
 }
 
 // ---- glob ----
@@ -945,8 +1074,8 @@ pub fn glob_in(root: &Path, base: &ResolvedPath, rest: &str, limits: &WalkLimits
     };
     let mut found = BTreeSet::new();
     let mut more = 0u64;
-    let stopped = if base.path.is_dir() {
-        walk_files(&base.path, limits, |p| {
+    let stopped = if stat_checked(base).is_ok_and(|m| m.is_dir()) {
+        walk_files(root, base, limits, |p| {
             if matcher.is_match(rel(&base.path, p)) {
                 found.insert(display(root, p));
                 if found.len() > GLOB_MAX {
