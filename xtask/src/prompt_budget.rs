@@ -9,16 +9,18 @@
 //! без флага к сети команда не обращается.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use za_agent::budget_cases;
 
-/// Предел подключения, записи и чтения `/tokenize`.
+/// Предел подключения и каждой операции записи и чтения `/tokenize`.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Предел всего обмена `/tokenize` (проверяется между чтениями).
+const HTTP_DEADLINE: Duration = Duration::from_secs(60);
 /// Предел размера ответа `/tokenize`, байты: ответ на промпт в тысячи токенов меньше.
-const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
+const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 
 /// Счёт токенов одного текста.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,9 +65,35 @@ pub fn over_limit(c: &Count, limit: u32) -> bool {
         .any(|n| n > limit)
 }
 
+/// Адрес `host:port` для `--llama` без DNS: IP-литерал (IPv6 — в скобках) или
+/// `localhost` (→ 127.0.0.1). Разрешение имён в std не имеет тайм-аута, поэтому имена
+/// хостов не принимаются; порт обязателен (M-4 ревью задачи 5).
+fn socket_addr(authority: &str) -> Result<SocketAddr, String> {
+    let (host, port) = authority
+        .rsplit_once(':')
+        .filter(|(h, _)| !h.is_empty() && (!h.contains(':') || h.ends_with(']')))
+        .ok_or_else(|| format!("{authority}: нужен порт, например http://127.0.0.1:8080"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|e| format!("{authority}: порт `{port}`: {e}"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip: IpAddr = if host.eq_ignore_ascii_case("localhost") {
+        IpAddr::from([127, 0, 0, 1])
+    } else {
+        host.parse().map_err(|_| {
+            format!("{authority}: нужен IP-адрес или localhost (имена хостов не разрешаются)")
+        })?
+    };
+    Ok(SocketAddr::new(ip, port))
+}
+
 /// Число токенов `text` по `POST {base}/tokenize` llama-server (`{"content": text}` →
-/// `{"tokens": [...]}`). `base` — `http://host:port` (путь-префикс допустим); HTTP/1.1
-/// с `Connection: close`, тело ответа по `Content-Length`, `chunked` или до закрытия.
+/// `{"tokens": [...]}`). `base` — `http://IP:порт` или `http://localhost:порт`
+/// (путь-префикс допустим, DNS не используется — [`socket_addr`]); HTTP/1.1 с
+/// `Connection: close`. Тайм-ауты: подключение, каждая запись и чтение —
+/// [`HTTP_TIMEOUT`], весь обмен — [`HTTP_DEADLINE`]. Ответ читается, пока тело не
+/// получено целиком по `Content-Length` или `chunked` (сервер может не закрыть
+/// соединение), без них — до закрытия; больше [`MAX_RESPONSE`] — ошибка.
 pub fn tokenize_http(base: &str, text: &str) -> Result<usize, String> {
     let rest = base
         .strip_prefix("http://")
@@ -77,23 +105,10 @@ pub fn tokenize_http(base: &str, text: &str) -> Result<usize, String> {
     if authority.is_empty() {
         return Err(format!("{base}: нет адреса"));
     }
-    let addrs: Vec<_> = authority
-        .to_socket_addrs()
-        .map_err(|e| format!("{authority}: {e}"))?
-        .collect();
-    let mut stream = None;
-    let mut last = String::from("адрес не найден");
-    for a in &addrs {
-        match TcpStream::connect_timeout(a, HTTP_TIMEOUT) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(e) => last = format!("{a}: {e}"),
-        }
-    }
-    let mut stream = stream.ok_or(last)?;
+    let addr = socket_addr(authority)?;
+    let deadline = Instant::now() + HTTP_DEADLINE;
     let io = |e: std::io::Error| format!("{authority}: {e}");
+    let mut stream = TcpStream::connect_timeout(&addr, HTTP_TIMEOUT).map_err(io)?;
     stream.set_read_timeout(Some(HTTP_TIMEOUT)).map_err(io)?;
     stream.set_write_timeout(Some(HTTP_TIMEOUT)).map_err(io)?;
     let body = serde_json::json!({ "content": text }).to_string();
@@ -103,11 +118,20 @@ pub fn tokenize_http(base: &str, text: &str) -> Result<usize, String> {
     );
     stream.write_all(request.as_bytes()).map_err(io)?;
     let mut raw = Vec::new();
-    stream
-        .take(MAX_RESPONSE)
-        .read_to_end(&mut raw)
-        .map_err(io)?;
-    let body = response_body(&raw)?;
+    let mut buf = [0u8; 8192];
+    let body = loop {
+        if Instant::now() > deadline {
+            return Err(format!("{authority}: /tokenize дольше {HTTP_DEADLINE:?}"));
+        }
+        let n = stream.read(&mut buf).map_err(io)?;
+        raw.extend_from_slice(&buf[..n]);
+        if raw.len() > MAX_RESPONSE {
+            return Err(format!("/tokenize: ответ больше {MAX_RESPONSE} байт"));
+        }
+        if let Some(body) = response_body(&raw, n == 0)? {
+            break body;
+        }
+    };
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| format!("/tokenize: ответ не JSON: {e}"))?;
     v.get("tokens")
@@ -116,12 +140,16 @@ pub fn tokenize_http(base: &str, text: &str) -> Result<usize, String> {
         .ok_or_else(|| "/tokenize: в ответе нет массива tokens".into())
 }
 
-/// Тело ответа HTTP/1.1 со статусом 2xx: по `Content-Length`, `chunked` или до конца.
-fn response_body(raw: &[u8]) -> Result<Vec<u8>, String> {
-    let end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("/tokenize: ответ без заголовков")?;
+/// Тело ответа HTTP/1.1 со статусом 2xx по `Content-Length`, `chunked` или до конца
+/// (`eof`). `Ok(None)` — ответ ещё не получен целиком и соединение не закрыто.
+fn response_body(raw: &[u8], eof: bool) -> Result<Option<Vec<u8>>, String> {
+    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return if eof {
+            Err("/tokenize: ответ без заголовков".into())
+        } else {
+            Ok(None)
+        };
+    };
     let head = String::from_utf8_lossy(&raw[..end]);
     let rest = &raw[end + 4..];
     let mut lines = head.split("\r\n");
@@ -146,37 +174,43 @@ fn response_body(raw: &[u8]) -> Result<Vec<u8>, String> {
             chunked = true;
         }
     }
-    if chunked {
-        return dechunk(rest);
-    }
-    match length {
-        Some(n) if rest.len() < n => Err(format!(
-            "/tokenize: тело короче Content-Length ({} < {n})",
+    let body = if chunked {
+        dechunk(rest)?
+    } else {
+        match length {
+            Some(n) if rest.len() >= n => Some(rest[..n].to_vec()),
+            Some(_) => None,
+            None if eof => Some(rest.to_vec()),
+            None => None,
+        }
+    };
+    match body {
+        None if eof => Err(format!(
+            "/tokenize: соединение закрыто до конца тела ({} байт)",
             rest.len()
         )),
-        Some(n) => Ok(rest[..n].to_vec()),
-        None => Ok(rest.to_vec()),
+        other => Ok(other),
     }
 }
 
-/// Тело `Transfer-Encoding: chunked` (расширения чанков и трейлеры пропускаются).
-fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>, String> {
+/// Тело `Transfer-Encoding: chunked` (расширения чанков и трейлеры пропускаются);
+/// `Ok(None)` — последний чанк ещё не получен.
+fn dechunk(mut rest: &[u8]) -> Result<Option<Vec<u8>>, String> {
     let mut out = Vec::new();
     loop {
-        let line_end = rest
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or("/tokenize: обрыв chunked")?;
+        let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
+            return Ok(None);
+        };
         let line = String::from_utf8_lossy(&rest[..line_end]);
         let size = line.split(';').next().unwrap_or_default().trim();
         let size = usize::from_str_radix(size, 16)
             .map_err(|e| format!("/tokenize: размер чанка `{size}`: {e}"))?;
         rest = &rest[line_end + 2..];
         if size == 0 {
-            return Ok(out);
+            return Ok(Some(out));
         }
         if rest.len() < size + 2 {
-            return Err("/tokenize: обрыв chunked".into());
+            return Ok(None);
         }
         out.extend_from_slice(&rest[..size]);
         rest = &rest[size + 2..];
@@ -335,9 +369,17 @@ mod tests {
         ));
     }
 
-    /// Поддельный llama-server: один запрос, ответ `response`; возвращает адрес и поток,
-    /// который отдаёт принятый запрос.
+    /// Поддельный llama-server: один запрос, ответ `response`, затем соединение не
+    /// закрывается (`hold`) до закрытия клиентом или 10 с, либо закрывается сразу.
+    /// Возвращает адрес и поток, который отдаёт принятый запрос.
     fn fake_server(response: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        fake_server_with(response, true)
+    }
+
+    fn fake_server_with(
+        response: &'static str,
+        hold: bool,
+    ) -> (String, std::thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
@@ -366,6 +408,10 @@ mod tests {
                 }
             }
             s.write_all(response.as_bytes()).unwrap();
+            if hold {
+                // Сервер без `Connection: close`: ждёт, пока клиент закроет соединение.
+                let _ = s.read(&mut buf);
+            }
             String::from_utf8(req).unwrap()
         });
         (format!("http://{addr}"), handle)
@@ -376,7 +422,10 @@ mod tests {
         let (base, server) = fake_server(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"tokens\":[1,2,3,4]}",
         );
+        // Тело по Content-Length читается без ожидания закрытия соединения сервером.
+        let t = Instant::now();
         assert_eq!(tokenize_http(&base, "hello \"world\""), Ok(4));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         let req = server.join().unwrap();
         assert!(req.starts_with("POST /tokenize HTTP/1.1\r\n"), "{req}");
         let body = &req[req.find("\r\n\r\n").unwrap() + 4..];
@@ -411,5 +460,45 @@ mod tests {
         server.join().unwrap();
         assert!(tokenize_http("https://127.0.0.1:1", "x").is_err());
         assert!(tokenize_http("127.0.0.1:1", "x").is_err());
+        // Тело короче Content-Length и закрытое соединение — ошибка, не зависание.
+        let (base, server) =
+            fake_server_with("HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n{}", false);
+        let err = tokenize_http(&base, "x").unwrap_err();
+        assert!(err.contains("закрыто"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tokenize_http_reads_until_close_without_length() {
+        let (base, server) = fake_server_with("HTTP/1.1 200 OK\r\n\r\n{\"tokens\":[5]}", false);
+        assert_eq!(tokenize_http(&base, "x"), Ok(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn llama_address_needs_ip_and_port() {
+        assert_eq!(
+            socket_addr("127.0.0.1:8080"),
+            Ok("127.0.0.1:8080".parse().unwrap())
+        );
+        assert_eq!(
+            socket_addr("localhost:8080"),
+            Ok("127.0.0.1:8080".parse().unwrap())
+        );
+        assert_eq!(socket_addr("[::1]:8080"), Ok("[::1]:8080".parse().unwrap()));
+        for bad in [
+            "127.0.0.1",
+            "localhost",
+            "example.com:80",
+            "::1",
+            "h:x",
+            ":80",
+        ] {
+            assert!(socket_addr(bad).is_err(), "{bad}");
+        }
+        let err = socket_addr("127.0.0.1").unwrap_err();
+        assert!(err.contains("порт"), "{err}");
+        let err = socket_addr("example.com:80").unwrap_err();
+        assert!(err.contains("IP"), "{err}");
     }
 }

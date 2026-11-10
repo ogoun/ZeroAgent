@@ -26,6 +26,10 @@ deny = [
     { name = "rig-core" },
     { name = "adk-rust" },
     { name = "autoagents" },
+    # Счёт токенов промптов (R1-B2 D64) — только инструмент CI: в продукт не попадает
+    # ни напрямую, ни транзитивно (полный граф; `cargo xtask policy` видит только
+    # прямые зависимости).
+    { name = "tiktoken-rs", wrappers = ["xtask"] },
 ]
 
 [sources]

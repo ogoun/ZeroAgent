@@ -23,7 +23,7 @@ mod spill;
 
 pub(crate) use compact::{
     CLIPPED, MEMORY_BEFORE_EFFECT, NO_USER_MESSAGES, RECITATION, RECITE_IN_TAIL, recite_task,
-    rubric_tokens,
+    rubric_tokens, text_samples as compact_text_samples,
 };
 pub use compact::{COMPACT_RUBRIC, CompactInput, Compacted, compact, summary_block};
 pub use prune::prune;

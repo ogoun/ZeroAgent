@@ -1564,6 +1564,7 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             frozen: st.frozen_ref.clone(),
             messages: st.refs.clone(),
             prefix: st.frozen.prefix_hash.clone(),
+            prompt_version: st.frozen.prompt_version.clone(),
         };
         let r = model_call(
             &mut st.ctx,

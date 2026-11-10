@@ -105,10 +105,15 @@ fn prompt_files_cover_directory_in_name_order() {
 #[test]
 fn prompt_hash_covers_names_and_texts() {
     // Формат: метка, затем для каждого файла по порядку имён — длина (u64 LE) и байты имени,
-    // длина и байты текста; затем так же постоянные тексты рантайма (`runtime/…`).
+    // длина и байты текста; затем так же тексты рантайма (`runtime/…`).
     let mut h = blake3::Hasher::new();
     h.update(b"za-prompts-v2\0");
-    for (name, text) in prompt_files().iter().chain(runtime_texts()) {
+    let runtime = runtime_texts();
+    let all = prompt_files()
+        .iter()
+        .map(|(n, t)| (*n, *t))
+        .chain(runtime.iter().map(|(n, t)| (*n, t.as_str())));
+    for (name, text) in all {
         for part in [name.as_bytes(), text.as_bytes()] {
             h.update(&(part.len() as u64).to_le_bytes());
             h.update(part);
@@ -685,10 +690,41 @@ fn runtime_texts_are_listed_and_hashed() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(names, sorted, "имена по порядку и без повторов");
-    for (name, text) in texts {
+    for (name, text) in &texts {
         assert!(name.starts_with("runtime/"), "{name}");
         assert!(!text.is_empty(), "{name}");
     }
+    let text = |n: &str| texts.iter().find(|(x, _)| *x == n).unwrap().1.clone();
+    // Образцы format!-текстов (M-1 ревью задачи 5): разметка сводки и строки опущенного.
+    let summary = text("runtime/compact.summary_block");
+    for part in [
+        "## Goal\n",
+        "\n## User messages\n",
+        "[correct] ",
+        "<summary from=\"model\">\n",
+        "\n</summary>",
+    ] {
+        assert!(summary.contains(part), "{part}");
+    }
+    assert_eq!(
+        text("runtime/compact.omitted_users"),
+        "[1 earlier user messages omitted]"
+    );
+    assert_eq!(
+        text("runtime/compact.omitted_messages"),
+        "[1 earlier messages omitted]"
+    );
+    assert_eq!(
+        text("runtime/tools.denied_read_only"),
+        "denied: read-only mode"
+    );
+    assert_eq!(text("runtime/tools.denied_plan"), "denied: plan mode");
+    assert_eq!(text("runtime/tools.timeout"), "timeout after 1.5 s");
+    assert!(text("runtime/turn.unparseable_nudge").starts_with("Your tool call could not"));
+    assert_eq!(
+        text("runtime/turn.too_many_calls"),
+        "not executed: too many tool calls (limit 1, skipped 2)"
+    );
     for n in [
         "runtime/compact.rubric",
         "runtime/driver.empty_nudge_subagent",
@@ -700,7 +736,21 @@ fn runtime_texts_are_listed_and_hashed() {
     ] {
         assert!(names.contains(&n), "{n}");
     }
-    assert!(texts.iter().any(|(_, t)| *t == COMPACT_RUBRIC));
+    assert!(texts.iter().any(|(_, t)| t == COMPACT_RUBRIC));
+}
+
+#[test]
+fn every_role_forbids_access_outside_workspace() {
+    // I-1 ревью задачи 5 (PRM-012, SEC-001): ОС-изоляции нет, граница — только в
+    // промпте; у каждой роли запрещены и чтение, и запись вне workspace без <grants>.
+    for role in ROLES {
+        let core = role_core(role).to_lowercase();
+        assert!(core.contains("read or write outside it"), "{role:?}");
+        assert!(core.contains("<grants>"), "{role:?}");
+    }
+    assert!(role_core(RunRole::Worker).contains(
+        "- Work only in the workspace; read or write outside it only paths in <grants>."
+    ));
 }
 
 #[test]
@@ -740,7 +790,11 @@ fn cases_cover_roles_tiers_modes() {
     assert!(has("orchestrator/writer", 500));
     assert!(has("worker", 300));
     assert!(has("worker/researcher", 300));
-    assert!(has("top/small/prefix", 1850));
+    // M-3 ревью задачи 5: префикс top small — на каждый overlay (вместо брифового
+    // одного `top/small/prefix` с самым длинным по байтам).
+    for m in ["coder", "researcher", "operator", "writer"] {
+        assert!(has(&format!("top/small/prefix/{m}"), 1850), "{m}");
+    }
     assert_eq!(c.iter().filter(|x| x.name.starts_with("mode/")).count(), 4);
     assert!(
         c.iter()
@@ -750,8 +804,8 @@ fn cases_cover_roles_tiers_modes() {
             .contains("<env>")
     );
     // Полный набор: top/small/core, env/max, 4 overlay, top standard и full по 5,
-    // orchestrator и worker по 5, top/small/prefix — 27 случаев с разными именами.
-    assert_eq!(c.len(), 27);
+    // orchestrator и worker по 5, top/small/prefix по 4 — 30 случаев с разными именами.
+    assert_eq!(c.len(), 30);
     let mut names: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
     names.sort_unstable();
     names.dedup();
@@ -778,12 +832,16 @@ fn cases_cover_roles_tiers_modes() {
         top_std.text,
         format!("{}\n\n{}", role_core(RunRole::Top), render_env(&max_env()))
     );
-    // Префикс top small: Core, самый длинный overlay и описания встроенных инструментов.
+    // Префикс top small: Core, overlay режима и схема finish (заглушка слота Tools).
     let prefix = &c
         .iter()
-        .find(|x| x.name == "top/small/prefix")
+        .find(|x| x.name == "top/small/prefix/researcher")
         .unwrap()
         .text;
-    assert!(prefix.starts_with(role_core(RunRole::Top)));
+    assert!(prefix.starts_with(&format!(
+        "{}\n\n{}\n\n",
+        role_core(RunRole::Top),
+        mode_overlay(WorkMode::Researcher)
+    )));
     assert!(prefix.contains("\"name\":\"finish\""));
 }

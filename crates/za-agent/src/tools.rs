@@ -318,20 +318,17 @@ fn plan(reg: &ToolRegistry, mode: RunMode, pc: &PlannedCall) -> Plan {
     }
     let call = &pc.call;
     let Some(tool) = reg.get(&call.name) else {
-        return Plan::Immediate(format!("unknown tool \"{}\"", escape_untrusted(&call.name)));
+        return Plan::Immediate(unknown_tool_text(&call.name));
     };
     let spec = tool.spec();
     match gate(mode, spec) {
-        Gate::Deny(reason) => Plan::Immediate(format!("denied: {reason}")),
+        Gate::Deny(reason) => Plan::Immediate(denied_text(reason)),
         Gate::Ask => Plan::Approve { tool },
         Gate::Allow => match call.name.as_str() {
             ASK_USER_TOOL => Plan::AskUser,
             FINISH_TOOL => match finish_args(&call.arguments) {
                 Ok(a) => Plan::Finish(a),
-                Err(e) => Plan::Immediate(format!(
-                    "invalid arguments for \"{FINISH_TOOL}\": {}",
-                    escape_untrusted(&e)
-                )),
+                Err(e) => Plan::Immediate(finish_invalid_text(&e)),
             },
             _ => Plan::Run {
                 parallel: spec.kind == ToolKind::Read,
@@ -344,12 +341,75 @@ fn plan(reg: &ToolRegistry, mode: RunMode, pc: &PlannedCall) -> Plan {
 fn finish_args(v: &Value) -> Result<FinishArgs, String> {
     let a: FinishArgs = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
     if !FINISH_STATUSES.contains(&a.status.as_str()) {
-        return Err(format!(
-            "status must be one of done, partial, blocked, got \"{}\"",
-            a.status
-        ));
+        return Err(finish_status_text(&a.status));
     }
     Ok(a)
+}
+
+/// Результат вызова неизвестного инструмента; имя экранируется.
+fn unknown_tool_text(name: &str) -> String {
+    format!("unknown tool \"{}\"", escape_untrusted(name))
+}
+
+/// Результат вызова, запрещённого режимом run (D14).
+fn denied_text(reason: &str) -> String {
+    format!("denied: {reason}")
+}
+
+/// Результат `finish` с неверными аргументами; текст ошибки экранируется.
+fn finish_invalid_text(e: &str) -> String {
+    format!(
+        "invalid arguments for \"{FINISH_TOOL}\": {}",
+        escape_untrusted(e)
+    )
+}
+
+/// Ошибка статуса `finish` (экранируется в [`finish_invalid_text`]).
+fn finish_status_text(status: &str) -> String {
+    format!("status must be one of done, partial, blocked, got \"{status}\"")
+}
+
+/// Результат прямого вызова встроенного инструмента.
+fn runtime_only_text(name: &str) -> String {
+    format!("{name} is handled by the runtime and cannot be called directly")
+}
+
+/// Образцы текстов для модели, собираемых `format!`, с фиксированными аргументами
+/// (PRM-010, M-1 ревью задачи 5): правка шаблона меняет образец и хэш промптов.
+pub(crate) fn text_samples() -> Vec<(&'static str, String)> {
+    // Причины запрета режимом — из таблицы гейта za-core для инструмента правки.
+    let edit = builtin_tools().into_iter().next().map(|t| ToolSpec {
+        kind: ToolKind::Edit,
+        approval: Approval::Mode,
+        ..t.spec().clone()
+    });
+    let deny = |mode: RunMode| match edit.as_ref().map(|spec| gate(mode, spec)) {
+        Some(Gate::Deny(reason)) => denied_text(reason),
+        _ => String::new(),
+    };
+    let (read_only, plan) = (deny(RunMode::ReadOnly), deny(RunMode::Plan));
+    vec![
+        (
+            "runtime/tools.denied_by_user",
+            denied_by_user(&json!({"note": "n"})),
+        ),
+        (
+            "runtime/tools.denied_by_user_bare",
+            denied_by_user(&json!({})),
+        ),
+        ("runtime/tools.denied_plan", plan),
+        ("runtime/tools.denied_read_only", read_only),
+        (
+            "runtime/tools.finish_invalid",
+            finish_invalid_text(&finish_status_text("s")),
+        ),
+        ("runtime/tools.runtime_only", runtime_only_text("t")),
+        (
+            "runtime/tools.timeout",
+            timeout_text(Duration::from_millis(1500)),
+        ),
+        ("runtime/tools.unknown_tool", unknown_tool_text("t")),
+    ]
 }
 
 fn is_parallel(p: &Plan) -> bool {
@@ -704,7 +764,7 @@ impl Tool for Builtin {
         let name = self.spec.schema.name.clone();
         Box::pin(async move {
             ToolOutput {
-                content: format!("{name} is handled by the runtime and cannot be called directly"),
+                content: runtime_only_text(&name),
                 is_error: true,
             }
         })

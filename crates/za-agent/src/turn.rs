@@ -35,7 +35,7 @@ use za_llm::{
 use za_protocol::{Actor, BlobHash, EffectClass, EventKind, NewEvent, RunId};
 use za_store::{StoreError, UsageRow};
 
-use crate::prompt::{PROMPT_VERSION, escape_untrusted};
+use crate::prompt::escape_untrusted;
 use crate::request::request_hash;
 
 // ---- Сигналы цикла (D9, D25, D26) ----
@@ -377,6 +377,10 @@ pub struct RequestRefs {
     pub messages: Vec<BlobHash>,
     /// Хэш стабильного префикса (аргумент эффекта `prefix`).
     pub prefix: String,
+    /// Версия промптов замороженного префикса run (`FrozenPrefix::prompt_version`,
+    /// PRM-010): run, начатый до обновления, продолжает со своей версией, а не с
+    /// текущей [`crate::PROMPT_VERSION`].
+    pub prompt_version: String,
 }
 
 /// Тело квитанции `model_error:` (D7).
@@ -655,7 +659,7 @@ impl LiveTurn<'_> {
             "frozen": self.refs.frozen,
             "messages": self.refs.messages,
             "options": options,
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": self.refs.prompt_version,
         });
         self.mark_kind(&mut payload);
         self.append(Actor::Runtime, EventKind::ModelRequest, payload)
@@ -1116,10 +1120,7 @@ pub fn review(
             CallRejection::Unparseable { .. } if length => cut = true,
             CallRejection::Unparseable { raw } => {
                 parse_errors += 1;
-                nudges.push(format!(
-                    "Your tool call could not be parsed: {}. Call the tool again with valid JSON arguments.",
-                    shown(raw)
-                ));
+                nudges.push(unparseable_nudge(raw));
             }
             other => tracing::debug!(rejection = ?other, "отклонён вызов, извлечённый из текста"),
         }
@@ -1232,6 +1233,61 @@ fn rejection_text(r: &CallRejection) -> String {
             format!("not executed: too many tool calls (limit {limit}, skipped {skipped})")
         }
     }
+}
+
+/// Nudge неразобранного вызова из текста (D27): начало разметки экранируется.
+fn unparseable_nudge(raw: &str) -> String {
+    format!(
+        "Your tool call could not be parsed: {}. Call the tool again with valid JSON arguments.",
+        shown(raw)
+    )
+}
+
+/// Образцы текстов для модели, собираемых `format!`, с фиксированными аргументами
+/// (PRM-010, M-1 ревью задачи 5): правка шаблона меняет образец и хэш промптов.
+pub(crate) fn text_samples() -> Vec<(&'static str, String)> {
+    let invalid = CallRejection::InvalidArgs {
+        name: "t".into(),
+        errors: vec![
+            za_llm::normalize::SchemaError {
+                path: String::new(),
+                message: "m".into(),
+            },
+            za_llm::normalize::SchemaError {
+                path: "/p".into(),
+                message: "m".into(),
+            },
+        ],
+    };
+    vec![
+        ("runtime/turn.invalid_args", rejection_text(&invalid)),
+        (
+            "runtime/turn.too_many_calls",
+            rejection_text(&CallRejection::TooManyCalls {
+                limit: 1,
+                skipped: 2,
+            }),
+        ),
+        (
+            "runtime/turn.unknown_tool",
+            rejection_text(&CallRejection::UnknownTool {
+                name: "t".into(),
+                nearest: vec!["a".into(), "b".into()],
+            }),
+        ),
+        (
+            "runtime/turn.unknown_tool_none",
+            rejection_text(&CallRejection::UnknownTool {
+                name: "t".into(),
+                nearest: Vec::new(),
+            }),
+        ),
+        (
+            "runtime/turn.unparseable",
+            rejection_text(&CallRejection::Unparseable { raw: "r".into() }),
+        ),
+        ("runtime/turn.unparseable_nudge", unparseable_nudge("r")),
+    ]
 }
 
 /// Замещающий id `{prefix}-{turn}-{k}` с наименьшим `k ≥ from`, не занятый ни

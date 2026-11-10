@@ -143,9 +143,21 @@ const RUNTIME_TEXTS: &[(&str, &str)] = &[
     ("runtime/turn.mutation_nudge", crate::turn::MUTATION_NUDGE),
 ];
 
-/// Постоянные тексты рантайма, уходящие модели: `(имя, текст)` в порядке имён.
-pub fn runtime_texts() -> &'static [(&'static str, &'static str)] {
-    RUNTIME_TEXTS
+/// Тексты рантайма, уходящие модели, `(имя, текст)` в порядке имён: постоянные
+/// ([`RUNTIME_TEXTS`]) и образцы текстов, собираемых `format!`, — результат их функций
+/// рендера с фиксированными аргументами (ошибки инструментов, отказы нормализации,
+/// разметка сводки компакции; M-1 ревью задачи 5). Правка шаблона меняет образец, а
+/// значит и [`prompt_texts_hash`].
+pub fn runtime_texts() -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = RUNTIME_TEXTS
+        .iter()
+        .map(|(n, t)| (*n, (*t).to_owned()))
+        .chain(crate::context::compact_text_samples())
+        .chain(crate::tools::text_samples())
+        .chain(crate::turn::text_samples())
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(b.0));
+    out
 }
 
 /// BLAKE3 hex всех текстов, уходящих модели без подстановки (PRM-010): файлы
@@ -158,7 +170,9 @@ pub fn runtime_texts() -> &'static [(&'static str, &'static str)] {
 pub fn prompt_texts_hash() -> String {
     let mut h = blake3::Hasher::new();
     h.update(b"za-prompts-v2\0");
-    for (name, text) in PROMPT_FILES.iter().chain(RUNTIME_TEXTS) {
+    let runtime = runtime_texts();
+    let files = PROMPT_FILES.iter().map(|(n, t)| (*n, *t));
+    for (name, text) in files.chain(runtime.iter().map(|(n, t)| (*n, t.as_str()))) {
         for part in [name.as_bytes(), text.as_bytes()] {
             h.update(&(part.len() as u64).to_le_bytes());
             h.update(part);
@@ -618,10 +632,14 @@ fn system_of(role: RunRole, overlay: Option<WorkMode>) -> String {
 ///   `"\n\n"` и `render_env(max_env())` (2000, 3000);
 /// - `orchestrator`, `orchestrator/{mode}` (500), `worker`, `worker/{mode}` (300) — Core
 ///   вместе с overlay;
-/// - `top/small/prefix` — system top small с самым длинным overlay и описания
-///   встроенных инструментов tier small (`render_tools`): 800 + 500 + 550 = 1850 (Core,
-///   слот overlay, Tools строки 8k таблицы 2.3). Встроенные инструменты берутся все,
-///   доступные на small при любой роли: консервативно, top small их сам не получает.
+/// - `top/small/prefix/{mode}` — Core top, overlay режима и схема `finish`
+///   (`render_tools`), лимит 800 + 500 + 550 = 1850 (Core, слот overlay, Tools строки 8k
+///   таблицы 2.3). Случай на каждый overlay, а не на самый длинный: самый длинный по
+///   токенам у разных токенизаторов может различаться (M-3 ревью задачи 5). Схема
+///   `finish` — заглушка слота Tools: top small встроенных инструментов не получает
+///   (`finish` — у worker и orchestrator, `ask_user` — со standard), а настоящих
+///   инструментов small ещё нет; когда появятся — брать набор реестра
+///   `for_run(Top, Small)` (M-2).
 pub fn budget_cases() -> Vec<BudgetCase> {
     let case = |name: String, text: String, limit: u32| BudgetCase { name, text, limit };
     let env = render_env(&max_env());
@@ -664,11 +682,6 @@ pub fn budget_cases() -> Vec<BudgetCase> {
             ));
         }
     }
-    let longest = MODES
-        .iter()
-        .map(|(m, _)| *m)
-        .max_by_key(|m| mode_overlay(*m).len())
-        .unwrap_or(WorkMode::Coder);
     let tools = crate::tools::builtin_tools()
         .iter()
         .filter(|t| t.spec().min_tier <= Tier::Small)
@@ -678,11 +691,13 @@ pub fn budget_cases() -> Vec<BudgetCase> {
         tools,
         ..Default::default()
     });
-    out.push(case(
-        "top/small/prefix".into(),
-        format!("{}\n\n{tools}", system_of(RunRole::Top, Some(longest))),
-        role_limit(RunRole::Top, Tier::Small) + MODE_LIMIT + SMALL_TOOLS_SLOT,
-    ));
+    for (m, name) in MODES {
+        out.push(case(
+            format!("top/small/prefix/{name}"),
+            format!("{}\n\n{tools}", system_of(RunRole::Top, Some(m))),
+            role_limit(RunRole::Top, Tier::Small) + MODE_LIMIT + SMALL_TOOLS_SLOT,
+        ));
+    }
     out
 }
 

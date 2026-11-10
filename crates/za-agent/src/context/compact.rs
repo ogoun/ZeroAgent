@@ -89,6 +89,34 @@ pub fn summary_block(
     s
 }
 
+/// Строка опущенных старых вводов пользователя в сводке (Ruling minor задачи 3).
+fn omitted_users_line(n: usize) -> String {
+    format!("[{n} earlier user messages omitted]")
+}
+
+/// Пометка опущенных сообщений во входе аварийной компакции (D49).
+fn omitted_messages_line(n: usize) -> String {
+    format!("[{n} earlier messages omitted]")
+}
+
+/// Образцы текстов для модели, собираемых рантаймом, с фиксированными аргументами
+/// (PRM-010, M-1 ревью задачи 5): разметка сводки (`## Goal`, `## User messages`,
+/// `[correct] `, `<summary from="model">`) и строки опущенного.
+pub(crate) fn text_samples() -> Vec<(&'static str, String)> {
+    vec![
+        ("runtime/compact.omitted_messages", omitted_messages_line(1)),
+        ("runtime/compact.omitted_users", omitted_users_line(1)),
+        (
+            "runtime/compact.summary_block",
+            summary_block("g", &[("u".into(), false), ("c".into(), true)], "m"),
+        ),
+        (
+            "runtime/compact.summary_block_empty",
+            summary_block("g", &[], "m"),
+        ),
+    ]
+}
+
 /// Текст в пределах `budget` токенов (байты / 4): длиннее — срез по границе символа и
 /// пометка `…[truncated]`.
 fn clip(text: &str, budget: u32) -> String {
@@ -131,7 +159,7 @@ fn limit_user_messages(users: Vec<(String, bool)>, budget: u32) -> Vec<(String, 
     let omitted = users.len() - keep;
     let mut out = Vec::with_capacity(keep + 1);
     if omitted > 0 {
-        out.push((format!("[{omitted} earlier user messages omitted]"), false));
+        out.push((omitted_users_line(omitted), false));
     }
     out.extend(users.into_iter().skip(omitted));
     out
@@ -285,6 +313,7 @@ pub async fn compact(
                 .map_err(|e| store_err(ctx, e))?
                 .refs,
             prefix: input.frozen.prefix_hash.clone(),
+            prompt_version: input.frozen.prompt_version.clone(),
         };
         match model_call(ctx, j, model, call, &refs, turn, sig, CallKind::Compact).await {
             Ok(out) => {
@@ -474,7 +503,7 @@ fn with_omitted(first: &Message, omitted: usize) -> Message {
     if omitted == 0 {
         return m;
     }
-    let note = format!("\n\n[{omitted} earlier messages omitted]");
+    let note = format!("\n\n{}", omitted_messages_line(omitted));
     match m.parts.iter_mut().rev().find_map(|p| match p {
         Part::Text(t) => Some(t),
         _ => None,

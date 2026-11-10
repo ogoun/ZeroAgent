@@ -1219,6 +1219,10 @@ async fn snapshot_v1_mid_step_continues() {
     let (_, after) = last_snapshot(&f.store, f.run).await;
     assert_eq!(after.v, 2);
     assert_eq!(after.task, "Задача");
+    // PRM-010 (ревью задачи 5): run R1-B1 продолжает с версией своего префикса.
+    for r in &reqs {
+        assert_eq!(r.payload["prompt_version"], "r1b.1");
+    }
 }
 
 /// I2 ревью задачи 1 (D66): run R1-B1 на паузе одобрения после обновления продолжается
@@ -1247,6 +1251,13 @@ async fn snapshot_v1_approval_continues() {
     assert!(cs[0].request.max_output_tokens.is_some());
     let (_, after) = last_snapshot(&f.store, f.run).await;
     assert_eq!(after.v, 2);
+    // Новый ход после обновления — с версией замороженного префикса R1-B1 (PRM-010).
+    let evs = events(&f.store, f.run).await;
+    let reqs = of_kind(&evs, EventKind::ModelRequest);
+    assert!(!reqs.is_empty());
+    for r in &reqs {
+        assert_eq!(r.payload["prompt_version"], "r1b.1");
+    }
 }
 
 /// D65: `[context]` замораживается на run: снимок хранит `setup.context`, resume

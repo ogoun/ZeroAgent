@@ -81,6 +81,8 @@ fn refs() -> RequestRefs {
         frozen: BlobHash("frozen".into()),
         messages: vec![BlobHash("m1".into())],
         prefix: "prefix-hash".into(),
+        // Версия замороженного префикса, а не текущая PROMPT_VERSION (PRM-010).
+        prompt_version: "r0.test".into(),
     }
 }
 
@@ -323,7 +325,8 @@ async fn turn_journals_request_deltas_usage() {
     assert_eq!(req["prefix"], "prefix-hash");
     assert_eq!(req["frozen"], "frozen");
     assert_eq!(req["messages"], json!(["m1"]));
-    assert_eq!(req["prompt_version"], za_agent::PROMPT_VERSION);
+    assert_eq!(req["prompt_version"], "r0.test");
+    assert_ne!(za_agent::PROMPT_VERSION, "r0.test");
     assert_eq!(ev[2].1["state"], "queued");
     assert_eq!(ev[2].1["position"], 2);
     assert_eq!(ev[2].1["turn"], 1);
