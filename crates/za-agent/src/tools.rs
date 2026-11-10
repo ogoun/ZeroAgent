@@ -86,6 +86,10 @@ pub struct ToolsOutcome {
     pub aborted: bool,
     /// Cancel: JoinSet::abort_all, идущий вызов брошен (D15).
     pub cancelled: bool,
+    /// `call_id` вызовов, чей слот исполнен (результат — квитанция эффекта), по порядку
+    /// результатов. Отказ разбора или гейта, отказ пользователя, повтор (D54), вызов
+    /// после `finish` и не начатый вызов сюда не входят.
+    pub executed: Vec<String>,
 }
 
 /// Окружение пакета.
@@ -207,6 +211,7 @@ pub async fn run_tools(
             let done = run_group(jobs, sig, &mut out).await;
             for (k, ex) in done {
                 let part = finish_part(ctx, &calls[k].call, ex)?;
+                out.executed.push(calls[k].call.id.clone());
                 out.results.push(part);
             }
             if out.cancelled || out.aborted {
@@ -281,6 +286,7 @@ pub async fn run_tools(
             return Ok(out);
         };
         let part = finish_part(ctx, call, ex)?;
+        out.executed.push(call.id.clone());
         if let (
             Plan::Finish(args),
             Part::ToolResult {

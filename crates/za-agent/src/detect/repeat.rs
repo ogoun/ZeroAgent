@@ -1,23 +1,32 @@
 //! Повтор A,A,A (D54), цикл ABAB и дрейф ABCABC (D55), застой (D56).
 //!
-//! Окна считаются по номерам ходов модели. Ход входит в окна повтора и цикла, только
-//! если в нём были вызовы, допущенные разбором ответа; застой считает ходы, после
-//! которых драйвер зовёт [`RepeatState::on_results`] (ходы с вызовами).
+//! Окна считаются по номерам ходов модели. Застой считает ходы, после которых драйвер
+//! зовёт [`RepeatState::on_results`] (ходы с вызовами).
 //!
-//! Повтор — по ходам, а не по вызовам: отпечаток хода — множество отпечатков его
-//! вызовов, и одинаковые вызовы одного хода получают одну реакцию (параллельный
-//! пакет из двух одинаковых чтений — не повтор).
+//! Повтор — по ходам: одинаковые вызовы одного хода получают одну реакцию
+//! (параллельный пакет из двух одинаковых чтений — не повтор). Появлением вызова
+//! считается только вызов с настоящим результатом: исполненный или перехваченный
+//! самим детектором (повтор, отказ). Вызов, оборванный вводом или паузой, отклонённый
+//! гейтом или пользователем, не исполненный после `finish`, — не появление (Ruling I-1
+//! ревью задачи 6).
 //!
-//! «Новый факт» — хэш содержимого результата, которого нет среди результатов последних
-//! [`SEEN_WINDOW`] ходов. Цикл ABAB — повтор пары ходов, вторая половина которого не
-//! дала новых фактов (в первой половине факты новые по определению: это первый раз).
+//! Окно повтора сбрасывает исполненный вызов, меняющий состояние (класс эффекта не
+//! `ReadOnly` и не `Pure`), — успешный или с ошибкой: состояние могло измениться и
+//! частично. Сброс действует на последующие вызовы того же пакета (они исполняются,
+//! решение о повторе для них не принимается) и на следующие ходы (Ruling I-2, I-3).
+//! Ввод пользователя тоже сбрасывает окно ([`RepeatState::on_user_input`]).
+//!
+//! «Новый факт» — хэш содержимого исполненного результата, которого нет среди
+//! результатов последних [`SEEN_WINDOW`] ходов. Цикл ABAB — повтор пары ходов, вторая
+//! половина которого не дала новых фактов (в первой половине факты новые по
+//! определению: это первый раз).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use za_core::ToolKind;
-use za_protocol::{BlobHash, detector};
+use za_protocol::{BlobHash, EffectClass, detector};
 
 use super::{CYCLE_NUDGE, REPEAT_NUDGE, REPEAT_REJECT, Reaction, call_fingerprint};
 
@@ -40,8 +49,8 @@ pub(super) struct RepeatState {
     calls: Vec<TurnCalls>,
     /// Прошлый результат по отпечатку вызова — для повторного показа (D54).
     results: BTreeMap<String, Prev>,
-    /// Вызовы хода между `on_calls` и `on_results`: `call_id` → отпечаток.
-    pending: BTreeMap<String, String>,
+    /// Вызовы хода между `on_calls` и `on_results`: `call_id` → вызов.
+    pending: BTreeMap<String, Pending>,
     /// Отпечаток хода из `on_calls` (D55: `on_results` берёт его отсюда).
     current: Option<Current>,
     /// Окно цикла: последние отпечатки ходов (не больше [`CYCLE_WINDOW`]).
@@ -65,6 +74,18 @@ struct TurnCalls {
 struct Prev {
     call_id: String,
     result: BlobHash,
+    /// Прошлый результат — ошибка: повтор показывается тоже ошибкой (Ruling m-1).
+    #[serde(default)]
+    is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Pending {
+    fingerprint: String,
+    /// Вызов меняет состояние (класс эффекта не `ReadOnly` и не `Pure`).
+    mutating: bool,
+    /// Детектор перехватил вызов (повтор или отказ): он не исполняется.
+    intercepted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,11 +112,16 @@ fn in_window(t: u32, now: u32, window: u32) -> bool {
     t < now && now - t < window
 }
 
+/// Вызов этого класса меняет состояние: его исполнение сбрасывает окно повтора.
+fn mutating(class: EffectClass) -> bool {
+    !matches!(class, EffectClass::ReadOnly | EffectClass::Pure)
+}
+
 impl RepeatState {
     pub(super) fn on_calls(
         &mut self,
         turn: u32,
-        calls: &[(String, String, Value)],
+        calls: &[(String, String, Value, EffectClass)],
     ) -> Vec<Reaction> {
         // Повторный вход в тот же ход (реплей в том же процессе) не считается дважды.
         self.calls
@@ -104,25 +130,26 @@ impl RepeatState {
         self.results
             .retain(|fp, _| calls_in_window.iter().any(|c| c.calls.contains(fp)));
 
-        let fps: Vec<String> = calls
-            .iter()
-            .map(|(_, name, args)| call_fingerprint(name, args))
-            .collect();
-        let mut set = fps.clone();
-        set.sort();
-        set.dedup();
-
         let mut nudge = false;
-        let mut reactions: Vec<Reaction> = fps
-            .iter()
-            .map(|fp| {
-                let seen = self.calls.iter().filter(|c| c.calls.contains(fp)).count();
+        // После вызова, меняющего состояние, решения о повторе нет: исход мутации до
+        // исполнения неизвестен, последующие вызовы пакета исполняются (Ruling I-2).
+        let mut after_mutation = false;
+        let mut set = Vec::with_capacity(calls.len());
+        let mut reactions = Vec::with_capacity(calls.len() + 1);
+        self.pending.clear();
+        for (id, name, args, class) in calls {
+            let fp = call_fingerprint(name, args);
+            let reaction = if after_mutation {
+                Reaction::None
+            } else {
+                let seen = self.calls.iter().filter(|c| c.calls.contains(&fp)).count();
                 match seen + 1 {
                     1 => Reaction::None,
-                    2 => match self.results.get(fp) {
+                    2 => match self.results.get(&fp) {
                         Some(p) => Reaction::ReusePrevious {
                             call_id: p.call_id.clone(),
                             result: p.result.clone(),
+                            is_error: p.is_error,
                         },
                         // Прошлого результата нет: отказ того же текста, что у третьего.
                         None => Reaction::Reject(REPEAT_REJECT.to_owned()),
@@ -134,25 +161,36 @@ impl RepeatState {
                     }
                     _ => Reaction::Block(detector::REPEAT),
                 }
-            })
-            .collect();
+            };
+            after_mutation |= mutating(*class);
+            self.pending.insert(
+                id.clone(),
+                Pending {
+                    fingerprint: fp.clone(),
+                    mutating: mutating(*class),
+                    intercepted: reaction != Reaction::None,
+                },
+            );
+            set.push(fp);
+            reactions.push(reaction);
+        }
         if nudge {
             reactions.push(Reaction::Nudge(REPEAT_NUDGE.to_owned()));
         }
-
-        self.pending = calls
-            .iter()
-            .zip(&fps)
-            .map(|((id, _, _), fp)| (id.clone(), fp.clone()))
-            .collect();
+        set.sort();
+        set.dedup();
         self.current = (!set.is_empty()).then(|| Current {
             turn,
             fingerprint: set.join(","),
         });
-        if !set.is_empty() {
-            self.calls.push(TurnCalls { turn, calls: set });
-        }
         reactions
+    }
+
+    /// Ввод пользователя: состояние мира могло измениться — окно повтора и прошлые
+    /// результаты сбрасываются (Ruling I-3).
+    pub(super) fn on_user_input(&mut self) {
+        self.calls.clear();
+        self.results.clear();
     }
 
     pub(super) fn on_results(
@@ -164,36 +202,60 @@ impl RepeatState {
         let current = self.current.take().filter(|c| c.turn == turn);
         let pending = std::mem::take(&mut self.pending);
 
-        // Мутация (успешный вызов `Edit` или `Exec`) сбрасывает счётчик повторов (D54).
-        let mutation = results
-            .iter()
-            .any(|(_, kind, err, _)| matches!(kind, ToolKind::Edit | ToolKind::Exec) && !err);
-        if mutation {
-            self.calls.clear();
-            self.results.clear();
-        } else {
-            for (id, _, _, hash) in results {
-                if let Some(fp) = pending.get(id) {
-                    self.results.entry(fp.clone()).or_insert_with(|| Prev {
-                        call_id: id.clone(),
-                        result: hash.clone(),
-                    });
-                }
+        // Окно повтора — по результатам в порядке исполнения.
+        let mut turn_calls: Vec<String> = Vec::new();
+        // Исполненные результаты: факты хода (повтор и отказ детектора — не факты).
+        let mut executed: Vec<&(String, ToolKind, bool, BlobHash)> = Vec::new();
+        for r in results {
+            let (id, _, is_error, hash) = r;
+            let Some(p) = pending.get(id) else {
+                continue;
+            };
+            if p.intercepted {
+                turn_calls.push(p.fingerprint.clone());
+                continue;
             }
+            executed.push(r);
+            if p.mutating {
+                self.calls.clear();
+                self.results.clear();
+                turn_calls.clear();
+                continue;
+            }
+            turn_calls.push(p.fingerprint.clone());
+            self.results.insert(
+                p.fingerprint.clone(),
+                Prev {
+                    call_id: id.clone(),
+                    result: hash.clone(),
+                    is_error: *is_error,
+                },
+            );
+        }
+        turn_calls.sort();
+        turn_calls.dedup();
+        if !turn_calls.is_empty() {
+            self.calls.push(TurnCalls {
+                turn,
+                calls: turn_calls,
+            });
         }
 
         // Новые факты: хэш, которого нет в окне новизны.
         self.seen.retain(|s| in_window(s.turn, turn, SEEN_WINDOW));
-        let fresh = results
+        let fresh = executed
             .iter()
             .any(|(_, _, _, h)| !self.seen.iter().any(|s| s.hashes.contains(h)));
-        let mut hashes: Vec<BlobHash> = results.iter().map(|(_, _, _, h)| h.clone()).collect();
+        let mut hashes: Vec<BlobHash> = executed.iter().map(|(_, _, _, h)| h.clone()).collect();
         hashes.sort_by(|a, b| a.0.cmp(&b.0));
         hashes.dedup();
         self.seen.push(SeenTurn { turn, hashes });
 
-        // Застой (D56).
-        if fresh || mutation || answered {
+        // Застой (D56): прогресс — новый факт, успешный `Edit` или `Exec`, ответ top.
+        let changed = executed
+            .iter()
+            .any(|(_, kind, err, _)| matches!(kind, ToolKind::Edit | ToolKind::Exec) && !err);
+        if fresh || changed || answered {
             self.stall = 0;
         } else {
             self.stall += 1;

@@ -30,7 +30,7 @@
 //! `correct` применяется на границе: управляющее сообщение в историю и
 //! `control.applied {action: "correct", command}` с тем же `command`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -874,6 +874,8 @@ async fn push_inbox(
                 let text = escape_untrusted(text);
                 st.conv.push_user(text.clone())?;
                 push_input(&store_of(deps), st, &text, false).await?;
+                // Ввод пользователя сбрасывает окно повтора (Ruling I-3 ревью задачи 6).
+                st.detectors.on_user_input();
             }
             Inbox::Correct { note, command, .. } => {
                 st.conv.push_user(render_control(
@@ -883,6 +885,7 @@ async fn push_inbox(
                     note,
                 ))?;
                 push_input(&store_of(deps), st, &escape_untrusted(note), true).await?;
+                st.detectors.on_user_input();
                 // D36: тот же `command`, что в `control.requested`.
                 st.last_seq = append(
                     &deps.journal,
@@ -1822,12 +1825,13 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         results,
         suspend,
         finish,
+        executed,
         ..
     } = out;
     // Детекторы после результатов хода (D55, D56) — когда ход доходит до границы.
     let facts = match verdict {
         ToolsVerdict::Next { .. } | ToolsVerdict::Pause => {
-            Some(results_facts(sh, &results, &screened.subjects).await?)
+            Some(results_facts(sh, &results, &executed, &screened).await?)
         }
         _ => None,
     };
@@ -1882,9 +1886,11 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
 /// Итог детектора повтора до пакета.
 #[derive(Debug, Default)]
 struct Screened {
-    /// Исполняемые вызовы (класс по имени): их результаты — факты хода. Повтор и
-    /// отказ детектора новых фактов не дают и в `on_results` не идут.
+    /// Вызовы под детектором (класс по имени). Вызовы `Control` (`finish`, `ask_user`)
+    /// под детектор не идут: повтор вопроса — новый вопрос пользователю.
     subjects: BTreeMap<String, ToolKind>,
+    /// Вызовы, перехваченные детектором (повтор, отказ): результат без исполнения.
+    intercepted: BTreeSet<String>,
     /// Nudge детектора повтора: после результатов хода.
     nudges: Vec<String>,
     /// Детектор, заблокировавший run.
@@ -1893,43 +1899,64 @@ struct Screened {
 
 /// D54: реакции детектора повтора на вызовы, допущенные разбором ответа.
 ///
-/// `ReusePrevious` — `CallVerdict::Reuse` с прошлым результатом из блоба. Блоб
-/// адресован содержимым и не меняется, поэтому его чтение при реплее даёт тот же
-/// текст (как чтение истории при resume), а не новое внешнее значение (D30). Блоба
-/// нет — отказ `REPEAT_REJECT`.
+/// `ReusePrevious` — прошлый результат из блоба с пометкой `REPEAT_MARK`: успех —
+/// `CallVerdict::Reuse`, прошлая ошибка — `CallVerdict::Reject` того же текста
+/// (`is_error = true`, Ruling m-1). Блоб адресован содержимым и не меняется, поэтому
+/// его чтение при реплее даёт тот же текст (как чтение истории при resume), а не новое
+/// внешнее значение (D30, Ruling ревью задачи 6). Блоба нет — отказ `REPEAT_REJECT`.
 async fn screen_calls(
     sh: &Shared,
     st: &mut LoopState,
     calls: &mut [PlannedCall],
 ) -> Result<Screened, LoopError> {
     let mut out = Screened::default();
-    let idx: Vec<usize> = (0..calls.len())
-        .filter(|&i| calls[i].verdict == CallVerdict::Run)
-        .collect();
+    let mut idx = Vec::new();
+    let mut input = Vec::new();
+    for (i, c) in calls.iter().enumerate() {
+        if c.verdict != CallVerdict::Run {
+            continue;
+        }
+        let spec = sh.registry.get(&c.call.name).map(|t| t.spec().clone());
+        // Неизвестный инструмент не исполняется: он не появление и не мутация.
+        let (kind, class) = spec.map_or((ToolKind::Read, EffectClass::ReadOnly), |s| {
+            (s.kind, s.class)
+        });
+        if kind == ToolKind::Control {
+            continue;
+        }
+        idx.push(i);
+        out.subjects.insert(c.call.id.clone(), kind);
+        input.push((
+            c.call.id.clone(),
+            c.call.name.clone(),
+            c.call.arguments.clone(),
+            class,
+        ));
+    }
     if idx.is_empty() {
         return Ok(out);
     }
-    let input: Vec<(String, String, Value)> = idx
-        .iter()
-        .map(|&i| {
-            let c = &calls[i].call;
-            (c.id.clone(), c.name.clone(), c.arguments.clone())
-        })
-        .collect();
     let reactions = st.detectors.on_calls(st.turn, &input);
     let store = store_of(&sh.deps);
     for (k, r) in reactions.into_iter().enumerate() {
         match (r, idx.get(k).copied()) {
             (Reaction::None, _) => {}
-            (Reaction::ReusePrevious { result, .. }, Some(i)) => {
+            (
+                Reaction::ReusePrevious {
+                    result, is_error, ..
+                },
+                Some(i),
+            ) => {
                 let (verdict, action) = match store.get_blob(&result).await? {
-                    Some(raw) => (
-                        CallVerdict::Reuse(format!(
-                            "{REPEAT_MARK}\n{}",
-                            String::from_utf8_lossy(&raw)
-                        )),
-                        "reuse",
-                    ),
+                    Some(raw) => {
+                        let text = format!("{REPEAT_MARK}\n{}", String::from_utf8_lossy(&raw));
+                        let verdict = if is_error {
+                            CallVerdict::Reject(text)
+                        } else {
+                            CallVerdict::Reuse(text)
+                        };
+                        (verdict, "reuse")
+                    }
                     None => {
                         tracing::warn!(run = %st.run, blob = %result.0,
                             "прошлого результата повтора нет: отказ вместо повтора");
@@ -1937,10 +1964,12 @@ async fn screen_calls(
                     }
                 };
                 calls[i].verdict = verdict;
+                out.intercepted.insert(calls[i].call.id.clone());
                 loop_detected(&sh.deps, st, detector::REPEAT, action).await?;
             }
             (Reaction::Reject(text), Some(i)) => {
                 calls[i].verdict = CallVerdict::Reject(text);
+                out.intercepted.insert(calls[i].call.id.clone());
                 loop_detected(&sh.deps, st, detector::REPEAT, "reject").await?;
             }
             (Reaction::Block(d), _) => out.block = Some(d),
@@ -1954,26 +1983,20 @@ async fn screen_calls(
             }
         }
     }
-    for &i in &idx {
-        let c = &calls[i];
-        if c.verdict == CallVerdict::Run {
-            let kind = sh
-                .registry
-                .get(&c.call.name)
-                .map_or(ToolKind::Read, |t| t.spec().kind);
-            out.subjects.insert(c.call.id.clone(), kind);
-        }
-    }
     Ok(out)
 }
 
-/// Факты хода для `on_results`: результаты исполняемых вызовов с хэшем блоба
-/// содержимого. Блоб пишется здесь (`put_blob` идемпотентен, адрес — содержимое): он
-/// нужен повтору D54 и записан раньше снимка, который хранит его хэш.
+/// Факты хода для `on_results` в порядке результатов (Ruling I-1): вызовы под
+/// детектором с настоящим результатом — исполненные (`ToolsOutcome::executed`) и
+/// перехваченные детектором. Оборванные, отклонённые гейтом или пользователем не
+/// входят. Блоб исполненного результата пишется здесь (`put_blob` идемпотентен, адрес
+/// — содержимое): он нужен повтору D54 и записан раньше снимка с его хэшем. У
+/// перехваченного — только хэш, детектор его фактом не считает.
 async fn results_facts(
     sh: &Shared,
     results: &[Part],
-    subjects: &BTreeMap<String, ToolKind>,
+    executed: &[String],
+    screened: &Screened,
 ) -> Result<Vec<(String, ToolKind, bool, BlobHash)>, LoopError> {
     let store = store_of(&sh.deps);
     let mut facts = Vec::new();
@@ -1986,16 +2009,24 @@ async fn results_facts(
         else {
             continue;
         };
-        if let Some(kind) = subjects.get(call_id) {
-            let hash = store.put_blob(content.as_bytes()).await?;
-            facts.push((call_id.clone(), *kind, *is_error, hash));
-        }
+        let Some(kind) = screened.subjects.get(call_id) else {
+            continue;
+        };
+        let hash = if screened.intercepted.contains(call_id) {
+            BlobHash(blake3::hash(content.as_bytes()).to_hex().to_string())
+        } else if executed.contains(call_id) {
+            store.put_blob(content.as_bytes()).await?
+        } else {
+            continue;
+        };
+        facts.push((call_id.clone(), *kind, *is_error, hash));
     }
     Ok(facts)
 }
 
 /// Реакции хода после результатов: nudge повтора (D54), цикл (D55), застой (D56).
-/// `Some` — выход вместо границы. После nudge цикла — рецитация задачи (D55).
+/// `Some` — выход вместо границы. Nudge после результатов — только цикла (nudge
+/// повтора приходит из `screen_calls`); за ним — рецитация задачи (D55).
 async fn apply_detected(
     deps: &LoopDeps,
     st: &mut LoopState,
@@ -2006,16 +2037,11 @@ async fn apply_detected(
     match reaction {
         Reaction::None => Ok(None),
         Reaction::Nudge(text) => {
-            let cycle = text == CYCLE_NUDGE;
-            let d = if cycle {
-                detector::CYCLE
-            } else {
-                detector::REPEAT
-            };
-            tracing::info!(run = %st.run, turn = st.turn, detector = d, "детектор: nudge");
-            loop_detected(deps, st, d, "nudge").await?;
+            tracing::info!(run = %st.run, turn = st.turn, "детектор цикла: nudge");
+            loop_detected(deps, st, detector::CYCLE, "nudge").await?;
+            let recite = text == CYCLE_NUDGE;
             push_nudges(st, &[text])?;
-            if cycle {
+            if recite {
                 st.conv.push_user(recite_task(&st.task, st.setup.n_ctx))?;
             }
             Ok(None)

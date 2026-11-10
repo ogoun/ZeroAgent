@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+
 use serde_json::{Value, json};
 use za_agent::CYCLE_NUDGE;
 use za_agent::{
@@ -50,28 +52,54 @@ fn h(s: &str) -> BlobHash {
     BlobHash(blake3::hash(s.as_bytes()).to_hex().to_string())
 }
 
-fn call(id: &str, name: &str, args: Value) -> (String, String, Value) {
-    (id.to_owned(), name.to_owned(), args)
+type Call = (String, String, Value, EffectClass);
+type Fact = (String, ToolKind, bool, BlobHash);
+
+fn call(id: &str, name: &str, args: Value, class: EffectClass) -> Call {
+    (id.to_owned(), name.to_owned(), args, class)
 }
 
-fn read(id: &str, p: &str) -> (String, String, Value) {
-    call(id, "read", json!({ "p": p }))
+fn read(id: &str, p: &str) -> Call {
+    call(id, "read", json!({ "p": p }), EffectClass::ReadOnly)
 }
 
-fn fact(id: &str, kind: ToolKind, content: &str) -> (String, ToolKind, bool, BlobHash) {
+fn exec(id: &str, cmd: &str) -> Call {
+    call(
+        id,
+        "bash",
+        json!({ "cmd": cmd }),
+        EffectClass::NonIdempotent,
+    )
+}
+
+/// Факт вызова с настоящим результатом. Драйвер передаёт и перехваченные детектором
+/// вызовы (повтор, отказ): они — появления, но не новые факты.
+fn fact(id: &str, kind: ToolKind, content: &str) -> Fact {
     (id.to_owned(), kind, false, h(content))
+}
+
+fn failed(id: &str, kind: ToolKind, content: &str) -> Fact {
+    (id.to_owned(), kind, true, h(content))
 }
 
 fn reject() -> Reaction {
     Reaction::Reject(REPEAT_REJECT.to_owned())
 }
 
+fn reuse(call_id: &str, content: &str) -> Reaction {
+    Reaction::ReusePrevious {
+        call_id: call_id.into(),
+        result: h(content),
+        is_error: false,
+    }
+}
+
 /// Ход: реакции на вызовы и реакция после результатов.
 fn turn(
     d: &mut DetectorState,
     n: u32,
-    calls: &[(String, String, Value)],
-    facts: &[(String, ToolKind, bool, BlobHash)],
+    calls: &[Call],
+    facts: &[Fact],
 ) -> (Vec<Reaction>, Reaction) {
     let on_calls = d.on_calls(n, calls);
     let on_results = d.on_results(n, facts, false);
@@ -97,10 +125,7 @@ fn aaa_reactions_in_order() {
     let mut d = DetectorState::default();
     let expected = [
         vec![Reaction::None],
-        vec![Reaction::ReusePrevious {
-            call_id: "c1".into(),
-            result: h("A"),
-        }],
+        vec![reuse("c1", "A")],
         vec![reject()],
         vec![reject(), Reaction::Nudge(REPEAT_NUDGE.to_owned())],
         vec![Reaction::Block("repeat")],
@@ -110,13 +135,8 @@ fn aaa_reactions_in_order() {
         let id = format!("c{n}");
         let r = d.on_calls(n, &[read(&id, "a")]);
         assert_eq!(&r, want, "ход {n}");
-        // Драйвер передаёт факты только исполненных вызовов: здесь — первого.
-        let facts = if n == 1 {
-            vec![fact(&id, ToolKind::Read, "A")]
-        } else {
-            Vec::new()
-        };
-        assert_eq!(d.on_results(n, &facts, false), Reaction::None, "ход {n}");
+        let after = d.on_results(n, &[fact(&id, ToolKind::Read, "A")], false);
+        assert_eq!(after, Reaction::None, "ход {n}");
     }
 }
 
@@ -130,10 +150,19 @@ fn mutation_resets_repeat_counter() {
         &[fact("c1", ToolKind::Read, "A")],
     );
     assert_eq!(r, vec![Reaction::None]);
-    let (r, _) = turn(&mut d, 2, &[read("c2", "a")], &[]);
-    assert!(matches!(r[..], [Reaction::ReusePrevious { .. }]), "{r:?}");
-    let exec = call("c3", "bash", json!({"cmd": "cargo test"}));
-    let (r, _) = turn(&mut d, 3, &[exec], &[fact("c3", ToolKind::Exec, "ok")]);
+    let (r, _) = turn(
+        &mut d,
+        2,
+        &[read("c2", "a")],
+        &[fact("c2", ToolKind::Read, "A")],
+    );
+    assert_eq!(r, vec![reuse("c1", "A")]);
+    let (r, _) = turn(
+        &mut d,
+        3,
+        &[exec("c3", "cargo test")],
+        &[fact("c3", ToolKind::Exec, "ok")],
+    );
     assert_eq!(r, vec![Reaction::None]);
     let (r, _) = turn(
         &mut d,
@@ -146,17 +175,146 @@ fn mutation_resets_repeat_counter() {
         vec![Reaction::None],
         "третий read после мутации исполняется"
     );
-    // Неуспешный Exec — не мутация: счётчик идёт дальше.
-    let mut failed = fact("c5", ToolKind::Exec, "err");
-    failed.2 = true;
+    // Ruling I-3: упавший вызов, меняющий состояние, тоже сбрасывает окно.
     turn(
         &mut d,
         5,
-        &[call("c5", "bash", json!({"cmd": "x"}))],
-        &[failed],
+        &[exec("c5", "x")],
+        &[failed("c5", ToolKind::Exec, "err")],
     );
-    let (r, _) = turn(&mut d, 6, &[read("c6", "a")], &[]);
-    assert!(matches!(r[..], [Reaction::ReusePrevious { .. }]), "{r:?}");
+    let (r, _) = turn(
+        &mut d,
+        6,
+        &[read("c6", "a")],
+        &[fact("c6", ToolKind::Read, "A3")],
+    );
+    assert_eq!(
+        r,
+        vec![Reaction::None],
+        "после упавшего Exec read исполняется"
+    );
+}
+
+#[test]
+fn mutation_in_same_batch_resets_for_later_calls() {
+    // Ruling I-2: [правка a, чтение a] после прежнего чтения a — чтение исполняется.
+    let mut d = DetectorState::default();
+    turn(
+        &mut d,
+        1,
+        &[read("c1", "a")],
+        &[fact("c1", ToolKind::Read, "A")],
+    );
+    let edit = call("c2", "edit", json!({"p": "a"}), EffectClass::Idempotent);
+    let (r, _) = turn(
+        &mut d,
+        2,
+        &[edit, read("c3", "a")],
+        &[
+            fact("c2", ToolKind::Edit, "ok"),
+            fact("c3", ToolKind::Read, "A'"),
+        ],
+    );
+    assert_eq!(r, vec![Reaction::None, Reaction::None]);
+    // Окно после хода 2 — только чтение после правки: следующий read a — повтор его.
+    let (r, _) = turn(
+        &mut d,
+        3,
+        &[read("c4", "a")],
+        &[fact("c4", ToolKind::Read, "A'")],
+    );
+    assert_eq!(r, vec![reuse("c3", "A'")]);
+    // Чтение до правки в том же пакете — повтор, правка затем сбрасывает окно.
+    let edit = call("c6", "edit", json!({"p": "a"}), EffectClass::Idempotent);
+    let (r, _) = turn(
+        &mut d,
+        4,
+        &[read("c5", "a"), edit],
+        &[
+            fact("c5", ToolKind::Read, "A'"),
+            fact("c6", ToolKind::Edit, "ok"),
+        ],
+    );
+    assert_eq!(r, vec![reject(), Reaction::None]);
+    let (r, _) = turn(
+        &mut d,
+        5,
+        &[read("c7", "a")],
+        &[fact("c7", ToolKind::Read, "A''")],
+    );
+    assert_eq!(r, vec![Reaction::None]);
+}
+
+#[test]
+fn interrupted_call_is_not_an_appearance() {
+    // Ruling I-1: вызов без результата (оборван, отклонён) в окно не идёт.
+    let mut d = DetectorState::default();
+    let (r, _) = turn(
+        &mut d,
+        1,
+        &[read("c1", "a"), read("c2", "b")],
+        &[fact("c1", ToolKind::Read, "A")],
+    );
+    assert_eq!(r, vec![Reaction::None, Reaction::None]);
+    let (r, _) = turn(
+        &mut d,
+        2,
+        &[read("c3", "b")],
+        &[fact("c3", ToolKind::Read, "B")],
+    );
+    assert_eq!(r, vec![Reaction::None], "b не исполнялся: повтора нет");
+    let (r, _) = turn(
+        &mut d,
+        3,
+        &[read("c4", "b")],
+        &[fact("c4", ToolKind::Read, "B")],
+    );
+    assert_eq!(r, vec![reuse("c3", "B")]);
+}
+
+#[test]
+fn user_input_resets_repeat_window() {
+    let mut d = DetectorState::default();
+    turn(
+        &mut d,
+        1,
+        &[read("c1", "a")],
+        &[fact("c1", ToolKind::Read, "A")],
+    );
+    d.on_user_input();
+    let (r, _) = turn(
+        &mut d,
+        2,
+        &[read("c2", "a")],
+        &[fact("c2", ToolKind::Read, "A")],
+    );
+    assert_eq!(r, vec![Reaction::None]);
+}
+
+#[test]
+fn reused_error_stays_error() {
+    // Ruling m-1: повтор прошлой ошибки — ошибка.
+    let mut d = DetectorState::default();
+    turn(
+        &mut d,
+        1,
+        &[read("c1", "a")],
+        &[failed("c1", ToolKind::Read, "no such file")],
+    );
+    let (r, _) = turn(
+        &mut d,
+        2,
+        &[read("c2", "a")],
+        &[failed("c2", ToolKind::Read, "x")],
+    );
+    assert_eq!(
+        r,
+        vec![Reaction::ReusePrevious {
+            call_id: "c1".into(),
+            result: h("no such file"),
+            is_error: true,
+        }]
+    );
 }
 
 #[test]
@@ -164,70 +322,72 @@ fn parallel_set_is_order_independent() {
     // Отпечаток хода {a, b} не зависит от порядка: [a, b], [c], [b, a], [c] — цикл ABAB.
     let mut d = DetectorState::default();
     let ab = [read("c1", "a"), read("c2", "b")];
-    turn(
-        &mut d,
-        1,
-        &ab,
-        &[
-            fact("c1", ToolKind::Read, "A"),
-            fact("c2", ToolKind::Read, "B"),
-        ],
-    );
+    let ab_facts = [
+        fact("c1", ToolKind::Read, "A"),
+        fact("c2", ToolKind::Read, "B"),
+    ];
+    turn(&mut d, 1, &ab, &ab_facts);
     turn(
         &mut d,
         2,
         &[read("c3", "c")],
         &[fact("c3", ToolKind::Read, "C")],
     );
-    let (r, after) = turn(&mut d, 3, &[read("c4", "b"), read("c5", "a")], &[]);
+    let (r, after) = turn(
+        &mut d,
+        3,
+        &[read("c4", "b"), read("c5", "a")],
+        &[
+            fact("c4", ToolKind::Read, "B"),
+            fact("c5", ToolKind::Read, "A"),
+        ],
+    );
     assert_eq!(
         r,
-        vec![
-            Reaction::ReusePrevious {
-                call_id: "c2".into(),
-                result: h("B"),
-            },
-            Reaction::ReusePrevious {
-                call_id: "c1".into(),
-                result: h("A"),
-            },
-        ],
+        vec![reuse("c2", "B"), reuse("c1", "A")],
         "реакции — по порядку вызовов"
     );
     assert_eq!(after, Reaction::None);
-    let (_, after) = turn(&mut d, 4, &[read("c6", "c")], &[]);
+    let (_, after) = turn(
+        &mut d,
+        4,
+        &[read("c6", "c")],
+        &[fact("c6", ToolKind::Read, "C")],
+    );
     assert_eq!(after, Reaction::Nudge(CYCLE_NUDGE.to_owned()));
 
     // Контроль: другой набор в третьем ходу — не цикл.
     let mut d = DetectorState::default();
-    turn(
-        &mut d,
-        1,
-        &ab,
-        &[
-            fact("c1", ToolKind::Read, "A"),
-            fact("c2", ToolKind::Read, "B"),
-        ],
-    );
+    turn(&mut d, 1, &ab, &ab_facts);
     turn(
         &mut d,
         2,
         &[read("c3", "c")],
         &[fact("c3", ToolKind::Read, "C")],
     );
-    turn(&mut d, 3, &[read("c4", "b"), read("c5", "d")], &[]);
-    let (_, after) = turn(&mut d, 4, &[read("c6", "c")], &[]);
+    turn(
+        &mut d,
+        3,
+        &[read("c4", "b"), read("c5", "d")],
+        &[
+            fact("c4", ToolKind::Read, "B"),
+            fact("c5", ToolKind::Read, "D"),
+        ],
+    );
+    let (_, after) = turn(
+        &mut d,
+        4,
+        &[read("c6", "c")],
+        &[fact("c6", ToolKind::Read, "C")],
+    );
     assert_eq!(after, Reaction::None);
 }
 
 #[test]
 fn abab_reflects_then_blocks() {
+    // Как в драйвере: X и Y с хода 3 перехвачены повтором (повтор, отказ) — новых
+    // фактов нет; результаты передаются, это появления.
     let mut d = DetectorState::default();
-    let x = |id: &str| read(id, "x");
-    let y = |id: &str| read(id, "y");
-    // Содержимое результатов одно и то же: новых фактов после ходов 1 и 2 нет.
-    let fx = |id: &str| fact(id, ToolKind::Read, "X");
-    let fy = |id: &str| fact(id, ToolKind::Read, "Y");
     let plan: [(u32, bool, Reaction); 8] = [
         (1, true, Reaction::None),
         (2, false, Reaction::None),
@@ -241,12 +401,15 @@ fn abab_reflects_then_blocks() {
     ];
     for (n, is_x, want) in plan {
         let id = format!("c{n}");
-        let (c, f) = if is_x {
-            (x(&id), fx(&id))
-        } else {
-            (y(&id), fy(&id))
-        };
-        let (_, after) = turn(&mut d, n, &[c], &[f]);
+        let p = if is_x { "x" } else { "y" };
+        let (r, after) = turn(&mut d, n, &[read(&id, p)], &[fact(&id, ToolKind::Read, p)]);
+        if n >= 3 {
+            assert_ne!(
+                r,
+                vec![Reaction::None],
+                "ход {n}: вызов перехвачен повтором"
+            );
+        }
         assert_eq!(after, want, "ход {n}");
     }
 }
@@ -270,16 +433,20 @@ fn abab_drift_of_three_reflects() {
 
 #[test]
 fn abab_with_new_facts_is_fine() {
+    // X — команда (исполняется каждый раз, сбрасывает окно повтора), Y — чтение её
+    // лога; содержимое каждый раз новое — цикла нет.
     let mut d = DetectorState::default();
     for n in 1..=8u32 {
         let id = format!("c{n}");
-        let p = if n % 2 == 1 { "x" } else { "y" };
-        let (_, after) = turn(
-            &mut d,
-            n,
-            &[read(&id, p)],
-            &[fact(&id, ToolKind::Read, &format!("content {n}"))],
-        );
+        let (c, kind) = if n % 2 == 1 {
+            (exec(&id, "make"), ToolKind::Exec)
+        } else {
+            (read(&id, "build.log"), ToolKind::Read)
+        };
+        let mut f = failed(&id, kind, &format!("content {n}"));
+        f.2 = n % 2 == 1; // команда падает: не прогресс по D56, но факт новый
+        let (r, after) = turn(&mut d, n, &[c], &[f]);
+        assert_eq!(r, vec![Reaction::None], "ход {n}: исполняется");
         assert_eq!(after, Reaction::None, "ход {n}");
     }
 }
@@ -323,25 +490,80 @@ fn state_roundtrips_and_defaults() {
 
 // ---- Драйвер ----
 
-/// Инструмент чтения `read`: считает исполнения, результат — `content of <p>`.
-struct Read {
+/// Инструмент: считает исполнения `read`; ответ — по имени (см. [`reply`]).
+struct Probe {
     spec: ToolSpec,
-    count: Arc<AtomicUsize>,
+    count: Option<Arc<AtomicUsize>>,
 }
 
-impl Tool for Read {
+/// `read` — `content of <p>`; `peek` — всегда одно и то же; `fail` — ошибка;
+/// `edit` — `edited <p>`.
+fn reply(name: &str, args: &Value) -> ToolOutput {
+    let (content, is_error) = match name {
+        "read" => (format!("content of {}", args["p"]), false),
+        "peek" => ("same".to_owned(), false),
+        "fail" => (format!("no such file {}", args["p"]), true),
+        _ => (format!("edited {}", args["p"]), false),
+    };
+    ToolOutput { content, is_error }
+}
+
+impl Tool for Probe {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
 
     fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
-        self.count.fetch_add(1, Ordering::SeqCst);
+        if let Some(c) = &self.count {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+        let out = reply(&self.spec.schema.name, &args);
+        Box::pin(async move { out })
+    }
+}
+
+/// Инструмент чтения `hold`: ждёт разрешения семафора.
+struct Hold {
+    spec: ToolSpec,
+    release: Arc<Semaphore>,
+}
+
+impl Tool for Hold {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        let release = Arc::clone(&self.release);
         Box::pin(async move {
+            within("разрешение hold", release.acquire())
+                .await
+                .expect("семафор закрыт")
+                .forget();
             ToolOutput {
-                content: format!("content of {}", args["p"]),
+                content: format!("held {args}"),
                 is_error: false,
             }
         })
+    }
+}
+
+fn spec_of(name: &str, kind: ToolKind, class: EffectClass) -> ToolSpec {
+    ToolSpec {
+        schema: ToolSchema {
+            name: name.into(),
+            description: "t".into(),
+            parameters: json!({"type": "object"}),
+        },
+        class,
+        kind,
+        // Правка без одобрения в режиме Ask.
+        approval: Approval::Never,
+        roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
+        min_tier: Tier::Small,
+        timeout: Duration::from_secs(60),
+        output_limit: None,
+        tainted: false,
     }
 }
 
@@ -351,6 +573,8 @@ struct Fx {
     deps: LoopDeps,
     run: RunId,
     count: Arc<AtomicUsize>,
+    bus: EventBus,
+    release: Arc<Semaphore>,
 }
 
 fn fx(name: &str) -> Fx {
@@ -362,31 +586,35 @@ fn fx(name: &str) -> Fx {
     let store = ProjectStore::open(&d).unwrap();
     let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
     let count = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Semaphore::new(0));
     let mut reg = ToolRegistry::default();
     for t in builtin_tools() {
         reg.register(t).unwrap();
     }
-    reg.register(Arc::new(Read {
-        spec: ToolSpec {
-            schema: ToolSchema {
-                name: "read".into(),
-                description: "t".into(),
-                parameters: json!({"type": "object"}),
-            },
-            class: EffectClass::ReadOnly,
-            kind: ToolKind::Read,
-            approval: Approval::Mode,
-            roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
-            min_tier: Tier::Small,
-            timeout: Duration::from_secs(60),
-            output_limit: None,
-            tainted: false,
-        },
-        count: Arc::clone(&count),
+    reg.register(Arc::new(Probe {
+        spec: spec_of("read", ToolKind::Read, EffectClass::ReadOnly),
+        count: Some(Arc::clone(&count)),
     }))
     .unwrap();
+    for (name, kind, class) in [
+        ("peek", ToolKind::Read, EffectClass::ReadOnly),
+        ("fail", ToolKind::Read, EffectClass::ReadOnly),
+        ("edit", ToolKind::Edit, EffectClass::Idempotent),
+    ] {
+        reg.register(Arc::new(Probe {
+            spec: spec_of(name, kind, class),
+            count: None,
+        }))
+        .unwrap();
+    }
+    reg.register(Arc::new(Hold {
+        spec: spec_of("hold", ToolKind::Read, EffectClass::ReadOnly),
+        release: Arc::clone(&release),
+    }))
+    .unwrap();
+    let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
+        journal: Journal::new(store.clone(), bus.clone()),
         model: model.clone(),
         tools: Arc::new(reg),
         capabilities: Vec::new(),
@@ -399,6 +627,8 @@ fn fx(name: &str) -> Fx {
         deps,
         run: RunId::new(),
         count,
+        bus,
+        release,
     }
 }
 
@@ -663,5 +893,230 @@ async fn detector_state_survives_resume() {
         f.count.load(Ordering::SeqCst),
         1,
         "инструмент исполнен 1 раз за оба процесса"
+    );
+}
+
+// ---- Раунд исправлений 1 (ревью задачи 6) ----
+
+/// Ответ модели с вызовами `(id, имя, аргументы)`.
+fn calls_turn(cs: &[(&str, &str, Value)]) -> Vec<Result<StreamEvent, ModelError>> {
+    vec![Ok(StreamEvent::Finished {
+        message: Message {
+            role: Role::Assistant,
+            parts: cs
+                .iter()
+                .map(|(id, name, args)| {
+                    Part::ToolCall(ToolCall {
+                        id: (*id).into(),
+                        name: (*name).into(),
+                        arguments: args.clone(),
+                        raw_arguments: None,
+                    })
+                })
+                .collect(),
+        },
+        finish: FinishReason::ToolCalls,
+        usage: Usage::default(),
+    })]
+}
+
+/// Число исполнений инструмента `name` по событиям `tool.started` (D8).
+async fn started(f: &Fx, name: &str) -> usize {
+    events(&f.store, f.run)
+        .await
+        .iter()
+        .filter(|e| e.kind == EventKind::ToolStarted && e.payload["name"] == name)
+        .count()
+}
+
+/// Run с управлением: `on_started` — действие по первому `tool.started` (по событию
+/// шины, не по таймеру).
+async fn start_with(
+    f: &Fx,
+    on_started: impl FnOnce(za_agent::RunControl, Arc<Semaphore>) -> BoxFuture<'static, ()>
+    + Send
+    + 'static,
+) -> LoopOutcome {
+    let (ctl, rx) = control_channel(f.store.clone(), f.run);
+    let mut bus = f.bus.subscribe();
+    let release = Arc::clone(&f.release);
+    let watcher = tokio::spawn(async move {
+        within("tool.started", async {
+            loop {
+                let ev = bus.recv().await.expect("шина закрыта");
+                if ev.event.kind == EventKind::ToolStarted {
+                    return;
+                }
+            }
+        })
+        .await;
+        on_started(ctl, release).await;
+    });
+    let out = within("start_run", start_run(&f.deps, f.run, spec(), rx))
+        .await
+        .unwrap();
+    within("наблюдатель", watcher).await.unwrap();
+    out
+}
+
+/// I-1: вызов, оборванный вводом, не появление — его повтор исполняется.
+#[tokio::test]
+async fn interrupted_call_repeat_executes() {
+    let f = fx("interrupted_repeat");
+    f.model.push(calls_turn(&[
+        ("c1", "hold", json!({"id": 1})),
+        ("c2", "read", json!({"p": "a"})),
+    ]));
+    f.model.push(read_turn("c3", "a"));
+    f.model.push(answer("готово"));
+    let out = start_with(&f, |ctl, release| {
+        Box::pin(async move {
+            ctl.input("стоп", za_agent::InputMode::Interrupt)
+                .await
+                .unwrap();
+            release.add_permits(1);
+        })
+    })
+    .await;
+    assert_eq!(out, done("готово"));
+    let conv = history(&f).await;
+    assert_eq!(
+        result_of(&conv, "c2"),
+        ("interrupted: call not executed".to_owned(), true)
+    );
+    let (c3, is_error) = result_of(&conv, "c3");
+    assert_eq!((c3.as_str(), is_error), (r#"content of "a""#, false));
+    assert_eq!(f.count.load(Ordering::SeqCst), 1);
+    assert!(detected(&f).await.is_empty(), "{:?}", detected(&f).await);
+}
+
+/// I-2: `[правка a, чтение a]` после прежнего чтения a — чтение исполняется заново.
+#[tokio::test]
+async fn edit_then_read_in_one_batch_reads_again() {
+    let f = fx("edit_then_read");
+    f.model.push(read_turn("c1", "a"));
+    f.model.push(calls_turn(&[
+        ("c2", "edit", json!({"p": "a"})),
+        ("c3", "read", json!({"p": "a"})),
+    ]));
+    f.model.push(answer("готово"));
+    assert_eq!(start(&f, &f.deps).await.unwrap(), done("готово"));
+    assert_eq!(f.count.load(Ordering::SeqCst), 2, "второе чтение исполнено");
+    let conv = history(&f).await;
+    assert_eq!(
+        result_of(&conv, "c3"),
+        (r#"content of "a""#.to_owned(), false)
+    );
+    assert!(detected(&f).await.is_empty());
+}
+
+/// I-3: ввод пользователя на границе сбрасывает окно повтора.
+#[tokio::test]
+async fn user_input_resets_repeat() {
+    let f = fx("input_resets");
+    f.model
+        .push(calls_turn(&[("c1", "hold", json!({"id": 1}))]));
+    f.model
+        .push(calls_turn(&[("c2", "hold", json!({"id": 1}))]));
+    f.model.push(answer("готово"));
+    let out = start_with(&f, |ctl, release| {
+        Box::pin(async move {
+            // Ввод записан до конца первого вызова: его прочитает граница хода 2.
+            ctl.input("я поправил конфиг", za_agent::InputMode::Queue)
+                .await
+                .unwrap();
+            release.add_permits(2);
+        })
+    })
+    .await;
+    assert_eq!(out, done("готово"));
+    assert_eq!(started(&f, "hold").await, 2, "повтор после ввода исполнен");
+    assert!(detected(&f).await.is_empty());
+}
+
+/// m-1: повтор прошлой ошибки — тоже ошибка.
+#[tokio::test]
+async fn reused_error_keeps_is_error() {
+    let f = fx("reused_error");
+    f.model
+        .push(calls_turn(&[("c1", "fail", json!({"p": "a"}))]));
+    f.model
+        .push(calls_turn(&[("c2", "fail", json!({"p": "a"}))]));
+    f.model.push(answer("готово"));
+    assert_eq!(start(&f, &f.deps).await.unwrap(), done("готово"));
+    assert_eq!(started(&f, "fail").await, 1);
+    let conv = history(&f).await;
+    let (first, e1) = result_of(&conv, "c1");
+    assert!(e1);
+    assert_eq!(
+        result_of(&conv, "c2"),
+        (format!("{REPEAT_MARK}\n{first}"), true)
+    );
+}
+
+/// m-6: цикл через драйвер — nudge цикла и рецитация задачи после хода 4.
+#[tokio::test]
+async fn cycle_nudges_with_recitation() {
+    let f = fx("cycle_driver");
+    for (n, p) in [(1, "x"), (2, "y"), (3, "x"), (4, "y")] {
+        f.model.push(read_turn(&format!("c{n}"), p));
+    }
+    f.model.push(answer("готово"));
+    assert_eq!(start(&f, &f.deps).await.unwrap(), done("готово"));
+    let conv = history(&f).await;
+    let texts: Vec<String> = conv
+        .messages()
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| &m.parts)
+        .filter_map(|p| match p {
+            Part::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    let at = texts
+        .iter()
+        .position(|t| t.contains(CYCLE_NUDGE))
+        .expect("нет nudge цикла");
+    assert!(
+        texts[at + 1].contains("Current task: Прочитай файл a"),
+        "{:?}",
+        texts[at + 1]
+    );
+    assert_eq!(
+        detected(&f).await,
+        [
+            ("repeat", "reuse", 3),
+            ("repeat", "reuse", 4),
+            ("cycle", "nudge", 4),
+        ]
+        .map(|(a, b, t)| (a.to_owned(), b.to_owned(), t))
+    );
+}
+
+/// m-6: застой через драйвер — 8 ходов без новых фактов, затем `blocked`.
+#[tokio::test]
+async fn stall_blocks_run() {
+    let f = fx("stall_driver");
+    for n in 1..=9 {
+        f.model.push(calls_turn(&[(
+            &format!("c{n}"),
+            "peek",
+            json!({"p": format!("f{n}")}),
+        )]));
+    }
+    let out = start(&f, &f.deps).await.unwrap();
+    assert_eq!(
+        out,
+        LoopOutcome::Finished {
+            status: RunStatus::Blocked,
+            answer: None,
+            finish: None,
+        }
+    );
+    assert_eq!(started(&f, "peek").await, 9);
+    assert_eq!(
+        detected(&f).await,
+        vec![("stall".to_owned(), "block".to_owned(), 9)]
     );
 }

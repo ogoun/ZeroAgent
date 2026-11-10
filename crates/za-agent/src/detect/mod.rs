@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use za_core::ToolKind;
 use za_llm::{ReasoningMode, Sampling};
-use za_protocol::{BlobHash, canonical_json};
+use za_protocol::{BlobHash, EffectClass, canonical_json};
 
 use repeat::RepeatState;
 
@@ -37,10 +37,12 @@ pub const CYCLE_NUDGE: &str = "You are cycling between the same calls without ne
 pub enum Reaction {
     None,
     /// Вызов не исполняется: результат — прошлый результат того же вызова (`call_id`
-    /// прошлого вызова, блоб его содержимого) с пометкой [`REPEAT_MARK`].
+    /// прошлого вызова, блоб его содержимого) с пометкой [`REPEAT_MARK`]; `is_error` —
+    /// прошлый результат был ошибкой, повтор тоже ошибка (Ruling m-1 ревью задачи 6).
     ReusePrevious {
         call_id: String,
         result: BlobHash,
+        is_error: bool,
     },
     /// Вызов не исполняется: результат-ошибка с этим текстом.
     Reject(String),
@@ -86,13 +88,28 @@ impl DetectorState {
     ///
     /// Первые `calls.len()` элементов — по одному на вызов (`None`, `ReusePrevious`,
     /// `Reject` или `Block`); за ними — реакции хода (`Nudge`), не больше одной.
-    pub fn on_calls(&mut self, turn: u32, calls: &[(String, String, Value)]) -> Vec<Reaction> {
+    /// `calls` — (call_id, имя, аргументы, класс эффекта) в порядке исполнения; после
+    /// вызова, меняющего состояние, остальные вызовы получают `None` (Ruling I-2).
+    pub fn on_calls(
+        &mut self,
+        turn: u32,
+        calls: &[(String, String, Value, EffectClass)],
+    ) -> Vec<Reaction> {
         self.repeat.on_calls(turn, calls)
+    }
+
+    /// Ввод пользователя (очередь, прерывание, поправка) сбрасывает окно повтора
+    /// (Ruling I-3 ревью задачи 6).
+    pub fn on_user_input(&mut self) {
+        self.repeat.on_user_input();
     }
 
     /// После результатов хода: факты, мутации, ABAB (D55), застой (D56); отпечаток — из
     /// `on_calls` того же `turn`. `results` — (call_id, класс, is_error, хэш блоба
-    /// содержимого). `answered` — у top ход дал ответ пользователю (прогресс D56).
+    /// содержимого) — только вызовов с настоящим результатом: исполненных и
+    /// перехваченных детектором (Ruling I-1); оборванные, отклонённые гейтом или
+    /// пользователем сюда не передаются. `answered` — у top ход дал ответ пользователю
+    /// (прогресс D56).
     pub fn on_results(
         &mut self,
         turn: u32,
