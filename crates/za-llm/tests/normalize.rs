@@ -240,16 +240,69 @@ fn unknown_name_lists_up_to_three_nearest() {
     let msg = assistant(vec![native("c1", "abcf", json!({}))]);
     let out = normalize(
         &msg,
-        &names(&["abcd", "abce", "abzz", "xyzw", "qqqq"]),
+        &names(&["abcd", "abce", "abcg", "abch", "abzz", "xyzw", "qqqq"]),
         all_formats(),
     );
     assert_eq!(
         out.rejected,
         [CallRejection::UnknownTool {
             name: "abcf".into(),
-            nearest: vec!["abcd".into(), "abce".into(), "abzz".into()]
+            nearest: vec!["abcd".into(), "abce".into(), "abcg".into()]
         }]
     );
+}
+
+/// Подсказка без порога (решение контроллера R1-B1, задача 10): расстояние
+/// ≤ max(длина, 3) / 3 или вызванное имя как подстрока без учёта регистра.
+#[test]
+fn nearest_hints_only_close_names() {
+    let reject = |name: &str, known: &[&str]| {
+        let out = normalize(
+            &assistant(vec![native("c1", name, json!({}))]),
+            &names(known),
+            all_formats(),
+        );
+        match &out.rejected[..] {
+            [CallRejection::UnknownTool { nearest, .. }] => nearest.clone(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert!(reject("raed_fil", &["write"]).is_empty());
+    assert!(reject("zzz", &["read_file"]).is_empty());
+    // Подстрока без учёта регистра: далеко по расстоянию, но имя целиком внутри.
+    assert_eq!(
+        reject("Read", &["read_file_lines", "write"]),
+        ["read_file_lines"]
+    );
+    // len 9 → порог подсказки 3; два кандидата на d = 2 — не исправление, а подсказка.
+    assert_eq!(
+        reject("read_fizz", &["read_file", "read_fila", "write"]),
+        ["read_fila", "read_file"]
+    );
+}
+
+/// Тексты ошибок схемы уходят модели — на английском (R1-B1 D23).
+#[test]
+fn schema_errors_are_english() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "n": {"type": "integer", "minimum": 1, "maximum": 2},
+            "s": {"type": "string", "minLength": 2, "maxLength": 3, "enum": ["ab", "abc"]},
+            "a": {"type": "array", "minItems": 1, "maxItems": 1},
+            "c": {"const": 5},
+            "o": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+            "b": {"type": "boolean"}
+        },
+        "required": ["n", "s", "a", "c", "o", "b", "missing"],
+        "additionalProperties": false
+    });
+    let mut args = json!({"n": 5, "s": "abcdef", "a": [], "c": 4, "o": [1], "b": {}, "extra": 1});
+    let errors = validate_and_coerce(&schema, &mut args).unwrap_err();
+    assert!(errors.len() >= 8, "{errors:?}");
+    for e in &errors {
+        assert!(e.message.is_ascii(), "{e:?}");
+    }
 }
 
 #[test]
@@ -789,7 +842,7 @@ fn complete_qwen_call_with_unknown_name_is_rejected_with_nearest() {
     let out = normalize(&text(src), &tools(), all_formats());
     assert!(out.calls.is_empty());
     assert!(
-        matches!(&out.rejected[..], [CallRejection::UnknownTool { name, nearest }] if name == "delete_everything" && nearest.len() == 3),
+        matches!(&out.rejected[..], [CallRejection::UnknownTool { name, nearest }] if name == "delete_everything" && nearest.is_empty()),
         "{:?}",
         out.rejected
     );

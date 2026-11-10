@@ -63,6 +63,13 @@ pub fn damerau_levenshtein(a: &str, b: &str) -> usize {
     d[(n + 1) * w + m + 1]
 }
 
+/// Порог подсказки для имени длиной `len` символов: max(len, 3) / 3 (правило rustc
+/// `find_best_match_for_name`; решение контроллера R1-B1, задача 10). Полностью чужие
+/// имена в подсказку не попадают.
+fn hint_limit(len: usize) -> usize {
+    len.clamp(3, MAX_NAME_CHARS) / 3
+}
+
 /// Итог проверки имени.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NameMatch {
@@ -70,7 +77,8 @@ pub(crate) enum NameMatch {
     /// Единственный кандидат с расстоянием ≤ min(2, длина / 4) при длине ≥ 5.
     Corrected(String),
     /// Нет единственного кандидата: до трёх ближайших по возрастанию расстояния,
-    /// при равенстве — по имени.
+    /// при равенстве — по имени. Ближайшие — на расстоянии ≤ max(длина, 3) / 3 или
+    /// содержащие вызванное имя без учёта регистра; пусто — близких нет.
     Unknown(Vec<String>),
 }
 
@@ -121,9 +129,12 @@ pub(crate) fn resolve_name(name: &str, known: &[&str]) -> NameMatch {
         return NameMatch::Corrected(only.to_owned());
     }
     let probe: String = name.chars().take(MAX_NAME_CHARS).collect();
+    let limit = hint_limit(len);
+    let lower = probe.to_lowercase();
     let mut ranked: Vec<(usize, &str)> = known
         .iter()
         .map(|k| (damerau_levenshtein(&probe, k), *k))
+        .filter(|(d, k)| *d <= limit || (!lower.is_empty() && k.to_lowercase().contains(&lower)))
         .collect();
     ranked.sort_unstable();
     ranked.dedup();

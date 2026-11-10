@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -330,7 +331,7 @@ async fn turn_journals_request_deltas_usage() {
     assert_eq!(ev[3].1["state"], "generating");
     assert_eq!(
         ev[4].1,
-        json!({"turn": 1, "attempt": 1, "text": "привет мир"})
+        json!({"turn": 1, "effect_key": key.0, "attempt": 1, "text": "привет мир"})
     );
     let usage = &ev[5].1;
     assert_eq!(usage["usage"]["input"], 50);
@@ -375,6 +376,7 @@ async fn restart_drops_partial_and_journals_restart() {
     ]);
     let mut ctx = RunCtx::new(s.clone(), run);
     ctx.next_step();
+    let k = EffectKey::derive(run, 1, 0).0;
     let (_tx, mut sig) = signal_channel();
     let out = model_turn(&mut ctx, &j, &m, call(run), &refs(), 1, &mut sig)
         .await
@@ -391,9 +393,9 @@ async fn restart_drops_partial_and_journals_restart() {
     assert_eq!(
         deltas,
         [
-            json!({"turn": 1, "attempt": 1, "text": "обры"}),
-            json!({"turn": 1, "attempt": 1, "restart": "StreamCut: x"}),
-            json!({"turn": 1, "attempt": 2, "text": "целый"}),
+            json!({"turn": 1, "effect_key": k, "attempt": 1, "text": "обры"}),
+            json!({"turn": 1, "effect_key": k, "attempt": 1, "restart": "StreamCut: x"}),
+            json!({"turn": 1, "effect_key": k, "attempt": 2, "text": "целый"}),
         ]
     );
 }
@@ -442,7 +444,10 @@ async fn stream_error_after_deltas_is_model_error_without_commit() {
         .filter(|(k, _)| *k == EventKind::ModelDelta)
         .map(|(_, p)| p)
         .collect();
-    assert_eq!(deltas, [json!({"turn": 1, "attempt": 1, "text": "часть"})]);
+    assert_eq!(
+        deltas,
+        [json!({"turn": 1, "effect_key": key.0, "attempt": 1, "text": "часть"})]
+    );
     assert!(
         receipt_error(&s, run, &key)
             .await
@@ -531,57 +536,202 @@ async fn refusal_is_reported_not_committed() {
     assert_eq!(out.message, text_msg(Role::Assistant, "частич"));
 }
 
-#[tokio::test]
-async fn abort_drops_stream_fast() {
-    let (s, j, run) = setup("abort").await;
-    let m = model();
+/// Обрыв хода сигналом (D7, NFR-03): drop стрима не позже 200 мс после сигнала,
+/// квитанция `interrupted:*`; реплей отдаёт тот же обрыв из журнала без стрима.
+async fn abort_with(name: &str, signal: Signal) {
+    let (s, j, run) = setup(name).await;
+    let m = Arc::new(model());
     m.push_open(vec![delta("a")]);
     let mut ctx = RunCtx::new(s.clone(), run);
     ctx.next_step();
     let key = EffectKey::derive(run, 1, 0);
     let (tx, mut sig) = signal_channel();
-    let pauser = tokio::spawn(async move {
+    let sender = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let at = tokio::time::Instant::now();
-        tx.pause();
+        match signal {
+            Signal::Pause => tx.pause(),
+            Signal::Cancel => tx.cancel(),
+            Signal::Input => tx.input(),
+        }
         (tx, at)
     });
-    let err = model_turn(&mut ctx, &j, &m, call(run), &refs(), 1, &mut sig)
+    // Момент drop стрима, а не возврата `model_turn`: записи журнала после обрыва
+    // (сброс дельты, квитанция) в предел NFR-03 не входят.
+    let watched = m.clone();
+    let watcher = tokio::spawn(async move {
+        let mut opened = false;
+        loop {
+            match watched.open_streams() {
+                0 if opened => return tokio::time::Instant::now(),
+                0 => {}
+                _ => opened = true,
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    let err = model_turn(&mut ctx, &j, m.as_ref(), call(run), &refs(), 1, &mut sig)
         .await
         .unwrap_err();
-    let done = tokio::time::Instant::now();
-    let (_tx, at) = pauser.await.unwrap();
+    let (_tx, at) = sender.await.unwrap();
+    let dropped = watcher.await.unwrap();
     assert!(
-        matches!(
-            err,
-            TurnError::Aborted {
-                signal: Signal::Pause,
-                source: EffectSource::Live
-            }
-        ),
+        matches!(err, TurnError::Aborted { signal: s, source: EffectSource::Live } if s == signal),
         "{err:?}"
     );
-    assert!(done - at <= Duration::from_millis(200), "{:?}", done - at);
+    let lag = dropped.saturating_duration_since(at);
+    assert!(lag <= Duration::from_millis(200), "{lag:?}");
     assert_eq!(m.open_streams(), 0);
-    assert_eq!(receipt_error(&s, run, &key).await, "interrupted:pause");
+    let tag = match signal {
+        Signal::Pause => "pause",
+        Signal::Cancel => "cancel",
+        Signal::Input => "input",
+    };
+    assert_eq!(
+        receipt_error(&s, run, &key).await,
+        format!("interrupted:{tag}")
+    );
+    // Дельта до обрыва сброшена в журнал.
+    let deltas: Vec<Value> = loop_events(&s, run)
+        .await
+        .into_iter()
+        .filter(|(k, _)| *k == EventKind::ModelDelta)
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(
+        deltas,
+        [json!({"turn": 1, "effect_key": key.0, "attempt": 1, "text": "a"})]
+    );
 
     // Реплей: квитанция обрыва из журнала, стрим не открывается.
     let mut ctx = RunCtx::resume_at(s.clone(), run, 1, 0);
     let (_tx2, mut sig2) = signal_channel();
-    let again = model_turn(&mut ctx, &j, &m, call(run), &refs(), 1, &mut sig2)
+    let again = model_turn(&mut ctx, &j, m.as_ref(), call(run), &refs(), 1, &mut sig2)
         .await
         .unwrap_err();
     assert!(
-        matches!(
-            again,
-            TurnError::Aborted {
-                signal: Signal::Pause,
-                source: EffectSource::Journal
-            }
-        ),
+        matches!(again, TurnError::Aborted { signal: s, source: EffectSource::Journal } if s == signal),
         "{again:?}"
     );
     assert_eq!(m.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn abort_drops_stream_fast() {
+    abort_with("abort", Signal::Pause).await;
+}
+
+#[tokio::test]
+async fn cancel_aborts_turn() {
+    abort_with("abort-cancel", Signal::Cancel).await;
+}
+
+#[tokio::test]
+async fn input_aborts_turn() {
+    abort_with("abort-input", Signal::Input).await;
+}
+
+#[tokio::test]
+async fn reasoning_and_usage_timings_journaled() {
+    let (s, j, run) = setup("reasoning").await;
+    let m = model();
+    // Первое событие сразу, следующие через 60 мс: длительность больше TTFT.
+    m.push_paced(
+        vec![
+            Ok(StreamEvent::ReasoningDelta("думаю".into())),
+            delta("ответ"),
+            finished(
+                "ответ",
+                FinishReason::Stop,
+                Usage {
+                    output: 12,
+                    ..Usage::default()
+                },
+            ),
+        ],
+        Duration::from_millis(60),
+    );
+    let mut ctx = RunCtx::new(s.clone(), run);
+    ctx.next_step();
+    let k = EffectKey::derive(run, 1, 0).0;
+    let (_tx, mut sig) = signal_channel();
+    let out = model_turn(&mut ctx, &j, &m, call(run), &refs(), 1, &mut sig)
+        .await
+        .unwrap();
+    let ev = loop_events(&s, run).await;
+    let deltas: Vec<&Value> = ev
+        .iter()
+        .filter(|(kind, _)| *kind == EventKind::ModelDelta)
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(
+        deltas,
+        [
+            &json!({"turn": 1, "effect_key": k, "attempt": 1, "reasoning": "думаю"}),
+            &json!({"turn": 1, "effect_key": k, "attempt": 1, "text": "ответ"}),
+        ]
+    );
+    let usage = &ev
+        .iter()
+        .find(|(kind, _)| *kind == EventKind::ModelUsage)
+        .unwrap()
+        .1;
+    let ttft = out.ttft_ms.expect("ttft");
+    assert!(out.duration_ms >= ttft + 100, "{out:?}");
+    assert_eq!(usage["ttft_ms"], ttft);
+    assert_eq!(usage["duration_ms"], out.duration_ms);
+    let tps = za_agent::output_tps(12, Some(ttft), out.duration_ms).unwrap();
+    assert_eq!(usage["output_tps"].as_f64(), Some(tps));
+}
+
+/// Намерение без квитанции (сбой посреди хода): `Idempotent` выполняется заново
+/// вживую под тем же ключом.
+#[tokio::test]
+async fn intent_without_receipt_is_retried_live() {
+    let (s, j, run) = setup("retry").await;
+    let m = model();
+    m.push(vec![finished("a", FinishReason::Stop, Usage::default())]);
+    let key = EffectKey::derive(run, 1, 0);
+    let c = call(run);
+    s.record_intent(
+        run,
+        &key,
+        EffectClass::Idempotent,
+        "model",
+        json!({
+            "endpoint": "local",
+            "request": za_agent::request_hash(&c.request).unwrap(),
+            "prefix": "prefix-hash",
+        }),
+    )
+    .await
+    .unwrap();
+    let mut ctx = RunCtx::resume_at(s.clone(), run, 1, 0);
+    let (_tx, mut sig) = signal_channel();
+    let out = model_turn(&mut ctx, &j, &m, c, &refs(), 1, &mut sig)
+        .await
+        .unwrap();
+    assert_eq!(out.message, text_msg(Role::Assistant, "a"));
+    assert_eq!(m.calls().len(), 1);
+    assert_eq!(
+        s.effect(run, &key).await.unwrap().unwrap().result.unwrap()["outcome"],
+        "ok"
+    );
+}
+
+/// Будущее хода — `Send`: драйвер может его спавнить.
+#[allow(dead_code)]
+fn model_turn_future_is_send(
+    ctx: &mut RunCtx,
+    j: &Journal,
+    m: &ScriptedModel,
+    c: ModelCall,
+    r: &RequestRefs,
+    sig: &mut za_agent::Signals,
+) {
+    fn assert_send<T: Send>(_: &T) {}
+    let f = model_turn(ctx, j, m, c, r, 1, sig);
+    assert_send(&f);
 }
 
 #[tokio::test]
@@ -773,6 +923,46 @@ fn review_invalid_native_args_listed() {
         "{t}"
     );
     assert!(t.contains("content"), "{t}");
+    // Текст уходит модели — английский (D23).
+    assert!(t.is_ascii(), "{t}");
+}
+
+#[test]
+fn review_replacement_ids_are_unique() {
+    let out = output(
+        vec![
+            native("nc-3-1", "read_file", json!({"path": "a"}), None),
+            native("", "read_file", json!({"path": "b"}), None),
+            native("xc-3-0", "read_file", json!({"path": "c"}), None),
+            Part::Text(
+                "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"d\"}}\n</tool_call>"
+                    .into(),
+            ),
+        ],
+        FinishReason::ToolCalls,
+    );
+    let r = review(&out, &tools(), &classes(), 3);
+    assert_eq!(
+        call_ids(&r.assistant),
+        ["nc-3-1", "nc-3-2", "xc-3-0", "xc-3-1"]
+    );
+    assert!(r.calls.iter().all(|c| c.verdict == CallVerdict::Run));
+}
+
+#[test]
+fn review_length_does_not_count_parse_errors() {
+    let out = output(
+        vec![native(
+            "c1",
+            "read_file",
+            Value::Null,
+            Some("{\"path\": \"a"),
+        )],
+        FinishReason::Length,
+    );
+    let r = review(&out, &tools(), &classes(), 1);
+    assert_eq!(r.parse_errors, 0);
+    assert!(reject_text(&r.calls[0].verdict).starts_with("not executed: response cut"));
 }
 
 #[test]
@@ -802,7 +992,7 @@ fn review_unknown_native_tool_keeps_call() {
     assert_eq!(call_ids(&r.assistant), ["c1"]);
     assert_eq!(
         r.calls[0].verdict,
-        CallVerdict::Reject("unknown tool \"raed_fil\"; nearest: write".into())
+        CallVerdict::Reject("unknown tool \"raed_fil\"; nearest: none".into())
     );
 }
 

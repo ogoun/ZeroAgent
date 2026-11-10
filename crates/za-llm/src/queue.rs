@@ -63,6 +63,7 @@ use za_protocol::{Priority, RunId};
 use za_res::{Admission, Need, ResourceSnapshot, Verdict};
 
 use crate::caps::PoolKind;
+use crate::error::queue_code;
 use crate::types::{QueueStatus, WaitState};
 
 /// Число мест облачной группы по умолчанию (RES-004); конфигурация может переопределить
@@ -122,12 +123,12 @@ impl QueueError {
     /// Код варианта без подробностей.
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Cancelled => "cancelled",
-            Self::WaitTimeout => "wait_timeout",
-            Self::BudgetExhausted { .. } => "budget_exhausted",
-            Self::UnknownGroup(_) => "unknown_group",
-            Self::MonitorStopped => "monitor_stopped",
-            Self::RuntimeStopped => "runtime_stopped",
+            Self::Cancelled => queue_code::CANCELLED,
+            Self::WaitTimeout => queue_code::WAIT_TIMEOUT,
+            Self::BudgetExhausted { .. } => queue_code::BUDGET_EXHAUSTED,
+            Self::UnknownGroup(_) => queue_code::UNKNOWN_GROUP,
+            Self::MonitorStopped => queue_code::MONITOR_STOPPED,
+            Self::RuntimeStopped => queue_code::RUNTIME_STOPPED,
         }
     }
 }

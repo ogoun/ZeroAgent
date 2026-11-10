@@ -614,7 +614,7 @@ impl LiveTurn<'_> {
                 self.append(
                     Actor::Model,
                     EventKind::ModelDelta,
-                    json!({"turn": self.turn, "attempt": st.attempt, "restart": reason}),
+                    json!({"turn": self.turn, "effect_key": self.key, "attempt": st.attempt, "restart": reason}),
                 )
                 .await?;
                 // Всё накопленное прежней попыткой отбрасывается (D20 R1-A).
@@ -681,7 +681,7 @@ impl LiveTurn<'_> {
     }
 
     async fn write_delta(&self, attempt: u32, field: &str, chunk: String) -> Result<(), Live> {
-        let mut payload = json!({"turn": self.turn, "attempt": attempt});
+        let mut payload = json!({"turn": self.turn, "effect_key": self.key, "attempt": attempt});
         payload[field] = Value::String(chunk);
         self.append(Actor::Model, EventKind::ModelDelta, payload)
             .await
@@ -856,9 +856,13 @@ const RAW_SHOWN: usize = 200;
 /// D27. `classes` — класс эффекта по имени инструмента. Нативные с пустым id получают `nc-{turn}-{i}` до normalize.
 /// `calls`: нативные в порядке сообщения (принятые и отвергнутые), затем извлечённые из текста и рассуждения.
 ///
-/// Повтор id нативного вызова в одном ответе тоже заменяется на `nc-{turn}-{i}`:
-/// иначе сопоставление отказов по id и фиксация хода (`DuplicateCallId`) ломаются.
+/// Повтор id нативного вызова в одном ответе тоже заменяется: иначе сопоставление
+/// отказов по id и фиксация хода (`DuplicateCallId`) ломаются. Замещающие id
+/// (`nc-{turn}-{k}`, `xc-{turn}-{k}`) уникальны в ответе: номер растёт от `i` (`n`),
+/// пока id занят исходным id ответа или уже выданным.
 /// Инструмент без класса в `classes` считается `NonIdempotent` (строже).
+/// При `finish = Length` неразобранные аргументы не считаются в `parse_errors`:
+/// их обрезал предел вывода, а не формат модели (MDL-018).
 pub fn review(
     out: &TurnOutput,
     tools: &[ToolSchema],
@@ -866,17 +870,27 @@ pub fn review(
     turn: u32,
 ) -> Reviewed {
     let mut msg = out.message.clone();
-    let mut ids: HashSet<String> = HashSet::new();
+    // Исходные id ответа: замещающий id не должен совпасть ни с одним из них.
+    let original: HashSet<String> = msg
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            Part::ToolCall(c) if !c.id.is_empty() => Some(c.id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut used: HashSet<String> = HashSet::new();
     let mut i = 0usize;
     for p in &mut msg.parts {
         if let Part::ToolCall(c) = p {
-            if c.id.is_empty() || ids.contains(&c.id) {
-                c.id = format!("nc-{turn}-{i}");
+            if c.id.is_empty() || used.contains(&c.id) {
+                c.id = fresh_id("nc", turn, i, &original, &used);
             }
-            ids.insert(c.id.clone());
+            used.insert(c.id.clone());
             i += 1;
         }
     }
+    let length = out.finish == FinishReason::Length;
 
     let norm = normalize(&msg, tools, &[]);
     let accepted: HashMap<&str, &NormalizedCall> = norm
@@ -905,7 +919,7 @@ pub fn review(
         }
         let text = match rejected.next() {
             Some(r) => {
-                if matches!(r, CallRejection::Unparseable { .. }) {
+                if !length && matches!(r, CallRejection::Unparseable { .. }) {
                     parse_errors += 1;
                 }
                 rejection_text(r)
@@ -932,7 +946,8 @@ pub fn review(
     {
         repairs += count(nc.repairs.len());
         let mut call = nc.call.clone();
-        call.id = format!("xc-{turn}-{n}");
+        call.id = fresh_id("xc", turn, n, &original, &used);
+        used.insert(call.id.clone());
         let class = classes
             .get(&call.name)
             .copied()
@@ -957,7 +972,9 @@ pub fn review(
     for r in rejected {
         match r {
             CallRejection::Unparseable { raw } => {
-                parse_errors += 1;
+                if !length {
+                    parse_errors += 1;
+                }
                 nudges.push(format!(
                     "Your tool call could not be parsed: {}. Call the tool again with valid JSON arguments.",
                     shown(raw)
@@ -967,7 +984,7 @@ pub fn review(
         }
     }
 
-    if out.finish == FinishReason::Length {
+    if length {
         for c in &mut calls {
             c.verdict = CallVerdict::Reject(LENGTH_CUT.to_owned());
         }
@@ -1035,15 +1052,11 @@ fn assistant_message(
 fn rejection_text(r: &CallRejection) -> String {
     match r {
         CallRejection::UnknownTool { name, nearest } => {
-            let near: Vec<&str> = nearest
-                .iter()
-                .filter(|k| is_near(name, k))
-                .map(String::as_str)
-                .collect();
-            let near = if near.is_empty() {
+            // Порог подсказки — в нормализации (D28, единое правило `za-llm`).
+            let near = if nearest.is_empty() {
                 "none".to_owned()
             } else {
-                near.join(", ")
+                escape_untrusted(&nearest.join(", "))
             };
             format!(
                 "unknown tool \"{}\"; nearest: {}",
@@ -1077,12 +1090,23 @@ fn rejection_text(r: &CallRejection) -> String {
     }
 }
 
-/// Близкое имя для подсказки: есть хоть один общий символ (без учёта регистра).
-/// Полностью чужое имя (`zzz` при `read_file`) подсказкой не считается — модель
-/// получает `nearest: none`. Порядок и отбор до трёх — от нормализации (D28).
-fn is_near(name: &str, known: &str) -> bool {
-    let name = name.to_lowercase();
-    known.to_lowercase().chars().any(|c| name.contains(c))
+/// Замещающий id `{prefix}-{turn}-{k}` с наименьшим `k ≥ from`, не занятый ни
+/// исходными id ответа, ни уже выданными.
+fn fresh_id(
+    prefix: &str,
+    turn: u32,
+    from: usize,
+    original: &HashSet<String>,
+    used: &HashSet<String>,
+) -> String {
+    let mut k = from;
+    loop {
+        let id = format!("{prefix}-{turn}-{k}");
+        if !original.contains(&id) && !used.contains(&id) {
+            return id;
+        }
+        k += 1;
+    }
 }
 
 /// Первые [`RAW_SHOWN`] символов разметки модели, экранированные.
@@ -1132,9 +1156,11 @@ mod tests {
     }
 
     #[test]
-    fn near_names_share_something() {
-        assert!(is_near("raed_fil", "write"));
-        assert!(!is_near("zzz", "read_file"));
+    fn fresh_id_skips_taken() {
+        let original = HashSet::from(["nc-3-1".to_owned(), "nc-3-2".to_owned()]);
+        let used = HashSet::from(["nc-3-3".to_owned()]);
+        assert_eq!(fresh_id("nc", 3, 1, &original, &used), "nc-3-4");
+        assert_eq!(fresh_id("xc", 3, 0, &original, &used), "xc-3-0");
     }
 
     #[test]

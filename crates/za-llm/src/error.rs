@@ -67,6 +67,18 @@ impl ErrorClass {
     }
 }
 
+/// Коды ошибок очереди (`QueueError::code()`): `Gateway` кладёт код в
+/// `ModelError::message` класса [`ErrorClass::Queue`]. Константы доступны без
+/// функций крейта — по ним цикл выбирает причину паузы (R1-B1 D11).
+pub mod queue_code {
+    pub const CANCELLED: &str = "cancelled";
+    pub const WAIT_TIMEOUT: &str = "wait_timeout";
+    pub const BUDGET_EXHAUSTED: &str = "budget_exhausted";
+    pub const UNKNOWN_GROUP: &str = "unknown_group";
+    pub const MONITOR_STOPPED: &str = "monitor_stopped";
+    pub const RUNTIME_STOPPED: &str = "runtime_stopped";
+}
+
 /// Ошибка вызова модели. Сообщение не содержит ключей (SEC-044).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
 #[error("{class:?}: {message}")]

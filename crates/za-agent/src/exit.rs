@@ -6,6 +6,7 @@
 //! как [`LoopExit`].
 
 use za_core::EffectError;
+use za_llm::error::queue_code;
 use za_llm::{ErrorClass, ModelError, WaitState};
 use za_protocol::{BudgetKind, RunStatus, pause_reason};
 
@@ -41,12 +42,12 @@ pub fn exit_for_model_error(e: &ModelError, last_wait: Option<&WaitState>) -> Lo
             pause_reason::PROVIDER
         }
         Queue => match e.message.as_str() {
-            "wait_timeout" => match last_wait {
+            queue_code::WAIT_TIMEOUT => match last_wait {
                 Some(WaitState::WaitingResource { .. }) => pause_reason::RESOURCE,
                 _ => pause_reason::QUEUE,
             },
-            "budget_exhausted" => pause_reason::BUDGET,
-            "monitor_stopped" => pause_reason::RESOURCE,
+            queue_code::BUDGET_EXHAUSTED => pause_reason::BUDGET,
+            queue_code::MONITOR_STOPPED => pause_reason::RESOURCE,
             _ => pause_reason::INTERNAL,
         },
         ContextOverflow => pause_reason::CONTEXT,

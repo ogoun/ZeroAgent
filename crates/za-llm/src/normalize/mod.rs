@@ -77,7 +77,8 @@ pub enum Repair {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallRejection {
-    /// Имя не найдено и не исправимо однозначно; `nearest` — до трёх ближайших.
+    /// Имя не найдено и не исправимо однозначно; `nearest` — до трёх ближайших
+    /// (расстояние ≤ max(длина, 3) / 3 или вызванное имя как подстрока), может быть пуст.
     UnknownTool { name: String, nearest: Vec<String> },
     InvalidArgs {
         name: String,

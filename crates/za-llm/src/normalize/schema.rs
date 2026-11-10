@@ -67,7 +67,8 @@ impl JsonType {
     }
 }
 
-/// Ошибка проверки: `path` — JSON Pointer значения (`""` — корень).
+/// Ошибка проверки: `path` — JSON Pointer значения (`""` — корень). `message` —
+/// на английском: текст уходит модели в результате вызова (R1-B1 D23).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaError {
     pub path: String,
@@ -162,13 +163,13 @@ impl<'a> Cx<'a> {
 
     fn check(&mut self, schema: &Value, value: &mut Value, path: &str, depth: usize) {
         if depth > MAX_DEPTH {
-            self.error(path, "схема слишком глубока или содержит цикл $ref");
+            self.error(path, "schema too deep or contains a $ref cycle");
             return;
         }
         let s = match schema {
             Value::Bool(true) => return,
             Value::Bool(false) => {
-                self.error(path, "схема запрещает любое значение");
+                self.error(path, "schema allows no value");
                 return;
             }
             Value::Object(s) => s,
@@ -204,7 +205,7 @@ impl<'a> Cx<'a> {
                         self.error(
                             path,
                             format!(
-                                "ожидается тип {}, получено {}",
+                                "expected type {}, got {}",
                                 names.join(" | "),
                                 type_name(value)
                             ),
@@ -224,16 +225,13 @@ impl<'a> Cx<'a> {
         {
             self.error(
                 path,
-                format!(
-                    "значение не входит в enum {}",
-                    Value::Array(options.clone())
-                ),
+                format!("value is not one of enum {}", Value::Array(options.clone())),
             );
         }
         if let Some(c) = s.get("const")
             && !json_eq(c, value)
         {
-            self.error(path, format!("ожидается константа {c}"));
+            self.error(path, format!("expected constant {c}"));
         }
 
         self.check_number(s, value, path);
@@ -290,12 +288,12 @@ impl<'a> Cx<'a> {
         if let Some(min) = s.get("minimum").and_then(Value::as_f64)
             && x < min
         {
-            self.error(path, format!("значение меньше minimum {min}"));
+            self.error(path, format!("value is less than minimum {min}"));
         }
         if let Some(max) = s.get("maximum").and_then(Value::as_f64)
             && x > max
         {
-            self.error(path, format!("значение больше maximum {max}"));
+            self.error(path, format!("value is greater than maximum {max}"));
         }
     }
 
@@ -305,12 +303,12 @@ impl<'a> Cx<'a> {
         if let Some(min) = s.get("minLength").and_then(Value::as_u64)
             && len < min
         {
-            self.error(path, format!("строка короче minLength {min}"));
+            self.error(path, format!("string is shorter than minLength {min}"));
         }
         if let Some(max) = s.get("maxLength").and_then(Value::as_u64)
             && len > max
         {
-            self.error(path, format!("строка длиннее maxLength {max}"));
+            self.error(path, format!("string is longer than maxLength {max}"));
         }
     }
 
@@ -320,12 +318,12 @@ impl<'a> Cx<'a> {
         if let Some(min) = s.get("minItems").and_then(Value::as_u64)
             && len < min
         {
-            self.error(path, format!("элементов меньше minItems {min}"));
+            self.error(path, format!("fewer items than minItems {min}"));
         }
         if let Some(max) = s.get("maxItems").and_then(Value::as_u64)
             && len > max
         {
-            self.error(path, format!("элементов больше maxItems {max}"));
+            self.error(path, format!("more items than maxItems {max}"));
         }
         match s.get("items") {
             Some(item_schema @ (Value::Object(_) | Value::Bool(_))) => {
@@ -377,7 +375,7 @@ impl<'a> Cx<'a> {
 
         for r in &required {
             if !obj.contains_key(*r) {
-                self.error(&child(path, r), "отсутствует обязательное поле");
+                self.error(&child(path, r), "missing required field");
             }
         }
         for (k, v) in obj.iter_mut() {
@@ -387,7 +385,7 @@ impl<'a> Cx<'a> {
             } else {
                 match s.get("additionalProperties") {
                     Some(Value::Bool(false)) => {
-                        self.error(&p, "лишнее поле запрещено additionalProperties")
+                        self.error(&p, "unexpected field, additionalProperties is false")
                     }
                     Some(extra @ Value::Object(_)) => self.check(extra, v, &p, depth + 1),
                     _ => {}
@@ -417,10 +415,7 @@ impl<'a> Cx<'a> {
             .count();
         if strict > 0 {
             if one && strict > 1 {
-                self.error(
-                    path,
-                    format!("значение подходит больше чем под один вариант {kw}"),
-                );
+                self.error(path, format!("value matches more than one variant of {kw}"));
             }
             return;
         }
@@ -429,10 +424,7 @@ impl<'a> Cx<'a> {
                 *value = v;
                 self.repairs.extend(repairs);
             }
-            None => self.error(
-                path,
-                format!("значение не подходит ни под один вариант {kw}"),
-            ),
+            None => self.error(path, format!("value matches no variant of {kw}")),
         }
     }
 }
