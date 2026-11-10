@@ -100,7 +100,9 @@ fn file_link(link: &Path, target: &Path) -> Option<()> {
 }
 
 /// Пропуск проверки с сообщением; если переменная `require` равна `1`, пропуск — падение:
-/// доказательство обязательно.
+/// доказательство обязательно. Пропуски бывают только в Windows-тестах (на Unix ссылки
+/// создаются без прав), поэтому помощники — под `cfg(windows)`.
+#[cfg(windows)]
 fn skip_unless(require: &str, why: &str) {
     if std::env::var(require).as_deref() == Ok("1") {
         panic!("{require}=1, а проверка пропущена: {why}");
@@ -110,12 +112,14 @@ fn skip_unless(require: &str, why: &str) {
 
 /// Пропуск теста ссылок (symlink, junction) без прав. `ZA_REQUIRE_LINK_TESTS=1` — в CI:
 /// раннер Windows — администратор, на Linux прав не нужно.
+#[cfg(windows)]
 fn skip(why: &str) {
     skip_unless("ZA_REQUIRE_LINK_TESTS", why);
 }
 
 /// Пропуск теста 8.3: том не создаёт короткие имена. `ZA_REQUIRE_8DOT3=1` — только там,
 /// где том их точно создаёт; в CI не задаётся (том раннера может их не создавать).
+#[cfg(windows)]
 fn skip_8dot3(why: &str) {
     skip_unless("ZA_REQUIRE_8DOT3", why);
 }
