@@ -3,7 +3,7 @@
 //!
 //! [`model_turn`] выполняет один вызов модели как эффект класса `Idempotent` с
 //! аргументами `{endpoint, request, prefix}`. Вживую замыкание слота пишет
-//! `model.request`, читает стрим, склеивает дельты ([`DeltaBuffer`]) в `model.delta`,
+//! `model.request` (с `options` хода и `turn_attempt`, R1-B2 D67), читает стрим, склеивает дельты ([`DeltaBuffer`]) в `model.delta`,
 //! пишет `agent.heartbeat` и, на `Finished`, `model.usage` вместе со строкой `usage`.
 //! Итог хода — квитанция-успех с [`TurnOutput`]; ошибка модели — квитанция-отказ
 //! `model_error:{json}`; обрыв сигналом — `interrupted:pause|cancel|input`. Реплей
@@ -388,6 +388,7 @@ pub async fn model_turn(
         j,
         run: ctx.run_id(),
         turn,
+        turn_attempt: 0,
         key: &key,
         request: &request,
         refs,
@@ -490,6 +491,8 @@ struct LiveTurn<'a> {
     j: &'a Journal,
     run: RunId,
     turn: u32,
+    /// Попытка хода (D67): 0 — первая; повторы D49, D58, D59 — с 1.
+    turn_attempt: u32,
     key: &'a str,
     request: &'a str,
     refs: &'a RequestRefs,
@@ -528,17 +531,27 @@ impl LiveTurn<'_> {
         sig: &mut Signals,
     ) -> Result<TurnOutput, Live> {
         let endpoint = call.endpoint.0.clone();
+        // D67: параметры хода вне истории — по ним инспектор восстанавливает запрос точно.
+        let r = &call.request;
+        let options = json!({
+            "tool_choice": r.tool_choice,
+            "sampling": r.sampling,
+            "max_output_tokens": r.max_output_tokens,
+            "reasoning": r.reasoning,
+        });
         self.append(
             Actor::Runtime,
             EventKind::ModelRequest,
             json!({
                 "turn": self.turn,
+                "turn_attempt": self.turn_attempt,
                 "endpoint": endpoint,
                 "effect_key": self.key,
                 "request": self.request,
                 "prefix": self.refs.prefix,
                 "frozen": self.refs.frozen,
                 "messages": self.refs.messages,
+                "options": options,
                 "prompt_version": PROMPT_VERSION,
             }),
         )

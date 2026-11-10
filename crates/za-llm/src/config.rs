@@ -507,6 +507,12 @@ const SHOWN_FIELDS: &[&str] = &[
     "usd",
     "steps",
     "duration_ms",
+    // `[context]` (R1-B2 D65).
+    "context",
+    "tier",
+    "compact_at",
+    "prune_at",
+    "spill_share",
     "api_key",
     "apikey",
     "key",

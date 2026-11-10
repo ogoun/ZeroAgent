@@ -1,5 +1,6 @@
-//! Конфигурация агента: `ZA_HOME/config.toml`, разделы `[models]`, `[resources]` (D23)
-//! и `[budgets.run]` (бюджет run по умолчанию, R1-B1 D19).
+//! Конфигурация агента: `ZA_HOME/config.toml`, разделы `[models]`, `[resources]` (D23),
+//! `[budgets.run]` (бюджет run по умолчанию, R1-B1 D19) и `[context]` (пороги контекста,
+//! R1-B2 D65).
 //!
 //! Текст ошибки разбора наружу — только [`ConfigParseError`] (белый список: место,
 //! категория, имя известного поля). `Display` ошибки `toml` печатает строку исходника,
@@ -11,6 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use za_agent::{ContextConfig, ContextConfigError};
 use za_llm::config::{ConfigError, ConfigParseError, EndpointConfig, ModelsConfig};
 use za_llm::{BackendKind, EndpointId};
 use za_protocol::Budget;
@@ -33,6 +35,10 @@ pub struct AgentConfig {
     /// `[budgets.run]`: пределы run по умолчанию (R1-B1 D19).
     #[serde(default)]
     pub budgets: BudgetsConfig,
+    /// `[context]`: тир, пороги компакции и удаления, доля выгрузки (R1-B2 D65).
+    /// Незнакомый ключ — ошибка разбора (`deny_unknown_fields` у `ContextConfig`).
+    #[serde(default)]
+    pub context: ContextConfig,
     /// `models` — запасной эндпоинт `local` из `LLAMA_URL`, а не раздел файла.
     #[serde(skip)]
     pub llama_url_fallback: bool,
@@ -68,6 +74,9 @@ pub enum AppConfigError {
         field: &'static str,
         reason: &'static str,
     },
+    /// Значение `[context]` вне диапазона (R1-B2 D65).
+    #[error("{file}: {0}", file = CONFIG_FILE)]
+    Context(ContextConfigError),
 }
 
 /// Читает `home/config.toml`; `LLAMA_URL` — из окружения.
@@ -108,12 +117,14 @@ pub fn parse_config(src: &str) -> Result<AgentConfig, AppConfigError> {
     })
 }
 
-/// Проверка значений: `[models]` (ссылки, D24, D25), `[resources]` и `[budgets.run]`.
+/// Проверка значений: `[models]` (ссылки, D24, D25), `[resources]`, `[budgets.run]` и
+/// `[context]`.
 pub fn validate(cfg: &AgentConfig) -> Result<(), AppConfigError> {
     cfg.resources
         .validate()
         .map_err(AppConfigError::Resources)?;
     validate_budget(&cfg.budgets.run)?;
+    cfg.context.validate().map_err(AppConfigError::Context)?;
     if let Some(m) = &cfg.models {
         // Предупреждения (D34) печатает `Gateway::start` и показывают `models`, `doctor`.
         m.validate().map_err(AppConfigError::Models)?;

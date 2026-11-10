@@ -20,6 +20,7 @@ use za_llm::{
 };
 use za_protocol::{Priority, RunMode, RunRole, Tier, canonical_json};
 
+use crate::context::ContextConfig;
 use crate::conversation::Conversation;
 use crate::prompt::{
     ENV_LIMIT, EnvInfo, PROMPT_VERSION, WorkMode, agents_md_budget, approx_tokens,
@@ -28,7 +29,7 @@ use crate::prompt::{
 };
 
 /// Параметры run, от которых зависит запрос. `tier` и `n_ctx` вычисляет `start_run`
-/// (D37); `tier` замораживается вместе с префиксом (D6).
+/// (D37); `tier` замораживается вместе с префиксом (D6), `context` — на run (D65).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunSetup {
     pub role: RunRole,
@@ -42,6 +43,9 @@ pub struct RunSetup {
     pub max_wait: Option<Duration>,
     pub project_id: String,
     pub project_dir: PathBuf,
+    /// Раздел `[context]`, замороженный на run (R1-B2 D65); у снимка R1-B1 — по умолчанию.
+    #[serde(default)]
+    pub context: ContextConfig,
 }
 
 /// BLAKE3 hex каждого блока префикса: `tools` — от [`render_tools`], остальные — от

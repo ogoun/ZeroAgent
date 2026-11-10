@@ -203,6 +203,10 @@ pub struct ResourcesView {
     pub warnings: Vec<String>,
 }
 
+/// Предел запроса `POST /tokenize` (R1-B2 D41): счётчик контекста не ждёт дольше и
+/// берёт оценку по байтам.
+pub const TOKENIZE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Шлюз к моделям. Clone дешёвый: состояние общее.
 #[derive(Clone)]
 pub struct Gateway {
@@ -504,6 +508,23 @@ impl ModelPort for Gateway {
     /// [`Gateway::finish_run`]: отпечатки run после ошибок разбора забываются.
     fn finish_run(&self, run: RunId) {
         Gateway::finish_run(self, run);
+    }
+
+    /// R1-B2 D41: у llama.cpp — `POST {base}/tokenize {"content": text}`, число
+    /// элементов `tokens` ответа; предел [`TOKENIZE_TIMEOUT`]. У прочих бэкендов, при
+    /// ошибке, 404 или ответе без `tokens` — `None` (`debug`).
+    fn count_tokens<'a>(
+        &'a self,
+        endpoint: &'a EndpointId,
+        text: &'a str,
+    ) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async move {
+            let ep = self.inner.endpoints.get(endpoint)?;
+            if !ep.is_llama() {
+                return None;
+            }
+            self.inner.tokenize(ep, text).await
+        })
     }
 }
 
@@ -1084,6 +1105,56 @@ impl Inner {
                 ErrorClass::Unreachable,
                 format!("эндпоинт {} недоступен: {reason}", ep.cfg.id),
             )
+        }
+    }
+
+    /// `POST {base}/tokenize` llama-server (R1-B2 D41) с ключом запроса модели.
+    async fn tokenize(&self, ep: &Endpoint, text: &str) -> Option<u32> {
+        let secret = match self.secret(ep) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(endpoint = %ep.cfg.id, class = ?e.class, "счёт токенов: нет ключа");
+                return None;
+            }
+        };
+        let url = format!(
+            "{}/tokenize",
+            ep.cfg.effective_base_url().trim_end_matches('/')
+        );
+        let mut headers = crate::http::HeaderMap::new();
+        if let Some(s) = &secret {
+            match s.header_value("Bearer ") {
+                Ok(v) => {
+                    headers.insert(reqwest::header::AUTHORIZATION, v);
+                }
+                Err(e) => {
+                    tracing::debug!(endpoint = %ep.cfg.id, class = ?e.class, "счёт токенов: ключ");
+                    return None;
+                }
+            }
+        }
+        let redact: Vec<&Secret> = secret.iter().collect();
+        let body = serde_json::json!({ "content": text });
+        let fut = ep.http.post_json(&url, headers, &body, &redact);
+        match tokio::time::timeout(TOKENIZE_TIMEOUT, fut).await {
+            Err(_) => {
+                tracing::debug!(endpoint = %ep.cfg.id, "счёт токенов: тайм-аут /tokenize");
+                None
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(endpoint = %ep.cfg.id, class = ?e.class, "счёт токенов: /tokenize не ответил");
+                None
+            }
+            Ok(Ok((v, _))) => {
+                let n = v
+                    .get("tokens")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len);
+                if n.is_none() {
+                    tracing::debug!(endpoint = %ep.cfg.id, "счёт токенов: ответ /tokenize без tokens");
+                }
+                n.and_then(|n| u32::try_from(n).ok())
+            }
         }
     }
 

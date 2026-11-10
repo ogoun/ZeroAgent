@@ -118,3 +118,53 @@ fn readme_budgets_example_is_valid() {
     zero_agent::config::validate(&cfg).unwrap();
     assert_ne!(cfg.budgets.run, za_protocol::Budget::default());
 }
+
+#[test]
+fn readme_context_example_is_valid() {
+    // Пример раздела `[context]` в README проходит разбор и проверку диапазонов.
+    let readme = include_str!("../../../README.md");
+    let start = readme
+        .find("```toml\n[context]")
+        .expect("пример [context] в README");
+    let body = &readme[start + "```toml\n".len()..];
+    let end = body.find("```").expect("конец примера");
+    let cfg = zero_agent::config::parse_config(&body[..end]).unwrap();
+    zero_agent::config::validate(&cfg).unwrap();
+    assert_eq!(cfg.context.tier, Some(za_protocol::Tier::Standard));
+}
+
+/// R1-B2 D65: раздел `[context]` — значения, диапазоны и опечатка ключа.
+#[test]
+fn context_section_is_parsed_and_validated() {
+    use za_protocol::Tier;
+    use zero_agent::config::AppConfigError;
+
+    let h = home("context_ok");
+    std::fs::write(
+        h.join(CONFIG_FILE),
+        "[context]\ntier = \"standard\"\ncompact_at = 0.7\nprune_at = 0.6\nspill_share = 0.2\n",
+    )
+    .unwrap();
+    let cfg = load_config_with(&h, None).unwrap();
+    assert_eq!(cfg.context.tier, Some(Tier::Standard));
+    assert_eq!(cfg.context.compact_at, 0.7);
+    assert_eq!(cfg.context.prune_at, 0.6);
+    assert_eq!(cfg.context.spill_share, 0.2);
+
+    // Без раздела — значения по умолчанию.
+    let cfg = load_config_with(&home("context_default"), None).unwrap();
+    assert_eq!(cfg.context, za_agent::ContextConfig::default());
+
+    // Вне диапазона — ошибка конфигурации с именем поля.
+    let h = home("context_range");
+    std::fs::write(h.join(CONFIG_FILE), "[context]\ncompact_at = 0.85\n").unwrap();
+    let e = load_config_with(&h, None).unwrap_err();
+    assert!(matches!(e, AppConfigError::Context(_)), "{e}");
+    assert!(e.to_string().contains("context.compact_at"), "{e}");
+
+    // Опечатка ключа — ошибка разбора (`deny_unknown_fields`).
+    let h = home("context_typo");
+    std::fs::write(h.join(CONFIG_FILE), "[context]\ncompact_after = 0.75\n").unwrap();
+    let e = load_config_with(&h, None).unwrap_err();
+    assert!(matches!(e, AppConfigError::Parse(_)), "{e}");
+}

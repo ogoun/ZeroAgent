@@ -14,10 +14,12 @@
 //! [`Snapshot`], D4, D5, D18, D31–D33) и управление run ([`RunControl`]: пауза,
 //! отмена, ввод [`InputMode`] и поправка, D25, D26, D36), продолжение run
 //! ([`resume_run`]: реплей после сбоя, выход из паузы и бюджета, блок [`state_block`],
-//! D4–D6, CORE-006, CORE-110). Модель
+//! D4–D6, CORE-006, CORE-110), контекст модели ([`ContextBudget`], [`output_plan`],
+//! [`ContextMeter`], раздел [`ContextConfig`], R1-B2 D40–D43, D65, D66). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod budget;
+mod context;
 mod control;
 mod conversation;
 mod driver;
@@ -31,6 +33,10 @@ mod tools;
 mod turn;
 
 pub use budget::{Spent, check_budget};
+pub use context::{
+    ANSWER_RESERVE, ContextBudget, ContextConfig, ContextConfigError, ContextMeter, Estimate,
+    OutputPlan, UserInput, output_plan, thinking_budget, truncation_suspected,
+};
 pub use control::{ControlRx, InputMode, RunControl, control_channel, submit_input};
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted};
 pub use driver::{CrashHook, CrashPoint, LoopDeps, LoopError, LoopOutcome, RunSpec, start_run};

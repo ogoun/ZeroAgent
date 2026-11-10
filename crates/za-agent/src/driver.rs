@@ -7,8 +7,10 @@
 //!
 //! Граница шага (D32), по порядку: сигналы ([`Signals::drain`]), `next_step`, эффект
 //! `boundary` (ввод, настенное время, расход — D9), активное время (D19), проверка
-//! бюджета (D19, [`check_budget`]), ввод → история, напоминания хуков, `persist`,
-//! `turn.started`, снимок `Model` на его `seq`.
+//! бюджета (D19, [`check_budget`]), ввод → история (и `user_inputs`, R1-B2 D66),
+//! напоминания хуков, эффект `context` — оценка запроса хода (R1-B2 D42), `persist`,
+//! `turn.started`, снимок `Model` на его `seq`. Ход получает лимит вывода из
+//! [`crate::output_plan`] (R1-B2 D40); после хода — проверка тихой обрезки (R1-B2 D43).
 //!
 //! Чистая пауза (D5): событие шага, снимок `{next: Boundary, exit: Some}` на `seq`
 //! этого события, затем статус. Конечные состояния после записи статуса вызывают
@@ -43,13 +45,16 @@ use za_protocol::{
 use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
 use crate::budget::{Spent, budget_number, check_budget};
+use crate::context::{
+    ContextBudget, ContextConfig, Estimate, UserInput, output_plan, truncation_suspected,
+};
 use crate::control::ControlRx;
 use crate::conversation::{Conversation, HistoryError};
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
 use crate::prompt::{
     ControlAction, ControlFrom, EnvInfo, WorkMode, escape_untrusted, reasoning_for, render_control,
-    render_control_trusted,
+    render_control_trusted, render_env,
 };
 use crate::request::{
     FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message, freeze,
@@ -109,6 +114,9 @@ pub struct RunSpec {
     pub agents_md: Option<String>,
     /// os, shell, project_dir, date, branch задаёт вызывающий; tier, n_ctx, budget перезаписывает start_run (D37).
     pub env: EnvInfo,
+    /// Раздел `[context]` (R1-B2 D65): замораживается на run в `RunSetup.context`.
+    /// Тир: `tier` (флаг `--tier`) важнее `context.tier`, тот — размера окна.
+    pub context: ContextConfig,
 }
 
 /// Итог цикла.
@@ -199,6 +207,8 @@ const BOUNDARY_EFFECT: &str = "boundary";
 const STATE_EFFECT: &str = "state";
 /// Имя эффекта снимка памяти шага 0 (D24).
 const MEMORY_EFFECT: &str = "memory.snapshot";
+/// Имя эффекта оценки контекста на границе шага (R1-B2 D42).
+const CONTEXT_EFFECT: &str = "context";
 /// Префикс квитанции-отказа эффекта, у которого внутри не прочитался журнал.
 const STORE_ERROR: &str = "store_error:";
 /// `n_ctx`, если эндпоинт не сообщает размер контекста (D37).
@@ -218,10 +228,11 @@ const EMPTY_NUDGE_SUBAGENT: &str = "Your last response made no tool calls. Conti
 // ---- Шаг 0 ----
 
 /// Создаёт run (role, parent, model_profile = endpoint), queued → running. Шаг 0 (без next_step):
-/// n_ctx = model.context_tokens(&endpoint).unwrap_or(8192) с warn (D37), tier = spec.tier или
-/// Tier::for_context(n_ctx); эффект memory.snapshot (ReadOnly, ключ {run}:0:0); при L0 — memory.unavailable;
-/// freeze, блоб FrozenPrefix (put_blob), первое сообщение, persist; снимок шага 0 {step: 0, next: Boundary,
-/// exit: None} на seq последнего события (D4); затем run_graph с узла boundary.
+/// n_ctx = model.context_tokens(&endpoint), нет значения — 8192 и `context.alert {kind:
+/// "n_ctx_unknown"}` (D37, R1-B2 D43); tier = spec.tier, иначе spec.context.tier, иначе
+/// Tier::for_context(n_ctx) (R1-B2 D65); эффект memory.snapshot (ReadOnly, ключ {run}:0:0); при L0 —
+/// memory.unavailable; freeze, блоб FrozenPrefix (put_blob), первое сообщение, persist; снимок шага 0
+/// {step: 0, next: Boundary, exit: None} на seq последнего события (D4); затем run_graph с узла boundary.
 ///
 /// Неизвестный эндпоинт проверяется до создания run: run не создаётся.
 pub async fn start_run(
@@ -262,15 +273,12 @@ async fn step_zero(
     generation: u64,
 ) -> Result<LoopState, LoopError> {
     let store = deps.journal.store().clone();
-    let n_ctx = match deps.model.context_tokens(&spec.endpoint) {
-        Some(n) => n,
-        None => {
-            tracing::warn!(endpoint = %spec.endpoint.0, n_ctx = DEFAULT_N_CTX,
-                "размер контекста эндпоинта неизвестен, принят по умолчанию");
-            DEFAULT_N_CTX
-        }
-    };
-    let tier = spec.tier.unwrap_or_else(|| Tier::for_context(n_ctx));
+    let known_ctx = deps.model.context_tokens(&spec.endpoint);
+    let n_ctx = known_ctx.unwrap_or(DEFAULT_N_CTX);
+    let tier = spec
+        .tier
+        .or(spec.context.tier)
+        .unwrap_or_else(|| Tier::for_context(n_ctx));
     let setup = RunSetup {
         role: spec.role,
         tier,
@@ -283,6 +291,7 @@ async fn step_zero(
         max_wait: spec.max_wait,
         project_id: spec.project_id.clone(),
         project_dir: spec.project_dir.clone(),
+        context: spec.context.clone(),
     };
     let mut ctx = RunCtx::new(store.clone(), run);
     let mut last_seq = None;
@@ -317,6 +326,11 @@ async fn step_zero(
             .await?,
         );
     }
+    // D43: окно неизвестно — 8192 и событие (после снимка памяти: снимок шага 0 стоит
+    // на этом событии).
+    if known_ctx.is_none() {
+        last_seq = Some(n_ctx_unknown(&deps.journal, run, &spec.endpoint, n_ctx).await?);
+    }
 
     let registry = run_registry(deps)?;
     let (tools, classes) = run_tools_of(&registry, spec.role, tier);
@@ -332,6 +346,7 @@ async fn step_zero(
     env.tier = tier;
     env.n_ctx = n_ctx;
     env.budget = budget_text(&spec.budget);
+    let env_text = render_env(&env);
     let mut conv = Conversation::default();
     conv.push_user(first_message(&env, memory_text.as_deref(), &spec.task))?;
     let refs = conv.persist(&store).await?.refs;
@@ -365,6 +380,10 @@ async fn step_zero(
         exit: None,
         stopping: None,
         at_boundary: AtBoundary::default(),
+        meter: Default::default(),
+        task: spec.task,
+        env_text,
+        user_inputs: Vec::new(),
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
@@ -805,7 +824,9 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
                 }
                 // Текст пользователя — как есть, только управляющий тег экранируется:
                 // ввод не выдаёт себя за голос рантайма (D23).
-                st.conv.push_user(escape_untrusted(text))?;
+                let text = escape_untrusted(text);
+                st.conv.push_user(text.clone())?;
+                push_input(&store_of(deps), st, &text, false).await?;
             }
             Inbox::Correct { note, command, .. } => {
                 st.conv.push_user(render_control(
@@ -814,6 +835,7 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
                     command,
                     note,
                 ))?;
+                push_input(&store_of(deps), st, &escape_untrusted(note), true).await?;
                 // D36: тот же `command`, что в `control.requested`.
                 st.last_seq = append(
                     &deps.journal,
@@ -857,6 +879,9 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
             }
         }
     }
+    // (7') Оценка запроса хода (R1-B2 D42): ввод и напоминания уже в истории.
+    let est = context_effect(deps, st, step, 0).await?;
+    context_thresholds(deps, st, est).await?;
     // (8)–(10) persist, turn.started, снимок `Model` на его seq.
     persist(&store_of(deps), st).await?;
     st.turn += 1;
@@ -914,18 +939,177 @@ async fn state_effect(deps: &LoopDeps, st: &mut LoopState) -> Result<String, Loo
         })
 }
 
-// ---- Узел model ----
+// ---- Контекст (R1-B2) ----
 
-async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopError> {
-    let deps = &sh.deps;
-    let opts = TurnOptions {
+/// Параметры хода: `Required` после второго пустого хода (D18), лимит вывода и
+/// мышление — [`output_plan`] (D40). Одни и те же для оценки на границе и для хода.
+fn turn_options(st: &LoopState) -> TurnOptions {
+    let plan = output_plan(
+        &ContextBudget::for_context(st.setup.n_ctx),
+        &st.setup.reasoning,
+    );
+    TurnOptions {
         tool_choice: if st.counters.forced_required {
             ToolChoice::Required
         } else {
             ToolChoice::Auto
         },
+        max_output_tokens: Some(plan.max_output_tokens),
+        reasoning: plan.reasoning,
         ..TurnOptions::default()
+    }
+}
+
+/// D66: ввод пользователя на шаге (6) границы — блоб текста и индекс его сообщения.
+async fn push_input(
+    store: &ProjectStore,
+    st: &mut LoopState,
+    text: &str,
+    correct: bool,
+) -> Result<(), StoreError> {
+    // Блоб адресуется содержимым: повтор при реплее границы безвреден, как `persist`.
+    let hash = store.put_blob(text.as_bytes()).await?;
+    st.user_inputs.push(UserInput {
+        text: hash,
+        correct,
+        at: st.conv.messages().len().checked_sub(1),
+    });
+    Ok(())
+}
+
+/// Эффект `context` (D42, `ReadOnly`, аргументы `{step, pass}`): оценка запроса хода
+/// по текущей истории ([`crate::ContextMeter::estimate`]). Внешний счётчик токенов
+/// входит в цикл только так: реплей получает ту же оценку и то же решение.
+async fn context_effect(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    step: u64,
+    pass: u32,
+) -> Result<Estimate, LoopError> {
+    let req = build_request(&st.frozen, &st.setup, &st.conv, &turn_options(st));
+    let model = Arc::clone(&deps.model);
+    let ep = st.setup.endpoint.clone();
+    let meter = st.meter.clone();
+    let v = st
+        .ctx
+        .effect(
+            EffectSpec {
+                class: EffectClass::ReadOnly,
+                name: CONTEXT_EFFECT.into(),
+                args: json!({ "step": step, "pass": pass }),
+            },
+            move || async move {
+                let e = meter.estimate(&req, model.as_ref(), &ep).await;
+                serde_json::to_value(e).map_err(|e| format!("оценка не сериализуется: {e}"))
+            },
+        )
+        .await
+        .map_err(effect_err)?;
+    let est: Estimate = serde_json::from_value(v).map_err(|e| {
+        let e = StoreError::Corrupt(format!("квитанция context шага {step}: {e}"));
+        st.ctx.observe::<()>(&Err(EffectError::Store(e.clone())));
+        LoopError::Store(e)
+    })?;
+    st.meter.last_estimate = Some(est.tokens);
+    Ok(est)
+}
+
+/// Пороги по одной мере `оценка + резерв` (D43, D45, D46), резерв — лимит вывода хода.
+/// Удаление старых результатов (задача 2) и компакция (задача 3) ещё не подключены:
+/// превышение порога или ждущая компакция пишут `context.alert {kind: "threshold"}`.
+async fn context_thresholds(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    est: Estimate,
+) -> Result<(), StoreError> {
+    let reserve = turn_options(st).max_output_tokens.unwrap_or(0);
+    let measure = u64::from(est.tokens) + u64::from(reserve);
+    let n_ctx = st.setup.n_ctx;
+    let cfg = &st.setup.context;
+    let at = |share: f32| measure as f64 >= f64::from(share) * f64::from(n_ctx);
+    let prune = at(cfg.prune_at);
+    let compact = at(cfg.compact_at) || st.meter.compact_pending;
+    if prune || compact {
+        tracing::debug!(run = %st.run, measure, n_ctx, prune, compact,
+            "порог контекста достигнут, разгрузка ещё не подключена");
+        st.last_seq = context_alert(
+            &deps.journal,
+            st.run,
+            json!({
+                "kind": "threshold",
+                "estimate": est.tokens,
+                "exact": est.exact,
+                "reserve": reserve,
+                "n_ctx": n_ctx,
+                "prune": prune,
+                "compact": compact,
+            }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// D43: расход хода меньше половины оценки его запроса — сервер, вероятно, срезал
+/// начало промпта: `context.alert {kind: "truncation_suspected"}` и компакция на
+/// ближайшей границе. Расход неизвестен (`input == 0`) — проверки нет.
+async fn check_truncation(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    out: &TurnOutput,
+) -> Result<(), StoreError> {
+    let Some(estimate) = st.meter.last_estimate else {
+        return Ok(());
     };
+    let input = out.usage.input;
+    if !truncation_suspected(estimate, input) {
+        return Ok(());
+    }
+    tracing::warn!(run = %st.run, turn = st.turn, estimate, input,
+        "расход хода меньше половины оценки: подозрение на обрезку контекста сервером");
+    st.last_seq = context_alert(
+        &deps.journal,
+        st.run,
+        json!({
+            "kind": "truncation_suspected",
+            "turn": st.turn,
+            "estimate": estimate,
+            "input": input,
+        }),
+    )
+    .await?;
+    st.meter.compact_pending = true;
+    Ok(())
+}
+
+/// `context.alert {kind: "n_ctx_unknown", endpoint, n_ctx}` (D43): старт run и resume
+/// со сменой эндпоинта.
+pub(crate) async fn n_ctx_unknown(
+    j: &Journal,
+    run: RunId,
+    endpoint: &EndpointId,
+    n_ctx: u32,
+) -> Result<Seq, StoreError> {
+    tracing::debug!(run = %run, endpoint = %endpoint.0, n_ctx,
+        "размер контекста эндпоинта неизвестен, принят по умолчанию");
+    context_alert(
+        j,
+        run,
+        json!({ "kind": "n_ctx_unknown", "endpoint": endpoint.0, "n_ctx": n_ctx }),
+    )
+    .await
+}
+
+/// Событие `context.alert` (D43, D63).
+async fn context_alert(j: &Journal, run: RunId, payload: Value) -> Result<Seq, StoreError> {
+    append(j, run, Actor::Runtime, EventKind::ContextAlert, payload).await
+}
+
+// ---- Узел model ----
+
+async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopError> {
+    let deps = &sh.deps;
+    let opts = turn_options(st);
     let call = ModelCall {
         endpoint: st.setup.endpoint.clone(),
         meta: RequestMeta {
@@ -1002,6 +1186,7 @@ async fn model_output(
     call: &ModelCall,
 ) -> Result<Transition, LoopError> {
     let deps = &sh.deps;
+    check_truncation(deps, st, &out).await?;
     if matches!(
         out.finish,
         FinishReason::Refusal | FinishReason::ContentFilter
@@ -1013,6 +1198,8 @@ async fn model_output(
     let rev = review(&out, &st.tools, &st.classes, st.turn);
     report_parse_errors(deps.model.as_ref(), st.run, call, rev.parse_errors);
     st.conv.commit_turn(out.service, rev.assistant.clone())?;
+    // База счётчика (D41): ход принят, история включает его ответ.
+    st.meter.after_turn(st.conv.messages().len(), &out.usage);
 
     if !rev.calls.is_empty() {
         st.counters.empty_turns = 0;
@@ -1664,6 +1851,7 @@ mod tests {
                 budget: "x".into(),
                 branch: "main".into(),
             },
+            context: ContextConfig::default(),
         };
         store
             .create_run(NewRun {

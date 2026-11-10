@@ -59,6 +59,10 @@ pub mod pause_reason {
     pub const CONTEXT: &str = "context";
     /// Модель отказалась отвечать (`finish = Refusal` или фильтр содержимого).
     pub const REFUSAL: &str = "refusal";
+    /// Подряд ошибки инструментов одного класса (R1-B2 D57).
+    pub const TOOL_ERRORS: &str = "tool_errors";
+    /// Модель зациклилась: повтор текста или бесконечное рассуждение (R1-B2 D58, D59, D61).
+    pub const MODEL_LOOP: &str = "model_loop";
 }
 
 /// Причины ошибки run: поле `reason` события `run.status` при переходе в `failed`.

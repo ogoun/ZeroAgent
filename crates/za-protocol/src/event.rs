@@ -49,6 +49,14 @@ pub enum EventKind {
     BudgetExceeded,
     /// Память недоступна (уровень L0): один раз за run, на шаге 0 (N-16).
     MemoryUnavailable,
+    /// Предупреждение о контексте модели (R1-B2 D43, D62, D70): `kind` — причина.
+    ContextAlert,
+    /// Старые результаты инструментов заменены ссылками на spill (R1-B2 D45).
+    ContextPruned,
+    /// История сжата сводкой (R1-B2 D46); событие помечено `tainted`.
+    ContextCompacted,
+    /// Сработал детектор зацикливания (R1-B2 D54–D61).
+    LoopDetected,
     Unknown(String),
 }
 
@@ -75,6 +83,10 @@ impl EventKind {
             Self::ControlApplied => "control.applied",
             Self::BudgetExceeded => "budget.exceeded",
             Self::MemoryUnavailable => "memory.unavailable",
+            Self::ContextAlert => "context.alert",
+            Self::ContextPruned => "context.pruned",
+            Self::ContextCompacted => "context.compacted",
+            Self::LoopDetected => "loop.detected",
             Self::Unknown(s) => s,
         }
     }
@@ -101,6 +113,10 @@ impl EventKind {
             "control.applied" => Self::ControlApplied,
             "budget.exceeded" => Self::BudgetExceeded,
             "memory.unavailable" => Self::MemoryUnavailable,
+            "context.alert" => Self::ContextAlert,
+            "context.pruned" => Self::ContextPruned,
+            "context.compacted" => Self::ContextCompacted,
+            "loop.detected" => Self::LoopDetected,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -191,10 +207,16 @@ mod tests {
             ControlApplied,
             BudgetExceeded,
             MemoryUnavailable,
+            ContextAlert,
+            ContextPruned,
+            ContextCompacted,
+            LoopDetected,
         ] {
             assert_eq!(EventKind::parse(k.as_str()), k);
         }
         assert_eq!(EventKind::AgentHeartbeat.as_str(), "agent.heartbeat");
+        assert_eq!(EventKind::ContextAlert.as_str(), "context.alert");
+        assert_eq!(EventKind::LoopDetected.as_str(), "loop.detected");
     }
 
     #[test]

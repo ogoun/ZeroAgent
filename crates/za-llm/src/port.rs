@@ -54,6 +54,16 @@ pub trait ModelPort: Send + Sync {
     /// (`ParseGuard`). Цикл вызывает при любом конечном состоянии run. По умолчанию
     /// ничего не делает.
     fn finish_run(&self, _run: RunId) {}
+    /// Точное число токенов `text` токенизатором модели эндпоинта (R1-B2 D41); `None` —
+    /// эндпоинт так не умеет или счёт не удался: вызывающий берёт оценку по байтам. По
+    /// умолчанию — `None`.
+    fn count_tokens<'a>(
+        &'a self,
+        _endpoint: &'a EndpointId,
+        _text: &'a str,
+    ) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async { None })
+    }
 }
 
 /// Guard фоновой задачи стрима: `Drop` вызывает `JoinHandle::abort()` (D2).

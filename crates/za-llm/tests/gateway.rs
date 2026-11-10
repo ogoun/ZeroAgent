@@ -1132,6 +1132,53 @@ async fn context_tokens_from_profile() {
     assert_eq!((v.context_tokens, v.slots), (Some(32768), Some(4)));
 }
 
+/// R1-B2 D41: точный счёт токенов у llama.cpp — `POST /tokenize`; у прочих бэкендов —
+/// `None` без запроса; 404 — `None` сразу, без ожидания тайм-аута.
+#[tokio::test]
+async fn count_tokens_via_llama_tokenize() {
+    let srv = FakeServer::start(vec![
+        (PROPS, vec![props("probe/llama_props.json")]),
+        (
+            "POST /tokenize",
+            vec![Reply::Json(200, json!({"tokens": [1, 2, 3]}))],
+        ),
+    ])
+    .await;
+    let cloud = FakeServer::start(vec![]).await;
+    let cfg = models(json!({
+        "default": "local",
+        "endpoints": [
+            {"id": "local", "backend": "llama_cpp", "base_url": srv.base_url},
+            {"id": "an", "backend": "anthropic", "base_url": cloud.base_url,
+             "model": "claude-opus-5-5", "key_ref": "anthropic"}
+        ]
+    }));
+    let g = start(cfg, "count_tokens", opts()).await;
+    assert_eq!(g.count_tokens(&id("an"), "abc").await, None);
+    assert_eq!(cloud.total_requests(), 0);
+    assert_eq!(g.count_tokens(&id("local"), "abc").await, Some(3));
+    let reqs = srv.requests("POST /tokenize");
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].json(), json!({"content": "abc"}));
+    assert_eq!(g.count_tokens(&id("nope"), "abc").await, None);
+
+    // Сервер без `/tokenize` (404): `None` без ожидания тайм-аута.
+    let bare = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;
+    let g = start(
+        llama_cfg(&bare.base_url, json!({})),
+        "count_tokens_404",
+        opts(),
+    )
+    .await;
+    let t0 = std::time::Instant::now();
+    assert_eq!(g.count_tokens(&id("local"), "abc").await, None);
+    assert!(
+        t0.elapsed() < za_llm::TOKENIZE_TIMEOUT,
+        "404 ждал тайм-аута: {:?}",
+        t0.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn view_serializes() {
     let srv = llama_server(vec![props("probe/llama_props.json")], vec![llama_text()]).await;

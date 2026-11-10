@@ -11,14 +11,16 @@ use za_core::RunCtx;
 use za_llm::ToolSchema;
 use za_protocol::{BlobHash, Budget, BudgetKind, EffectClass, RunId, RunMode, RunStatus, Seq};
 
+use crate::context::{ContextMeter, UserInput};
 use crate::conversation::Conversation;
 use crate::exit::LoopExit;
 use crate::request::{FrozenPrefix, RunSetup};
 use crate::tools::FinishArgs;
 use crate::turn::{Reviewed, Signals};
 
-/// Версия формата снимка.
-pub const SNAPSHOT_V: u32 = 1;
+/// Версия формата снимка: 2 — R1-B2 (D66). Снимок версии 1 (R1-B1) читается: новые
+/// поля — по умолчанию, `resume` восстанавливает их разбором истории.
+pub const SNAPSHOT_V: u32 = 2;
 
 /// С чего resume продолжает run (D4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +57,18 @@ pub struct Snapshot {
     pub inbox_after: u64,
     pub budget: Budget,
     pub counters: Counters,
+    /// Счётчик контекста (D41, D43).
+    #[serde(default)]
+    pub meter: ContextMeter,
+    /// Задача run, как в первом сообщении (D47).
+    #[serde(default)]
+    pub task: String,
+    /// Блок `<env>` первого сообщения (D46).
+    #[serde(default)]
+    pub env_text: String,
+    /// Вводы пользователя по порядку (D47, D48).
+    #[serde(default)]
+    pub user_inputs: Vec<UserInput>,
 }
 
 /// Счётчики цикла, переживающие resume.
@@ -131,10 +145,18 @@ pub struct LoopState {
     pub stopping: Option<RunStatus>,
     /// Изменения resume, ждущие ближайшей границы шага.
     pub at_boundary: AtBoundary,
+    /// Счётчик контекста (D41, D43).
+    pub meter: ContextMeter,
+    /// Задача run, как в первом сообщении (D47).
+    pub task: String,
+    /// Блок `<env>` первого сообщения (D46).
+    pub env_text: String,
+    /// Вводы пользователя по порядку; дописываются на шаге (6) границы (D66).
+    pub user_inputs: Vec<UserInput>,
 }
 
 impl LoopState {
-    /// Снимок текущего состояния; v = 1. История — `refs` последнего `persist`.
+    /// Снимок текущего состояния; v = [`SNAPSHOT_V`]. История — `refs` последнего `persist`.
     pub fn snapshot(&self, next: Next, exit: Option<PendingExit>) -> Snapshot {
         Snapshot {
             v: SNAPSHOT_V,
@@ -150,6 +172,10 @@ impl LoopState {
             inbox_after: self.inbox_after,
             budget: self.budget.clone(),
             counters: self.counters.clone(),
+            meter: self.meter.clone(),
+            task: self.task.clone(),
+            env_text: self.env_text.clone(),
+            user_inputs: self.user_inputs.clone(),
         }
     }
 }

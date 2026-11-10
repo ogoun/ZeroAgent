@@ -437,6 +437,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 endpoint,
                 run_mode: n.run_mode,
                 work_mode: n.work_mode,
+                // Порядок тира (D65): `--tier` > `[context].tier` > по окну; выбирает
+                // `start_run` по `tier` и `context.tier`.
                 tier: n.tier,
                 budget,
                 priority: Priority::Top,
@@ -444,6 +446,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 task: n.task,
                 agents_md,
                 env: env_info(&project),
+                context: cfg.context.clone(),
             };
             let (deps, bus) = deps(&store, &gateway, tools);
             let (ctl, rx) = control_channel(store.clone(), run);

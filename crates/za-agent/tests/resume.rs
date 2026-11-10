@@ -15,9 +15,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use za_agent::{
-    CrashPoint, EnvInfo, LoopDeps, LoopError, LoopOutcome, Next, NoMemory, PendingExit,
-    ResumeChange, RunSpec, Snapshot, builtin_tools, control_channel, resume_run, start_run,
-    state_block,
+    ContextConfig, CrashPoint, EnvInfo, LoopDeps, LoopError, LoopOutcome, Next, NoMemory,
+    PendingExit, ResumeChange, RunSpec, Snapshot, builtin_tools, control_channel, resume_run,
+    start_run, state_block,
 };
 use za_core::{
     AgentEvent, Approval, EventBus, Journal, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
@@ -265,6 +265,7 @@ fn spec(mode: RunMode, budget: Budget) -> RunSpec {
             budget: "x".into(),
             branch: "main".into(),
         },
+        context: ContextConfig::default(),
     }
 }
 
@@ -602,7 +603,8 @@ async fn pause_receipt_without_snapshot_resumes_once() {
     let reqs = of_kind(&evs, EventKind::ModelRequest);
     assert_eq!(
         reqs.last().unwrap().payload["effect_key"],
-        EffectKey::derive(f.run, 2, 1).0
+        // Эффекты шага 2: boundary, context (R1-B2 D42), model.
+        EffectKey::derive(f.run, 2, 2).0
     );
 }
 
@@ -921,7 +923,8 @@ async fn resume_with_more_budget() {
             .last()
             .unwrap()
             .payload["effect_key"],
-        EffectKey::derive(f.run, 4, 2).0
+        // Эффекты шага 4: boundary, state, context (R1-B2 D42), model.
+        EffectKey::derive(f.run, 4, 3).0
     );
 }
 
@@ -1094,13 +1097,142 @@ async fn broken_snapshot_fails_other_version_does_not() {
     // Снимок другой версии: статус не меняется, его может прочитать новая версия.
     let (f, last, _) = paused_run("other_version").await;
     f.store
-        .save_snapshot(f.run, last, json!({"v": 2}))
+        .save_snapshot(f.run, last, json!({"v": 3}))
         .await
         .unwrap();
     let err = resume(&f, ResumeChange::default()).await.unwrap_err();
     assert!(
-        matches!(&err, LoopError::Snapshot(s) if s == "версия снимка 2"),
+        matches!(&err, LoopError::Snapshot(s) if s == "версия снимка 3"),
         "{err:?}"
     );
     assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
+}
+
+// ---- R1-B2, задача 1: снимок версии 2 (D66) и `[context]` на run (D65) ----
+
+/// Снимок версии 2 → снимок R1-B1: `v = 1`, без полей D66 и `setup.context`.
+fn as_v1(snap: &Snapshot) -> Value {
+    let mut v = serde_json::to_value(snap).unwrap();
+    let o = v.as_object_mut().unwrap();
+    o.insert("v".into(), json!(1));
+    for k in ["meter", "task", "env_text", "user_inputs"] {
+        assert!(o.remove(k).is_some(), "в снимке v2 нет поля {k}");
+    }
+    o["setup"].as_object_mut().unwrap().remove("context");
+    v
+}
+
+/// D66: снимок v1 с `next = boundary` продолжается; `task`, `env_text` и
+/// `user_inputs` восстанавливаются разбором истории.
+#[tokio::test]
+async fn snapshot_v1_boundary_continues() {
+    let f = fx("v1_boundary");
+    f.model.push(server_error());
+    assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+    // Ввод пользователя в истории: resume с вводом, снова ошибка провайдера.
+    f.model.push(server_error());
+    let change = ResumeChange {
+        input: Some("ещё <раз>".into()),
+        ..ResumeChange::default()
+    };
+    assert_eq!(resume(&f, change).await.unwrap(), paused("provider"));
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.v, 2);
+    assert_eq!(snap.next, Next::Boundary);
+    assert_eq!(snap.user_inputs.len(), 1);
+    let v1 = as_v1(&snap);
+    let last = events(&f.store, f.run).await.last().unwrap().seq;
+    f.store.save_snapshot(f.run, last, v1).await.unwrap();
+
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    let (_, after) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(after.v, 2);
+    assert_eq!(after.task, "Задача");
+    assert!(after.env_text.starts_with("<env>\n"), "{}", after.env_text);
+    assert!(after.env_text.ends_with("\n</env>"), "{}", after.env_text);
+    assert_eq!(after.setup.context, ContextConfig::default());
+    // Ввод восстановлен из истории: экранированный текст, индекс сообщения.
+    assert_eq!(after.user_inputs.len(), 1, "{:?}", after.user_inputs);
+    let u = &after.user_inputs[0];
+    assert!(!u.correct);
+    assert_eq!(u.at, snap.user_inputs[0].at);
+    let text = f.store.get_blob(&u.text).await.unwrap().unwrap();
+    assert_eq!(String::from_utf8(text).unwrap(), "ещё &lt;раз&gt;");
+    assert_eq!(u, &snap.user_inputs[0]);
+}
+
+/// D66, Ruling M2 R1-B1: снимок v1 посреди шага не продолжается, статус тот же.
+#[tokio::test]
+async fn snapshot_v1_model_is_rejected() {
+    let f = fx("v1_model");
+    f.model.push_open(Vec::new());
+    let mut bus = f.bus.subscribe();
+    let (h, _ctl) = spawn_start(&f, ask());
+    nth_of(&mut bus, EventKind::ModelRequest, 1, |_| true).await;
+    crash(h).await;
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.next, Next::Model);
+    let last = events(&f.store, f.run).await.last().unwrap().seq;
+    f.store
+        .save_snapshot(f.run, last, as_v1(&snap))
+        .await
+        .unwrap();
+    let err = resume(&f, ResumeChange::default()).await.unwrap_err();
+    assert!(
+        matches!(&err, LoopError::Snapshot(s) if s == "снимок R1-B1 посреди шага"),
+        "{err:?}"
+    );
+    assert_eq!(status(&f.store, f.run).await, RunStatus::Running);
+    assert_eq!(f.model.calls().len(), 1);
+}
+
+/// D65: `[context]` замораживается на run: снимок хранит `setup.context`, resume
+/// берёт её из снимка.
+#[tokio::test]
+async fn context_config_frozen_on_run() {
+    let f = fx("context_frozen");
+    let mut s = ask();
+    s.context.compact_at = 0.70;
+    f.model.push(server_error());
+    assert_eq!(start(&f, s).await.unwrap(), paused("provider"));
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.setup.context.compact_at, 0.70);
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    let (_, after) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(after.setup.context.compact_at, 0.70);
+}
+
+/// D43: resume на эндпоинт без размера контекста — 8192 и `context.alert`.
+#[tokio::test]
+async fn resume_to_unknown_window_alerts() {
+    let f = fx("resume_unknown_window");
+    f.model.push(server_error());
+    assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+    let before = of_kind(&events(&f.store, f.run).await, EventKind::ContextAlert)
+        .iter()
+        .filter(|e| e.payload["kind"] == "n_ctx_unknown")
+        .count();
+    f.model.push(answer("ок"));
+    let change = ResumeChange {
+        endpoint: Some(EndpointId("b".into())),
+        ..ResumeChange::default()
+    };
+    assert_eq!(resume(&f, change).await.unwrap(), done("ок"));
+    let evs = events(&f.store, f.run).await;
+    let alerts: Vec<_> = of_kind(&evs, EventKind::ContextAlert)
+        .into_iter()
+        .filter(|e| e.payload["kind"] == "n_ctx_unknown")
+        .collect();
+    assert_eq!(alerts.len(), before + 1);
+    assert_eq!(alerts.last().unwrap().payload["endpoint"], "b");
+    let (_, after) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(after.setup.n_ctx, 8192);
 }

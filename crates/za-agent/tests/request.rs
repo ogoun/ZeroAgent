@@ -28,6 +28,7 @@ fn setup(role: RunRole, tier: Tier, work_mode: Option<WorkMode>) -> RunSetup {
         max_wait: None,
         project_id: "proj-1".into(),
         project_dir: PathBuf::from("H:/p"),
+        context: za_agent::ContextConfig::default(),
     }
 }
 

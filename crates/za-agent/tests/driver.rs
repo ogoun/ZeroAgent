@@ -219,6 +219,7 @@ fn spec(role: RunRole) -> RunSpec {
             budget: "x".into(),
             branch: "main".into(),
         },
+        context: za_agent::ContextConfig::default(),
     }
 }
 
@@ -652,7 +653,12 @@ async fn step0_snapshot_and_memory_unavailable() {
     let evs = events(&f.store, f.run).await;
     let mem = of_kind(&evs, EventKind::MemoryUnavailable);
     assert_eq!(mem.len(), 1);
-    assert_eq!(mem[0].seq, *seq0);
+    // R1-B2 D43: окно неизвестно — `context.alert` после снимка памяти, снимок шага 0
+    // стоит на нём.
+    let alert = of_kind(&evs, EventKind::ContextAlert);
+    assert_eq!(alert[0].payload["kind"], "n_ctx_unknown");
+    assert!(mem[0].seq < alert[0].seq);
+    assert_eq!(alert[0].seq, *seq0);
     // До первого хода: снимок шага 0 раньше turn.started.
     let started = of_kind(&evs, EventKind::TurnStarted);
     assert!(*seq0 < started[0].seq);

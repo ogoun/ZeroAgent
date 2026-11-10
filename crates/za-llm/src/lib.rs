@@ -53,7 +53,7 @@ pub use error::{ErrorClass, ModelError};
 #[cfg(feature = "gateway")]
 pub use gateway::{
     DEFAULT_LOCAL_PARALLEL, DEFAULT_PROBE_DEADLINE, DEFAULT_REPROBE_MAX, DEFAULT_REPROBE_MIN,
-    EndpointView, Gateway, GatewayOptions, ResourcesView, SelectError, Selection,
+    EndpointView, Gateway, GatewayOptions, ResourcesView, SelectError, Selection, TOKENIZE_TIMEOUT,
 };
 #[cfg(feature = "http")]
 pub use http::{EnvSecrets, Secret, SecretSource};

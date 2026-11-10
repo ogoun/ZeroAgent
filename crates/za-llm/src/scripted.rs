@@ -36,6 +36,8 @@ struct Script {
 pub struct ScriptedModel {
     caps: ProviderCapabilities,
     context: Option<u32>,
+    /// Счётчик токенов для `count_tokens`; `None` — счёта нет (как у облачных бэкендов).
+    tokens: Option<fn(&str) -> u32>,
     scripts: Mutex<VecDeque<Script>>,
     calls: Mutex<Vec<ModelCall>>,
     parse_errors: Mutex<Vec<(RunId, ModelCall)>>,
@@ -77,6 +79,7 @@ impl ScriptedModel {
         Self {
             caps,
             context: None,
+            tokens: None,
             scripts: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
             parse_errors: Mutex::new(Vec::new()),
@@ -88,6 +91,12 @@ impl ScriptedModel {
     /// Размер контекста для `context_tokens()`; без вызова — `None`.
     pub fn with_context(mut self, tokens: u32) -> Self {
         self.context = Some(tokens);
+        self
+    }
+
+    /// Счётчик токенов для `count_tokens()`; без вызова — `None` (счёта нет).
+    pub fn with_token_counter(mut self, f: fn(&str) -> u32) -> Self {
+        self.tokens = Some(f);
         self
     }
 
@@ -204,6 +213,15 @@ impl ModelPort for ScriptedModel {
     fn finish_run(&self, run: RunId) {
         lock(&self.finished).push(run);
     }
+
+    fn count_tokens<'a>(
+        &'a self,
+        _endpoint: &'a EndpointId,
+        text: &'a str,
+    ) -> BoxFuture<'a, Option<u32>> {
+        let n = self.tokens.map(|f| f(text));
+        Box::pin(async move { n })
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +314,9 @@ mod tests {
         );
         let m = m.with_context(32768);
         assert_eq!(m.context_tokens(&ep), Some(32768));
+        assert_eq!(m.count_tokens(&ep, "abcd").await, None);
+        let m = m.with_token_counter(|s| s.len() as u32);
+        assert_eq!(m.count_tokens(&ep, "abcd").await, Some(4));
     }
 
     #[tokio::test]

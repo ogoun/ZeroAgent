@@ -214,6 +214,7 @@ fn spec(budget: Budget) -> RunSpec {
             budget: "x".into(),
             branch: "main".into(),
         },
+        context: za_agent::ContextConfig::default(),
     }
 }
 
