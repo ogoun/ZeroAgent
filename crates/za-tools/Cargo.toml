@@ -1,0 +1,31 @@
+[package]
+name = "za-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-tools"
+
+[lints]
+workspace = true
+
+# Нативные инструменты (R1-C1 D73, D74, D87): `read`, `search`, `glob`. Из крейтов
+# workspace — только `za-protocol`, `za-core`, `za-jail` (проверяет `cargo xtask policy`).
+[dependencies]
+za-protocol = { path = "../za-protocol" }
+za-core = { path = "../za-core" }
+# Хэш содержимого у трекера чтений (раздел 4.1 ТЗ 02, D87).
+blake3.workspace = true
+globset.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `rt` — `spawn_blocking`: вся работа с ФС идёт вне потоков tokio.
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

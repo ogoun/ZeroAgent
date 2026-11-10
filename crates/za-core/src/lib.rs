@@ -50,6 +50,9 @@ pub use tool::{
     Access, Approval, DuplicateTool, Gate, Postcondition, RawPath, RiskClass, Subjects, Tool,
     ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
 };
+/// Схема инструмента для модели (поле [`ToolSpec::schema`]): крейты инструментов
+/// (`za-tools`) строят её без зависимости от `za-llm`.
+pub use za_llm::ToolSchema;
 /// Прежнее имя причины паузы; значение живёт в [`za_protocol::pause_reason`].
 pub use za_protocol::pause_reason::NEEDS_DECISION;
 /// Разбор команд оболочки (D81, D99) — крейт `za-shell`.

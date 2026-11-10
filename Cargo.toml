@@ -85,3 +85,21 @@ nix = { version = "=0.31.3", default-features = false, features = ["signal", "pr
 # Только Windows (`za-jail`): тип флагов создания процесса для `CreationFlags`
 # (`CREATE_NO_WINDOW`). Крейт уже в дереве через `process-wrap` и `sysinfo`, новых крейтов нет.
 windows = { version = "=0.62.2", features = ["Win32_System_Threading"] }
+# Обход дерева у `search` и `glob` (`za-tools`, R1-C1 D73, D87): `.gitignore`, `.ignore` и
+# `.git/info/exclude` без git в `PATH`, без чтения родительских каталогов, без перехода по
+# ссылкам. Последняя 0.4.x, вышедшая не меньше двух недель назад (2026-10-27); лицензия
+# Unlicense OR MIT. Требует `globset ^0.4.18`, поэтому версия `globset` ниже общая.
+ignore = "=0.4.34"
+# Шаблоны `glob` и фильтр `search` (D73, D87); та же версия пойдёт правилам политики `za-agent`
+# (D80, Ruling 6/globset). Лицензия Unlicense OR MIT.
+globset = "=0.4.20"
+# Построчный поиск `search` (D73, D87): двоичные файлы пропускаются по NUL, BOM UTF-16
+# распознаётся. Последняя 0.1.x старше двух недель (2026-07-15); лицензия Unlicense OR MIT,
+# транзитивный `encoding_rs` — (Apache-2.0 OR MIT) AND BSD-3-Clause (разрешена в `deny.toml`).
+grep-searcher = "=0.1.17"
+# Регулярные выражения `search` поверх `regex-automata` (уже в Cargo.lock). Последняя 0.1.x
+# (2025-10-16); лицензия Unlicense OR MIT.
+grep-regex = "=0.1.14"
+# Только тип `LineTerminator`: CRLF у поиска и выражения `search` должен совпадать (`$` перед
+# `\r\n` в файлах Windows). Крейт и так приходит через `grep-searcher`, новых крейтов не добавляет.
+grep-matcher = "=0.1.9"
