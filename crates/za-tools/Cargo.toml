@@ -14,6 +14,8 @@ workspace = true
 [dependencies]
 za-protocol = { path = "../za-protocol" }
 za-core = { path = "../za-core" }
+# Запуск команд `bash` — только через `za_jail::Runner` (SEC-006, D84, D85).
+za-jail = { path = "../za-jail" }
 # Хэш содержимого у трекера чтений (раздел 4.1 ТЗ 02, D87).
 blake3.workspace = true
 globset.workspace = true

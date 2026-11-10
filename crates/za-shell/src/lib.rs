@@ -123,6 +123,12 @@ pub fn argv0(seg: &Segment) -> Option<String> {
     analyze(&seg.argv, Lang::Pwsh).map(|c| c.name)
 }
 
+/// Имя команды, как у [`argv0`], и её аргументы после имени (сжатие вывода D86 узнаёт
+/// подкоманду: `cargo test`, `git diff`). `None` — команды нет.
+pub fn command_args(seg: &Segment) -> Option<(String, Vec<String>)> {
+    analyze(&seg.argv, Lang::Pwsh).map(|c| (c.name, c.args))
+}
+
 /// Слова сегмента, похожие на путь наружу (D77, best effort): абсолютные пути, `~`,
 /// компонент `..`, цели перенаправлений, аргументы `cd`, `Set-Location`, `pushd`,
 /// `git -C`, файлы `git config --global|--system|--file`. Слова с `~` вызывающий

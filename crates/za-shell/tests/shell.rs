@@ -6,8 +6,8 @@
 //! молчат). Каждый случай — строка таблицы с текстом команды в сообщении о падении.
 
 use za_shell::{
-    Dialect, Segment, argv0, irreversible, is_network, is_simple, path_words, reads_network,
-    segments,
+    Dialect, Segment, argv0, command_args, irreversible, is_network, is_simple, path_words,
+    reads_network, segments,
 };
 
 const B: Dialect = Dialect::Bash;
@@ -271,6 +271,19 @@ fn argv0_strips_wrappers_path_case_and_exe() {
     ] {
         assert_eq!(argv0(&seg0(c, d)).as_deref(), n, "{c}");
     }
+}
+
+#[test]
+fn command_args_follow_the_name() {
+    let s = seg0("env A=1 timeout 10 cargo test -p za-core", B);
+    assert_eq!(
+        command_args(&s),
+        Some((
+            "cargo".to_owned(),
+            vec!["test".into(), "-p".into(), "za-core".into()]
+        ))
+    );
+    assert_eq!(command_args(&seg0("A=1", B)), None);
 }
 
 #[test]

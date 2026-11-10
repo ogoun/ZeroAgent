@@ -2260,6 +2260,7 @@ dependencies = [
  "tokio",
  "tracing",
  "za-core",
+ "za-jail",
  "za-protocol",
 ]
 

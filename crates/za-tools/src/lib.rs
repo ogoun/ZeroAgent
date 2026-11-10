@@ -20,8 +20,16 @@
 //! `Idempotent`, риск `LocalWrite`. Правят только прочитанный и не изменившийся файл
 //! (трекер по каноническому пути), толерантный патчер [`apply`] и защита от перезаписи
 //! [`shrink_guard`], запись — атомарная, по каноническому пути, через `za_core::paths`;
-//! повтор после сбоя — по маркеру `work_dir("edits")/<file_stem>.json`.
+//! повтор после сбоя — по маркеру `ZA_HOME/projects/<project_id>/edits/<file_stem>.json`.
+//!
+//! `bash` ([`bash_tool`], D85): вид `Exec`, класс `NonIdempotent`, риск `Exec` (по вызову —
+//! метки необратимости D81 в предметах). Запуск только через `za_jail::Runner`; ненулевой
+//! код выхода — данные, ошибка — только сбой запуска и тайм-аут. Предметы вызова — разбор
+//! [`za_core::shell`]; решение принимает политика. Сжатие вывода по типу — [`digest()`]
+//! (D86).
 
+mod bash;
+mod digest;
 mod edit;
 mod fs;
 mod nearest;
@@ -32,6 +40,10 @@ mod tracker;
 #[path = "../../../test-support/unique_dir.rs"]
 mod unique_dir;
 
+pub use bash::{
+    BASH_DEFAULT_TIMEOUT_S, BASH_MAX_TIMEOUT_S, Shell, bash_tool, format_output, powershell_encoded,
+};
+pub use digest::digest;
 pub use edit::{
     EditHome, EditHook, EditPoint, clean_edit_leftovers, clean_leftovers_older, edit_tool,
     edit_tool_with_hook, multi_edit_tool, multi_edit_tool_with_hook,
