@@ -27,9 +27,9 @@ const WORK_GITIGNORE: &str = "*\n";
 /// Доля головы в лимите, проценты (D44); хвост — остаток.
 const HEAD_PERCENT: usize = 60;
 /// Начало строки-указателя пропуска.
-const OMITTED: &str = "… omitted ";
+pub(crate) const OMITTED: &str = "… omitted ";
 /// Указатель на файл выгрузки: `search <путь>`; перед ним в строке пропуска — `; `.
-const SEARCH: &str = "search ";
+pub(crate) const SEARCH: &str = "search ";
 /// Указатель, если файл выгрузки записать не удалось.
 pub(crate) const NOT_SAVED: &str = "full output not saved";
 

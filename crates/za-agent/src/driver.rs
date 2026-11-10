@@ -230,11 +230,11 @@ const EMPTY_TURNS_LIMIT: u32 = 3;
 const INBOX_PAGE: usize = 512;
 
 /// Nudge пустого хода top (D18, D23).
-const EMPTY_NUDGE_TOP: &str = "Your last response had no text and no tool calls. Continue the task: answer the user or call a tool.";
+pub(crate) const EMPTY_NUDGE_TOP: &str = "Your last response had no text and no tool calls. Continue the task: answer the user or call a tool.";
 /// Nudge обрезанного ответа: текст без вызовов с `finish = Length` (решение контроллера, I2).
-const TRUNCATED_NUDGE: &str = "Your previous reply was cut off by the output limit. Continue more briefly or split the answer into parts.";
+pub(crate) const TRUNCATED_NUDGE: &str = "Your previous reply was cut off by the output limit. Continue more briefly or split the answer into parts.";
 /// Nudge пустого хода worker и orchestrator (D18, D23).
-const EMPTY_NUDGE_SUBAGENT: &str = "Your last response made no tool calls. Continue the task with tool calls; when the work is done, partly done or blocked, call finish.";
+pub(crate) const EMPTY_NUDGE_SUBAGENT: &str = "Your last response made no tool calls. Continue the task with tool calls; when the work is done, partly done or blocked, call finish.";
 
 // ---- Шаг 0 ----
 
@@ -434,7 +434,7 @@ pub(crate) fn run_tools_of(
 }
 
 /// Бюджет для `<env>`: `steps 50, tokens 1000`; без пределов — `-`.
-fn budget_text(b: &Budget) -> String {
+pub(crate) fn budget_text(b: &Budget) -> String {
     let mut parts = Vec::new();
     if let Some(n) = b.steps {
         parts.push(format!("steps {n}"));

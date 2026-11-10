@@ -48,14 +48,14 @@ pub const FINISH_TOOL: &str = "finish";
 /// Имя встроенного инструмента вопроса пользователю (D17).
 pub const ASK_USER_TOOL: &str = "ask_user";
 /// Синтетический результат `finish` (D17).
-const FINISH_OK: &str = "ok";
+pub(crate) const FINISH_OK: &str = "ok";
 /// Текст квитанции-отказа при ошибке журнала внутри слота: при реплее он уходит
 /// модели, поэтому по-английски и без подробностей (они — в `tracing`).
-const JOURNAL_FAILED: &str = "internal error: journal write failed";
+pub(crate) const JOURNAL_FAILED: &str = "internal error: journal write failed";
 /// Квитанция вызова, вывод которого потерян при остановке рантайма во время выгрузки.
-const OUTPUT_LOST: &str = "internal error: tool output lost";
+pub(crate) const OUTPUT_LOST: &str = "internal error: tool output lost";
 /// Результат вызовов пакета после принятого `finish`: они не исполняются.
-const AFTER_FINISH: &str = "not executed: run finished by finish";
+pub(crate) const AFTER_FINISH: &str = "not executed: run finished by finish";
 
 /// Аргументы `finish` (D17, часть 02, 5.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

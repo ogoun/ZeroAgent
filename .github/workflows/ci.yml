@@ -42,4 +42,7 @@ jobs:
       # за http/gateway в нём при --workspace прошёл бы незамеченным.
       - run: cargo check -p za-agent --locked
       - run: cargo --locked xtask policy
+      # Лимиты фиксированных промптов токенизаторами cl100k и o200k (PRM-007, D64); сеть
+      # не нужна: словари встроены в tiktoken-rs, точный счёт `--llama` — вручную.
+      - run: cargo --locked xtask prompt-budget
       - run: cargo deny --locked check

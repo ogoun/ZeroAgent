@@ -14,7 +14,7 @@ use za_llm::{Effort, ReasoningMode};
 use za_protocol::{RunId, RunRole, Tier};
 
 /// Версия набора промптов; входит в `FrozenPrefix` и `model.request` (PRM-010).
-pub const PROMPT_VERSION: &str = "r1b.1";
+pub const PROMPT_VERSION: &str = "r1b.2";
 
 /// Лимит блока `<env>`, токены (PRM-002: «top small ≤ 800 + `<env>` ≤ 200»).
 pub const ENV_LIMIT: u32 = 200;
@@ -88,14 +88,73 @@ pub fn prompt_files() -> &'static [(&'static str, &'static str)] {
     PROMPT_FILES
 }
 
-/// BLAKE3 hex всех текстов `prompts/` в порядке имён файлов (PRM-010).
+/// Постоянные тексты рантайма, которые уходят модели, в порядке имён: `(имя, текст)`.
 ///
-/// Формат: метка `za-prompts-v1\0`, затем для каждого файла длина (u64 LE) и байты
-/// имени, длина и байты текста — граница между файлами однозначна.
+/// Рубрика компакции, nudge, тексты результатов-отказов и неизменные части
+/// указателей и сводки (решение контроллера по Carry задачи 3 R1-B2). Входят в
+/// [`prompt_texts_hash`]: их правка видна как смена версии промптов (PRM-010). Лимита
+/// токенов у них нет — в приложении A его нет. Описания встроенных инструментов сюда
+/// не входят: они в префиксе (`BlockHashes::tools`).
+const RUNTIME_TEXTS: &[(&str, &str)] = &[
+    ("runtime/compact.clipped", crate::context::CLIPPED),
+    (
+        "runtime/compact.no_user_messages",
+        crate::context::NO_USER_MESSAGES,
+    ),
+    ("runtime/compact.recitation", crate::context::RECITATION),
+    (
+        "runtime/compact.recite_in_tail",
+        crate::context::RECITE_IN_TAIL,
+    ),
+    ("runtime/compact.rubric", crate::context::COMPACT_RUBRIC),
+    (
+        "runtime/conversation.interrupted",
+        crate::conversation::INTERRUPTED,
+    ),
+    (
+        "runtime/driver.empty_nudge_subagent",
+        crate::driver::EMPTY_NUDGE_SUBAGENT,
+    ),
+    (
+        "runtime/driver.empty_nudge_top",
+        crate::driver::EMPTY_NUDGE_TOP,
+    ),
+    (
+        "runtime/driver.truncated_nudge",
+        crate::driver::TRUNCATED_NUDGE,
+    ),
+    ("runtime/spill.not_saved", crate::context::SPILL_NOT_SAVED),
+    ("runtime/spill.omitted", crate::context::SPILL_OMITTED),
+    ("runtime/spill.search", crate::context::SPILL_SEARCH),
+    ("runtime/tools.after_finish", crate::tools::AFTER_FINISH),
+    ("runtime/tools.finish_ok", crate::tools::FINISH_OK),
+    ("runtime/tools.journal_failed", crate::tools::JOURNAL_FAILED),
+    ("runtime/tools.output_lost", crate::tools::OUTPUT_LOST),
+    ("runtime/turn.blocked", crate::turn::BLOCKED),
+    ("runtime/turn.length_cut", crate::turn::LENGTH_CUT),
+    (
+        "runtime/turn.length_cut_nudge",
+        crate::turn::LENGTH_CUT_NUDGE,
+    ),
+    ("runtime/turn.mutation_nudge", crate::turn::MUTATION_NUDGE),
+];
+
+/// Постоянные тексты рантайма, уходящие модели: `(имя, текст)` в порядке имён.
+pub fn runtime_texts() -> &'static [(&'static str, &'static str)] {
+    RUNTIME_TEXTS
+}
+
+/// BLAKE3 hex всех текстов, уходящих модели без подстановки (PRM-010): файлы
+/// `prompts/` в порядке имён, затем [`runtime_texts`].
+///
+/// Формат: метка `za-prompts-v2\0`, затем для каждого текста длина (u64 LE) и байты
+/// имени, длина и байты текста — граница между текстами однозначна, имена файлов
+/// (`*.txt`) и текстов рантайма (`runtime/…`) не пересекаются. В `v1` (R1-B1) текстов
+/// рантайма не было.
 pub fn prompt_texts_hash() -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"za-prompts-v1\0");
-    for (name, text) in PROMPT_FILES {
+    h.update(b"za-prompts-v2\0");
+    for (name, text) in PROMPT_FILES.iter().chain(RUNTIME_TEXTS) {
         for part in [name.as_bytes(), text.as_bytes()] {
             h.update(&(part.len() as u64).to_le_bytes());
             h.update(part);
@@ -493,6 +552,134 @@ pub fn role_limit(role: RunRole, tier: Tier) -> u32 {
 /// сообщения, как `<task>`).
 pub fn env_in_role_limit(role: RunRole, tier: Tier) -> bool {
     role == RunRole::Top && tier != Tier::Small
+}
+
+/// Слот описаний инструментов в префиксе top small, токены: строка 8k таблицы 2.3
+/// части 02 (D64).
+const SMALL_TOOLS_SLOT: u32 = 550;
+
+/// Случай CI-проверки лимита промптов (PRM-007, D64): имя, текст и лимит в токенах.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetCase {
+    pub name: String,
+    pub text: String,
+    pub limit: u32,
+}
+
+/// `<env>` с максимальной подстановкой (PRM-007): длинные ОС, оболочка, путь и ветка,
+/// окно 1M и бюджет со всеми пятью пределами на максимумах их типов.
+pub fn max_env() -> EnvInfo {
+    let budget = za_protocol::Budget {
+        steps: Some(u32::MAX),
+        tokens: Some(u64::MAX),
+        gpu_ms: Some(u64::MAX),
+        usd: Some(f64::MAX),
+        duration_ms: Some(u64::MAX),
+    };
+    EnvInfo {
+        os: "Windows 11 Pro for Workstations 10.0.26300 x86_64".into(),
+        shell: "powershell 5.1.26100.1".into(),
+        project_dir: format!("H:/Documents/GitHub/{}", "x".repeat(100)),
+        date: "2026-11-09".into(),
+        tier: Tier::Standard,
+        n_ctx: 1_048_576,
+        budget: crate::driver::budget_text(&budget),
+        branch: "b".repeat(BRANCH_MAX_CHARS),
+    }
+}
+
+/// Все режимы с их именами в случаях [`budget_cases`].
+const MODES: [(WorkMode, &str); 4] = [
+    (WorkMode::Coder, "coder"),
+    (WorkMode::Researcher, "researcher"),
+    (WorkMode::Operator, "operator"),
+    (WorkMode::Writer, "writer"),
+];
+
+/// Блоки 2–5 так, как они стоят в system-сообщении: Core и overlay (адаптер пуст,
+/// PRM-009; `AGENTS.md` — недоверенные данные, считается в рантайме [`upper_tokens`]).
+fn system_of(role: RunRole, overlay: Option<WorkMode>) -> String {
+    za_llm::render_system(&za_llm::PromptBlocks {
+        core: role_core(role).to_owned(),
+        overlay: overlay.map(mode_overlay).unwrap_or_default().to_owned(),
+        ..Default::default()
+    })
+}
+
+/// Случаи CI-лимита (D64), лимиты — [`role_limit`], [`ENV_LIMIT`], [`MODE_LIMIT`]:
+/// - `top/small/core` — Core top (800); `env/max` — `render_env(max_env())` (200,
+///   регрессия: [`render_env`] и так режет блок до 200 байт);
+/// - `mode/{coder,researcher,operator,writer}` — overlay (500);
+/// - `top/{standard,full}` и `top/{standard,full}/{mode}` — system (Core и overlay),
+///   `"\n\n"` и `render_env(max_env())` (2000, 3000);
+/// - `orchestrator`, `orchestrator/{mode}` (500), `worker`, `worker/{mode}` (300) — Core
+///   вместе с overlay;
+/// - `top/small/prefix` — system top small с самым длинным overlay и описания
+///   встроенных инструментов tier small (`render_tools`): 800 + 500 + 550 = 1850 (Core,
+///   слот overlay, Tools строки 8k таблицы 2.3). Встроенные инструменты берутся все,
+///   доступные на small при любой роли: консервативно, top small их сам не получает.
+pub fn budget_cases() -> Vec<BudgetCase> {
+    let case = |name: String, text: String, limit: u32| BudgetCase { name, text, limit };
+    let env = render_env(&max_env());
+    let mut out = vec![
+        case(
+            "top/small/core".into(),
+            role_core(RunRole::Top).to_owned(),
+            role_limit(RunRole::Top, Tier::Small),
+        ),
+        case("env/max".into(), env.clone(), ENV_LIMIT),
+    ];
+    for (m, name) in MODES {
+        out.push(case(
+            format!("mode/{name}"),
+            mode_overlay(m).to_owned(),
+            MODE_LIMIT,
+        ));
+    }
+    let overlays = std::iter::once((None, String::new()))
+        .chain(MODES.map(|(m, name)| (Some(m), format!("/{name}"))))
+        .collect::<Vec<_>>();
+    for (tier, tier_name) in [(Tier::Standard, "standard"), (Tier::Full, "full")] {
+        for (m, suffix) in &overlays {
+            out.push(case(
+                format!("top/{tier_name}{suffix}"),
+                format!("{}\n\n{env}", system_of(RunRole::Top, *m)),
+                role_limit(RunRole::Top, tier),
+            ));
+        }
+    }
+    for (role, role_name) in [
+        (RunRole::Orchestrator, "orchestrator"),
+        (RunRole::Worker, "worker"),
+    ] {
+        for (m, suffix) in &overlays {
+            out.push(case(
+                format!("{role_name}{suffix}"),
+                system_of(role, *m),
+                role_limit(role, Tier::Small),
+            ));
+        }
+    }
+    let longest = MODES
+        .iter()
+        .map(|(m, _)| *m)
+        .max_by_key(|m| mode_overlay(*m).len())
+        .unwrap_or(WorkMode::Coder);
+    let tools = crate::tools::builtin_tools()
+        .iter()
+        .filter(|t| t.spec().min_tier <= Tier::Small)
+        .map(|t| t.spec().schema.clone())
+        .collect();
+    let tools = za_llm::render_tools(&za_llm::PromptBlocks {
+        tools,
+        ..Default::default()
+    });
+    out.push(case(
+        "top/small/prefix".into(),
+        format!("{}\n\n{tools}", system_of(RunRole::Top, Some(longest))),
+        role_limit(RunRole::Top, Tier::Small) + MODE_LIMIT + SMALL_TOOLS_SLOT,
+    ));
+    out
 }
 
 /// Предел блока `AGENTS.md`, токены: «`AGENTS.md` и резерв ≤ 700» распределения Full

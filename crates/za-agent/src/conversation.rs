@@ -36,7 +36,7 @@ use crate::context::message_text;
 use crate::prompt::approx_tokens;
 
 /// Содержимое синтетического результата прерванного вызова (CORE-105).
-const INTERRUPTED: &str = "interrupted: call not executed";
+pub(crate) const INTERRUPTED: &str = "interrupted: call not executed";
 
 /// Нарушение инвариантов истории.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

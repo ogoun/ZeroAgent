@@ -45,13 +45,13 @@ const NEXT_STEP: &str = "## Next step";
 /// Хвост с активного запроса — не больше `n_ctx / 5` (20 %, D48).
 const TAIL_DIVISOR: u32 = 5;
 /// Начало текста рецитации (CTX-014, D48).
-const RECITATION: &str = "Current task: ";
+pub(crate) const RECITATION: &str = "Current task: ";
 /// Рецитация, когда активный запрос целиком в хвосте (m-B): текст не повторяется.
-const RECITE_IN_TAIL: &str = "the latest user message above.";
+pub(crate) const RECITE_IN_TAIL: &str = "the latest user message above.";
 /// Пометка обрезанной рецитации.
-const CLIPPED: &str = " …[truncated]";
+pub(crate) const CLIPPED: &str = " …[truncated]";
 /// Раздел `## User messages` без вводов.
-const NO_USER_MESSAGES: &str = "none";
+pub(crate) const NO_USER_MESSAGES: &str = "none";
 /// Вводы пользователя в сводке — не больше `n_ctx / 4` токенов (25 %, Ruling minor).
 const USER_MESSAGES_DIVISOR: u32 = 4;
 /// Аварийный хвост — не больше `n_ctx / 10` (Ruling I-1: бюджет меньше обычного).

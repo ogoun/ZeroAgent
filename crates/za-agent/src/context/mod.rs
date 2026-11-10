@@ -21,11 +21,16 @@ mod compact;
 mod prune;
 mod spill;
 
+pub(crate) use compact::{
+    CLIPPED, MEMORY_BEFORE_EFFECT, NO_USER_MESSAGES, RECITATION, RECITE_IN_TAIL, rubric_tokens,
+};
 pub use compact::{COMPACT_RUBRIC, CompactInput, Compacted, compact, summary_block};
-pub(crate) use compact::{MEMORY_BEFORE_EFFECT, rubric_tokens};
 pub use prune::prune;
 pub(crate) use prune::{PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES};
-pub(crate) use spill::{NOT_SAVED as SPILL_NOT_SAVED, cut as spill_cut};
+pub(crate) use spill::{
+    NOT_SAVED as SPILL_NOT_SAVED, OMITTED as SPILL_OMITTED, SEARCH as SPILL_SEARCH,
+    cut as spill_cut,
+};
 pub use spill::{SPILL_DIR, SpillCfg, SpillResult, spill, spill_limit_bytes, spill_name};
 
 use serde::{Deserialize, Serialize};

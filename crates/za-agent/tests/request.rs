@@ -290,14 +290,17 @@ fn capability_instructions_bounded_by_role_limit() {
     assert_eq!(f.system.len(), role_core(RunRole::Top).len() + 2 + limit);
     let f = freeze(&s, &[], &[exact(limit + 1)], None);
     assert_eq!(f.system, role_core(RunRole::Top));
-    // Worker: Core почти весь лимит 300 — инструкции не помещаются ни на одном тире.
+    // Worker (D71, r1b.2): Core короче, остаток лимита 300 по оценке байты / 4 — около
+    // 70 токенов. Малая инструкция входит на любом тире, большая — нет.
     for tier in [Tier::Small, Tier::Standard, Tier::Full] {
-        let f = freeze(
-            &setup(RunRole::Worker, tier, None),
-            &[],
-            &[caps[10].clone()],
-            None,
+        let s = setup(RunRole::Worker, tier, None);
+        let f = freeze(&s, &[], &[caps[10].clone()], None);
+        assert_eq!(
+            f.system,
+            format!("{}\n\nUse small wisely.", role_core(RunRole::Worker))
         );
+        assert_within_role_limit(&s, &f);
+        let f = freeze(&s, &[], &[caps[0].clone()], None);
         assert_eq!(f.system, role_core(RunRole::Worker));
     }
 }

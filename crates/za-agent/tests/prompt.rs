@@ -3,11 +3,12 @@
 use std::path::Path;
 
 use za_agent::{
-    AGENTS_MD_LIMIT, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo, LEFT_ANGLES, MODE_LIMIT,
-    MemoryLevel, MemoryPort, NoMemory, PROMPT_VERSION, RIGHT_ANGLES, Recall, TaskBlock, WorkMode,
-    agents_md_budget, approx_tokens, env_in_role_limit, escape_untrusted, fit_agents_md,
-    git_branch, memory_budget, mode_overlay, prompt_files, prompt_texts_hash, reasoning_for,
-    render_control, render_env, render_task, role_core, role_limit, upper_tokens, utility_rules,
+    AGENTS_MD_LIMIT, BudgetCase, COMPACT_RUBRIC, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo,
+    LEFT_ANGLES, MODE_LIMIT, MemoryLevel, MemoryPort, NoMemory, PROMPT_VERSION, RIGHT_ANGLES,
+    Recall, TaskBlock, WorkMode, agents_md_budget, approx_tokens, budget_cases, env_in_role_limit,
+    escape_untrusted, fit_agents_md, git_branch, max_env, memory_budget, mode_overlay,
+    prompt_files, prompt_texts_hash, reasoning_for, render_control, render_env, render_task,
+    role_core, role_limit, runtime_texts, upper_tokens, utility_rules,
 };
 use za_llm::{Effort, ReasoningMode};
 use za_protocol::{RunId, RunRole, Tier};
@@ -30,7 +31,7 @@ fn texts_match_appendix() {
             .ends_with("Finish with finish(status, result, evidence, open_issues).")
     );
     assert!(role_core(RunRole::Worker).starts_with("You are a worker in zero-agent."));
-    assert!(role_core(RunRole::Worker).ends_with("Result: facts and paths, no narrative."));
+    assert!(role_core(RunRole::Worker).ends_with("Result: facts and paths."));
     assert!(mode_overlay(WorkMode::Coder).starts_with("# Mode: coder\n"));
     assert!(mode_overlay(WorkMode::Researcher).starts_with("# Mode: researcher\n"));
     assert!(mode_overlay(WorkMode::Operator).starts_with("# Mode: operator\n"));
@@ -55,7 +56,7 @@ fn texts_match_appendix() {
             assert!(!text.contains("\n\n"), "{name}");
         }
     }
-    assert_eq!(PROMPT_VERSION, "r1b.1");
+    assert_eq!(PROMPT_VERSION, "r1b.2");
 }
 
 /// Окно байтов «4 ASCII-цифры, '-', 2 ASCII-цифры» (дата вида 2026-11).
@@ -104,10 +105,10 @@ fn prompt_files_cover_directory_in_name_order() {
 #[test]
 fn prompt_hash_covers_names_and_texts() {
     // Формат: метка, затем для каждого файла по порядку имён — длина (u64 LE) и байты имени,
-    // длина и байты текста.
+    // длина и байты текста; затем так же постоянные тексты рантайма (`runtime/…`).
     let mut h = blake3::Hasher::new();
-    h.update(b"za-prompts-v1\0");
-    for (name, text) in prompt_files() {
+    h.update(b"za-prompts-v2\0");
+    for (name, text) in prompt_files().iter().chain(runtime_texts()) {
         for part in [name.as_bytes(), text.as_bytes()] {
             h.update(&(part.len() as u64).to_le_bytes());
             h.update(part);
@@ -672,4 +673,117 @@ fn texts_equal_appendix_blocks() {
     for (m, block) in MODES.iter().zip([modes[0], modes[1], modes[2], modes[3]]) {
         assert_eq!(mode_overlay(*m), block);
     }
+}
+
+#[test]
+fn runtime_texts_are_listed_and_hashed() {
+    // Carry задачи 3: постоянные тексты рантайма, уходящие модели (рубрика компакции,
+    // nudge, тексты результатов-отказов), входят в хэш версии промптов.
+    let texts = runtime_texts();
+    let names: Vec<&str> = texts.iter().map(|(n, _)| *n).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(names, sorted, "имена по порядку и без повторов");
+    for (name, text) in texts {
+        assert!(name.starts_with("runtime/"), "{name}");
+        assert!(!text.is_empty(), "{name}");
+    }
+    for n in [
+        "runtime/compact.rubric",
+        "runtime/driver.empty_nudge_subagent",
+        "runtime/driver.empty_nudge_top",
+        "runtime/driver.truncated_nudge",
+        "runtime/turn.length_cut",
+        "runtime/turn.length_cut_nudge",
+        "runtime/turn.mutation_nudge",
+    ] {
+        assert!(names.contains(&n), "{n}");
+    }
+    assert!(texts.iter().any(|(_, t)| *t == COMPACT_RUBRIC));
+}
+
+#[test]
+fn max_env_is_maximal() {
+    let e = max_env();
+    assert_eq!(e.os, "Windows 11 Pro for Workstations 10.0.26300 x86_64");
+    assert_eq!(e.shell, "powershell 5.1.26100.1");
+    assert_eq!(
+        e.project_dir,
+        format!("H:/Documents/GitHub/{}", "x".repeat(100))
+    );
+    assert_eq!(e.date, "2026-11-09");
+    assert_eq!(e.tier, Tier::Standard);
+    assert_eq!(e.n_ctx, 1_048_576);
+    assert_eq!(e.branch, "b".repeat(64));
+    for part in [
+        format!("steps {}", u32::MAX),
+        format!("tokens {}", u64::MAX),
+        format!("gpu_ms {}", u64::MAX),
+        format!("usd {}", f64::MAX),
+        format!("duration_ms {}", u64::MAX),
+    ] {
+        assert!(e.budget.contains(&part), "{part}");
+    }
+    // Регрессия: render_env и при максимальной подстановке режет блок до ENV_LIMIT байт.
+    assert!(render_env(&e).len() <= ENV_LIMIT as usize);
+}
+
+#[test]
+fn cases_cover_roles_tiers_modes() {
+    let c = budget_cases();
+    let has = |n: &str, l: u32| c.iter().any(|x| x.name == n && x.limit == l);
+    assert!(has("top/small/core", 800));
+    assert!(has("env/max", 200));
+    assert!(has("top/standard/researcher", 2000));
+    assert!(has("top/full/coder", 3000));
+    assert!(has("orchestrator/writer", 500));
+    assert!(has("worker", 300));
+    assert!(has("worker/researcher", 300));
+    assert!(has("top/small/prefix", 1850));
+    assert_eq!(c.iter().filter(|x| x.name.starts_with("mode/")).count(), 4);
+    assert!(
+        c.iter()
+            .find(|x| x.name == "top/full/coder")
+            .unwrap()
+            .text
+            .contains("<env>")
+    );
+    // Полный набор: top/small/core, env/max, 4 overlay, top standard и full по 5,
+    // orchestrator и worker по 5, top/small/prefix — 27 случаев с разными именами.
+    assert_eq!(c.len(), 27);
+    let mut names: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), c.len());
+    // Субагенты — Core вместе с overlay; overlay — свой слот.
+    let worker_coder: &BudgetCase = c.iter().find(|x| x.name == "worker/coder").unwrap();
+    assert_eq!(
+        worker_coder.text,
+        format!(
+            "{}\n\n{}",
+            role_core(RunRole::Worker),
+            mode_overlay(WorkMode::Coder)
+        )
+    );
+    for m in MODES {
+        assert!(
+            c.iter()
+                .any(|x| x.text == mode_overlay(m) && x.limit == MODE_LIMIT)
+        );
+    }
+    // top standard и full — system вместе с <env> максимальной подстановки.
+    let top_std = c.iter().find(|x| x.name == "top/standard").unwrap();
+    assert_eq!(
+        top_std.text,
+        format!("{}\n\n{}", role_core(RunRole::Top), render_env(&max_env()))
+    );
+    // Префикс top small: Core, самый длинный overlay и описания встроенных инструментов.
+    let prefix = &c
+        .iter()
+        .find(|x| x.name == "top/small/prefix")
+        .unwrap()
+        .text;
+    assert!(prefix.starts_with(role_core(RunRole::Top)));
+    assert!(prefix.contains("\"name\":\"finish\""));
 }

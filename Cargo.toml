@@ -56,3 +56,7 @@ clap = { version = "4.6.7", default-features = false, features = ["std", "derive
 # (своя реализация через WinAPI потребовала бы `unsafe`). Только `system` и `disk`, без
 # сети, компонентов и пользователей. Лицензия MIT.
 sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
+# Счёт токенов фиксированных промптов в CI (`cargo xtask prompt-budget`, PRM-007, D64):
+# словари cl100k и o200k встроены в крейт, сеть не нужна; `tokenizers` от HF тянет
+# десятки крейтов. Только у `xtask` (проверяется `cargo xtask policy`).
+tiktoken-rs = { version = "=0.12.1", default-features = false }

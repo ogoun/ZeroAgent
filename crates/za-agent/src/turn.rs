@@ -979,14 +979,14 @@ pub struct Reviewed {
 }
 
 /// Результат извлечённой из текста мутации (D27).
-const BLOCKED: &str = "blocked: calls that change state must use the tool-calling interface; this call was not executed";
+pub(crate) const BLOCKED: &str = "blocked: calls that change state must use the tool-calling interface; this call was not executed";
 /// Nudge извлечённой мутации (D23, D27).
-const MUTATION_NUDGE: &str = "The tool call in your text was not executed: calls that change state must use the tool-calling interface. Make the call again as a tool call.";
+pub(crate) const MUTATION_NUDGE: &str = "The tool call in your text was not executed: calls that change state must use the tool-calling interface. Make the call again as a tool call.";
 /// Nudge при `Length` для извлечённого вызова, который не разобран: JSON обрезан
 /// пределом вывода, а не испорчен, поэтому просьба о валидном JSON неуместна.
 pub(crate) const LENGTH_CUT_NUDGE: &str = "Your tool call was cut by the output limit (finish_reason=length) and was not executed. Repeat the call with shorter arguments or split the work.";
 /// Результат вызова в ответе, обрезанном по длине (D27).
-const LENGTH_CUT: &str = "not executed: response cut by output limit (finish_reason=length). Repeat the call with shorter arguments or split the work.";
+pub(crate) const LENGTH_CUT: &str = "not executed: response cut by output limit (finish_reason=length). Repeat the call with shorter arguments or split the work.";
 /// Сколько символов исходной разметки показывается модели.
 const RAW_SHOWN: usize = 200;
 

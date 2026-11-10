@@ -9,6 +9,9 @@ publish = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+tiktoken-rs.workspace = true
+za-agent = { path = "../crates/za-agent" }
+za-protocol = { path = "../crates/za-protocol" }
 
 [lints]
 workspace = true

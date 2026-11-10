@@ -49,11 +49,11 @@ pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 pub use inspect::{BlockCost, InspectError, Inspection, RunMetrics, inspect, run_metrics};
 pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};
 pub use prompt::{
-    AGENTS_MD_LIMIT, BRANCH_MAX_CHARS, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo, LEFT_ANGLES,
-    MODE_LIMIT, PROMPT_VERSION, RIGHT_ANGLES, TaskBlock, WorkMode, agents_md_budget, approx_tokens,
-    env_in_role_limit, escape_untrusted, fit_agents_md, git_branch, mode_overlay, prompt_files,
-    prompt_texts_hash, reasoning_for, render_control, render_env, render_task, role_core,
-    role_limit, upper_tokens, utility_rules,
+    AGENTS_MD_LIMIT, BRANCH_MAX_CHARS, BudgetCase, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo,
+    LEFT_ANGLES, MODE_LIMIT, PROMPT_VERSION, RIGHT_ANGLES, TaskBlock, WorkMode, agents_md_budget,
+    approx_tokens, budget_cases, env_in_role_limit, escape_untrusted, fit_agents_md, git_branch,
+    max_env, mode_overlay, prompt_files, prompt_texts_hash, reasoning_for, render_control,
+    render_env, render_task, role_core, role_limit, runtime_texts, upper_tokens, utility_rules,
 };
 pub use request::{
     BlockHashes, BlockSizes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions,

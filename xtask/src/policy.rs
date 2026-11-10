@@ -4,7 +4,8 @@
 //! агентных фреймворков, направление зависимостей между `za-*`
 //! (`za-res` — только от `za-protocol`, `za-core` и `za-agent` — `za-llm` без функций
 //! по умолчанию, `za-agent` — только над нижними слоями, и они от него не зависят),
-//! лимит размера `za-core` (ARC-011).
+//! лимит размера `za-core` (ARC-011), инструменты сборки (`tiktoken-rs`) — только у
+//! `xtask`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,8 @@ const PURE_LLM_USERS: &[&str] = &["za-core", "za-agent"];
 const AGENT_FORBIDDEN_DEPS: &[&str] = &["reqwest"];
 /// Единственный крейт `za-*`, от которого может зависеть `za-res` (D1).
 const RES_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol"];
+/// Крейты только для `xtask` (R1-B2 D64): счёт токенов промптов в CI, не в продукте.
+const XTASK_ONLY_DEPS: &[&str] = &["tiktoken-rs"];
 
 /// Нарушение политики.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +174,13 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                 out.push(Violation(format!(
                     "za-agent не должен зависеть от {}",
                     dep.name
+                )));
+            }
+            // Все виды: и dev-зависимость тянет крейт в сборку тестов продукта.
+            if pkg.name != "xtask" && XTASK_ONLY_DEPS.contains(&dep.name.as_str()) {
+                out.push(Violation(format!(
+                    "{} не должен зависеть от {} (только xtask)",
+                    pkg.name, dep.name
                 )));
             }
             if pkg.name == "za-protocol" && dep.name.starts_with("za-") {
@@ -529,6 +539,18 @@ version = \"0.0.1\"
     fn core_must_not_depend_on_res_or_http() {
         assert_eq!(check_direction(&meta("za-core", "za-res")).len(), 1);
         assert_eq!(check_direction(&meta("za-core", "reqwest")).len(), 1);
+    }
+    #[test]
+    fn tiktoken_only_in_xtask() {
+        assert!(check_direction(&meta("xtask", "tiktoken-rs")).is_empty());
+        for pkg in ["za-agent", "za-llm", "zero-agent"] {
+            assert_eq!(check_direction(&meta(pkg, "tiktoken-rs")).len(), 1, "{pkg}");
+        }
+        let dev = Dependency {
+            kind: Some("dev".into()),
+            ..dep("tiktoken-rs")
+        };
+        assert_eq!(check_direction(&meta_with("za-core", dev)).len(), 1);
     }
     #[test]
     fn core_over_limit_is_reported() {
