@@ -2,11 +2,12 @@
 //! режима (D14), одобрение и `ask_user` (D16, D17), сигналы (D25, D26), события `tool.*`.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::time::Instant;
+use tokio::sync::{Barrier, watch};
+use tokio::time::{Instant, timeout};
 use za_agent::{
     CallVerdict, PlannedCall, Signals, ToolEnv, ToolsOutcome, builtin_tools, run_tools,
     signal_channel,
@@ -17,10 +18,31 @@ use za_core::{
 };
 use za_llm::normalize::CallSource;
 use za_llm::{BoxFuture, Part, ToolCall, ToolSchema};
-use za_protocol::{EffectClass, EffectKey, EventKind, RunId, RunMode, RunRole, Seq, Tier};
+use za_protocol::{Actor, EffectClass, EffectKey, EventKind, RunId, RunMode, RunRole, Seq, Tier};
 use za_store::{NewRun, ProjectStore};
 
 // ---- Помощники ----
+
+/// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1), как в R1-A.
+fn time_scale() -> u32 {
+    static SCALE: OnceLock<u32> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("ZA_TEST_TIME_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(1, |n| n.clamp(1, 6))
+    })
+}
+
+/// Длительность с множителем [`time_scale`].
+fn scaled(d: Duration) -> Duration {
+    d * time_scale()
+}
+
+/// Предел ожиданий теста, которые при регрессии повисли бы.
+fn limit() -> Duration {
+    scaled(Duration::from_secs(5))
+}
 
 fn dir(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -61,6 +83,11 @@ struct TestTool {
     delay: Duration,
     out: ToolOutput,
     log: SharedLog,
+    /// Рандеву одновременных вызовов: при последовательном исполнении — таймаут и
+    /// результат-ошибка `barrier timeout`.
+    barrier: Option<Arc<Barrier>>,
+    /// Вызов держится, пока тест не отпустит (`true`); не дождался — `hold timeout`.
+    hold: Option<watch::Receiver<bool>>,
 }
 
 impl Tool for TestTool {
@@ -72,12 +99,31 @@ impl Tool for TestTool {
         let delay = self.delay;
         let out = self.out.clone();
         let log = Arc::clone(&self.log);
+        let barrier = self.barrier.clone();
+        let hold = self.hold.clone();
         Box::pin(async move {
             log.lock().unwrap().starts.push((
                 cx.call_id.clone(),
                 cx.effect_key.clone(),
                 Instant::now(),
             ));
+            let mut out = out;
+            if let Some(b) = barrier
+                && timeout(limit(), b.wait()).await.is_err()
+            {
+                out = ToolOutput {
+                    content: "barrier timeout".into(),
+                    is_error: true,
+                };
+            }
+            if let Some(mut h) = hold
+                && timeout(limit(), h.wait_for(|v| *v)).await.is_err()
+            {
+                out = ToolOutput {
+                    content: "hold timeout".into(),
+                    is_error: true,
+                };
+            }
             tokio::time::sleep(delay).await;
             log.lock().unwrap().ends.push((cx.call_id, Instant::now()));
             out
@@ -115,17 +161,45 @@ fn tool_with(
     out: ToolOutput,
     log: &SharedLog,
 ) -> Arc<dyn Tool> {
+    Arc::new(test_tool(name, kind, delay_ms, timeout, out, log))
+}
+
+fn test_tool(
+    name: &str,
+    kind: ToolKind,
+    delay_ms: u64,
+    timeout: Duration,
+    out: ToolOutput,
+    log: &SharedLog,
+) -> TestTool {
     let class = match kind {
         ToolKind::Read | ToolKind::Control => EffectClass::ReadOnly,
         ToolKind::Edit => EffectClass::Idempotent,
         ToolKind::Exec => EffectClass::NonIdempotent,
     };
-    Arc::new(TestTool {
+    TestTool {
         spec: spec(name, kind, class, timeout),
         delay: Duration::from_millis(delay_ms),
         out,
         log: Arc::clone(log),
-    })
+        barrier: None,
+        hold: None,
+    }
+}
+
+/// Инструмент чтения, который держится до отпуска `release.send(true)`.
+fn held(name: &str, log: &SharedLog) -> (Arc<dyn Tool>, watch::Sender<bool>) {
+    let (tx, rx) = watch::channel(false);
+    let mut t = test_tool(
+        name,
+        ToolKind::Read,
+        0,
+        Duration::from_secs(60),
+        ok(name),
+        log,
+    );
+    t.hold = Some(rx);
+    (Arc::new(t), tx)
 }
 
 fn ok(s: &str) -> ToolOutput {
@@ -189,7 +263,12 @@ async fn run_batch(
     sig: &mut Signals,
 ) -> Result<ToolsOutcome, EffectError> {
     let mut ctx = RunCtx::resume_at(s.clone(), env.run, 0, 0);
-    run_tools(&mut ctx, j, reg, env, calls, sig).await
+    timeout(
+        scaled(Duration::from_secs(30)),
+        run_tools(&mut ctx, j, reg, env, calls, sig),
+    )
+    .await
+    .expect("run_tools не вернулся за предел теста")
 }
 
 fn start_of(log: &SharedLog, id: &str) -> Instant {
@@ -202,24 +281,29 @@ fn end_of(log: &SharedLog, id: &str) -> Instant {
     l.ends.iter().find(|(c, _)| c == id).unwrap().1
 }
 
-/// Ждёт старта первого вызова инструмента, затем ещё `delay`; возвращает момент
-/// после ожидания. Сигнал отправляется от старта инструмента, а не от начала пакета:
-/// запись намерения в журнал под нагрузкой бывает дольше 50 мс.
-async fn after_first_start(log: &SharedLog, delay: Duration) -> Instant {
-    while log.lock().unwrap().starts.is_empty() {
-        tokio::time::sleep(Duration::from_millis(2)).await;
+/// Ждёт `n` стартов инструментов (под пределом теста), затем ещё `delay`; возвращает
+/// момент после ожидания. Сигнал отправляется от старта инструмента, а не от начала
+/// пакета: запись намерения в журнал под нагрузкой бывает дольше 50 мс.
+async fn after_starts(log: &SharedLog, n: usize, delay: Duration) -> Instant {
+    let wait = async {
+        while log.lock().unwrap().starts.len() < n {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    if timeout(limit(), wait).await.is_err() {
+        panic!("за предел теста стартовало меньше {n} вызовов инструмента");
     }
     tokio::time::sleep(delay).await;
     Instant::now()
 }
 
-async fn tool_events(s: &ProjectStore, run: RunId) -> Vec<(EventKind, Value)> {
+async fn tool_events(s: &ProjectStore, run: RunId) -> Vec<(EventKind, Actor, Value)> {
     s.read_run(run, Seq(0), 10_000)
         .await
         .unwrap()
         .into_iter()
         .filter(|e| matches!(e.kind, EventKind::ToolStarted | EventKind::ToolFinished))
-        .map(|e| (e.kind, e.payload))
+        .map(|e| (e.kind, e.actor, e.payload))
         .collect()
 }
 
@@ -229,13 +313,25 @@ async fn tool_events(s: &ProjectStore, run: RunId) -> Vec<(EventKind, Value)> {
 async fn reads_run_concurrently_mutations_in_order() {
     let (s, j, run) = setup("concurrent").await;
     let log = SharedLog::default();
+    // r1 и r2 встречаются на рандеву: при последовательном исполнении r1 не дождался
+    // бы r2 и вернул `barrier timeout`. Время записи журнала на исход не влияет.
+    let mut pair = test_tool(
+        "pair",
+        ToolKind::Read,
+        100,
+        Duration::from_secs(60),
+        ok("pair"),
+        &log,
+    );
+    pair.barrier = Some(Arc::new(Barrier::new(2)));
     let reg = registry(vec![
+        Arc::new(pair),
         tool("read", ToolKind::Read, 100, &log),
         tool("exec", ToolKind::Exec, 50, &log),
     ]);
     let calls = [
-        planned("r1", "read", json!({"p": 1})),
-        planned("r2", "read", json!({"p": 2})),
+        planned("r1", "pair", json!({"p": 1})),
+        planned("r2", "pair", json!({"p": 2})),
         planned("w", "exec", json!({})),
         planned("r3", "read", json!({"p": 3})),
     ];
@@ -251,9 +347,11 @@ async fn reads_run_concurrently_mutations_in_order() {
     .await
     .unwrap();
 
-    let (s1, s2) = (start_of(&log, "r1"), start_of(&log, "r2"));
-    let gap = if s1 > s2 { s1 - s2 } else { s2 - s1 };
-    assert!(gap < Duration::from_millis(30), "старты r1 и r2: {gap:?}");
+    assert_eq!(result_of(&out.results[0]), ("r1", "pair done", false));
+    assert_eq!(result_of(&out.results[1]), ("r2", "pair done", false));
+    // Интервалы исполнения r1 и r2 пересекаются.
+    assert!(start_of(&log, "r1") < end_of(&log, "r2"));
+    assert!(start_of(&log, "r2") < end_of(&log, "r1"));
     assert!(start_of(&log, "w") >= end_of(&log, "r1").max(end_of(&log, "r2")));
     assert!(start_of(&log, "r3") >= end_of(&log, "w"));
     assert_eq!(ids(&out), ["r1", "r2", "w", "r3"]);
@@ -302,15 +400,18 @@ async fn tool_events_written_live_only() {
 
     let ev = tool_events(&s, run).await;
     assert_eq!(ev.len(), 2, "{ev:?}");
-    assert_eq!(ev[0].0, EventKind::ToolStarted);
     assert_eq!(
-        ev[0].1,
+        (&ev[0].0, ev[0].1),
+        (&EventKind::ToolStarted, Actor::Runtime)
+    );
+    assert_eq!(
+        ev[0].2,
         json!({"call_id": "c1", "name": "echo", "effect_key": format!("{run}:0:0")})
     );
-    assert_eq!(ev[1].0, EventKind::ToolFinished);
-    assert_eq!(ev[1].1["call_id"], "c1");
-    assert_eq!(ev[1].1["is_error"], false);
-    assert!(ev[1].1["duration_ms"].as_u64().is_some());
+    assert_eq!((&ev[1].0, ev[1].1), (&EventKind::ToolFinished, Actor::Tool));
+    assert_eq!(ev[1].2["call_id"], "c1");
+    assert_eq!(ev[1].2["is_error"], false);
+    assert!(ev[1].2["duration_ms"].as_u64().is_some());
 
     // Реплей с того же шага: результат из журнала, новых событий и вызовов нет.
     let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
@@ -328,7 +429,7 @@ async fn cancel_drops_running_tools() {
     let (tx, mut sig) = signal_channel();
     let l2 = Arc::clone(&log);
     let cancel_at = tokio::spawn(async move {
-        let at = after_first_start(&l2, Duration::from_millis(50)).await;
+        let at = after_starts(&l2, 1, Duration::from_millis(50)).await;
         tx.cancel();
         at
     });
@@ -343,9 +444,12 @@ async fn cancel_drops_running_tools() {
     .await
     .unwrap();
     let returned = Instant::now();
-    let at = cancel_at.await.unwrap();
+    let at = timeout(limit(), cancel_at)
+        .await
+        .expect("задача отмены не завершилась")
+        .unwrap();
     assert!(
-        returned - at <= Duration::from_millis(200),
+        returned - at <= scaled(Duration::from_millis(200)),
         "{:?}",
         returned - at
     );
@@ -535,16 +639,13 @@ async fn tool_timeout() {
     )]);
     let calls = [planned("c1", "slow", json!({}))];
     let (_tx, mut sig) = signal_channel();
-    let o = run_batch(
-        &s,
-        &j,
-        &reg,
-        &env(run, RunMode::Auto, true),
-        &calls,
-        &mut sig,
-    )
-    .await
-    .unwrap();
+    // Без внешнего предела `run_batch`: на остановленных часах автопродвижение, пока
+    // тест ждёт писателя журнала, сработало бы на нём раньше таймаута инструмента.
+    let mut ctx = RunCtx::new(s.clone(), run);
+    let e = env(run, RunMode::Auto, true);
+    let o = run_tools(&mut ctx, &j, &reg, &e, &calls, &mut sig)
+        .await
+        .unwrap();
     assert_eq!(result_of(&o.results[0]), ("c1", "timeout after 1 s", true));
 }
 
@@ -578,7 +679,9 @@ async fn finish_returns_args() {
 async fn abort_skips_unstarted_calls() {
     let (s, j, run) = setup("abort").await;
     let log = SharedLog::default();
-    let reg = registry(vec![tool("read", ToolKind::Read, 100, &log)]);
+    // r1 держится до отпуска: сигнал гарантированно приходит во время вызова.
+    let (read, release) = held("read", &log);
+    let reg = registry(vec![read]);
     let calls = [
         planned("r1", "read", json!({"p": 1})),
         planned("r2", "read", json!({"p": 2})),
@@ -587,8 +690,9 @@ async fn abort_skips_unstarted_calls() {
     let (tx, mut sig) = signal_channel();
     let l2 = Arc::clone(&log);
     tokio::spawn(async move {
-        after_first_start(&l2, Duration::from_millis(50)).await;
+        after_starts(&l2, 1, Duration::from_millis(50)).await;
         tx.input();
+        let _ = release.send(true);
     });
     let o = run_batch(
         &s,
@@ -603,6 +707,7 @@ async fn abort_skips_unstarted_calls() {
     assert_eq!(ids(&o), ["r1"]);
     assert!(o.aborted);
     assert!(!o.cancelled);
+    assert_eq!(log.lock().unwrap().starts.len(), 1);
 }
 
 // ---- Дополнительные ----
@@ -642,17 +747,21 @@ async fn rejected_call_keeps_key_and_skips_effect() {
 async fn pause_during_parallel_group_waits_running_reads() {
     let (s, j, run) = setup("pause_group").await;
     let log = SharedLog::default();
-    let reg = registry(vec![tool("read", ToolKind::Read, 100, &log)]);
+    // Чтения держатся, пока не придёт пауза; после группы — мутация, она не начинается.
+    let (read, release) = held("read", &log);
+    let reg = registry(vec![read, tool("exec", ToolKind::Exec, 0, &log)]);
     let calls = [
         planned("r1", "read", json!({"p": 1})),
         planned("r2", "read", json!({"p": 2})),
         planned("r3", "read", json!({"p": 3})),
+        planned("w", "exec", json!({})),
     ];
     let (tx, mut sig) = signal_channel();
     let l2 = Arc::clone(&log);
     tokio::spawn(async move {
-        after_first_start(&l2, Duration::from_millis(50)).await;
+        after_starts(&l2, 3, Duration::ZERO).await;
         tx.pause();
+        let _ = release.send(true);
     });
     let o = run_batch(
         &s,
@@ -664,7 +773,171 @@ async fn pause_during_parallel_group_waits_running_reads() {
     )
     .await
     .unwrap();
-    // Все три чтения — одна группа, идущие дорабатывают.
+    // Все три чтения — одна группа, идущие дорабатывают; `w` не начат.
     assert_eq!(ids(&o), ["r1", "r2", "r3"]);
+    assert!(o.results.iter().all(|p| !result_of(p).2));
     assert!(o.aborted);
+    assert_eq!(log.lock().unwrap().starts.len(), 3);
+}
+
+#[tokio::test]
+async fn calls_after_finish_not_executed() {
+    let (s, j, run) = setup("after_finish").await;
+    let log = SharedLog::default();
+    let mut tools = builtin_tools();
+    tools.push(tool("exec", ToolKind::Exec, 0, &log));
+    let reg = registry(tools);
+    let calls = [
+        planned("f1", "finish", json!({"status": "done", "result": "r"})),
+        planned("w", "exec", json!({})),
+    ];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    assert_eq!(o.finish.expect("finish").status, "done");
+    assert_eq!(result_of(&o.results[0]), ("f1", "ok", false));
+    assert_eq!(
+        result_of(&o.results[1]),
+        ("w", "not executed: run finished by finish", true)
+    );
+    assert!(log.lock().unwrap().starts.is_empty());
+    assert!(
+        s.effect(run, &EffectKey::derive(run, 0, 1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Квитанция записана заранее, как после решения `unknown_outcome` или отказа.
+async fn recorded(s: &ProjectStore, run: RunId, receipt: Value) {
+    let key = EffectKey::derive(run, 0, 0);
+    s.record_intent(run, &key, EffectClass::NonIdempotent, "exec", json!({}))
+        .await
+        .unwrap();
+    s.record_receipt(run, &key, receipt).await.unwrap();
+}
+
+#[tokio::test]
+async fn recorded_other_form_value_is_canonical_json() {
+    let (s, j, run) = setup("other_form").await;
+    recorded(
+        &s,
+        run,
+        json!({"outcome": "ok", "value": {"resolved": "done"}}),
+    )
+    .await;
+    let log = SharedLog::default();
+    let reg = registry(vec![tool("exec", ToolKind::Exec, 0, &log)]);
+    let calls = [planned("w", "exec", json!({}))];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result_of(&o.results[0]),
+        ("w", r#"{"resolved":"done"}"#, false)
+    );
+    assert!(log.lock().unwrap().starts.is_empty());
+}
+
+#[tokio::test]
+async fn recorded_failure_is_error_result() {
+    let (s, j, run) = setup("failed").await;
+    let msg = "not executed: the user decided the action did not happen";
+    recorded(&s, run, json!({"outcome": "error", "message": msg})).await;
+    let log = SharedLog::default();
+    let reg = registry(vec![tool("exec", ToolKind::Exec, 0, &log)]);
+    let calls = [planned("w", "exec", json!({}))];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_of(&o.results[0]), ("w", msg, true));
+    assert!(log.lock().unwrap().starts.is_empty());
+}
+
+#[tokio::test]
+async fn denied_in_plan_mode() {
+    let (s, j, run) = setup("plan_mode").await;
+    let log = SharedLog::default();
+    let reg = registry(vec![tool("exec", ToolKind::Exec, 0, &log)]);
+    let calls = [planned("w", "exec", json!({}))];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Plan, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_of(&o.results[0]), ("w", "denied: plan mode", true));
+    assert!(log.lock().unwrap().starts.is_empty());
+}
+
+#[tokio::test]
+async fn approval_always_read_is_barrier_in_group() {
+    let (s, j, run) = setup("always_barrier").await;
+    let log = SharedLog::default();
+    let mut ask = test_tool(
+        "read_ask",
+        ToolKind::Read,
+        0,
+        Duration::from_secs(60),
+        ok("read_ask"),
+        &log,
+    );
+    ask.spec.approval = Approval::Always;
+    let reg = registry(vec![tool("read", ToolKind::Read, 0, &log), Arc::new(ask)]);
+    let calls = [
+        planned("r1", "read", json!({"p": 1})),
+        planned("a1", "read_ask", json!({})),
+        planned("r2", "read", json!({"p": 2})),
+    ];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&o), ["r1"]);
+    assert_eq!(o.suspend.expect("одобрение").id, format!("appr-{run}:0:1"));
+    let starts: Vec<String> = log
+        .lock()
+        .unwrap()
+        .starts
+        .iter()
+        .map(|(c, _, _)| c.clone())
+        .collect();
+    assert_eq!(starts, ["r1"]);
 }

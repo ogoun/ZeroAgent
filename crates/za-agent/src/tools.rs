@@ -45,8 +45,11 @@ pub const FINISH_TOOL: &str = "finish";
 pub const ASK_USER_TOOL: &str = "ask_user";
 /// Синтетический результат `finish` (D17).
 const FINISH_OK: &str = "ok";
-/// Префикс квитанции-отказа при ошибке журнала внутри слота (как у хода модели).
-const STORE_ERROR: &str = "store_error:";
+/// Текст квитанции-отказа при ошибке журнала внутри слота: при реплее он уходит
+/// модели, поэтому по-английски и без подробностей (они — в `tracing`).
+const JOURNAL_FAILED: &str = "internal error: journal write failed";
+/// Результат вызовов пакета после принятого `finish`: они не исполняются.
+const AFTER_FINISH: &str = "not executed: run finished by finish";
 
 /// Аргументы `finish` (D17, часть 02, 5.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -264,6 +267,15 @@ pub async fn run_tools(
             out.finish = Some(args.clone());
         }
         out.results.push(part);
+        if out.finish.is_some() {
+            // `finish` — последнее действие run: остальные вызовы пакета получают
+            // результат без исполнения, история остаётся валидной.
+            for rest in &calls[i + 1..] {
+                out.results
+                    .push(result(&rest.call, AFTER_FINISH.to_owned(), true));
+            }
+            return Ok(out);
+        }
         if out.aborted {
             return Ok(out);
         }
@@ -538,9 +550,9 @@ async fn execute(jb: Job) -> Executed {
                 ))
                 .await
             {
-                let msg = format!("{STORE_ERROR} {e}");
+                tracing::error!(key = %key, error = %e, "tool.started не записано, инструмент не вызван");
                 *fref = Some(e);
-                return Err(msg);
+                return Err(JOURNAL_FAILED.to_owned());
             }
             let out = call_action(action).await;
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -554,10 +566,13 @@ async fn execute(jb: Job) -> Executed {
                 ))
                 .await
             {
+                tracing::error!(key = %key, error = %e, "tool.finished не записано");
                 *fref = Some(e);
             }
-            serde_json::to_value(&out)
-                .map_err(|e| format!("{STORE_ERROR} tool output is not serializable: {e}"))
+            serde_json::to_value(&out).map_err(|e| {
+                tracing::error!(key = %key, error = %e, "итог инструмента не сериализуется");
+                JOURNAL_FAILED.to_owned()
+            })
         })
         .await;
     Executed {
