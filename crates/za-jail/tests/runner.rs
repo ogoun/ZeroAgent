@@ -677,6 +677,61 @@ mod linux {
         cleanup(c);
     }
 
+    /// Лидер записи мёртв, а номер его группы занят чужой группой (двойной `fork` демона):
+    /// её участник без маркера записи не убит (ревью задачи 5, N1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reap_dead_leader_spares_foreign_group() {
+        use std::os::unix::process::CommandExt;
+        let reg = registry("reap_foreign_group");
+        let base = dir("reap_foreign_group_pids");
+        let pid_file = base.join("pids.txt");
+        // Чужой лидер группы N порождает участника и выходит.
+        let mut leader = std::process::Command::new(tree())
+            .args(["--depth", "1", "--background", "--pid-file"])
+            .arg(&pid_file)
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("чужой лидер");
+        let n = leader.id();
+        let p = wait_pid_file(&pid_file, 2).await;
+        let _ = leader.wait();
+        let member = *p.iter().find(|x| **x != n).expect("участник группы");
+        assert!(alive(member));
+        let f = reg.join("a.json");
+        std::fs::write(&f, record(n, 1, &boot_id())).unwrap();
+        assert_eq!(reap(&reg), 0);
+        assert!(alive(member), "участник чужой группы убит");
+        let _ = kill(Pid::from_raw(member as i32), Signal::SIGKILL);
+    }
+
+    /// Каталог реестра, открытый на запись другим, — отказ и при чтении, и при записи
+    /// (ревью задачи 5, N4).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_writable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let reg = registry("reap_mode");
+        std::fs::set_permissions(&reg, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let (c, pid) = victim();
+        let f = reg.join("a.json");
+        std::fs::write(&f, record(pid, starttime(pid), &boot_id())).unwrap();
+        assert_eq!(reap(&reg), 0);
+        assert!(alive(pid));
+        assert!(f.exists());
+        cleanup(c);
+        let project = dir("reap_mode_project");
+        let mut s = spec(&project, &["--exit", "0"], scaled(Duration::from_secs(20)));
+        s.leftover = Some(Leftover {
+            file: reg.join("b.json"),
+            run: "r".into(),
+        });
+        let err = within(Duration::from_secs(30), "запуск", DirectRunner.run(s))
+            .await
+            .expect_err("реестр, открытый другим, — отказ");
+        assert!(err.to_string().contains("доступен на запись"), "{err}");
+        assert!(!reg.join("b.json").exists());
+    }
+
     /// Потомок и внук уходят в свои группы (`setpgid`, как GNU `timeout`): тайм-аут
     /// убивает и их.
     #[tokio::test(flavor = "multi_thread")]

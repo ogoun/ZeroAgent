@@ -89,6 +89,37 @@ pub(crate) fn parse_stat(text: &str) -> Option<Stat> {
     })
 }
 
+/// Каталог реестра групп годится (Unix, ревью задачи 5, N4): настоящий каталог (не
+/// ссылка), владелец — текущий пользователь, запись группе и прочим запрещена.
+#[cfg(target_os = "linux")]
+pub(crate) fn check_registry(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(dir)?;
+    let bad = |why: String| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("реестр групп процессов {}: {why}", dir.display()),
+        )
+    };
+    if !m.file_type().is_dir() {
+        return Err(bad("не каталог или символическая ссылка".into()));
+    }
+    let me = nix::unistd::geteuid().as_raw();
+    if m.uid() != me {
+        return Err(bad(format!(
+            "владелец uid {}, а не текущий пользователь (uid {me})",
+            m.uid()
+        )));
+    }
+    if m.mode() & 0o022 != 0 {
+        return Err(bad(format!(
+            "каталог доступен на запись группе или всем (права {:o}); нужно, например, chmod 700",
+            m.mode() & 0o777
+        )));
+    }
+    Ok(())
+}
+
 /// См. [`crate::DirectRunner::reap_leftovers`].
 pub(crate) fn reap_leftovers(dir: &Path) -> usize {
     #[cfg(target_os = "linux")]
@@ -111,14 +142,15 @@ fn linux_reap(dir: &Path) -> usize {
 
     use crate::linux;
 
-    match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.file_type().is_dir() => {}
-        Ok(_) => {
-            tracing::warn!(dir = %dir.display(), "реестр групп — не каталог или ссылка, пропущен");
+    match check_registry(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!(error = %e, "реестр групп пропущен");
             return 0;
         }
-        Err(_) => return 0,
     }
+    let me = nix::unistd::geteuid().as_raw();
     let Some(boot) = linux::boot_id() else {
         tracing::warn!("нет boot_id, остатки не убираются");
         return 0;
@@ -139,7 +171,14 @@ fn linux_reap(dir: &Path) -> usize {
             .read(true)
             .custom_flags(OFlag::O_NOFOLLOW.bits())
             .open(&path)
-            .and_then(|f| f.take(RECORD_MAX + 1).read_to_end(&mut bytes));
+            .and_then(|f| {
+                use std::os::unix::fs::MetadataExt;
+                // Запись другого пользователя — не наша (ревью задачи 5, N4).
+                if f.metadata()?.uid() != me {
+                    return Err(std::io::Error::other("чужой владелец"));
+                }
+                f.take(RECORD_MAX + 1).read_to_end(&mut bytes)
+            });
         let rec = match read {
             Ok(n) if (n as u64) <= RECORD_MAX => parse_record(&bytes),
             _ => None,
@@ -168,29 +207,27 @@ fn kill_recorded(rec: &Record) -> usize {
 
     let procs = linux::snapshot();
     let mut roots = Vec::new();
-    match procs.iter().find(|p| p.pid == rec.leader_pid) {
-        Some(l) if l.starttime == rec.leader_starttime => roots.push(l.pid),
+    // Лидер жив и его `starttime` совпал — группа наша. Лидер мёртв — номер группы мог
+    // достаться чужому процессу (двойной `fork` демона), поэтому группа не в счёт:
+    // только процессы с маркером записи и их потомки (ревью задачи 5, N1).
+    let group = match procs.iter().find(|p| p.pid == rec.leader_pid) {
+        Some(l) if l.starttime == rec.leader_starttime => {
+            roots.push(l.pid);
+            Some(rec.pgid)
+        }
         Some(_) => {
             tracing::info!(pid = rec.leader_pid, run = %rec.run, "номер лидера занят другим процессом, без сигнала");
             return 0;
         }
-        None => {
-            let members = procs
-                .iter()
-                .any(|p| p.pgrp == rec.pgid && p.starttime >= rec.leader_starttime);
-            if !members {
-                return 0;
-            }
-        }
-    }
-    // Процессы с маркером дерева: ушедшие из группы и потерявшие родителя.
+        None => None,
+    };
     roots.extend(
         procs
             .iter()
             .filter(|p| linux::has_marker(p.pid, &rec.marker))
             .map(|p| p.pid),
     );
-    let targets = linux::targets(&procs, &roots, Some(rec.pgid), rec.leader_starttime);
+    let targets = linux::targets(&procs, &roots, group, rec.leader_starttime);
     let n = linux::kill_all(&targets);
     tracing::info!(pgid = rec.pgid, run = %rec.run, killed = n, "убраны остатки дерева");
     n

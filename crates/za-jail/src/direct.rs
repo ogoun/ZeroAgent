@@ -334,7 +334,9 @@ mod unix {
     #[cfg(target_os = "linux")]
     use std::path::PathBuf;
 
+    #[cfg(not(target_os = "linux"))]
     use nix::sys::signal::{Signal, killpg};
+    #[cfg(not(target_os = "linux"))]
     use nix::unistd::Pid;
     use process_wrap::tokio::ChildWrapper;
 
@@ -406,7 +408,10 @@ mod unix {
                 marker: self.marker.clone(),
             };
             let text = serde_json::to_vec(&rec).map_err(std::io::Error::other)?;
-            tokio::fs::write(&left.file, text).await?;
+            let file = left.file.clone();
+            tokio::task::spawn_blocking(move || write_record(&file, &text))
+                .await
+                .map_err(std::io::Error::other)??;
             self.file = Some(left.file.clone());
             Ok(())
         }
@@ -420,9 +425,12 @@ mod unix {
             }
         }
 
-        /// Убивает дерево.
+        /// Убивает дерево. На Linux после сбора лидера группа не трогается: её номер мог
+        /// достаться чужому процессу (ревью задачи 5, N1).
         pub(super) fn kill(&mut self, child: &mut dyn ChildWrapper) {
-            super::start_kill(child);
+            if self.leader_alive || cfg!(not(target_os = "linux")) {
+                super::start_kill(child);
+            }
             self.kill_rest();
         }
 
@@ -450,12 +458,46 @@ mod unix {
         }
     }
 
+    /// Атомарная запись реестра (ревью задачи 5, N4, N5): каталог проверяется
+    /// (`check_registry`), временный файл рядом создаётся с `O_CREAT | O_EXCL | O_NOFOLLOW`
+    /// и правами 0600, затем `rename` на место (ссылку на месте имени `rename` заменяет, а
+    /// не проходит). Обрыв не оставляет полузаписанного `*.json`.
+    #[cfg(target_os = "linux")]
+    fn write_record(file: &std::path::Path, text: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = file.parent().unwrap_or(std::path::Path::new("."));
+        crate::reap::check_registry(dir)?;
+        let mut tmp = file.as_os_str().to_owned();
+        tmp.push(format!(
+            ".{}-{}.tmp",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tmp = PathBuf::from(tmp);
+        let r = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+            .open(&tmp)
+            .and_then(|mut f| {
+                f.write_all(text)?;
+                f.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, file));
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
-            if self.armed
-                && let Some(leader) = self.leader
-            {
-                let _ = killpg(Pid::from_raw(leader), Signal::SIGKILL);
+            if self.armed {
                 self.kill_rest();
             }
             #[cfg(target_os = "linux")]

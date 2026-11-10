@@ -117,13 +117,15 @@ pub(crate) fn kill_all(pids: &[i32]) -> usize {
         .count()
 }
 
-/// Уничтожает дерево вызова: группа лидера, его потомки (если лидер ещё не собран tokio,
-/// иначе его номер мог достаться другому процессу), усыновлённые агентом процессы с
-/// маркером. `since` — `starttime` лидера (0 — неизвестен). Затем собирает зомби
-/// усыновлённых.
+/// Уничтожает дерево вызова: усыновлённые агентом процессы с маркером и их потомки; пока
+/// лидер не собран tokio — ещё группа лидера и его потомки. После сбора номер лидера и
+/// его группы мог достаться чужому процессу, поэтому группа не в счёт (ревью задачи 5,
+/// N1). `since` — `starttime` лидера (0 — неизвестен). Затем собирает зомби усыновлённых.
 pub(crate) fn kill_tree(leader: i32, marker: &str, leader_alive: bool, since: u64) {
     let me = std::process::id() as i32;
-    let _ = killpg(Pid::from_raw(leader), Signal::SIGKILL);
+    if leader_alive {
+        let _ = killpg(Pid::from_raw(leader), Signal::SIGKILL);
+    }
     for _ in 0..KILL_PASSES {
         let procs = snapshot();
         let mut roots = Vec::new();
@@ -136,7 +138,8 @@ pub(crate) fn kill_tree(leader: i32, marker: &str, leader_alive: bool, since: u6
                 .filter(|p| p.ppid == me && p.pid != leader && has_marker(p.pid, marker))
                 .map(|p| p.pid),
         );
-        let live = targets(&procs, &roots, Some(leader), since);
+        let group = leader_alive.then_some(leader);
+        let live = targets(&procs, &roots, group, since);
         if live.is_empty() {
             break;
         }
