@@ -17,7 +17,6 @@
 //! Экранирование и предел размера результата — на стороне пакета (D94, D44).
 
 use std::collections::BTreeSet;
-use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,6 +72,9 @@ const TOO_LARGE: &str = "[file is larger than 4 MiB; only the first 4 MiB are re
 const EMPTY: &str = "[file is empty]";
 const NO_MATCHES: &str = "no matches";
 const NO_FILES: &str = "no files matched";
+/// Пометка: часть файлов правил игнорирования не загружена из-за бюджета памяти (N1).
+const RULES_OVER_BUDGET: &str =
+    "[some ignore rules were not loaded (over 8 MiB); ignored files may be listed]";
 pub(crate) const INTERNAL: &str = "internal error: file tool failed";
 
 // ---- тексты с подстановкой: одна функция и для вывода, и для образца в `texts` ----
@@ -170,7 +172,7 @@ impl WalkLimits {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    fn stopped(&self) -> bool {
+    pub(crate) fn stopped(&self) -> bool {
         self.cancel.load(Ordering::Relaxed) || Instant::now() >= self.deadline
     }
 
@@ -630,17 +632,21 @@ fn same_name(name: &std::ffi::OsStr, skip: &str) -> bool {
 }
 
 /// Обычные файлы обхода `base` по порядку; `root` — канонический корень проекта (от него
-/// собираются правила игнорирования). Возвращает, остановлен ли обход пределами.
+/// собираются правила игнорирования).
 fn walk_files(
     root: &Path,
     base: &ResolvedPath,
     limits: &WalkLimits,
     mut f: impl FnMut(&Path),
-) -> bool {
-    let rules = Arc::new(Rules::new(root, &base.path, base.inside));
-    for entry in walker(&base.path, rules) {
+) -> WalkEnd {
+    let rules = Arc::new(Rules::new(root, &base.path, base.inside, limits));
+    let end = |rules: &Rules| WalkEnd {
+        stopped: limits.stopped(),
+        rules_over_budget: rules.over_budget(),
+    };
+    for entry in walker(&base.path, rules.clone()) {
         if limits.stopped() {
-            return true;
+            return end(&rules);
         }
         let e = match entry {
             Ok(e) => e,
@@ -653,7 +659,29 @@ fn walk_files(
             f(e.path());
         }
     }
-    limits.stopped()
+    end(&rules)
+}
+
+/// Итог обхода: остановлен ли он пределами и все ли правила загружены.
+#[derive(Default)]
+struct WalkEnd {
+    stopped: bool,
+    /// Часть файлов правил не загружена из-за бюджета памяти (N1).
+    rules_over_budget: bool,
+}
+
+impl WalkEnd {
+    /// Пометки в конце вывода.
+    fn notes(&self, text: &mut String, limits: &WalkLimits) {
+        if self.rules_over_budget {
+            text.push('\n');
+            text.push_str(RULES_OVER_BUDGET);
+        }
+        if self.stopped {
+            text.push('\n');
+            text.push_str(&limits.note());
+        }
+    }
 }
 
 /// Путь `p` относительно `base` через `/`.
@@ -767,6 +795,10 @@ impl Tool for SearchTool {
                 "runtime/fs.search.not_found",
                 not_found_text("src/mian.rs", &["src/main.rs".to_owned()]),
             ),
+            (
+                "runtime/fs.search.rules_over_budget",
+                RULES_OVER_BUDGET.to_owned(),
+            ),
             ("runtime/fs.search.skipped_long", skipped_long_text(1)),
             (
                 "runtime/fs.search.skipped_unreadable",
@@ -819,18 +851,18 @@ enum FileOutcome {
 
 /// Чтение файла с проверкой пределов на каждом блоке (I2): отмена и дедлайн действуют и
 /// внутри большого файла без совпадений.
-struct Watched<'a> {
-    file: &'a File,
+struct Watched<'a, R> {
+    inner: R,
     limits: &'a WalkLimits,
 }
 
-impl Read for Watched<'_> {
+impl<R: Read> Read for Watched<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.limits.stopped() {
             // Не `Interrupted`: читатели повторяют чтение после него.
             return Err(io::Error::other("search stopped"));
         }
-        self.file.read(buf)
+        self.inner.read(buf)
     }
 }
 
@@ -840,8 +872,10 @@ impl Read for Watched<'_> {
 /// с `/` сопоставляется с путём от `base`, без `/` — с именем файла; на Windows без учёта
 /// регистра. Явно указанный файл ищется, даже если он игнорируется; его ошибка открытия или
 /// чтения — результат-ошибка (I4). В обходе нечитаемые файлы и файлы со строкой длиннее
-/// [`SEARCH_LINE_HEAP`] пропускаются и считаются в пометках. Двоичные файлы (NUL)
-/// пропускаются, строки не в UTF-8 показываются с заменой.
+/// [`SEARCH_LINE_HEAP`] пропускаются и считаются в пометках. Совпадения такого файла до
+/// длинной строки остаются в выводе, а у явно указанного файла отбрасываются вместе с
+/// ошибкой (N5). Двоичные файлы (NUL) пропускаются, строки не в UTF-8 показываются с
+/// заменой. Правила игнорирования сверх бюджета памяти не загружаются — пометка в выводе.
 pub fn search_in(
     root: &Path,
     base: &ResolvedPath,
@@ -869,12 +903,7 @@ pub fn search_in(
         Err(e) => return open_error(root, base, &e),
     };
     // Терминатор строки у поиска и у выражения один: CRLF (`$` и перед `\r\n`).
-    let mut searcher = SearcherBuilder::new()
-        .line_terminator(LineTerminator::crlf())
-        .line_number(true)
-        .binary_detection(BinaryDetection::quit(0))
-        .heap_limit(Some(SEARCH_LINE_HEAP))
-        .build();
+    let mut searcher = new_searcher();
     let mut out = Vec::new();
     let mut more = 0u64;
     let mut search_file = |r: &ResolvedPath| -> FileOutcome {
@@ -888,22 +917,10 @@ pub fn search_in(
             more: &mut more,
             limits,
         };
-        let reader = Watched {
-            file: &file,
-            limits,
-        };
-        match searcher.search_reader(&matcher, reader, hits) {
-            Ok(()) if limits.stopped() => FileOutcome::Stopped,
-            Ok(()) => FileOutcome::Done,
-            Err(_) if limits.stopped() => FileOutcome::Stopped,
-            // `grep-searcher`: «configured allocation limit (N) exceeded» — строка длиннее
-            // `heap_limit`.
-            Err(e) if e.to_string().contains("allocation limit") => FileOutcome::TooLong,
-            Err(e) => FileOutcome::Failed(e),
-        }
+        search_stream(&mut searcher, &matcher, &file, hits, limits)
     };
     let (mut unreadable, mut too_long) = (0u64, 0u64);
-    let stopped = if meta.is_dir() {
+    let walk = if meta.is_dir() {
         walk_files(root, base, limits, |p| {
             let keep = match &filter {
                 None => true,
@@ -935,7 +952,10 @@ pub fn search_in(
             }
             FileOutcome::Failed(e) => return open_error(root, base, &e),
         }
-        limits.stopped()
+        WalkEnd {
+            stopped: limits.stopped(),
+            ..WalkEnd::default()
+        }
     };
     let mut text = if out.is_empty() {
         NO_MATCHES.to_owned()
@@ -954,11 +974,29 @@ pub fn search_in(
         text.push('\n');
         text.push_str(&skipped_unreadable_text(unreadable));
     }
-    if stopped {
-        text.push('\n');
-        text.push_str(&limits.note());
-    }
+    walk.notes(&mut text, limits);
     ToolOutput::ok(text)
+}
+
+/// Поиск в одном потоке байт (файл или, в тестах, любой `Read`) с проверкой пределов на
+/// каждом блоке ([`Watched`]).
+fn search_stream<R: Read>(
+    searcher: &mut Searcher,
+    matcher: &grep_regex::RegexMatcher,
+    inner: R,
+    hits: Hits<'_>,
+    limits: &WalkLimits,
+) -> FileOutcome {
+    let reader = Watched { inner, limits };
+    match searcher.search_reader(matcher, reader, hits) {
+        Ok(()) if limits.stopped() => FileOutcome::Stopped,
+        Ok(()) => FileOutcome::Done,
+        Err(_) if limits.stopped() => FileOutcome::Stopped,
+        // `grep-searcher`: «configured allocation limit (N) exceeded» — строка длиннее
+        // `heap_limit`.
+        Err(e) if e.to_string().contains("allocation limit") => FileOutcome::TooLong,
+        Err(e) => FileOutcome::Failed(e),
+    }
 }
 
 // ---- glob ----
@@ -1061,6 +1099,10 @@ impl Tool for GlobTool {
             ),
             ("runtime/fs.glob.more", more_files_text(1)),
             ("runtime/fs.glob.no_files", NO_FILES.to_owned()),
+            (
+                "runtime/fs.glob.rules_over_budget",
+                RULES_OVER_BUDGET.to_owned(),
+            ),
             ("runtime/fs.glob.stopped", stopped_text(1)),
         ]
     }
@@ -1077,7 +1119,7 @@ pub fn glob_in(root: &Path, base: &ResolvedPath, rest: &str, limits: &WalkLimits
     };
     let mut found = BTreeSet::new();
     let mut more = 0u64;
-    let stopped = if stat_checked(base).is_ok_and(|m| m.is_dir()) {
+    let walk = if stat_checked(base).is_ok_and(|m| m.is_dir()) {
         walk_files(root, base, limits, |p| {
             if matcher.is_match(rel(&base.path, p)) {
                 found.insert(display(root, p));
@@ -1088,7 +1130,7 @@ pub fn glob_in(root: &Path, base: &ResolvedPath, rest: &str, limits: &WalkLimits
             }
         })
     } else {
-        false
+        WalkEnd::default()
     };
     let mut text = if found.is_empty() {
         NO_FILES.to_owned()
@@ -1099,9 +1141,90 @@ pub fn glob_in(root: &Path, base: &ResolvedPath, rest: &str, limits: &WalkLimits
         text.push('\n');
         text.push_str(&more_files_text(more));
     }
-    if stopped {
-        text.push('\n');
-        text.push_str(&limits.note());
-    }
+    walk.notes(&mut text, limits);
     ToolOutput::ok(text)
+}
+
+/// Поиск `search`: терминатор CRLF (как у выражения), номера строк, двоичные файлы по NUL
+/// пропускаются, строка не длиннее [`SEARCH_LINE_HEAP`].
+fn new_searcher() -> Searcher {
+    SearcherBuilder::new()
+        .line_terminator(LineTerminator::crlf())
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(0))
+        .heap_limit(Some(SEARCH_LINE_HEAP))
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Read};
+    use std::time::{Duration, Instant};
+
+    use grep_regex::RegexMatcherBuilder;
+
+    use super::{FileOutcome, Hits, WalkLimits, new_searcher, search_stream};
+
+    /// Бесконечный поток строк без совпадений; на втором чтении (событие «первый блок
+    /// прочитан») отменяет вызов.
+    struct Endless<'a> {
+        limits: &'a WalkLimits,
+        reads: usize,
+    }
+
+    impl Read for Endless<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 2 {
+                self.limits.cancel();
+            }
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = b"line\n"[i % 5];
+            }
+            Ok(buf.len())
+        }
+    }
+
+    /// N4: отмена посреди файла без совпадений останавливает чтение. Без проверки в
+    /// `Watched` поиск по бесконечному потоку не кончился бы, и тест упал бы по тайм-ауту.
+    #[test]
+    fn cancel_stops_reading_inside_file() {
+        let scale: u64 = std::env::var("ZA_TEST_TIME_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 6);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let limits = WalkLimits::new(Instant::now() + Duration::from_secs(3600));
+            let matcher = RegexMatcherBuilder::new()
+                .line_terminator(Some(b'\n'))
+                .crlf(true)
+                .build("hit")
+                .unwrap();
+            let (mut out, mut more) = (Vec::new(), 0u64);
+            let hits = Hits {
+                shown: "endless".into(),
+                out: &mut out,
+                more: &mut more,
+                limits: &limits,
+            };
+            let mut src = Endless {
+                limits: &limits,
+                reads: 0,
+            };
+            let outcome = search_stream(&mut new_searcher(), &matcher, &mut src, hits, &limits);
+            let _ = tx.send((
+                matches!(outcome, FileOutcome::Stopped),
+                src.reads,
+                out.len(),
+            ));
+        });
+        let (stopped, reads, found) = rx
+            .recv_timeout(Duration::from_secs(30 * scale))
+            .expect("поиск не остановился после отмены посреди файла");
+        assert!(stopped);
+        assert_eq!(reads, 2, "после отмены поток больше не читается");
+        assert_eq!(found, 0);
+    }
 }

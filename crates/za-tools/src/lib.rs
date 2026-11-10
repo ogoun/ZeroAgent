@@ -28,6 +28,9 @@ mod nearest;
 mod patch;
 mod rules;
 mod tracker;
+#[cfg(test)]
+#[path = "../../../test-support/unique_dir.rs"]
+mod unique_dir;
 
 pub use edit::{
     EditHook, EditPoint, edit_tool, edit_tool_with_hook, multi_edit_tool, multi_edit_tool_with_hook,
