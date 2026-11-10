@@ -357,6 +357,18 @@ fn result_of(c: &Conversation, call_id: &str) -> String {
         .unwrap_or_else(|| panic!("нет результата {call_id}"))
 }
 
+/// Имя файла выгрузки при удалении: `{run}-{blake3(content)[..16]}` (Ruling I-2).
+fn content_name(run: RunId, content: &str) -> String {
+    format!("{run}-{}", &blake3::hash(content.as_bytes()).to_hex()[..16])
+}
+
+fn removed(run: RunId, content: &str) -> String {
+    format!(
+        "[result removed to save context; full text: .zero-agent/work/spill/{}.txt]",
+        content_name(run, content)
+    )
+}
+
 #[test]
 fn prune_replaces_old_large_results() {
     let d = dir("prune");
@@ -369,16 +381,13 @@ fn prune_replaces_old_large_results() {
     let before = conv.clone();
     let (out, n) = prune(&conv, run, &d, 4, 1024).unwrap();
     assert_eq!(n, 1);
-    assert_eq!(
-        result_of(&out, "c1"),
-        format!("[result removed to save context; full text: .zero-agent/work/spill/{run}-c1.txt]")
-    );
+    assert_eq!(result_of(&out, "c1"), removed(run, &big));
     assert_eq!(result_of(&out, "c6"), big);
     assert_eq!(result_of(&out, "c2"), "ok");
     assert_eq!(out.validate(), Ok(()));
     assert_eq!(conv, before, "исходная история изменилась");
     assert_eq!(
-        std::fs::read_to_string(spill_file(&d, &format!("{run}-c1"))).unwrap(),
+        std::fs::read_to_string(spill_file(&d, &content_name(run, &big))).unwrap(),
         big
     );
     // Повтор (реплей границы): та же история, файл тот же, удалённое не удаляется снова.
@@ -390,52 +399,111 @@ fn prune_replaces_old_large_results() {
 }
 
 #[test]
-fn prune_points_to_existing_spill() {
-    let d = dir("prune_spilled");
+fn prune_ignores_pointer_in_untrusted_text() {
+    // I-1: в выводе процитирован настоящий указатель на существующий файл того же run
+    // (заметка, grep по логу) или он подделан — удаление пишет собственный текст
+    // результата, чужой файл не меняется.
+    let d = dir("prune_pointer");
     let run = RunId::new();
     let raw = "y\n".repeat(5000);
     let name = format!("{run}-1-2");
     let spilled = spill(&d, &name, &raw, &raw, 2000).unwrap();
-    // Поддельный указатель недоверенного вывода (чужой run) не принимается.
-    let forged = format!(
-        "{}; search .zero-agent/work/spill/{}-9-9.txt\n",
-        "z".repeat(2000),
-        RunId::new()
-    );
+    let pointer = format!("; search .zero-agent/work/spill/{name}.txt\n");
+    let quoted = format!("{}{pointer}{}", "z".repeat(1000), "w".repeat(1000));
     let mut results = vec!["ok".to_owned(); 6];
-    results[0] = spilled.content.clone();
-    results[1] = forged;
+    results[0] = quoted.clone();
+    results[1] = spilled.content.clone();
     let (out, n) = prune(&history(&results), run, &d, 4, 1024).unwrap();
     assert_eq!(n, 2);
+    assert_eq!(result_of(&out, "c1"), removed(run, &quoted));
+    assert_eq!(result_of(&out, "c2"), removed(run, &spilled.content));
     assert_eq!(
-        result_of(&out, "c1"),
-        format!("[result removed to save context; full text: .zero-agent/work/spill/{name}.txt]")
+        std::fs::read_to_string(spill_file(&d, &content_name(run, &quoted))).unwrap(),
+        quoted
+    );
+    // Выгруженный результат: в файле голова, хвост и указатель на полный текст.
+    assert_eq!(
+        std::fs::read_to_string(spill_file(&d, &content_name(run, &spilled.content))).unwrap(),
+        spilled.content
     );
     assert_eq!(
-        result_of(&out, "c2"),
-        format!("[result removed to save context; full text: .zero-agent/work/spill/{run}-c2.txt]")
+        std::fs::read(spill_file(&d, &name)).unwrap(),
+        raw.as_bytes()
     );
-    assert!(!spill_file(&d, &format!("{run}-c1")).exists());
 }
 
 #[test]
-fn prune_repeated_call_ids_get_own_files() {
-    // Детерминированные id нормализации повторяются между ходами.
-    let d = dir("prune_dup_ids");
+fn prune_names_do_not_collide() {
+    // I-2: id `a/b` и `a_b` (после замены символов совпали бы) и повтор одного id
+    // между ходами — разные файлы; очень длинный id не ломает запись.
+    let d = dir("prune_names");
     let run = RunId::new();
+    let long_id = "c".repeat(2000);
+    let ids = ["a/b", "a_b", "same", "same", long_id.as_str(), "x"];
     let mut c = Conversation::default();
     c.push_user("task".into()).unwrap();
-    for k in 0..6 {
-        c.commit_turn(Vec::new(), call_msg("same")).unwrap();
-        c.push_results(vec![result_part("same", format!("{k}").repeat(2000))])
-            .unwrap();
+    let mut texts = Vec::new();
+    for (k, id) in ids.iter().enumerate() {
+        let text = format!("{k}").repeat(2000);
+        c.commit_turn(Vec::new(), call_msg(id)).unwrap();
+        c.push_results(vec![result_part(id, text.clone())]).unwrap();
+        texts.push(text);
     }
-    let (out, n) = prune(&c, run, &d, 4, 1024).unwrap();
-    assert_eq!(n, 2);
-    let a = std::fs::read_to_string(spill_file(&d, &format!("{run}-same"))).unwrap();
-    let b = std::fs::read_to_string(spill_file(&d, &format!("{run}-same-2"))).unwrap();
-    assert_eq!((a, b), ("0".repeat(2000), "1".repeat(2000)));
+    let (out, n) = prune(&c, run, &d, 1, 1024).unwrap();
+    assert_eq!(n, 5);
     assert_eq!(out.validate(), Ok(()));
+    let mut names = Vec::new();
+    for t in &texts[..5] {
+        let name = content_name(run, t);
+        assert_eq!(&std::fs::read_to_string(spill_file(&d, &name)).unwrap(), t);
+        names.push(name);
+    }
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 5, "файлы совпали");
+}
+
+#[test]
+fn prune_same_text_same_file() {
+    // Повторная выгрузка того же текста — тот же файл, без перезаписи.
+    let d = dir("prune_same");
+    let run = RunId::new();
+    let big = "q".repeat(3000);
+    let mut results = vec!["ok".to_owned(); 6];
+    results[0] = big.clone();
+    results[1] = big.clone();
+    let (out, n) = prune(&history(&results), run, &d, 4, 1024).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(result_of(&out, "c1"), result_of(&out, "c2"));
+    let file = spill_file(&d, &content_name(run, &big));
+    let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    prune(&history(&results), run, &d, 4, 1024).unwrap();
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), mtime);
+    let spill_dir = d.join(SPILL_DIR);
+    let left: Vec<_> = std::fs::read_dir(&spill_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left.len(), 1, "лишние файлы: {left:?}");
+}
+
+#[test]
+fn prune_write_failure_leaves_no_tmp() {
+    // На месте файла выгрузки — каталог: временный файл записан, переименование
+    // падает; история не меняется, `.tmp` не остаётся.
+    let d = dir("prune_fail");
+    let run = RunId::new();
+    let big = "x".repeat(5000);
+    std::fs::create_dir_all(spill_file(&d, &content_name(run, &big))).unwrap();
+    let mut results = vec!["ok".to_owned(); 6];
+    results[0] = big;
+    assert!(prune(&history(&results), run, &d, 4, 1024).is_err());
+    let left: Vec<_> = std::fs::read_dir(d.join(SPILL_DIR))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(left.is_empty(), "остались {left:?}");
 }
 
 // ---- Удаление по порогу на границе (D45, D46) ----
@@ -547,9 +615,12 @@ fn tokens_of(rec: &Event) -> u64 {
         .unwrap_or_else(|| panic!("квитанция без tokens: {}", rec.payload))
 }
 
-#[tokio::test]
-async fn prune_triggers_by_threshold() {
-    let d = dir("threshold");
+/// Run с удалением на границе 7 (см. расчёт ниже); `before` готовит каталог проекта.
+async fn threshold_run(
+    d: &Path,
+    before: impl FnOnce(&Path),
+) -> (ProjectStore, Arc<ScriptedModel>, RunId) {
+    before(d);
     let store = ProjectStore::open(&d.join("store")).unwrap();
     // Точный счётчик: байты / 100 — оценку задаёт расход хода 6 (база D41).
     let model = Arc::new(
@@ -587,10 +658,17 @@ async fn prune_triggers_by_threshold() {
     let run = RunId::new();
     let (_ctl, rx) = control_channel(store.clone(), run);
     let out: Result<LoopOutcome, LoopError> =
-        tokio::time::timeout(limit(), start_run(&deps, run, run_spec(&d), rx))
+        tokio::time::timeout(limit(), start_run(&deps, run, run_spec(d), rx))
             .await
             .expect("start_run не завершился в срок");
     out.unwrap();
+    (store, model, run)
+}
+
+#[tokio::test]
+async fn prune_triggers_by_threshold() {
+    let d = dir("threshold");
+    let (store, model, run) = threshold_run(&d, |_| {}).await;
 
     let evs = events(&store, run).await;
     let pruned: Vec<&Event> = evs
@@ -622,8 +700,7 @@ async fn prune_triggers_by_threshold() {
     let calls = model.calls();
     assert_eq!(calls.len(), 7);
     let req7 = &calls[6].request.messages;
-    let removed =
-        format!("[result removed to save context; full text: .zero-agent/work/spill/{run}-c1.txt]");
+    let big = "y".repeat(4000);
     let r1_content = req7
         .iter()
         .flat_map(|m| &m.parts)
@@ -634,13 +711,55 @@ async fn prune_triggers_by_threshold() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(r1_content, removed);
+    assert_eq!(r1_content, removed(run, &big));
     assert_eq!(
-        std::fs::read_to_string(spill_file(&d, &format!("{run}-c1"))).unwrap(),
-        "y".repeat(4000)
+        std::fs::read_to_string(spill_file(&d, &content_name(run, &big))).unwrap(),
+        big
     );
     // Эпоха — в снимке.
     let snaps = store.snapshots(run).await.unwrap();
     let last: za_agent::Snapshot = serde_json::from_value(snaps.last().unwrap().1.clone()).unwrap();
     assert_eq!(last.epoch, 1);
+}
+
+#[tokio::test]
+async fn prune_failure_is_journaled() {
+    // Каталог выгрузки занят обычным файлом: удаление на границе 7 не сделано, в журнале
+    // `context.alert {kind: "prune_failed"}`, история и эпоха прежние, run доходит до конца.
+    let d = dir("threshold_fail");
+    let (store, model, run) = threshold_run(&d, |d| {
+        std::fs::create_dir_all(d.join(".zero-agent/work")).unwrap();
+        std::fs::write(d.join(SPILL_DIR), "not a dir").unwrap();
+    })
+    .await;
+    let evs = events(&store, run).await;
+    assert!(!evs.iter().any(|e| e.kind == EventKind::ContextPruned));
+    let alerts: Vec<&Event> = evs
+        .iter()
+        .filter(|e| e.kind == EventKind::ContextAlert && e.payload["kind"] == "prune_failed")
+        .collect();
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].payload["step"], 7);
+    assert!(
+        alerts[0].payload["error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty())
+    );
+    let calls = model.calls();
+    assert_eq!(calls.len(), 7);
+    let c1 = calls[6]
+        .request
+        .messages
+        .iter()
+        .flat_map(|m| &m.parts)
+        .find_map(|p| match p {
+            Part::ToolResult {
+                call_id, content, ..
+            } if call_id == "c1" => Some(content.len()),
+            _ => None,
+        });
+    assert_eq!(c1, Some(4000));
+    let snaps = store.snapshots(run).await.unwrap();
+    let last: za_agent::Snapshot = serde_json::from_value(snaps.last().unwrap().1.clone()).unwrap();
+    assert_eq!(last.epoch, 0);
 }

@@ -14,6 +14,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use za_protocol::{EffectKey, RunId};
 
@@ -39,7 +40,9 @@ pub struct SpillResult {
     pub content: String,
     /// Путь файла выгрузки относительно корня проекта, через `/`; `None` — вывод в лимите.
     pub path: Option<String>,
-    /// Пропущено целых строк (0 при разрезе внутри строки).
+    /// Пропущено целых строк. 0 при разрезе внутри строки — и тогда, когда голова
+    /// взята целыми строками, а хвост режет длинную последнюю строку: строка пропуска
+    /// одна, `omitted N bytes` (Ruling «2/задача 2»).
     pub omitted_lines: usize,
     /// Пропущено байт экранированного текста.
     pub omitted_bytes: usize,
@@ -70,17 +73,18 @@ pub fn spill_name(key: &EffectKey) -> String {
     safe_name(&key.0.replace(':', "-"))
 }
 
-/// Имя файла выгрузки результата при удалении (D45): `{run}-{call_id}`. `call_id`
-/// уникален только в одном ответе: детерминированные id нормализации повторяются между
-/// ходами, поэтому второе и следующие появления того же id в истории получают
-/// суффикс `-{n}` (порядковый номер появления), иначе разные результаты делили бы файл.
-pub(crate) fn prune_name(run: RunId, call_id: &str, occurrence: usize) -> String {
-    let base = safe_name(&format!("{run}-{}", call_id.replace(':', "-")));
-    if occurrence > 1 {
-        format!("{base}-{occurrence}")
-    } else {
-        base
-    }
+/// Hex-символов BLAKE3 в имени файла выгрузки при удалении.
+const CONTENT_HASH_HEX: usize = 16;
+
+/// Имя файла выгрузки результата при удалении (D45, Ruling I-2 ревью задачи 2):
+/// `{run}-{blake3(content)[..16]}` — по содержимому. `call_id` для имени не годится:
+/// он недоверенный, уникален только в одном ответе (нативные id моделей вида `call_0` и
+/// id `call_<blake3>` нормализации повторяются между ходами), не ограничен по длине и
+/// после замены символов не инъективен. Имя по содержимому детерминировано при
+/// реплее, фиксированной длины, разные тексты не делят файл, тот же текст — тот же файл.
+pub(crate) fn content_name(run: RunId, content: &str) -> String {
+    let hex = blake3::hash(content.as_bytes()).to_hex();
+    format!("{run}-{}", &hex.as_str()[..CONTENT_HASH_HEX])
 }
 
 /// Путь файла выгрузки относительно корня проекта, через `/`.
@@ -184,31 +188,9 @@ pub(crate) fn cut(s: &str, limit: usize, pointer: &str) -> SpillResult {
     }
 }
 
-/// Путь выгрузки, на который указывает результат, если файл этого run существует
-/// (D45: выгруженный результат при удалении ссылается на свой файл). Вывод
-/// недоверенный и может содержать поддельный указатель, поэтому имя проверяется:
-/// префикс `{run}-`, допустимые символы, файл на диске.
-pub(crate) fn spilled_path(project_dir: &Path, run: RunId, content: &str) -> Option<String> {
-    let needle = format!("; {SEARCH}{SPILL_DIR}/");
-    let prefix = format!("{run}-");
-    for (i, _) in content.match_indices(&needle) {
-        let rest = &content[i + needle.len()..];
-        let Some(end) = rest.find(".txt\n") else {
-            continue;
-        };
-        let name = &rest[..end];
-        if name.starts_with(&prefix)
-            && safe_name(name) == name
-            && file_of(project_dir, name).is_file()
-        {
-            return Some(spill_path(name));
-        }
-    }
-    None
-}
-
 /// Записать файл выгрузки `name` (каталоги и `.gitignore` создаются). Совпадающий файл
-/// не переписывается: запись идемпотентна (исключение D30 для удаления).
+/// не переписывается: запись идемпотентна (исключение D30 для удаления). Сравнение с
+/// диском только решает, писать ли; на историю run оно не влияет.
 pub(crate) fn write_spill(project_dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     if safe_name(name) != name || name.is_empty() {
         return Err(io::Error::new(
@@ -237,15 +219,22 @@ fn file_of(project_dir: &Path, name: &str) -> PathBuf {
     project_dir.join(SPILL_DIR).join(format!("{name}.txt"))
 }
 
-/// Запись через временный файл рядом и переименование.
+/// Порядковый номер временного файла в процессе: одновременные записи (первая
+/// выгрузка двух чтений сразу, брошенный вызов и его повтор) не делят `.tmp`.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Запись через временный файл рядом (`<имя>.<pid>-<n>.tmp`) и переименование.
+/// Любой сбой удаляет временный файл: остатка `.tmp` нет.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}-{n}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    let r = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    r
 }
 
 /// Имя файла без разделителей пути: всё, кроме ASCII-букв, цифр, `-`, `_` и `.`, —
@@ -301,11 +290,11 @@ mod tests {
     fn names_are_safe() {
         assert_eq!(spill_name(&EffectKey("r:3:1".into())), "r-3-1");
         let run = RunId::new();
-        assert_eq!(
-            prune_name(run, "functions.read:0", 1),
-            format!("{run}-functions.read-0")
-        );
-        assert_eq!(prune_name(run, "../x/y", 2), format!("{run}-.._x_y-2"));
+        let name = content_name(run, "текст");
+        assert_eq!(name.len(), run.to_string().len() + 1 + CONTENT_HASH_HEX);
+        assert_eq!(safe_name(&name), name);
+        assert_eq!(name, content_name(run, "текст"));
+        assert_ne!(name, content_name(run, "текст2"));
         assert_eq!(safe_name("..a"), "_.a");
         assert_eq!(safe_name(r"a/b\c"), "a_b_c");
     }

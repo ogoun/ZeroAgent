@@ -1082,7 +1082,8 @@ async fn context_thresholds(
 /// (`before`, `after` — оценки до и после, токены); возвращает новую оценку. Нечего
 /// удалять — история, эпоха и оценка прежние, события нет. Файлы выгрузки пишутся вне
 /// эффекта (исключение D30: имя и содержимое детерминированы историей); ошибка записи
-/// — `warn` и удаление пропускается: run продолжается с полной историей.
+/// — `warn`, событие `context.alert {kind: "prune_failed", step, error}` и удаление
+/// на этой границе пропускается: run продолжается с полной историей.
 async fn prune_results(
     deps: &LoopDeps,
     st: &mut LoopState,
@@ -1101,6 +1102,13 @@ async fn prune_results(
         Err(e) => {
             tracing::warn!(run = %st.run, step, error = %e,
                 "старые результаты не удалены: файл выгрузки не записан");
+            // Видно в журнале, а не только в логе: удаление на этой границе не сделано.
+            st.last_seq = context_alert(
+                &deps.journal,
+                st.run,
+                json!({ "kind": "prune_failed", "step": step, "error": e.to_string() }),
+            )
+            .await?;
             return Ok(before);
         }
     };
