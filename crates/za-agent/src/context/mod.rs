@@ -14,11 +14,15 @@
 //! получает эффект `context` драйвера (D42), поэтому реплей принимает те же решения.
 //!
 //! [`spill`] выгружает большой вывод инструмента в файл (D44), [`prune`] удаляет старые
-//! результаты инструментов из истории (D45).
+//! результаты инструментов из истории (D45), [`compact`] сжимает историю пилой: сводка,
+//! хвост и рецитация (D46–D50).
 
+mod compact;
 mod prune;
 mod spill;
 
+pub use compact::{COMPACT_RUBRIC, CompactInput, Compacted, compact, summary_block};
+pub(crate) use compact::{MEMORY_BEFORE_EFFECT, rubric_tokens};
 pub use prune::prune;
 pub(crate) use prune::{PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES};
 pub(crate) use spill::{NOT_SAVED as SPILL_NOT_SAVED, cut as spill_cut};
@@ -211,7 +215,7 @@ impl Estimate {
 
 /// Токенов шаблона чата на сообщение (D41): приближение, `/apply-template` не
 /// используется.
-const TEMPLATE_TOKENS: u64 = 4;
+pub(crate) const TEMPLATE_TOKENS: u64 = 4;
 /// Оценка запроса, выше которой проверяется тихая обрезка (D43).
 const TRUNCATION_MIN_ESTIMATE: u32 = 1024;
 

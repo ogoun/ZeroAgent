@@ -273,13 +273,15 @@ impl ControlFrom {
 }
 
 /// Действие управляющего сообщения (атрибут `action`, D23): `correct` и `resume` — A.6,
-/// `nudge` и `reminder` — сообщения рантайма.
+/// `nudge`, `reminder` и `compact` (рубрика сводки компакции, R1-B2 D46) — сообщения
+/// рантайма.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ControlAction {
     Correct,
     Resume,
     Nudge,
     Reminder,
+    Compact,
 }
 
 impl ControlAction {
@@ -289,6 +291,7 @@ impl ControlAction {
             ControlAction::Resume => "resume",
             ControlAction::Nudge => "nudge",
             ControlAction::Reminder => "reminder",
+            ControlAction::Compact => "compact",
         }
     }
 }

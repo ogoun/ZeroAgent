@@ -8,10 +8,11 @@
 //! Граница шага (D32), по порядку: сигналы ([`Signals::drain`]), `next_step`, эффект
 //! `boundary` (ввод, настенное время, расход — D9), активное время (D19), проверка
 //! бюджета (D19, [`check_budget`]), ввод → история (и `user_inputs`, R1-B2 D66),
-//! напоминания хуков, эффект `context` — оценка запроса хода (R1-B2 D42) и по порогу
-//! удаление старых результатов (новая эпоха, R1-B2 D45), `persist`,
-//! `turn.started`, снимок `Model` на его `seq`. Ход получает лимит вывода из
-//! [`crate::output_plan`] (R1-B2 D40); после хода — проверка тихой обрезки (R1-B2 D43).
+//! напоминания хуков, эффект `context` — оценка запроса хода (R1-B2 D42), по порогам
+//! удаление старых результатов (новая эпоха, R1-B2 D45) и компакция (R1-B2 D46–D50,
+//! D70), `persist`, `turn.started`, снимок `Model` на его `seq`. Ход получает лимит
+//! вывода из [`crate::output_plan`] (R1-B2 D40); после хода — проверка тихой обрезки
+//! (R1-B2 D43); `ContextOverflow` хода — аварийная компакция и один повтор (R1-B2 D49).
 //!
 //! Чистая пауза (D5): событие шага, снимок `{next: Boundary, exit: Some}` на `seq`
 //! этого события, затем статус. Конечные состояния после записи статуса вызывают
@@ -38,7 +39,9 @@ use za_core::{
     Capability, EffectError, EffectSpec, Exit, Graph, GraphError, Journal, Node, NodeId, RunCtx,
     ToolRegistry, Transition, pause_reason_for,
 };
-use za_llm::{BoxFuture, EndpointId, FinishReason, ModelCall, ModelPort, RequestMeta, ToolChoice};
+use za_llm::{
+    BoxFuture, EndpointId, ErrorClass, FinishReason, ModelCall, ModelPort, RequestMeta, ToolChoice,
+};
 use za_protocol::{
     Actor, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId, RunMode, RunRole,
     RunStatus, Seq, Tier, canonical_json, fail_reason, pause_reason,
@@ -47,8 +50,8 @@ use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
 use crate::budget::{Spent, budget_number, check_budget};
 use crate::context::{
-    ContextBudget, ContextConfig, Estimate, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES, SpillCfg, UserInput,
-    output_plan, prune, truncation_suspected,
+    CompactInput, ContextBudget, ContextConfig, Estimate, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES,
+    SpillCfg, UserInput, compact, output_plan, prune, rubric_tokens, truncation_suspected,
 };
 use crate::control::ControlRx;
 use crate::conversation::{Conversation, HistoryError};
@@ -65,8 +68,8 @@ use crate::resume::state_block;
 use crate::state::{AtBoundary, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools};
 use crate::turn::{
-    CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, RequestRefs, Reviewed, Signal, TurnError,
-    TurnOutput, model_turn, report_parse_errors, review,
+    CallKind, CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, RequestRefs, Reviewed, Signal,
+    TurnError, TurnOutput, model_call, report_parse_errors, review,
 };
 
 /// Точки «сбоя» для тестов и --crash-at (D33).
@@ -80,6 +83,9 @@ pub enum CrashPoint {
     AfterExitSnapshot { step: u64 },
     /// конечный статус (done, partial, blocked, cancelled) записан, конечного снимка ещё нет
     AfterFinalStatus { step: u64 },
+    /// квитанция `compact` шага записана; новая история, `context.compacted` и снимок
+    /// `Model` — нет (R1-B2 D68): компакция по порогу на границе и аварийная в узле `model`
+    AfterCompact { step: u64 },
 }
 
 /// true — драйвер немедленно возвращает Err(LoopError::Halted) без единой записи.
@@ -388,6 +394,7 @@ async fn step_zero(
         env_text,
         user_inputs: Vec::new(),
         epoch: 0,
+        last_next_step: String::new(),
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
@@ -887,7 +894,9 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     }
     // (7') Оценка запроса хода (R1-B2 D42): ввод и напоминания уже в истории.
     let est = context_effect(deps, st, step, 0).await?;
-    context_thresholds(deps, st, step, est).await?;
+    if let Some(t) = context_thresholds(sh, st, step, est).await? {
+        return Ok(t);
+    }
     // (8)–(10) persist, turn.started, снимок `Model` на его seq.
     persist(&store_of(deps), st).await?;
     st.turn += 1;
@@ -1035,46 +1044,245 @@ async fn context_effect(
     Ok(est)
 }
 
+/// Причина компакции в `context.compacted.reason`: порог `compact_at` (D46).
+const COMPACT_THRESHOLD: &str = "threshold";
+/// Причина компакции: подозрение на тихую обрезку (D43, `compact_pending`).
+const COMPACT_TRUNCATION: &str = "truncation";
+/// Причина компакции: `оценка + резерв > n_ctx` на границе (D49, D70).
+const COMPACT_WINDOW: &str = "window";
+/// Причина компакции: `ContextOverflow` хода (D49).
+const COMPACT_OVERFLOW: &str = "overflow";
+/// Подозрение на обрезку в пределах стольких ходов после компакции по этой причине —
+/// пауза `context` (D43).
+const TRUNCATION_REPEAT_TURNS: u32 = 2;
+
+/// `оценка + резерв ≥ share × n_ctx` — одна мера порогов (D43, D45, D46).
+fn over_share(est: Estimate, reserve: u32, share: f32, n_ctx: u32) -> bool {
+    (u64::from(est.tokens) + u64::from(reserve)) as f64 >= f64::from(share) * f64::from(n_ctx)
+}
+
+/// `оценка + резерв > n_ctx`: запрос хода не помещается в окно (D49, D70).
+fn beyond_window(est: Estimate, reserve: u32, n_ctx: u32) -> bool {
+    u64::from(est.tokens) + u64::from(reserve) > u64::from(n_ctx)
+}
+
 /// Пороги по одной мере `оценка + резерв` (D43, D45, D46), резерв — лимит вывода хода.
 /// Порядок (D46): удаление старых результатов при `≥ prune_at × n_ctx` (D45), затем
-/// `reset` и эффект `context` следующего прохода; решение о компакции — по новой
-/// оценке. Компакция (задача 3) ещё не подключена: порог компакции или ждущая
-/// компакция пишут `context.alert {kind: "threshold"}`.
+/// `reset` и эффект `context {pass: 1}`; компакция по новой оценке — при
+/// `≥ compact_at × n_ctx` (не больше одной по порогу на границе), при ждущей компакции
+/// (D43) или при `оценка + резерв > n_ctx` (аварийная, D49); затем `reset` и
+/// `context {pass: 2}`. Пока порог подавлен (D70), по порогу не сжимается, предел —
+/// окно. Остался выше окна после обычной компакции — одна аварийная и
+/// `context {pass: 3}`. `Some` — выход из границы (пауза, отмена, ошибка модели).
 async fn context_thresholds(
-    deps: &LoopDeps,
+    sh: &Shared,
     st: &mut LoopState,
     step: u64,
     mut est: Estimate,
-) -> Result<(), LoopError> {
+) -> Result<Option<Transition>, LoopError> {
+    let deps = &sh.deps;
     let reserve = turn_options(st).max_output_tokens.unwrap_or(0);
     let n_ctx = st.setup.n_ctx;
-    let over = |est: Estimate, share: f32| {
-        (u64::from(est.tokens) + u64::from(reserve)) as f64 >= f64::from(share) * f64::from(n_ctx)
-    };
-    if over(est, st.setup.context.prune_at) {
+    let (prune_at, compact_at) = (st.setup.context.prune_at, st.setup.context.compact_at);
+    if over_share(est, reserve, prune_at, n_ctx) {
         est = prune_results(deps, st, step, est).await?;
     }
-    let prune = over(est, st.setup.context.prune_at);
-    let compact = over(est, st.setup.context.compact_at) || st.meter.compact_pending;
-    if compact {
-        tracing::debug!(run = %st.run, estimate = est.tokens, reserve, n_ctx,
-            "порог компакции достигнут, компакция ещё не подключена");
+    let pending = st.meter.compact_pending;
+    let threshold = over_share(est, reserve, compact_at, n_ctx);
+    let window = beyond_window(est, reserve, n_ctx);
+    if !(pending || window || (threshold && !st.meter.suppressed)) {
+        if threshold {
+            tracing::debug!(run = %st.run, step, estimate = est.tokens, reserve,
+                "компакция по порогу подавлена: прошлая не опустила оценку ниже порога (D70)");
+        }
+        return Ok(None);
+    }
+    let reason = if pending {
+        COMPACT_TRUNCATION
+    } else if window {
+        COMPACT_WINDOW
+    } else {
+        COMPACT_THRESHOLD
+    };
+    // Запрос компакции не помещается в окно — сразу аварийный вход (D49).
+    let budget = ContextBudget::for_context(n_ctx);
+    let emergency = window
+        || u64::from(est.tokens)
+            + u64::from(rubric_tokens())
+            + u64::from(budget.compaction_reserve)
+            > u64::from(n_ctx);
+    let done_emergency = match run_compaction(sh, st, step, emergency, reason).await? {
+        CompactStep::Done { emergency } => emergency,
+        CompactStep::Skipped => return Ok(None),
+        CompactStep::Exit(t) => return Ok(Some(t)),
+    };
+    if pending {
+        st.meter.truncation_turn = Some(st.turn);
+    }
+    let est = context_effect(deps, st, step, 2).await?;
+    check_sufficient(deps, st, step, est, reserve).await?;
+    if done_emergency || !beyond_window(est, reserve, n_ctx) {
+        return Ok(None);
+    }
+    // Хвост новой эпохи сам не помещается в окно: одна аварийная компакция (D49, 1.17).
+    match run_compaction(sh, st, step, true, COMPACT_WINDOW).await? {
+        CompactStep::Done { .. } => {}
+        CompactStep::Skipped => return Ok(None),
+        CompactStep::Exit(t) => return Ok(Some(t)),
+    }
+    let est = context_effect(deps, st, step, 3).await?;
+    check_sufficient(deps, st, step, est, reserve).await?;
+    Ok(None)
+}
+
+/// D70: после компакции `оценка + резерв ≥ compact_at × n_ctx` — компакция бесполезна:
+/// `context.alert {kind: "compaction_insufficient"}` и подавление порога; ниже порога —
+/// подавление снято.
+async fn check_sufficient(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    step: u64,
+    est: Estimate,
+    reserve: u32,
+) -> Result<(), StoreError> {
+    let n_ctx = st.setup.n_ctx;
+    let insufficient = over_share(est, reserve, st.setup.context.compact_at, n_ctx);
+    st.meter.suppressed = insufficient;
+    if insufficient {
+        tracing::warn!(run = %st.run, step, estimate = est.tokens, reserve, n_ctx,
+            "после компакции оценка выше порога: компакции по порогу подавлены");
         st.last_seq = context_alert(
             &deps.journal,
             st.run,
             json!({
-                "kind": "threshold",
+                "kind": "compaction_insufficient",
+                "step": step,
                 "estimate": est.tokens,
-                "exact": est.exact,
                 "reserve": reserve,
                 "n_ctx": n_ctx,
-                "prune": prune,
-                "compact": compact,
             }),
         )
         .await?;
     }
     Ok(())
+}
+
+/// Итог [`run_compaction`].
+enum CompactStep {
+    /// История новой эпохи принята; `emergency` — сводку дал аварийный вход.
+    Done { emergency: bool },
+    /// Квитанция обрыва компакции прочитана при реплее: команда не применяется второй
+    /// раз (D7), история прежняя.
+    Skipped,
+    /// Выход из узла: пауза, отмена, ошибка модели или эффекта.
+    Exit(Transition),
+}
+
+/// Компакция (D46–D50, D68): [`compact`], точка сбоя `AfterCompact`, новая история
+/// (`epoch += 1`, `meter.reset()`, вводы с новым `at`, `last_next_step`) и событие
+/// `context.compacted` с `tainted = true` (CTX-011). Ошибка модели — пауза по D11
+/// (`ContextOverflow` после аварийного входа — `context`) с событием
+/// `context.alert {kind: "compaction_failed"}`; пауза и отмена во время компакции —
+/// как у хода (D26).
+async fn run_compaction(
+    sh: &Shared,
+    st: &mut LoopState,
+    step: u64,
+    emergency: bool,
+    reason: &str,
+) -> Result<CompactStep, LoopError> {
+    let deps = &sh.deps;
+    let r = compact(
+        &mut st.ctx,
+        &deps.journal,
+        deps.model.as_ref(),
+        deps.memory.as_ref(),
+        CompactInput {
+            frozen: &st.frozen,
+            frozen_ref: &st.frozen_ref,
+            setup: &st.setup,
+            conv: &st.conv,
+            env: &st.env_text,
+            goal: &st.task,
+            user_inputs: &st.user_inputs,
+            last_next_step: &st.last_next_step,
+            emergency,
+        },
+        st.turn,
+        &mut st.sig,
+    )
+    .await;
+    if r.is_ok() && crashed(deps, CrashPoint::AfterCompact { step }) {
+        return Err(LoopError::Halted);
+    }
+    match r {
+        Ok(c) => {
+            st.conv = c.conv;
+            st.user_inputs = c.user_inputs;
+            st.last_next_step = c.next_step;
+            st.epoch += 1;
+            st.meter.reset();
+            st.meter.compact_pending = false;
+            tracing::info!(run = %st.run, step, epoch = st.epoch, reason, emergency = c.emergency,
+                before = c.before, after = c.after, tail = c.tail, omitted = c.omitted,
+                "история сжата: новая эпоха");
+            st.last_seq = append_tainted(
+                &deps.journal,
+                st.run,
+                EventKind::ContextCompacted,
+                json!({
+                    "epoch": st.epoch,
+                    "step": step,
+                    "turn": st.turn,
+                    "reason": reason,
+                    "emergency": c.emergency,
+                    "before": c.before,
+                    "after": c.after,
+                    "tail": c.tail,
+                    "omitted": c.omitted,
+                }),
+            )
+            .await?;
+            Ok(CompactStep::Done {
+                emergency: c.emergency,
+            })
+        }
+        Err(TurnError::Model { error, last_wait }) => {
+            tracing::warn!(run = %st.run, step, error = %error, "компакция завершилась ошибкой модели");
+            st.last_seq = context_alert(
+                &deps.journal,
+                st.run,
+                json!({
+                    "kind": "compaction_failed",
+                    "step": step,
+                    "class": error.class,
+                    "error": error.message,
+                }),
+            )
+            .await?;
+            let exit = exit_for_model_error(&error, last_wait.as_ref());
+            Ok(CompactStep::Exit(clean_pause(deps, st, exit).await?))
+        }
+        Err(TurnError::Effect(e)) => {
+            st.exit = Some(effect_exit(e)?);
+            Ok(CompactStep::Exit(Transition::Done))
+        }
+        Err(TurnError::Aborted { signal, source }) => match (signal, source) {
+            (Signal::Pause, za_core::EffectSource::Live) => {
+                Ok(CompactStep::Exit(command_pause(sh, st).await?))
+            }
+            (Signal::Cancel, za_core::EffectSource::Live) => {
+                Ok(CompactStep::Exit(command_cancel(deps, st).await?))
+            }
+            // Реплей обрыва (D7) или ввод (компакция его не ждёт): история прежняя.
+            _ => {
+                tracing::info!(run = %st.run, step, ?signal, ?source,
+                    "компакция прервана раньше: при реплее не применяется");
+                Ok(CompactStep::Skipped)
+            }
+        },
+        Err(TurnError::Request(e)) => Err(LoopError::Request(e)),
+    }
 }
 
 /// Удаление старых результатов (D45): новая эпоха истории, `meter.reset()`, эффект
@@ -1139,20 +1347,22 @@ async fn prune_results(
 
 /// D43: расход хода меньше половины оценки его запроса — сервер, вероятно, срезал
 /// начало промпта: `context.alert {kind: "truncation_suspected"}` и компакция на
-/// ближайшей границе. Расход неизвестен (`input == 0`) — проверки нет.
+/// ближайшей границе. Расход неизвестен (`input == 0`) — проверки нет. Повторное
+/// подозрение в пределах 2 ходов после компакции по этой причине — `true`: пауза
+/// `context` (компакция не помогла, повторять её бессмысленно).
 async fn check_truncation(
     deps: &LoopDeps,
     st: &mut LoopState,
     out: &TurnOutput,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     // Нижняя оценка — без рассуждений прошлых ходов: шаблоны llama.cpp их выбрасывают,
     // и полная оценка дала бы ложное подозрение после длинного рассуждения.
     let Some(estimate) = st.meter.last_floor.or(st.meter.last_estimate) else {
-        return Ok(());
+        return Ok(false);
     };
     let input = out.usage.input;
     if !truncation_suspected(estimate, input) {
-        return Ok(());
+        return Ok(false);
     }
     tracing::warn!(run = %st.run, turn = st.turn, estimate, input,
         "расход хода меньше половины оценки: подозрение на обрезку контекста сервером");
@@ -1167,8 +1377,20 @@ async fn check_truncation(
         }),
     )
     .await?;
+    let repeated = st
+        .meter
+        .truncation_turn
+        .is_some_and(|t| st.turn.saturating_sub(t) <= TRUNCATION_REPEAT_TURNS);
+    if repeated {
+        tracing::warn!(run = %st.run, turn = st.turn,
+            "обрезка повторилась после компакции: run на паузе context");
+        // Следующее подозрение после resume — снова сначала компакция.
+        st.meter.truncation_turn = None;
+        st.meter.compact_pending = false;
+        return Ok(true);
+    }
     st.meter.compact_pending = true;
-    Ok(())
+    Ok(false)
 }
 
 /// `context.alert {kind: "n_ctx_unknown", endpoint, n_ctx}` (D43): старт run и resume
@@ -1189,6 +1411,24 @@ pub(crate) async fn n_ctx_unknown(
     .await
 }
 
+/// `context.alert {kind: "n_ctx_changed", endpoint, from, to}` (D6, D43): resume на
+/// эндпоинт с другим окном.
+pub(crate) async fn n_ctx_changed(
+    j: &Journal,
+    run: RunId,
+    endpoint: &EndpointId,
+    from: u32,
+    to: u32,
+) -> Result<Seq, StoreError> {
+    tracing::info!(run = %run, endpoint = %endpoint.0, from, to, "окно контекста сменилось на resume");
+    context_alert(
+        j,
+        run,
+        json!({ "kind": "n_ctx_changed", "endpoint": endpoint.0, "from": from, "to": to }),
+    )
+    .await
+}
+
 /// Событие `context.alert` (D43, D63).
 async fn context_alert(j: &Journal, run: RunId, payload: Value) -> Result<Seq, StoreError> {
     append(j, run, Actor::Runtime, EventKind::ContextAlert, payload).await
@@ -1196,48 +1436,89 @@ async fn context_alert(j: &Journal, run: RunId, payload: Value) -> Result<Seq, S
 
 // ---- Узел model ----
 
+/// Узел `model`: ход модели. `ContextOverflow` первой попытки (D49) — исход
+/// `overflow`, аварийная компакция и один повтор хода в том же шаге (тот же `turn`,
+/// `turn_attempt = 1`, `steps += 1` — D67, D69). Снимка после компакции нет: сбой до
+/// конца шага реплеит его со снимка `Model` по квитанциям к той же истории.
 async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopError> {
     let deps = &sh.deps;
-    let opts = turn_options(st);
-    let call = ModelCall {
-        endpoint: st.setup.endpoint.clone(),
-        meta: RequestMeta {
-            run_id: st.run,
-            priority: st.setup.priority,
-            session: Some(st.run.to_string()),
-            max_wait: st.setup.max_wait,
-        },
-        request: build_request(&st.frozen, &st.setup, &st.conv, &opts),
-    };
-    let refs = RequestRefs {
-        frozen: st.frozen_ref.clone(),
-        messages: st.refs.clone(),
-        prefix: st.frozen.prefix_hash.clone(),
-    };
-    let r = model_turn(
-        &mut st.ctx,
-        &deps.journal,
-        deps.model.as_ref(),
-        call.clone(),
-        &refs,
-        st.turn,
-        &mut st.sig,
-    )
-    .await;
-    // Квитанция эффекта записана (успех, ошибка модели или обрыв) — точка сбоя D33.
-    if matches!(
-        r,
-        Ok(_) | Err(TurnError::Model { .. } | TurnError::Aborted { .. })
-    ) && crashed(
-        deps,
-        CrashPoint::AfterModelEffect {
-            step: st.ctx.step(),
-        },
-    ) {
-        return Err(LoopError::Halted);
+    let mut attempt = 0;
+    loop {
+        let opts = turn_options(st);
+        let call = ModelCall {
+            endpoint: st.setup.endpoint.clone(),
+            meta: RequestMeta {
+                run_id: st.run,
+                priority: st.setup.priority,
+                session: Some(st.run.to_string()),
+                max_wait: st.setup.max_wait,
+            },
+            request: build_request(&st.frozen, &st.setup, &st.conv, &opts),
+        };
+        let refs = RequestRefs {
+            frozen: st.frozen_ref.clone(),
+            messages: st.refs.clone(),
+            prefix: st.frozen.prefix_hash.clone(),
+        };
+        let r = model_call(
+            &mut st.ctx,
+            &deps.journal,
+            deps.model.as_ref(),
+            call.clone(),
+            &refs,
+            st.turn,
+            &mut st.sig,
+            CallKind::Turn { attempt },
+        )
+        .await;
+        // Квитанция эффекта записана (успех, ошибка модели или обрыв) — точка сбоя D33.
+        if matches!(
+            r,
+            Ok(_) | Err(TurnError::Model { .. } | TurnError::Aborted { .. })
+        ) && crashed(
+            deps,
+            CrashPoint::AfterModelEffect {
+                step: st.ctx.step(),
+            },
+        ) {
+            return Err(LoopError::Halted);
+        }
+        match r {
+            Err(TurnError::Model { error, .. })
+                if error.class == ErrorClass::ContextOverflow && attempt == 0 =>
+            {
+                tracing::warn!(run = %st.run, turn = st.turn, error = %error,
+                    "запрос хода не поместился в окно: аварийная компакция и повтор");
+                turn_finished(deps, st, "overflow", None).await?;
+                let step = st.ctx.step();
+                match run_compaction(sh, st, step, true, COMPACT_OVERFLOW).await? {
+                    CompactStep::Done { .. } => {}
+                    CompactStep::Skipped => return Ok(Transition::Goto(BOUNDARY)),
+                    CompactStep::Exit(t) => return Ok(t),
+                }
+                persist(&store_of(deps), st).await?;
+                // Оценка прежнего запроса к новому не относится: проверки обрезки у
+                // повтора нет (D43).
+                st.meter.last_estimate = None;
+                st.meter.last_floor = None;
+                st.counters.steps += 1;
+                attempt = 1;
+            }
+            r => return model_result(sh, st, r, &call).await,
+        }
     }
+}
+
+/// Итог хода модели: ответ, ошибка модели (D11), ошибка эффекта, обрыв сигналом.
+async fn model_result(
+    sh: &Shared,
+    st: &mut LoopState,
+    r: Result<TurnOutput, TurnError>,
+    call: &ModelCall,
+) -> Result<Transition, LoopError> {
+    let deps = &sh.deps;
     match r {
-        Ok(out) => model_output(sh, st, out, &call).await,
+        Ok(out) => model_output(sh, st, out, call).await,
         Err(TurnError::Model { error, last_wait }) => {
             tracing::warn!(run = %st.run, turn = st.turn, error = %error, "ход модели завершился ошибкой");
             turn_finished(deps, st, "error", None).await?;
@@ -1275,7 +1556,11 @@ async fn model_output(
     call: &ModelCall,
 ) -> Result<Transition, LoopError> {
     let deps = &sh.deps;
-    check_truncation(deps, st, &out).await?;
+    if check_truncation(deps, st, &out).await? {
+        // Ответ по срезанному контексту в историю не принимается (D43).
+        turn_finished(deps, st, "error", None).await?;
+        return clean_pause(deps, st, LoopExit::Paused(pause_reason::CONTEXT)).await;
+    }
     if matches!(
         out.finish,
         FinishReason::Refusal | FinishReason::ContentFilter
@@ -1735,6 +2020,25 @@ async fn append(
         kind,
         payload,
         tainted: false,
+    })
+    .await
+}
+
+/// Событие с `tainted = true` (D63): производный недоверенный ввод — сводка компакции
+/// (CTX-011).
+async fn append_tainted(
+    j: &Journal,
+    run: RunId,
+    kind: EventKind,
+    payload: Value,
+) -> Result<Seq, StoreError> {
+    j.append(NewEvent {
+        run_id: run,
+        parent_seq: None,
+        actor: Actor::Runtime,
+        kind,
+        payload,
+        tainted: true,
     })
     .await
 }

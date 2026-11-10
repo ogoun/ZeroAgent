@@ -22,16 +22,17 @@ use za_protocol::{
 };
 use za_store::{INTERRUPT_RESOLVED, ProjectStore, StoreError};
 
+use crate::context::MEMORY_BEFORE_EFFECT;
 use crate::context::UserInput;
 use crate::control::{ControlRx, InputMode, submit_input};
 use crate::conversation::{Conversation, LoadError};
 use crate::driver::{
-    BOUNDARY, DEFAULT_N_CTX, LoopDeps, LoopError, LoopOutcome, MODEL, fail, n_ctx_unknown,
-    run_graph, run_registry, run_tools_of,
+    BOUNDARY, DEFAULT_N_CTX, LoopDeps, LoopError, LoopOutcome, MODEL, fail, n_ctx_changed,
+    n_ctx_unknown, run_graph, run_registry, run_tools_of,
 };
 use crate::prompt::escape_untrusted;
 use crate::state::{AtBoundary, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};
-use crate::turn::MODEL_EFFECT;
+use crate::turn::{COMPACT_EFFECT, MODEL_EFFECT};
 use za_llm::{Message, Part, Role};
 
 /// Изменения run при resume (CORE-110).
@@ -196,9 +197,15 @@ pub async fn resume_run(
                 // D6: префикс и тир заморожены, окно — по новому эндпоинту; окно
                 // неизвестно — 8192 и `context.alert` (R1-B2 D43).
                 let known = deps.model.context_tokens(&ep);
-                st.setup.n_ctx = known.unwrap_or(DEFAULT_N_CTX);
+                let (from, to) = (st.setup.n_ctx, known.unwrap_or(DEFAULT_N_CTX));
+                st.setup.n_ctx = to;
                 if known.is_none() {
                     st.last_seq = n_ctx_unknown(j, run, &ep, DEFAULT_N_CTX).await?;
+                }
+                // Окно сменилось: решения о разгрузке — по новому окну, меньшее окно даёт
+                // компакцию на первой границе (D6, R1-B2 D43).
+                if from != to {
+                    st.last_seq = n_ctx_changed(j, run, &ep, from, to).await?;
                 }
                 // База счётчика посчитана токенизатором прежней модели (D41).
                 st.meter.reset();
@@ -318,6 +325,7 @@ async fn restore(
         env_text,
         user_inputs,
         epoch: snap.epoch,
+        last_next_step: snap.last_next_step,
     })
 }
 
@@ -388,10 +396,11 @@ async fn inputs_of(store: &ProjectStore, msgs: &[Message]) -> Result<Vec<UserInp
 /// Текст <state>: шаги, последняя причина паузы, решённые неизвестные исходы, мутирующие вызовы
 /// (имя и аргументы до 120 символов) — эффект ReadOnly "state".
 ///
-/// Шаги — число `turn.finished`; пауза — причина последнего перехода в `paused`
-/// (`blocked_on_budget` — так и пишется); мутирующие вызовы — намерения классов
-/// `Idempotent` и `NonIdempotent`, кроме эффекта модели, с квитанцией-успехом без
-/// `is_error`. Имена и аргументы экранируются [`escape_untrusted`].
+/// Шаги — число `turn.finished` с конечным исходом (без `overflow`, R1-B2 D69); пауза —
+/// причина последнего перехода в `paused` (`blocked_on_budget` — так и пишется);
+/// мутирующие вызовы — намерения классов `Idempotent` и `NonIdempotent`, кроме вызовов
+/// модели (ход, сводка компакции) и хука памяти, с квитанцией-успехом без `is_error`.
+/// Имена и аргументы экранируются [`escape_untrusted`].
 pub async fn state_block(store: &ProjectStore, run: RunId) -> Result<String, StoreError> {
     let mut steps = 0u64;
     let mut last_pause = String::from("none");
@@ -403,7 +412,8 @@ pub async fn state_block(store: &ProjectStore, run: RunId) -> Result<String, Sto
         for e in page {
             cursor = e.seq;
             match e.kind {
-                EventKind::TurnFinished => steps += 1,
+                // Исход `overflow` — не конец хода: ход повторяется в том же шаге (D69).
+                EventKind::TurnFinished if e.payload["outcome"] != "overflow" => steps += 1,
                 EventKind::RunStatus => {
                     let to = serde_json::from_value::<RunStatus>(e.payload["to"].clone()).ok();
                     match to {
@@ -464,10 +474,11 @@ async fn change_of(
 ) -> Result<Option<String>, StoreError> {
     let class = serde_json::from_value::<EffectClass>(p["class"].clone()).ok();
     let name = p["name"].as_str().unwrap_or_default();
+    // Вызовы модели (ход и сводка компакции) и хук памяти — не изменения проекта.
     if !matches!(
         class,
         Some(EffectClass::Idempotent | EffectClass::NonIdempotent)
-    ) || name == MODEL_EFFECT
+    ) || [MODEL_EFFECT, COMPACT_EFFECT, MEMORY_BEFORE_EFFECT].contains(&name)
     {
         return Ok(None);
     }

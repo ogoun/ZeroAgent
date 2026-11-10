@@ -73,6 +73,10 @@ pub struct Snapshot {
     /// (D45) и компакции (D46).
     #[serde(default)]
     pub epoch: u32,
+    /// Раздел `## Next step` последней сводки компакции (D50): `next_step` хука памяти
+    /// перед следующей компакцией.
+    #[serde(default)]
+    pub last_next_step: String,
 }
 
 /// Счётчики цикла, переживающие resume.
@@ -162,6 +166,8 @@ pub struct LoopState {
     pub user_inputs: Vec<UserInput>,
     /// Эпоха истории (D45, D46).
     pub epoch: u32,
+    /// Раздел `## Next step` последней сводки компакции (D50).
+    pub last_next_step: String,
 }
 
 impl LoopState {
@@ -186,6 +192,7 @@ impl LoopState {
             env_text: self.env_text.clone(),
             user_inputs: self.user_inputs.clone(),
             epoch: self.epoch,
+            last_next_step: self.last_next_step.clone(),
         }
     }
 }

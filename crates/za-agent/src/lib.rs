@@ -16,7 +16,7 @@
 //! ([`resume_run`]: реплей после сбоя, выход из паузы и бюджета, блок [`state_block`],
 //! D4–D6, CORE-006, CORE-110), контекст модели ([`ContextBudget`], [`output_plan`],
 //! [`ContextMeter`], раздел [`ContextConfig`], выгрузка вывода [`spill`] и удаление
-//! старых результатов [`prune`], R1-B2 D40–D45, D65, D66). Модель
+//! старых результатов [`prune`], компакция [`compact`], R1-B2 D40–D50, D65, D66). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod budget;
@@ -35,12 +35,13 @@ mod turn;
 
 pub use budget::{Spent, check_budget};
 pub use context::{
-    ANSWER_RESERVE, ContextBudget, ContextConfig, ContextConfigError, ContextMeter, Estimate,
-    OutputPlan, SPILL_DIR, SpillCfg, SpillResult, UserInput, output_plan, prune, spill,
-    spill_limit_bytes, spill_name, thinking_budget, truncation_suspected,
+    ANSWER_RESERVE, COMPACT_RUBRIC, CompactInput, Compacted, ContextBudget, ContextConfig,
+    ContextConfigError, ContextMeter, Estimate, OutputPlan, SPILL_DIR, SpillCfg, SpillResult,
+    UserInput, compact, output_plan, prune, spill, spill_limit_bytes, spill_name, summary_block,
+    thinking_budget, truncation_suspected,
 };
 pub use control::{ControlRx, InputMode, RunControl, control_channel, submit_input};
-pub use conversation::{Conversation, HistoryError, LoadError, Persisted};
+pub use conversation::{Conversation, HistoryError, LoadError, Persisted, cut_points, split_tail};
 pub use driver::{CrashHook, CrashPoint, LoopDeps, LoopError, LoopOutcome, RunSpec, start_run};
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};
@@ -61,7 +62,7 @@ pub use tools::{
     ASK_USER_TOOL, FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, builtin_tools, run_tools,
 };
 pub use turn::{
-    CallVerdict, ControlFlags, DELTA_FLUSH_AFTER, DELTA_FLUSH_BYTES, DeltaBuffer,
+    COMPACT_EFFECT, CallVerdict, ControlFlags, DELTA_FLUSH_AFTER, DELTA_FLUSH_BYTES, DeltaBuffer,
     HEARTBEAT_POSITION_EVERY, MODEL_EFFECT, PlannedCall, RequestRefs, Reviewed, Signal, SignalTx,
     Signals, TurnError, TurnOutput, model_turn, output_tps, report_parse_errors, review,
     signal_channel,

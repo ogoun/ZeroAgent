@@ -32,6 +32,9 @@ use za_llm::{Message, Part, Role};
 use za_protocol::{BlobHash, canonical_json};
 use za_store::{ProjectStore, StoreError};
 
+use crate::context::message_text;
+use crate::prompt::approx_tokens;
+
 /// Содержимое синтетического результата прерванного вызова (CORE-105).
 const INTERRUPTED: &str = "interrupted: call not executed";
 
@@ -95,6 +98,41 @@ impl Conversation {
     /// Сообщения по порядку.
     pub fn messages(&self) -> &[Message] {
         &self.msgs
+    }
+
+    /// История из готовых сообщений (новая эпоха компакции, вход аварийной компакции,
+    /// R1-B2 D46, D49): инварианты проверяются [`Conversation::validate`]; блобы
+    /// сообщений пишет следующий `persist`.
+    pub fn from_messages(msgs: Vec<Message>) -> Result<Conversation, HistoryError> {
+        let c = Conversation {
+            refs: vec![None; msgs.len()],
+            msgs,
+        };
+        c.validate()?;
+        Ok(c)
+    }
+
+    /// Новая голова и суффикс этой истории с `from`, затем `extra` (R1-B2 D46, D49):
+    /// `[head] + messages[from..] + extra`; `from` приводится к `1..=len`. Сообщения
+    /// суффикса сохраняют ссылки на блобы; инварианты проверяются.
+    pub(crate) fn rebased(
+        &self,
+        head: Message,
+        from: usize,
+        extra: Vec<Message>,
+    ) -> Result<Conversation, HistoryError> {
+        let from = from.max(1).min(self.msgs.len());
+        let mut msgs = vec![head];
+        let mut refs = vec![None];
+        msgs.extend_from_slice(&self.msgs[from..]);
+        refs.extend_from_slice(&self.refs[from..]);
+        for m in extra {
+            msgs.push(m);
+            refs.push(None);
+        }
+        let c = Conversation { msgs, refs };
+        c.validate()?;
+        Ok(c)
     }
 
     /// Сообщение пользователя; `PendingCalls`, если есть ждущие вызовы; `EmptyMessage`
@@ -386,6 +424,50 @@ impl Conversation {
     fn append(&mut self, m: Message) {
         self.msgs.push(m);
         self.refs.push(None);
+    }
+}
+
+/// Точки разреза истории (R1-B2 D48, D49): индексы больше 0, с которых может начаться
+/// хвост новой эпохи или суффикс входа аварийной компакции. Это сообщение пользователя
+/// или начало хода модели — первое из его служебных `Role::System`, а без них ответ
+/// ассистента. Разрез не попадает между `System` и ответом и между вызовом и
+/// результатом: результаты (`Role::Tool`) точкой разреза не бывают.
+pub fn cut_points(conv: &Conversation) -> Vec<usize> {
+    let m = conv.messages();
+    (1..m.len())
+        .filter(|&i| match m[i].role {
+            Role::User => true,
+            Role::System | Role::Assistant => m[i - 1].role != Role::System,
+            Role::Tool => false,
+        })
+        .collect()
+}
+
+/// Начало хвоста новой эпохи (R1-B2 D48). `request_at` — индекс активного запроса
+/// (последний ввод пользователя в истории): хвост с него, если суффикс не больше
+/// `max_tail_tokens` по `approx_tokens`; иначе (или запроса нет) — с начала последнего
+/// хода модели вместе с его `Role::System`. Ни одного ответа ассистента — хвост пуст
+/// (длина истории). Первое сообщение в хвост не входит никогда: у непустой истории
+/// результат ≥ 1.
+pub fn split_tail(conv: &Conversation, request_at: Option<usize>, max_tail_tokens: u32) -> usize {
+    let m = conv.messages();
+    if let Some(at) = request_at.filter(|&a| a >= 1 && a < m.len() && m[a].role == Role::User) {
+        let tokens: u64 = m[at..]
+            .iter()
+            .map(|x| u64::from(approx_tokens(&message_text(x))))
+            .sum();
+        if tokens <= u64::from(max_tail_tokens) {
+            return at;
+        }
+    }
+    match m.iter().rposition(|x| x.role == Role::Assistant) {
+        Some(mut i) if i >= 1 => {
+            while i > 1 && m[i - 1].role == Role::System {
+                i -= 1;
+            }
+            i
+        }
+        _ => m.len(),
     }
 }
 

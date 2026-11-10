@@ -7,7 +7,9 @@
 //! пишет `agent.heartbeat` и, на `Finished`, `model.usage` вместе со строкой `usage`.
 //! Итог хода — квитанция-успех с [`TurnOutput`]; ошибка модели — квитанция-отказ
 //! `model_error:{json}`; обрыв сигналом — `interrupted:pause|cancel|input`. Реплей
-//! получает тот же итог из журнала без вызова модели и без событий хода.
+//! получает тот же итог из журнала без вызова модели и без событий хода. Тот же путь
+//! (`model_call`) у запроса сводки компакции (R1-B2 D46): эффект `compact` с
+//! аргументами `{request}`, `model.request` и `model.usage` с `kind: "compact"`.
 //!
 //! История в этом модуле не меняется: ход фиксирует драйвер, и только по
 //! завершённому ответу (D10, D13). [`review`] готовит ответ к фиксации:
@@ -271,6 +273,10 @@ pub fn output_tps(output: u64, ttft_ms: Option<u64>, duration_ms: u64) -> Option
 
 /// Имя эффекта вызова модели (D7).
 pub const MODEL_EFFECT: &str = "model";
+/// Имя эффекта запроса сводки компакции (R1-B2 D46).
+pub const COMPACT_EFFECT: &str = "compact";
+/// Значение `kind` в `model.request` и `model.usage` запроса компакции (D46, D67).
+const COMPACT_KIND: &str = "compact";
 /// Префикс квитанции-отказа с ошибкой модели (D7).
 const MODEL_ERROR: &str = "model_error:";
 /// Префикс квитанции обрыва сигналом (D7).
@@ -371,24 +377,78 @@ pub async fn model_turn(
     turn: u32,
     sig: &mut Signals,
 ) -> Result<TurnOutput, TurnError> {
+    model_call(
+        ctx,
+        j,
+        model,
+        call,
+        refs,
+        turn,
+        sig,
+        CallKind::Turn { attempt: 0 },
+    )
+    .await
+}
+
+/// Вид вызова модели (R1-B2 D46, D67).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallKind {
+    /// Ход модели: эффект `model`; `attempt` — `turn_attempt` в `model.request` (0 —
+    /// первая попытка, 1 — повтор после аварийной компакции D49).
+    Turn { attempt: u32 },
+    /// Компакция (D46): эффект `compact` с аргументами `{request}`, `model.request` и
+    /// `model.usage` с `kind: "compact"`. Ввод пользователя стрим компакции не обрывает:
+    /// его прочитает следующая граница.
+    Compact,
+}
+
+/// Вызов модели как эффект `Idempotent`: ход ([`model_turn`]) или компакция (D46).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn model_call(
+    ctx: &mut RunCtx,
+    j: &Journal,
+    model: &dyn ModelPort,
+    call: ModelCall,
+    refs: &RequestRefs,
+    turn: u32,
+    sig: &mut Signals,
+    kind: CallKind,
+) -> Result<TurnOutput, TurnError> {
     // До резервирования: ошибка хэша не занимает ключ эффекта.
     let request = request_hash(&call.request).map_err(TurnError::Request)?;
     let slot = ctx.reserve()?;
     let key = slot.key().0.clone();
-    let spec = EffectSpec {
-        class: EffectClass::Idempotent,
-        name: MODEL_EFFECT.into(),
-        args: json!({
-            "endpoint": call.endpoint.0,
-            "request": request,
-            "prefix": refs.prefix,
-        }),
+    let (spec, turn_attempt, compact) = match kind {
+        CallKind::Turn { attempt } => (
+            EffectSpec {
+                class: EffectClass::Idempotent,
+                name: MODEL_EFFECT.into(),
+                args: json!({
+                    "endpoint": call.endpoint.0,
+                    "request": request,
+                    "prefix": refs.prefix,
+                }),
+            },
+            attempt,
+            false,
+        ),
+        // D46: реплей с другой историей даёт `ReplayMismatch`, а не чужую сводку.
+        CallKind::Compact => (
+            EffectSpec {
+                class: EffectClass::Idempotent,
+                name: COMPACT_EFFECT.into(),
+                args: json!({ "request": request }),
+            },
+            0,
+            true,
+        ),
     };
     let live = LiveTurn {
         j,
         run: ctx.run_id(),
         turn,
-        turn_attempt: 0,
+        turn_attempt,
+        compact,
         key: &key,
         request: &request,
         refs,
@@ -493,6 +553,8 @@ struct LiveTurn<'a> {
     turn: u32,
     /// Попытка хода (D67): 0 — первая; повторы D49, D58, D59 — с 1.
     turn_attempt: u32,
+    /// Запрос компакции (D46): `kind: "compact"`, ввод не обрывает стрим.
+    compact: bool,
     key: &'a str,
     request: &'a str,
     refs: &'a RequestRefs,
@@ -510,6 +572,13 @@ struct StreamState {
 }
 
 impl LiveTurn<'_> {
+    /// `kind: "compact"` у событий запроса компакции (D46, D67).
+    fn mark_kind(&self, payload: &mut Value) {
+        if self.compact {
+            payload["kind"] = Value::String(COMPACT_KIND.into());
+        }
+    }
+
     async fn append(&self, actor: Actor, kind: EventKind, payload: Value) -> Result<(), Live> {
         self.j
             .append(NewEvent {
@@ -539,23 +608,21 @@ impl LiveTurn<'_> {
             "max_output_tokens": r.max_output_tokens,
             "reasoning": r.reasoning,
         });
-        self.append(
-            Actor::Runtime,
-            EventKind::ModelRequest,
-            json!({
-                "turn": self.turn,
-                "turn_attempt": self.turn_attempt,
-                "endpoint": endpoint,
-                "effect_key": self.key,
-                "request": self.request,
-                "prefix": self.refs.prefix,
-                "frozen": self.refs.frozen,
-                "messages": self.refs.messages,
-                "options": options,
-                "prompt_version": PROMPT_VERSION,
-            }),
-        )
-        .await?;
+        let mut payload = json!({
+            "turn": self.turn,
+            "turn_attempt": self.turn_attempt,
+            "endpoint": endpoint,
+            "effect_key": self.key,
+            "request": self.request,
+            "prefix": self.refs.prefix,
+            "frozen": self.refs.frozen,
+            "messages": self.refs.messages,
+            "options": options,
+            "prompt_version": PROMPT_VERSION,
+        });
+        self.mark_kind(&mut payload);
+        self.append(Actor::Runtime, EventKind::ModelRequest, payload)
+            .await?;
         let started = Instant::now();
         let mut st = StreamState {
             attempt: 1,
@@ -586,6 +653,8 @@ impl LiveTurn<'_> {
                     if deadline.is_some() => Step::Timer,
             };
             match step {
+                // Компакцию ввод не обрывает: его прочитает следующая граница (D46).
+                Step::Signal(Signal::Input) if self.compact => {}
                 Step::Signal(s) => {
                     // Drop закрывает соединение (D2 R1-A) до записи квитанции.
                     drop(stream);
@@ -682,7 +751,7 @@ impl LiveTurn<'_> {
                     gpu_ms: usage.gpu_ms,
                     cost_usd: usage.cost_usd,
                 };
-                let payload = json!({
+                let mut payload = json!({
                     "turn": self.turn,
                     "endpoint": endpoint,
                     "effect_key": self.key,
@@ -692,6 +761,7 @@ impl LiveTurn<'_> {
                     "duration_ms": duration_ms,
                     "output_tps": tps,
                 });
+                self.mark_kind(&mut payload);
                 self.j.record_usage(self.run, row, payload).await?;
                 return Ok(Some(TurnOutput {
                     service: std::mem::take(&mut st.service),
