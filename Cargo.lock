@@ -2157,6 +2157,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "winapi-util",
  "za-llm",
  "za-protocol",

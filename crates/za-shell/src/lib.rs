@@ -36,6 +36,7 @@
 mod classify;
 mod command;
 mod lex;
+mod net;
 mod words;
 
 use std::collections::HashSet;
@@ -43,6 +44,7 @@ use std::collections::HashSet;
 use classify::{base_label, check_cmd, net_cmd, reads_cmd};
 use command::{Inner, analyze};
 use lex::lex_code;
+pub use net::{NetHosts, network_hosts};
 use words::words_of;
 
 /// Метки необратимых команд (D81). Те же строки — `za_protocol::irreversible`;

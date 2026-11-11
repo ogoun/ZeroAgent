@@ -6,8 +6,8 @@
 //! молчат). Каждый случай — строка таблицы с текстом команды в сообщении о падении.
 
 use za_shell::{
-    Dialect, Segment, argv0, command_args, irreversible, is_network, is_simple, path_words,
-    reads_network, segments,
+    Dialect, NetHosts, Segment, argv0, command_args, irreversible, is_network, is_simple,
+    network_hosts, path_words, reads_network, segments,
 };
 
 const B: Dialect = Dialect::Bash;
@@ -1123,4 +1123,221 @@ fn strict_n4_nested_code_is_not_rewritten() {
     );
     let c = "powershell -c \"Write-Output '\u{2019}; Remove-Item -Recurse ../x; Write-Output \u{2019}'\"";
     assert!(labels(c, P).contains(&"delete"), "{:?}", labels(c, P));
+}
+
+// --- Хосты сетевых команд (R1-C2 D104) ------------------------------------------------
+
+/// Хосты всех сегментов команды без повторов и признак неопределённого хоста — как их
+/// собирает `bash::subjects_in` (D105).
+fn hosts_of(c: &str, d: Dialect) -> NetHosts {
+    let mut out = NetHosts::default();
+    for s in segments(c, d) {
+        let h = network_hosts(&s, d);
+        out.unknown |= h.unknown;
+        for x in h.hosts {
+            if !out.hosts.contains(&x) {
+                out.hosts.push(x);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn hosts_table_raw() {
+    let t = [
+        (
+            "curl -sL https://Example.COM:8443/x?y=1",
+            vec!["Example.COM"],
+            false,
+        ),
+        (
+            "git clone git@github.com:o/r.git",
+            vec!["github.com"],
+            false,
+        ),
+        (
+            "git remote add up https://gitlab.com/o/r",
+            vec!["gitlab.com"],
+            false,
+        ),
+        ("ssh -p 22 me@host.example", vec!["host.example"], false),
+        ("scp a.txt srv.example:/tmp/a", vec!["srv.example"], false),
+        ("curl https://пример.рф/", vec!["пример.рф"], false),
+        ("wget http://10.0.0.1/a", vec!["10.0.0.1"], false),
+        ("curl https://evil.test./x", vec!["evil.test."], false),
+        ("curl $URL", vec![], true),
+        (
+            "curl --connect-to a.test::b.test: https://a.test/",
+            vec!["a.test"],
+            true,
+        ),
+        (
+            "ssh -J jump.test me@host.example",
+            vec!["host.example"],
+            true,
+        ),
+        (
+            "curl -x http://proxy.test:8080 https://a.test/",
+            vec!["a.test"],
+            true,
+        ),
+    ];
+    for (cmd, want, unknown) in t {
+        let h = hosts_of(cmd, Dialect::Bash);
+        let want: Vec<String> = want.into_iter().map(String::from).collect();
+        assert_eq!((h.hosts, h.unknown), (want, unknown), "{cmd}");
+    }
+}
+
+/// Сверх брифа: формы URL и scp, значения опций, обходы и неопределённый хост.
+#[test]
+fn hosts_table_extended() {
+    let t: &[(&str, Dialect, &[&str], bool)] = &[
+        ("curl -o out.txt https://a.test/", B, &["a.test"], false),
+        ("curl -sLo out.txt https://a.test/", B, &["a.test"], false),
+        ("curl https://u:pw@a.test:8080/p", B, &["a.test"], false),
+        ("curl http://[::1]:8080/", B, &["[::1]"], false),
+        ("curl 'https://a.test\\@b.test/'", B, &["a.test"], false),
+        ("curl https://x@y@a.test/", B, &["a.test"], false),
+        ("curl --url=https://a.test/", B, &["a.test"], false),
+        ("timeout 5 curl https://a.test/", B, &["a.test"], false),
+        ("bash -c 'curl https://a.test/'", B, &["a.test"], false),
+        ("x=$(curl https://a.test/)", B, &["a.test"], false),
+        ("scp me@[::1]:a b", B, &["[::1]"], false),
+        ("rsync -a x host.test:/y", B, &["host.test"], false),
+        ("rsync -a x rsync://r.test/m", B, &["r.test"], false),
+        ("sftp me@s.test", B, &["s.test"], false),
+        ("ssh ssh://me@h.test:2222", B, &["h.test"], false),
+        (
+            "git remote add up git@gitlab.com:o/r",
+            B,
+            &["gitlab.com"],
+            false,
+        ),
+        ("git -C a fetch https://a.test/r", B, &["a.test"], false),
+        ("git push ssh://git@a.test/r main", B, &["a.test"], false),
+        ("iwr https://a.test/ -OutFile a", P, &["a.test"], false),
+        (
+            "Invoke-RestMethod -Uri https://a.test/ -Method Post",
+            P,
+            &["a.test"],
+            false,
+        ),
+        // Хост не найден: имя удалённого репозитория, адрес без схемы, файл со списком.
+        ("git fetch origin", B, &[], true),
+        ("git pull", B, &[], true),
+        ("git remote update", B, &[], true),
+        ("curl a.test", B, &[], true),
+        ("curl https://a.test/ b.test", B, &["a.test"], true),
+        ("curl --max-redirs 3 https://a.test/", B, &["a.test"], true),
+        ("curl --retry 3 https://a.test/", B, &["a.test"], false),
+        ("wget -i list.txt", B, &[], true),
+        ("curl -K cfg https://a.test/", B, &["a.test"], true),
+        ("nc a.test 80", B, &[], true),
+        ("gh pr view 1", B, &[], true),
+        ("cat urls | xargs curl", B, &[], true),
+        ("iwr -Uri a.test", P, &[], true),
+        // Схема не с начала слова; многобайтовый символ перед схемой (без паники).
+        ("curl ёhttps://a.test/", B, &[], true),
+        ("curl 'x https://a.test/'", B, &[], true),
+        ("nc ёhttps://a.test/", B, &["a.test"], false),
+        // Хост не записан буквально.
+        ("curl https://$H/x", B, &[], true),
+        ("curl 'https://%65vil.test/'", B, &[], true),
+        ("curl 'https://{a,b}.test/'", B, &[], true),
+        ("curl $(cat u)", B, &[], true),
+        ("curl https://a.test/ <<EOF", B, &["a.test"], true),
+        // Ключи подмены адреса.
+        (
+            "curl --resolve a.test:443:1.2.3.4 https://a.test/",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "curl --resolve=a.test:443:1.2.3.4 https://a.test/",
+            B,
+            &["a.test"],
+            true,
+        ),
+        ("curl -sx p.test:1 https://a.test/", B, &["a.test"], true),
+        (
+            "curl --proxy p.test:1 https://a.test/",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "curl --socks5 p.test:1 https://a.test/",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "https_proxy=http://p.test:1 curl https://a.test/",
+            B,
+            &["a.test"],
+            true,
+        ),
+        ("ssh -o ProxyJump=j.test h.test", B, &["h.test"], true),
+        (
+            "ssh -o 'ProxyCommand nc j.test 22' h.test",
+            B,
+            &["h.test"],
+            true,
+        ),
+        ("ssh -oProxyJump=j.test h.test", B, &["h.test"], true),
+        ("ssh -F cfg h.test", B, &["h.test"], true),
+        ("scp -J j.test a h.test:b", B, &["h.test"], true),
+        ("rsync -e 'ssh -J j.test' x h.test:/y", B, &["h.test"], true),
+        (
+            "git -c http.proxy=p.test:1 clone https://a.test/r",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "git -c core.sshCommand=x clone git@a.test:r",
+            B,
+            &["a.test"],
+            true,
+        ),
+        ("wget -e use_proxy=on https://a.test/", B, &["a.test"], true),
+        (
+            "iwr https://a.test/ -Proxy http://p.test:1",
+            P,
+            &["a.test"],
+            true,
+        ),
+        // Удалённая команда ssh — вложенная интерпретация (`has_subst`), консервативно.
+        ("ssh h.test ls", B, &["h.test"], true),
+    ];
+    for (cmd, d, want, unknown) in t {
+        let h = hosts_of(cmd, *d);
+        let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+        assert_eq!((h.hosts, h.unknown), (want, *unknown), "{cmd}");
+    }
+}
+
+#[test]
+fn git_remote_add_is_network_not_reading() {
+    for c in [
+        "git remote add up https://gitlab.com/o/r",
+        "git -C a remote add up git@gitlab.com:o/r",
+    ] {
+        let s = &segments(c, B)[0];
+        assert!(is_network(s, B), "{c}");
+        assert!(!reads_network(s, B), "{c}");
+    }
+    let s = &segments("git remote -v", B)[0];
+    assert!(!is_network(s, B));
+}
+
+#[test]
+fn hosts_clean_corpus() {
+    for line in include_str!("fixtures/net_clean.txt").lines() {
+        let h = hosts_of(line, Dialect::Bash);
+        assert!(h.hosts.is_empty() && !h.unknown, "{line}");
+    }
 }

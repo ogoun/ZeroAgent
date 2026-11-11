@@ -713,10 +713,12 @@ pub(crate) fn net_cmd(seg: &Segment, lang: Lang) -> bool {
         "certutil" => a.iter().any(|x| x.eq_ignore_ascii_case("-urlcache")),
         "new-object" => net_object(a),
         "rsync" => a.iter().any(|x| !x.starts_with('-') && remote_spec(x)),
+        // `git remote add` сетевой, но не читающий (D104): адрес удалённого репозитория.
         "git" => matches!(
             git_subs(a),
             ("clone" | "fetch" | "pull" | "push" | "ls-remote", _)
                 | ("submodule" | "remote", "update")
+                | ("remote", "add")
         ),
         _ => false,
     }

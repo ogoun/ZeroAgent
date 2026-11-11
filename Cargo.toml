@@ -111,3 +111,8 @@ grep-matcher = "=0.1.9"
 # cargo; только функция `text`, без `unicode`, `bytes` и `inline`. Зависимостей нет;
 # лицензия Apache-2.0.
 similar = { version = "=2.7.0", default-features = false, features = ["text"] }
+# Нормализация хоста (R1-C2 D124, `za_core::net::normalize_host`): `Host::parse` по WHATWG —
+# IDNA в punycode, IPv4 в любой записи (`0x7f.1`), канонический IPv6. Позже — разбор URL
+# шлюза `za-web`. Крейт уже в Cargo.lock через `reqwest`, новых крейтов нет; только `std`.
+# Лицензия MIT OR Apache-2.0.
+url = { version = "=2.5.8", default-features = false, features = ["std"] }

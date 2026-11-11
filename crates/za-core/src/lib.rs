@@ -34,6 +34,7 @@ mod checkpoint;
 mod demo;
 mod graph;
 pub mod interrupt;
+pub mod net;
 pub mod paths;
 mod recovery;
 mod runtime;
