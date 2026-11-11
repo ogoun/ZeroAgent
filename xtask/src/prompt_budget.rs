@@ -7,13 +7,18 @@
 //! счёта — код 1. Флаг `--llama` добавляет точный счёт токенизатором целевой модели
 //! через `POST /tokenize` llama-server (HTTP/1.1 поверх `TcpStream`, только `http://`);
 //! без флага к сети команда не обращается.
+//!
+//! Случаи префикса top small (`top/small/tools`, `top/small/prefix/{mode}`, R1-C1 D93)
+//! считаются по настоящему набору run `for_run(Top, Small)`: встроенные инструменты и
+//! `za_tools::native_capability()` ([`all_cases`]).
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use za_agent::budget_cases;
+use za_agent::{budget_cases, small_prefix_cases};
+use za_tools::{AgentHome, NativeDeps, ReadTracker, Shell, native_capability};
 
 /// Предел подключения и каждой операции записи и чтения `/tokenize`.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -217,6 +222,27 @@ fn dechunk(mut rest: &[u8]) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
+/// Все случаи CI-лимита: фиксированные тексты ([`budget_cases`]) и префикс top small с
+/// нативными инструментами ([`small_prefix_cases`]). Инструменты только описываются:
+/// оболочка и `ZA_HOME` — заглушки (описания от них не зависят, D97).
+pub fn all_cases() -> Vec<za_agent::BudgetCase> {
+    let deps = NativeDeps {
+        runner: std::sync::Arc::new(za_jail::DirectRunner),
+        tracker: ReadTracker::new(),
+        shell: Shell {
+            program: "no-shell".into(),
+            dialect: za_core::shell::Dialect::Bash,
+        },
+        home: AgentHome {
+            za_home: "no-home".into(),
+            project_id: "0".into(),
+        },
+    };
+    let mut cases = budget_cases();
+    cases.extend(small_prefix_cases(&native_capability(&deps).tools));
+    cases
+}
+
 /// Аргументы команды: `--llama <http://host:port>` или ничего.
 fn parse_args(args: &[String]) -> Result<Option<String>, String> {
     match args {
@@ -237,7 +263,7 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let cases = budget_cases();
+    let cases = all_cases();
     let width = cases.iter().map(|c| c.name.len()).max().unwrap_or(0).max(6);
     println!(
         "{:<width$} | {:>6} | {:>6} | {:>6} | {:>6} | {:>5}",
@@ -286,7 +312,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
-    use za_agent::{budget_cases, role_core};
+    use za_agent::role_core;
     use za_protocol::RunRole;
 
     #[test]
@@ -312,13 +338,53 @@ mod tests {
 
     #[test]
     fn all_cases_within_limits() {
-        for case in budget_cases() {
+        for case in all_cases() {
             let c = count(&case.text);
             assert!(
                 !over_limit(&c, case.limit),
                 "{}: {c:?} при лимите {}",
                 case.name,
                 case.limit
+            );
+        }
+    }
+
+    /// R1-C1 D93: префикс top small считается с настоящими нативными инструментами набора
+    /// `for_run(Top, Small)`; заглушки `finish` нет, лимиты 550 и 1800.
+    #[test]
+    fn prompt_budget_has_real_tool_cases() {
+        let cases = all_cases();
+        let tools = cases.iter().find(|c| c.name == "top/small/tools").unwrap();
+        assert_eq!(tools.limit, 550);
+        for name in ["read", "search", "edit", "bash"] {
+            assert!(
+                tools.text.contains(&format!("\"name\":\"{name}\"")),
+                "{name}: {}",
+                tools.text
+            );
+        }
+        // glob и multi_edit — со standard, finish — у субагентов, request_grant — со standard.
+        for name in ["glob", "multi_edit", "finish", "request_grant", "ask_user"] {
+            assert!(
+                !tools.text.contains(&format!("\"name\":\"{name}\"")),
+                "{name}"
+            );
+        }
+        for m in ["coder", "researcher", "operator", "writer"] {
+            let c = cases
+                .iter()
+                .find(|c| c.name == format!("top/small/prefix/{m}"))
+                .unwrap();
+            assert_eq!(c.limit, 1800, "{m}");
+            assert!(c.text.ends_with(&tools.text), "{m}");
+        }
+        for c in &cases {
+            let n = count(&c.text);
+            assert!(
+                !over_limit(&n, c.limit),
+                "{}: {n:?} при лимите {}",
+                c.name,
+                c.limit
             );
         }
     }

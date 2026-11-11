@@ -5,13 +5,21 @@
 //! заходит и к цели не обращается. Помощники ссылок и пропуска — как в
 //! `za-core/tests/paths.rs`: на Windows ссылка на файл требует прав, без них проверка
 //! пропускается с сообщением, а `ZA_REQUIRE_LINK_TESTS=1` превращает пропуск в падение.
+//!
+//! Доверие в `run` (R1-C1 задача 13, D83): недоверенный проект не читает `AGENTS.md`,
+//! `CLAUDE.md` и `.zero-agent/config.toml`; `zero-agent trust` даёт доверие заранее;
+//! правка доверенного файла снимает доверие с перечнем изменений; первая команда в
+//! недоверенном проекте — прерывание `trust-…`, ответ пишет `trust.granted` в аудит.
 
 use std::path::{Path, PathBuf};
 
-use zero_agent::trust::{EXTERNAL_LINK, LINK_PREFIX, trust_set};
+use axum::response::Response;
+use serde_json::Value;
+use zero_agent::trust::{EXTERNAL_LINK, LINK_PREFIX, TrustDiff, TrustSet, trust_set};
 
 mod support;
-use support::process::unique_dir;
+use support::fake_llama::{Fake, call_reply, llama_config, text_reply};
+use support::process::{Env, env_in, interrupt_id, run_id, unique_dir};
 
 /// Каталог проекта и внешний каталог теста.
 fn fixture(name: &str) -> (PathBuf, PathBuf) {
@@ -203,4 +211,233 @@ fn unc_links_are_not_touched() {
     );
     assert_eq!(s.files[".claude/skills"], EXTERNAL_LINK);
     assert_eq!(s.files["AGENTS.md"], EXTERNAL_LINK);
+}
+
+// ---- Доверие в run (задача 13) ----
+
+/// Окно `/props` сценариев доверия.
+const N_CTX: u32 = 32768;
+
+/// Метка текста `AGENTS.md` / `CLAUDE.md`: по ней видно, попал ли файл в system.
+const MARK: &str = "PROJECT-INSTRUCTIONS-MARK";
+
+fn paris(_: &[Value]) -> Response {
+    text_reply(&["Париж"])
+}
+
+/// Сервер и окружение теста с конфигурацией модели.
+fn run_env(name: &str, handler: support::fake_llama::ChatHandler) -> (Fake, Env) {
+    let srv = Fake::start(N_CTX, true, handler);
+    let e = env_in("zero-agent-trust-run", name, &llama_config(&srv.base));
+    (srv, e)
+}
+
+/// Текст system-сообщения тела запроса.
+fn system_of(body: &Value) -> String {
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "system")
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Правила политики снимка run.
+fn rules_of(snap: &Value) -> usize {
+    snap["policy"]["rules"].as_array().map_or(0, Vec::len)
+}
+
+/// Проектная конфигурация с правилом `deny` для `bash`.
+const DENY_BASH: &str = "[[policy.rules]]\naction = \"deny\"\ntool = \"bash\"\n";
+
+#[test]
+fn untrusted_project_skips_agents_md_and_config() {
+    let (srv, e) = run_env("untrusted", paris);
+    std::fs::write(e.project.join("AGENTS.md"), MARK).unwrap();
+    std::fs::create_dir_all(e.project.join(".zero-agent")).unwrap();
+    std::fs::write(e.project.join(".zero-agent/config.toml"), DENY_BASH).unwrap();
+    let o = e.run_cmd(&["Столица Франции?"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert!(o.stderr.contains("проект не доверен"), "{o:?}");
+    let body = &srv.bodies()[0];
+    assert!(
+        !system_of(body).contains(MARK),
+        "AGENTS.md недоверенного проекта прочитан"
+    );
+    let snap = e.snapshot(run_id(&o));
+    assert_eq!(snap["trusted"], false, "{snap}");
+    assert_eq!(
+        rules_of(&snap),
+        0,
+        "проектное правило недоверенного проекта действует"
+    );
+    assert!(
+        snap["taint"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("untrusted_project"))
+    );
+    // Тот же проект после доверия: AGENTS.md в system, правило проекта в снимке.
+    e.trust();
+    let o = e.run_cmd(&["Столица Франции?"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert!(!o.stderr.contains("проект не доверен"), "{o:?}");
+    assert!(system_of(&srv.bodies()[1]).contains(MARK));
+    let snap = e.snapshot(run_id(&o));
+    assert_eq!(snap["trusted"], true, "{snap}");
+    assert_eq!(rules_of(&snap), 1, "{snap}");
+    assert_eq!(snap["policy"]["rules"][0][0], "project", "{snap}");
+    // policy.loaded — на каждую смену хэша политики, не на каждый run.
+    let loaded = e.last_audit("policy.").unwrap();
+    assert_eq!(loaded.payload["project_rules"], 1, "{loaded:?}");
+    let o = e.run_cmd(&["Ещё раз"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert_eq!(e.last_audit("policy.").unwrap().seq, loaded.seq);
+}
+
+#[test]
+fn trust_then_change_detected() {
+    let (srv, e) = run_env("change", paris);
+    std::fs::write(e.project.join("AGENTS.md"), format!("{MARK} v1")).unwrap();
+    let t = e.trust();
+    assert!(t.stderr.contains("AGENTS.md"), "{t:?}");
+    let o = e.run_cmd(&["Вопрос"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert!(system_of(&srv.bodies()[0]).contains(&format!("{MARK} v1")));
+    // Правка доверенного файла снимает доверие; stderr называет файл.
+    std::fs::write(e.project.join("AGENTS.md"), format!("{MARK} v2")).unwrap();
+    let o = e.run_cmd(&["Вопрос"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert!(o.stderr.contains("проект не доверен"), "{o:?}");
+    assert!(o.stderr.contains("изменены: AGENTS.md"), "{o:?}");
+    assert!(!system_of(&srv.bodies()[1]).contains(MARK));
+    assert_eq!(e.snapshot(run_id(&o))["trusted"], false);
+    // Отзыв доверия: следующий run не доверен без перечня изменений.
+    e.trust();
+    let r = e.run(&["trust", "--project", e.project_arg(), "--revoke"]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert_eq!(e.last_audit("trust.").unwrap().action, "trust.revoked");
+    let o = e.run_cmd(&["Вопрос"]);
+    assert!(o.stderr.contains("проект не доверен"), "{o:?}");
+    assert!(!o.stderr.contains("изменены"), "{o:?}");
+}
+
+/// Запрос 1 — вызов `bash` (`echo trusted-ok`), далее — «готово».
+fn bash_then_done(seen: &[Value]) -> Response {
+    if seen.len() > 1 {
+        return text_reply(&["готово"]);
+    }
+    call_reply("call_1", "bash", "{\"cmd\":\"echo trusted-ok\"}")
+}
+
+#[test]
+fn trust_interrupt_answer_records_audit() {
+    let (srv, e) = run_env("interrupt", bash_then_done);
+    std::fs::write(e.project.join("AGENTS.md"), MARK).unwrap();
+    let o = e.run_cmd(&["--mode", "auto", "Запусти echo"]);
+    assert_eq!(o.code(), Some(3), "{o:?}");
+    assert!(o.stderr.contains("needs_trust"), "{o:?}");
+    let int = interrupt_id(&o);
+    assert!(int.starts_with("trust-"), "{int}: {o:?}");
+    assert!(o.stderr.contains("--approve | --deny"), "{o:?}");
+    let a = e.run(&[
+        "answer",
+        "--project",
+        e.project_arg(),
+        "--interrupt",
+        &int,
+        "--approve",
+    ]);
+    assert_eq!(a.code(), Some(0), "{a:?}");
+    let audit = e.last_audit("trust.").unwrap();
+    assert_eq!(audit.action, "trust.granted", "{audit:?}");
+    let files: TrustSet = serde_json::from_value(audit.payload.clone()).unwrap();
+    assert!(files.files.contains_key("AGENTS.md"), "{audit:?}");
+    // Продолжение: доверие снимает метку, команда исполняется, run завершается.
+    let id = run_id(&o).to_string();
+    let r = e.run_cmd(&["--resume", &id]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert_eq!(r.stdout, "готово\n", "{r:?}");
+    let bodies = srv.bodies();
+    let result = serde_json::to_string(&bodies[1]["messages"]).unwrap();
+    assert!(result.contains("trusted-ok"), "{result}");
+    let snap = e.snapshot(run_id(&o));
+    assert_eq!(snap["trusted"], true, "{snap}");
+    // Якорь аудита в снимке — голова цепочки на момент продолжения.
+    assert!(
+        snap["audit_head"]["seq"].as_u64().unwrap() >= audit.seq,
+        "{snap}"
+    );
+}
+
+#[test]
+fn claude_md_is_fallback() {
+    let (srv, e) = run_env("claude-md", paris);
+    std::fs::write(e.project.join("CLAUDE.md"), format!("{MARK} claude")).unwrap();
+    e.trust();
+    let o = e.run_cmd(&["Вопрос"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert!(system_of(&srv.bodies()[0]).contains(&format!("{MARK} claude")));
+    // Есть оба — читается AGENTS.md.
+    std::fs::write(e.project.join("AGENTS.md"), format!("{MARK} agents")).unwrap();
+    e.trust();
+    let o = e.run_cmd(&["Вопрос"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let system = system_of(&srv.bodies()[1]);
+    assert!(system.contains(&format!("{MARK} agents")), "{system}");
+    assert!(!system.contains(&format!("{MARK} claude")), "{system}");
+}
+
+#[test]
+fn agents_md_flag_gives_hint() {
+    let e = env_in("zero-agent-trust-run", "agents-md-flag", "");
+    let o = e.run_cmd(&["--agents-md", "Вопрос"]);
+    assert_eq!(o.code(), Some(2), "{o:?}");
+    assert!(o.stderr.contains("zero-agent trust"), "{o:?}");
+}
+
+/// Изменённый журнал аудита: запись, сохранённая в снимке run, исчезла — resume
+/// отказывает с подсказкой `audit --verify` (D91, m1 ревью задачи 4).
+#[test]
+fn resume_detects_removed_audit_tail() {
+    let (_srv, e) = run_env("anchor", bash_then_done);
+    e.trust();
+    let o = e.run_cmd(&["--mode", "ask", "Запусти echo"]);
+    assert_eq!(o.code(), Some(3), "{o:?}");
+    let head = e.snapshot(run_id(&o))["audit_head"]["seq"]
+        .as_u64()
+        .unwrap();
+    // Удаление хвоста цепочки мимо хранилища (как в тесте `audit --verify`).
+    let db = e.journal_dir().join("journal.db");
+    let c = rusqlite::Connection::open(&db).unwrap();
+    c.execute("DELETE FROM audit WHERE seq >= ?1", [head as i64])
+        .unwrap();
+    drop(c);
+    let r = e.run_cmd(&["--resume", &run_id(&o).to_string()]);
+    assert_eq!(r.code(), Some(1), "{r:?}");
+    assert!(r.stderr.contains("audit --verify"), "{r:?}");
+}
+
+#[test]
+fn trust_diff_names_changed_added_removed() {
+    let set = |pairs: &[(&str, &str)]| TrustSet {
+        files: pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+    };
+    let d = TrustDiff::between(
+        &set(&[("AGENTS.md", "1"), ("CLAUDE.md", "2")]),
+        &set(&[("AGENTS.md", "9"), (".claude/skills", "3")]),
+    );
+    assert_eq!(d.changed, ["AGENTS.md"]);
+    assert_eq!(d.added, [".claude/skills"]);
+    assert_eq!(d.removed, ["CLAUDE.md"]);
+    assert_eq!(
+        d.describe(),
+        "изменены: AGENTS.md; новые: .claude/skills; удалены: CLAUDE.md"
+    );
+    assert!(TrustDiff::between(&set(&[]), &set(&[])).is_empty());
 }

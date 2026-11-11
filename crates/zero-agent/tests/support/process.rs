@@ -166,6 +166,35 @@ impl Env {
         ])
     }
 
+    /// `trust --project <dir>` (R1-C1 D83): доверие проекту до run (набор доверенных
+    /// файлов сейчас — в аудит); ожидается код 0.
+    pub fn trust(&self) -> Out {
+        let o = self.run(&["trust", "--project", self.project_arg()]);
+        assert_eq!(o.code(), Some(0), "trust: {o:?}");
+        o
+    }
+
+    /// Последний снимок run (JSON); снимка нет — паника.
+    pub fn snapshot(&self, run: RunId) -> Value {
+        let store = self.store();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(store.latest_snapshot(run))
+            .unwrap()
+            .unwrap_or_else(|| panic!("у run {run} нет снимка"))
+            .1
+    }
+
+    /// Последняя запись аудита с действием на `prefix` (`trust.`, `approval.` и т. п.).
+    pub fn last_audit(&self, prefix: &str) -> Option<za_store::AuditEntry> {
+        let store = self.store();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(store.last_audit(prefix)).unwrap()
+    }
+
     pub fn journal_dir(&self) -> PathBuf {
         self.home
             .join("projects")

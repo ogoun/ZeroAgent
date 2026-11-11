@@ -376,6 +376,8 @@ async fn restore(
         trust_refused: snap.trust_refused,
         grants: snap.grants,
         taint: snap.taint,
+        // D91: голова аудита этого продолжения (бинарник сверил прежнюю), иначе прежняя.
+        audit_head: deps.audit_head.clone().or(snap.audit_head),
         detectors: {
             // D62: кэш сервера за время паузы или на новом эндпоинте не тот, что был.
             let mut d = snap.detectors;

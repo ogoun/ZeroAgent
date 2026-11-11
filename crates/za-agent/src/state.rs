@@ -26,6 +26,16 @@ use crate::turn::{Reviewed, Signals};
 /// разбором истории.
 pub const SNAPSHOT_V: u32 = 3;
 
+/// Голова цепочки аудита журнала проекта (R1-C1 D91, m1 ревью задачи 4): последняя
+/// запись на момент старта или продолжения run. Хранится в снимке; бинарник при resume
+/// сверяет, что запись `seq` с этим `hash` в цепочке есть, — удаление хвоста аудита
+/// (например, `trust.revoked`) не проходит молча.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditHead {
+    pub seq: u64,
+    pub hash: String,
+}
+
 /// С чего resume продолжает run (D4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +109,10 @@ pub struct Snapshot {
     /// Происхождения недоверенного содержимого (D82).
     #[serde(default)]
     pub taint: BTreeSet<String>,
+    /// Голова цепочки аудита на момент старта или последнего продолжения run (D91);
+    /// `None` — не задана (тесты без бинарника, снимки до задачи 13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_head: Option<AuditHead>,
 }
 
 /// Счётчики цикла, переживающие resume.
@@ -220,6 +234,8 @@ pub struct LoopState {
     pub grants: Vec<Grant>,
     /// Происхождения недоверенного содержимого run (D82).
     pub taint: BTreeSet<String>,
+    /// Голова цепочки аудита (D91): из `LoopDeps::audit_head`, иначе из снимка.
+    pub audit_head: Option<AuditHead>,
 }
 
 impl LoopState {
@@ -285,6 +301,7 @@ impl LoopState {
             trust_refused: self.trust_refused,
             grants: self.grants.clone(),
             taint: self.taint.clone(),
+            audit_head: self.audit_head.clone(),
         }
     }
 }

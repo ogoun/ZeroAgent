@@ -13,8 +13,8 @@
 //!
 //! Доверие (D83, I2): git вызывается только у доверенного проекта — последняя запись
 //! аудита доверия `trust.granted` с нынешним набором доверенных файлов. Иначе видны и
-//! восстанавливаются только копии файлов, в stderr — подсказка `zero-agent trust`. Единая
-//! проверка доверия перед git — задача 13.
+//! восстанавливаются только копии файлов, в stderr — подсказка `zero-agent trust`. Проверка
+//! доверия перед git — общая с `run` (`trust::trust_state`).
 //!
 //! Обе команды работают с журналом проекта: его нет (`journal.db` проверяется до
 //! открытия) — ошибка «журнал проекта не найден»; журнал держит идущий run —
@@ -34,7 +34,7 @@ use za_tools::{AgentHome, GitCheckpointer, RestoreError, backup_before_restore, 
 
 use crate::home;
 use crate::run::{RunError, canonical_project, open_existing};
-use crate::trust::{TrustSet, trust_set};
+use crate::trust::trust_state;
 
 /// Кто восстанавливает: пользователь через CLI (как у `answer`, D91).
 const ACTOR_USER: &str = "user";
@@ -110,24 +110,10 @@ fn to_json(cp: &Checkpoint) -> Result<String, CheckpointsCmdError> {
     Ok(canonical_json(&v))
 }
 
-/// Доверен ли проект сейчас (D83): последняя запись аудита доверия — `trust.granted`, и
-/// её набор доверенных файлов совпадает с нынешним. До задачи 13 (единая проверка
-/// доверия перед git) — здесь; любой сбой — «не доверен».
+/// Доверен ли проект сейчас (D83) — единая проверка доверия перед git
+/// ([`trust_state`], та же, что у `run`); любой сбой — «не доверен».
 async fn trusted_now(store: &ProjectStore, project: &Path) -> bool {
-    let Ok(Some(last)) = store.last_audit("trust.").await else {
-        return false;
-    };
-    if last.action != audit_action::TRUST_GRANTED {
-        return false;
-    }
-    let Ok(granted) = serde_json::from_value::<TrustSet>(last.payload) else {
-        return false;
-    };
-    let dir = project.to_path_buf();
-    match tokio::task::spawn_blocking(move || trust_set(&dir)).await {
-        Ok(Ok(now)) => now == granted,
-        _ => false,
-    }
+    matches!(trust_state(store, project).await, Ok((true, _)))
 }
 
 /// Подсказка недоверенному проекту: чекпоинты git не видны (I2 ревью задачи 9).

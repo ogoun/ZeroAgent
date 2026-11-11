@@ -6,12 +6,18 @@
 //! недоступность — предупреждение, не отказ (нет GPU, модель `inactive` или
 //! `unreachable` — `Warn`). Отказ — старая SQLite и ошибка конфигурации. Строка
 //! `secrets` называет источник секретов (R1-C1 D90): пока переменные `ZA_SECRET_*`, Vault
-//! памяти — с клиентом ZeroAIMemory. Проверка памяти ZeroAIMemory появится вместе с её
-//! клиентом.
+//! памяти — с клиентом ZeroAIMemory. Строки `git` и `shell` (R1-C1 D96): `git` в `PATH` и
+//! его версия (без git чекпоинты — копиями файлов, D89), оболочка инструмента `bash`
+//! (D85); их нет — `Warn`. Проверка памяти ZeroAIMemory появится вместе с её клиентом.
 
 use std::path::Path;
 
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
 use serde::Serialize;
+use za_jail::{CommandSpec, DirectRunner, EnvMode, Exit, Runner};
 use za_llm::EndpointView;
 use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query_nvidia_smi};
 
@@ -67,6 +73,10 @@ pub struct DoctorReport {
     pub gpu: Check,
     /// Источник секретов (D90); всегда `Ok`.
     pub secrets: Check,
+    /// `git` в `PATH` и его версия (D89, D96); нет — `Warn`.
+    pub git: Check,
+    /// Оболочка инструмента `bash` (D85, D96); нет — `Warn`.
+    pub shell: Check,
     /// Модели по id эндпоинта; `config` — ошибка или предупреждение конфигурации.
     pub models: Vec<(String, Check)>,
     /// Компилятор сборки и MSRV.
@@ -76,10 +86,17 @@ pub struct DoctorReport {
 impl DoctorReport {
     /// Есть ли отказ: `doctor` завершается с кодом 1.
     pub fn has_failure(&self) -> bool {
-        [&self.sqlite, &self.llama, &self.gpu, &self.secrets]
-            .into_iter()
-            .chain(self.models.iter().map(|(_, c)| c))
-            .any(|c| matches!(c, Check::Fail(_)))
+        [
+            &self.sqlite,
+            &self.llama,
+            &self.gpu,
+            &self.secrets,
+            &self.git,
+            &self.shell,
+        ]
+        .into_iter()
+        .chain(self.models.iter().map(|(_, c)| c))
+        .any(|c| matches!(c, Check::Fail(_)))
     }
 
     /// Человекочитаемый вывод.
@@ -90,6 +107,8 @@ impl DoctorReport {
             ("llama", &self.llama),
             ("gpu", &self.gpu),
             ("secrets", &self.secrets),
+            ("git", &self.git),
+            ("shell", &self.shell),
         ] {
             out.push_str(&format!("  {name:<7} {:<5} {}\n", c.label(), c.detail()));
         }
@@ -121,7 +140,7 @@ pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
             Some(check_llama(llama_url).await)
         }
     };
-    let (llama, (gpu, models)) = tokio::join!(llama, check_home(home, cfg));
+    let (llama, (gpu, models), git) = tokio::join!(llama, check_home(home, cfg), check_git());
     let llama = llama.unwrap_or_else(|| {
         let shown = llama_url.map(display_url).unwrap_or_default();
         match models.iter().find(|(id, _)| id == LLAMA_URL_ENDPOINT) {
@@ -142,6 +161,8 @@ pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
         llama,
         gpu,
         secrets: check_secrets(&StoreSecrets::from_env().short_names()),
+        git,
+        shell: check_shell(),
         models,
         rust: rust_version(),
     }
@@ -159,6 +180,51 @@ pub fn check_secrets(short: &[String]) -> Check {
             "{text}; значения короче 8 символов не маскируются: {}",
             short.join(", ")
         ))
+    }
+}
+
+/// Предел `git --version` в `doctor`.
+const GIT_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// git в `PATH` (абсолютные каталоги, как у чекпоинтов D89) и его версия: `git --version`
+/// через `za_jail::Runner` с очищенным окружением. Нет git или он не запустился — `Warn`
+/// (чекпоинты без git — копиями файлов).
+async fn check_git() -> Check {
+    let Some(git) = find_in_path(if cfg!(windows) { "git.exe" } else { "git" }) else {
+        return Check::Warn(
+            "git не найден в PATH: чекпоинты — копиями затронутых файлов".to_owned(),
+        );
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut spec = CommandSpec::new(git.clone(), cwd, GIT_VERSION_TIMEOUT);
+    spec.args = vec!["--version".into()];
+    spec.env_mode = EnvMode::Clear;
+    let runner: Arc<dyn Runner> = Arc::new(DirectRunner);
+    match runner.run(spec).await {
+        Ok(o) if o.exit == Exit::Code(0) => {
+            Check::Ok(format!("{} ({})", o.stdout.trim(), git.display()))
+        }
+        Ok(o) => Check::Warn(format!("{}: git --version: {:?}", git.display(), o.exit)),
+        Err(e) => Check::Warn(format!("{}: {e}", git.display())),
+    }
+}
+
+/// Файл `name` в абсолютных каталогах `PATH`.
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Оболочка `bash` (D85): `pwsh`/`powershell` на Windows, `bash`/`sh` иначе.
+fn check_shell() -> Check {
+    match za_tools::Shell::detect() {
+        Some(s) => Check::Ok(format!("{} ({:?})", s.program.display(), s.dialect)),
+        None => {
+            Check::Warn("оболочка для bash не найдена в PATH: команды не запустятся".to_owned())
+        }
     }
 }
 
@@ -399,6 +465,8 @@ mod tests {
             llama: Check::Warn("нет".to_owned()),
             gpu: Check::Warn("нет".to_owned()),
             secrets: check_secrets(&[]),
+            git: Check::Warn("нет".to_owned()),
+            shell: Check::Ok("bash".to_owned()),
             models: vec![("local".to_owned(), Check::Warn("inactive".to_owned()))],
             rust: rust_version(),
         };
@@ -418,6 +486,8 @@ mod tests {
             llama: Check::Warn("нет".to_owned()),
             gpu: Check::Ok("RTX".to_owned()),
             secrets: check_secrets(&[]),
+            git: Check::Ok("git version 2.47.0".to_owned()),
+            shell: Check::Warn("нет".to_owned()),
             models: vec![("local".to_owned(), Check::Ok("ready".to_owned()))],
             rust: "rustc 1.99.1".to_owned(),
         };
@@ -429,6 +499,8 @@ mod tests {
                 "llama": {"status": "warn", "detail": "нет"},
                 "gpu": {"status": "ok", "detail": "RTX"},
                 "secrets": {"status": "ok", "detail": "источник секретов: переменные ZA_SECRET_* (Vault памяти — с клиентом ZeroAIMemory)"},
+                "git": {"status": "ok", "detail": "git version 2.47.0"},
+                "shell": {"status": "warn", "detail": "нет"},
                 "models": [["local", {"status": "ok", "detail": "ready"}]],
                 "rust": "rustc 1.99.1",
             })

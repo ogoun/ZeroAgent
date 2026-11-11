@@ -16,6 +16,14 @@
 //! прерывание и пишет аудит одной транзакцией (`resolve_with_audit`, R1-C1 D91):
 //! `approval.resolved`, а при доверии ещё `trust.granted` с набором доверенных файлов на
 //! момент ответа (D83).
+//!
+//! R1-C1 (задача 13): `run` подключает нативные инструменты (`za_tools::native_capability`),
+//! чекпоинты, политику (глобальная, у доверенного проекта — и проектная), корни проекта,
+//! маску секретов и набор доверия. До цикла: проверка доверия ([`crate::trust::trust_check`]),
+//! уборка остатков прошлых сбоев, `policy.loaded`, гранты (`--grant`, `[[policy.grants]]`);
+//! у доверенного проекта — `AGENTS.md` или `CLAUDE.md`. Resume сверяет якорь аудита из
+//! снимка и передаёт отличия доверия, политики и грантов через `ResumeChange`. Пауза
+//! `needs_trust` — код 3.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -27,12 +35,16 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use za_agent::{
-    EnvInfo, LoopDeps, LoopError, LoopOutcome, ResumeChange, RunSpec, WorkMode, builtin_tools,
+    AuditHead, EnvInfo, Grant, GrantMode, GrantSource, LoopDeps, LoopError, LoopOutcome,
+    PolicyError, PolicySnapshot, ResumeChange, RunSpec, TrustSetFn, WorkMode, builtin_tools,
     control_channel, git_branch, resume_run, start_run,
 };
+use za_core::paths::{self, Roots};
 use za_core::{
-    AgentEvent, EventBus, InterruptKind, Journal, ToolRegistry, UnknownDecision, resolve_unknown,
+    Access, AgentEvent, EventBus, InterruptKind, Journal, ToolRegistry, UnknownDecision,
+    resolve_unknown,
 };
+use za_jail::DirectRunner;
 use za_llm::{EndpointId, SelectError, Selection};
 use za_protocol::{
     Actor, Budget, BudgetKind, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Seq, Tier,
@@ -40,12 +52,15 @@ use za_protocol::{
 };
 use za_secrets::SecretMasker;
 use za_store::{AuditNew, INTERRUPT_OPEN, InterruptRow, ProjectStore, StoreError};
+use za_tools::{AgentHome, GitCheckpointer, NativeDeps, ReadTracker, Shell, native_capability};
 
-use crate::config::load_config;
+use crate::config::{AgentConfig, PROJECT_CONFIG, load_config, parse_project_config};
 use crate::home;
 use crate::journal::open_retrying;
 use crate::models::{CommandError, PROBE_WAIT, start_gateway, state_text, wait_endpoint};
-use crate::trust::{TrustSet, trust_set};
+use crate::trust::{
+    TrustSet, current_set, project_instructions, read_trusted, trust_check, trust_set,
+};
 
 /// Код выхода: `done` или `partial`.
 pub const EXIT_DONE: u8 = 0;
@@ -67,8 +82,10 @@ pub const TRUST_SET_HASH: &str = "set_hash";
 const TRUST_REASK_MARK: &str = "-set";
 /// Actor записей аудита, которые пишет решение пользователя в `answer`.
 const AUDIT_ACTOR_USER: &str = "user";
-/// Файл инструкций проекта (блок 5, D22).
-const AGENTS_MD: &str = "AGENTS.md";
+/// Actor записей аудита, которые пишет бинарник сам (`policy.loaded`, гранты `--grant`).
+const AUDIT_ACTOR_RUNTIME: &str = "runtime";
+/// Длина аргументов вызова в подсказке одобрения, символы (D96).
+const ARGS_SHOWN_CHARS: usize = 400;
 
 /// Ошибка команд `run` и `answer`.
 #[derive(Debug, thiserror::Error)]
@@ -100,6 +117,17 @@ pub enum RunError {
         kind: String,
         hint: &'static str,
     },
+    /// Политика: режим `bypass` без `allow_bypass`, неверное правило (D80).
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+    /// Путь гранта (`--grant`, `[[policy.grants]]`) не разрешается (D78).
+    #[error("грант {path}: {reason}")]
+    Grant { path: String, reason: String },
+    /// Запись аудита из снимка run не найдена в цепочке (D91, m1 ревью задачи 4).
+    #[error(
+        "журнал аудита проекта изменён: записи {seq}, сохранённой при прошлом запуске run, нет в цепочке; проверка: zero-agent audit --verify"
+    )]
+    AuditAnchor { seq: u64 },
 }
 
 /// Точка аварийного завершения `--crash-at` (D33).
@@ -128,7 +156,6 @@ pub struct NewRunArgs {
     pub work_mode: Option<WorkMode>,
     pub tier: Option<Tier>,
     pub max_wait: Option<Duration>,
-    pub agents_md: bool,
     pub task: String,
 }
 
@@ -153,6 +180,8 @@ pub struct RunArgs {
     pub project: PathBuf,
     pub action: RunAction,
     pub budget: BudgetFlags,
+    /// `--grant <путь>[=ro|=rw]` (D78): у нового run и у resume (добавляются с границы).
+    pub grants: Vec<(PathBuf, GrantMode)>,
     pub crash: Option<RunCrash>,
 }
 
@@ -346,29 +375,395 @@ fn env_info(project: &Path) -> EnvInfo {
     }
 }
 
-/// `AGENTS.md` проекта; нет файла — предупреждение и `None`.
-fn read_agents_md(project: &Path) -> Result<Option<String>, RunError> {
-    let path = project.join(AGENTS_MD);
-    match std::fs::read_to_string(&path) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "zero-agent: {} не найден, run без инструкций проекта",
-                path.display()
-            );
-            Ok(None)
-        }
-        Err(source) => Err(RunError::Io {
-            what: "файл инструкций проекта",
-            path,
-            source,
-        }),
-    }
-}
-
 /// Строка аргумента для подсказок: путь в кавычках.
 fn quoted(p: &Path) -> String {
     format!("\"{}\"", display_path(p))
+}
+
+/// Что `run` знает о проекте до цикла (D78, D80, D83, D84, D91): доверие, политика,
+/// инструкции, гранты, корни и голова аудита.
+struct Prepared {
+    trusted: bool,
+    /// Последнее решение о доверии — явный отзыв (`trust --revoke`).
+    revoked: bool,
+    set: TrustSet,
+    policy: PolicySnapshot,
+    grants: Vec<Grant>,
+    roots: Roots,
+    project_id: String,
+    audit_head: Option<AuditHead>,
+}
+
+/// Подготовка run (новый и resume). Порядок: доверие (D83: набор сейчас против
+/// последней записи аудита доверия; не доверен — сообщение и отличия), уборка остатков
+/// прошлых сбоев (`reap_leftovers` реестра групп в `ZA_HOME`, временные файлы правок,
+/// D84), проектная конфигурация — только у доверенного проекта, снимок политики
+/// (глобальная и проектная, ARC-041) и `policy.loaded` при смене хэша, гранты (`--grant`
+/// и глобальные `[[policy.grants]]`, пути канонизируются), корни (D76) и голова аудита.
+async fn prepare(
+    za_home: &Path,
+    project: &Path,
+    store: &ProjectStore,
+    cfg: &AgentConfig,
+    cli_grants: &[(PathBuf, GrantMode)],
+) -> Result<Prepared, RunError> {
+    let check = trust_check(store, project).await?;
+    if !check.trusted {
+        untrusted_message(project, &check);
+    }
+    let roots = blocking("корни проекта", project, {
+        let (p, h) = (project.to_path_buf(), za_home.to_path_buf());
+        move || Roots::canonical(&p, &h)
+    })
+    .await?;
+    let project_id = home::project_id(project).map_err(|source| RunError::Io {
+        what: "каталог проекта",
+        path: project.to_path_buf(),
+        source,
+    })?;
+    cleanup_leftovers(&roots, &project_id).await;
+    let project_cfg = if check.trusted {
+        let (p, set) = (project.to_path_buf(), check.set.clone());
+        match blocking(
+            "проектная конфигурация",
+            project,
+            move || read_trusted(&p, &set, PROJECT_CONFIG),
+        )
+        .await?
+        {
+            Some(src) => Some(parse_project_config(&src).map_err(CommandError::from)?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let policy = PolicySnapshot::build(&cfg.policy, project_cfg.as_ref().map(|c| &c.policy))?;
+    for _ in &policy.ignored {
+        eprintln!(
+            "zero-agent: {PROJECT_CONFIG}: правило allow проекта не действует (только ask и deny, ARC-041)"
+        );
+    }
+    policy_loaded(store, project, &policy).await?;
+    let mut grants = Vec::new();
+    for (path, mode) in cli_grants {
+        grants.push(grant(&roots, path, *mode, GrantSource::Cli, String::new()).await?);
+    }
+    for g in &cfg.policy.grants {
+        grants.push(
+            grant(
+                &roots,
+                &g.path,
+                g.mode,
+                GrantSource::Config,
+                g.reason.clone(),
+            )
+            .await?,
+        );
+    }
+    let audit_head = store
+        .audit_head()
+        .await?
+        .map(|(seq, hash)| AuditHead { seq, hash });
+    Ok(Prepared {
+        trusted: check.trusted,
+        revoked: check.revoked,
+        set: check.set,
+        policy,
+        grants,
+        roots,
+        project_id,
+        audit_head,
+    })
+}
+
+/// Блокирующая работа с ФС вне потоков tokio; ошибка — `RunError::Io` с `what` и путём.
+async fn blocking<T: Send + 'static>(
+    what: &'static str,
+    path: &Path,
+    f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<T, RunError> {
+    let io = |source| RunError::Io {
+        what,
+        path: path.to_path_buf(),
+        source,
+    };
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| io(std::io::Error::other(e.to_string())))?
+        .map_err(io)
+}
+
+/// Сообщение недоверенному проекту (D83, D96): что не читается и как дать доверие;
+/// изменённые доверенные файлы и разрыв цепочки аудита называются.
+fn untrusted_message(project: &Path, check: &crate::trust::TrustCheck) {
+    if check.chain_broken {
+        eprintln!(
+            "zero-agent: цепочка журнала аудита проекта не сходится (zero-agent audit --verify): прежнее доверие не действует"
+        );
+    }
+    if let Some(d) = check.diff.as_ref().filter(|d| !d.is_empty()) {
+        eprintln!(
+            "zero-agent: доверенные файлы проекта изменились после доверия: {}",
+            d.describe()
+        );
+    }
+    eprintln!(
+        "zero-agent: проект не доверен: AGENTS.md, CLAUDE.md, {PROJECT_CONFIG} и скиллы не читаются, команды — после разового доверия (вопрос при первой команде или zero-agent trust --project {})",
+        quoted(project)
+    );
+}
+
+/// Уборка остатков прошлых сбоев (D84; заметка 3 задачи 13): деревья процессов из
+/// реестра групп `ZA_HOME/projects/<id>/procs` (Linux) и временные файлы правок в
+/// `.zero-agent/work/edits` — только если каталог уже есть (в чужом проекте каталоги
+/// агента не создаются). Сбой уборки run не останавливает: `warn`.
+async fn cleanup_leftovers(roots: &Roots, project_id: &str) {
+    let procs = roots
+        .za_home
+        .join("projects")
+        .join(project_id)
+        .join("procs");
+    let project = roots.project.clone();
+    let r = tokio::task::spawn_blocking(move || {
+        let killed = if procs.is_dir() {
+            DirectRunner::reap_leftovers(&procs)
+        } else {
+            0
+        };
+        let edits = project.join(".zero-agent").join("work").join("edits");
+        let cleaned = match std::fs::symlink_metadata(&edits) {
+            Ok(m) if m.is_dir() => za_tools::clean_edit_leftovers(&project),
+            _ => Ok(0),
+        };
+        (killed, cleaned)
+    })
+    .await;
+    match r {
+        Ok((killed, cleaned)) => {
+            if killed > 0 {
+                tracing::warn!(killed, "убиты процессы, пережившие прошлый запуск агента");
+            }
+            if let Err(e) = cleaned {
+                tracing::warn!(error = %e, "временные файлы правок не убраны");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "уборка остатков не выполнена"),
+    }
+}
+
+/// Убирает `.zero-agent/work/tmp/<run>` (рабочие каталоги процессов run, D84) после
+/// выхода из цикла; каталога нет — ничего. Путь проверяется по компонентам без ссылок
+/// (`work_dir`), внутри — `remove_dir_all` (по ссылкам не переходит).
+async fn cleanup_run_tmp(project: &Path, run: RunId) {
+    let tmp = project
+        .join(".zero-agent")
+        .join("work")
+        .join("tmp")
+        .join(run.to_string());
+    let root = project.to_path_buf();
+    let r = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        match std::fs::symlink_metadata(&tmp) {
+            Ok(m) if m.is_dir() => {}
+            _ => return Ok(()),
+        }
+        paths::work_dir(&root, &format!("tmp/{run}"))?;
+        std::fs::remove_dir_all(&tmp)
+    })
+    .await;
+    match r {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "рабочий каталог процессов run не убран"),
+        Err(e) => tracing::warn!(error = %e, "рабочий каталог процессов run не убран"),
+    }
+}
+
+/// `policy.loaded` (D91): пишется, только если хэш снимка политики отличается от
+/// последней такой записи аудита. Цепочка аудита не сходится — запись не пишется (`warn`):
+/// её сверит `audit --verify`.
+async fn policy_loaded(
+    store: &ProjectStore,
+    project: &Path,
+    policy: &PolicySnapshot,
+) -> Result<(), RunError> {
+    let last = match store.last_audit(audit_action::POLICY_LOADED).await {
+        Ok(l) => l,
+        Err(StoreError::Corrupt(e)) => {
+            tracing::warn!(error = %e, "цепочка аудита не сходится: policy.loaded не записан");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if last
+        .as_ref()
+        .and_then(|e| e.payload.get("hash"))
+        .and_then(Value::as_str)
+        == Some(policy.hash.as_str())
+    {
+        return Ok(());
+    }
+    let project_rules = policy
+        .rules
+        .iter()
+        .filter(|(s, _)| *s == za_agent::RuleSource::Project)
+        .count();
+    store
+        .append_audit(AuditNew {
+            actor: AUDIT_ACTOR_RUNTIME.to_owned(),
+            action: audit_action::POLICY_LOADED.to_owned(),
+            target: display_path(project),
+            payload: json!({
+                "hash": policy.hash,
+                "allow_bypass": policy.allow_bypass,
+                "rules": policy.rules.len(),
+                "project_rules": project_rules,
+                "ignored": policy.ignored,
+            }),
+        })
+        .await?;
+    Ok(())
+}
+
+/// Грант с каноническим путём (D78): относительный путь `--grant` — от текущего
+/// каталога; сетевые и device-пути отвергаются до обращения к ФС (D76), несуществующий
+/// хвост дописывается к каноническому префиксу.
+async fn grant(
+    roots: &Roots,
+    path: &Path,
+    mode: GrantMode,
+    source: GrantSource,
+    reason: String,
+) -> Result<Grant, RunError> {
+    let shown = path.display().to_string();
+    let bad = |reason: String| RunError::Grant {
+        path: shown.clone(),
+        reason,
+    };
+    let abs = std::path::absolute(path).map_err(|e| bad(e.to_string()))?;
+    let arg = abs
+        .to_str()
+        .ok_or_else(|| bad("путь не в UTF-8".to_owned()))?
+        .to_owned();
+    let roots_c = roots.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        let lex = paths::classify(&roots_c.project, &arg)?;
+        paths::resolve(&roots_c, &lex, Access::Read)
+    })
+    .await
+    .map_err(|e| bad(e.to_string()))?
+    .map_err(|e| bad(e.to_string()))?;
+    Ok(Grant {
+        path: resolved.path,
+        mode,
+        source,
+        reason,
+    })
+}
+
+/// Сверка якоря аудита (D91, m1 ревью задачи 4): запись `seq` из снимка run должна быть
+/// в цепочке с тем же хэшем; иначе хвост аудита удалён или переписан —
+/// [`RunError::AuditAnchor`]. Снимок без якоря (run до задачи 13) — без сверки.
+async fn check_audit_anchor(store: &ProjectStore, snap: &Value) -> Result<(), RunError> {
+    let Some(head) = snap
+        .get("audit_head")
+        .and_then(|v| serde_json::from_value::<AuditHead>(v.clone()).ok())
+    else {
+        return Ok(());
+    };
+    let found = store
+        .audit_entries(head.seq.saturating_sub(1), 1)
+        .await?
+        .into_iter()
+        .next()
+        .is_some_and(|e| e.seq == head.seq && e.hash == head.hash);
+    if !found {
+        return Err(RunError::AuditAnchor { seq: head.seq });
+    }
+    Ok(())
+}
+
+/// Отличия resume от снимка run (D92): доверие, политика, гранты. Доверие снимается
+/// только явным отзывом (`trust --revoke`): правка доверенных файлов посреди run (тем же
+/// агентом) доверие этого run не отменяет, предупреждение — в stderr.
+fn resume_changes(p: &Prepared, snap: &Value) -> Result<ResumeChange, RunError> {
+    let snap_trusted = snap
+        .get("trusted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let trusted = if p.trusted && !snap_trusted {
+        Some(true)
+    } else if snap_trusted && p.revoked {
+        eprintln!("zero-agent: доверие к проекту отозвано: команды run больше не выполняются");
+        Some(false)
+    } else {
+        if snap_trusted && !p.trusted {
+            eprintln!(
+                "zero-agent: доверие run к проекту сохраняется до его конца; следующий run спросит доверие заново"
+            );
+        }
+        None
+    };
+    let snap_hash = snap
+        .get("policy")
+        .and_then(|v| v.get("hash"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let policy = (p.policy.hash != snap_hash).then(|| p.policy.clone());
+    let had: Vec<Grant> = snap
+        .get("grants")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let grants_add = p
+        .grants
+        .iter()
+        .filter(|g| !had.contains(g))
+        .cloned()
+        .collect();
+    // Run в bypass продолжается, только пока bypass разрешён глобально (D80).
+    if snap
+        .get("setup")
+        .and_then(|s| s.get("run_mode"))
+        .and_then(Value::as_str)
+        == Some("bypass")
+    {
+        p.policy.check_mode(RunMode::Bypass)?;
+    }
+    Ok(ResumeChange {
+        policy,
+        trusted,
+        grants_add,
+        ..ResumeChange::default()
+    })
+}
+
+/// Оболочка `bash` (D85): `pwsh`/`powershell` на Windows, `bash`/`sh` иначе; не найдена —
+/// имя по умолчанию: вызов вернёт `failed to start`.
+fn shell() -> Shell {
+    Shell::detect().unwrap_or_else(|| {
+        tracing::warn!("оболочка для bash не найдена в PATH");
+        if cfg!(windows) {
+            Shell {
+                program: PathBuf::from("powershell.exe"),
+                dialect: za_core::shell::Dialect::PowerShell,
+            }
+        } else {
+            Shell {
+                program: PathBuf::from("/bin/sh"),
+                dialect: za_core::shell::Dialect::Bash,
+            }
+        }
+    })
+}
+
+/// Набор доверенных файлов для прерывания `Trust` (D83): `{files, set_hash}`; ошибка
+/// обхода — пустой набор (доверие к нему `answer` не запишет: набор пересчитывается).
+fn trust_set_fn() -> TrustSetFn {
+    Arc::new(|p: &Path| match trust_set(p) {
+        Ok(s) => json!({"files": s.files, "set_hash": s.hash()}),
+        Err(e) => {
+            tracing::warn!(error = %e, "набор доверенных файлов не посчитан");
+            json!({})
+        }
+    })
 }
 
 /// `zero-agent run`.
@@ -398,6 +793,10 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
     };
 
     let cfg = load_config(home).map_err(CommandError::from)?;
+    // D80: `bypass` — только при `[policy] allow_bypass = true` глобальной конфигурации.
+    if let RunAction::New(n) = &args.action {
+        PolicySnapshot::build(&cfg.policy, None)?.check_mode(n.run_mode)?;
+    }
     if cfg.models.as_ref().is_none_or(|m| m.endpoints.is_empty()) {
         return Err(CommandError::NoModels.into());
     }
@@ -437,19 +836,25 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             }
             let dir = journal_dir(home, &project)?;
             let store = ProjectStore::open(&dir)?;
+            let prep = prepare(home, &project, &store, &cfg, &args.grants).await?;
             // Бюджет нового run: `[budgets.run]`, поверх него флаги.
             let budget = run_budget(&cfg.budgets.run, &args.budget);
-            let project_id = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let agents_md = if n.agents_md {
-                read_agents_md(&project)?
+            // D83, CAP-084: инструкции — только у доверенного проекта.
+            let agents_md = if prep.trusted {
+                let (p, set) = (project.clone(), prep.set.clone());
+                blocking(
+                    "файл инструкций проекта",
+                    &project,
+                    move || project_instructions(&p, &set),
+                )
+                .await?
+                .map(|(_, text)| text)
             } else {
                 None
             };
+            grants_audit(&store, run, &prep.grants).await?;
             let spec = RunSpec {
-                project_id,
+                project_id: prep.project_id.clone(),
                 project_dir: project.clone(),
                 role: RunRole::Top,
                 parent: None,
@@ -466,21 +871,30 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 agents_md,
                 env: env_info(&project),
                 context: cfg.context.clone(),
-                // Доверие и гранты бинарник подаёт в задаче 13 (D83, D78); до неё нативных
-                // команд в наборе нет, а консервативное «не доверен» ничего не открывает.
-                trusted: false,
-                grants: Vec::new(),
+                trusted: prep.trusted,
+                grants: prep.grants.clone(),
             };
-            let (deps, bus) = deps(&store, &gateway, tools, &masker);
+            let (deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
-            let outcome = drive(&bus, fut, &ctl, args.crash, masker).await;
-            report(&store, &project, run, outcome).await
+            let outcome = drive(&bus, fut, &ctl, args.crash, masker.clone()).await;
+            cleanup_run_tmp(&project, run).await;
+            report(&store, &project, run, outcome, &masker).await
         }
         RunAction::Resume(r) => {
             let Some(store) = resume_store else {
                 return Err(RunError::NoJournal(journal_dir(home, &project)?));
             };
+            // D91: якорь аудита прошлого запуска — до любых новых записей.
+            let snap = store
+                .latest_snapshot(r.run)
+                .await?
+                .map(|(_, v)| v)
+                .unwrap_or(Value::Null);
+            check_audit_anchor(&store, &snap).await?;
+            let prep = prepare(home, &project, &store, &cfg, &args.grants).await?;
+            let mut change = resume_changes(&prep, &snap)?;
+            grants_audit(&store, r.run, &change.grants_add).await?;
             let endpoint = match r.model {
                 Some(m) => Some(select(Some(m)).map_err(CommandError::from)?),
                 None => None,
@@ -497,22 +911,40 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             } else {
                 None
             };
-            let (deps, bus) = deps(&store, &gateway, tools, &masker);
+            let (deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
             // Новый канал управления на каждый resume: `start_run` и `resume_run` забирают
             // `ControlRx`, а Ctrl+C управляет этим `RunControl` (Carry M2 задачи 12).
             let (ctl, rx) = control_channel(store.clone(), r.run);
-            let change = ResumeChange {
-                endpoint,
-                budget,
-                input: r.input,
-                run_mode: None,
-                ..ResumeChange::default()
-            };
+            change.endpoint = endpoint;
+            change.budget = budget;
+            change.input = r.input;
             let fut = resume_run(&deps, r.run, change, rx);
-            let outcome = drive(&bus, fut, &ctl, args.crash, masker).await;
-            report(&store, &project, r.run, outcome).await
+            let outcome = drive(&bus, fut, &ctl, args.crash, masker.clone()).await;
+            cleanup_run_tmp(&project, r.run).await;
+            report(&store, &project, r.run, outcome, &masker).await
         }
     }
+}
+
+/// Аудит грантов `--grant` (D78): запись `grant.added` на каждый грант из командной
+/// строки (глобальные `[[policy.grants]]` входят в хэш `policy.loaded`).
+async fn grants_audit(store: &ProjectStore, run: RunId, grants: &[Grant]) -> Result<(), RunError> {
+    for g in grants.iter().filter(|g| g.source == GrantSource::Cli) {
+        store
+            .append_audit(AuditNew {
+                actor: AUDIT_ACTOR_USER.to_owned(),
+                action: audit_action::GRANT_ADDED.to_owned(),
+                target: g.path.to_string_lossy().into_owned(),
+                payload: json!({
+                    "run": run.to_string(),
+                    "path": g.path.to_string_lossy(),
+                    "mode": g.mode,
+                    "source": g.source,
+                }),
+            })
+            .await?;
+    }
+    Ok(())
 }
 
 /// Первая строка stderr: `run <id>` — по нему продолжают после сбоя.
@@ -521,12 +953,15 @@ fn announce(run: RunId) {
     let _ = std::io::stderr().flush();
 }
 
-/// Зависимости цикла и шина его событий (`EventBus::DEFAULT_CAPACITY`, D35).
+/// Зависимости цикла и шина его событий (`EventBus::DEFAULT_CAPACITY`, D35): нативные
+/// инструменты (D74), чекпоинты (D89), политика, корни, маска, набор доверия и голова
+/// аудита (задача 13).
 fn deps(
     store: &ProjectStore,
     gateway: &Arc<za_llm::Gateway>,
     tools: ToolRegistry,
     masker: &SecretMasker,
+    prep: &Prepared,
 ) -> (LoopDeps, EventBus) {
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
     let mut deps = LoopDeps::new(
@@ -534,8 +969,24 @@ fn deps(
         Arc::clone(gateway) as Arc<dyn za_llm::ModelPort>,
         Arc::new(tools),
     );
+    let agent_home = AgentHome {
+        za_home: prep.roots.za_home.clone(),
+        project_id: prep.project_id.clone(),
+    };
+    let runner: Arc<dyn za_jail::Runner> = Arc::new(DirectRunner);
+    deps.capabilities = vec![native_capability(&NativeDeps {
+        runner: Arc::clone(&runner),
+        tracker: ReadTracker::new(),
+        shell: shell(),
+        home: agent_home.clone(),
+    })];
+    deps.checkpointer = Some(Arc::new(GitCheckpointer::new(runner, agent_home)));
+    deps.policy = prep.policy.clone();
+    deps.roots = prep.roots.clone();
     // D100: ответ модели и результаты инструментов маскируются до квитанции.
     deps.masker = Some(Arc::new(masker.clone()));
+    deps.trust_set = Some(trust_set_fn());
+    deps.audit_head = prep.audit_head.clone();
     (deps, bus)
 }
 
@@ -553,6 +1004,9 @@ struct Printer {
     any: bool,
     /// Подписчик отстал (`Lagged`): дельты больше не печатаются.
     lagged: bool,
+    /// Идёт запрос компакции (`model.request` с `kind: "compact"`, D46): его дельты —
+    /// сводка для истории, а не ответ, и не печатаются.
+    compacting: bool,
     crash: Option<RunCrash>,
 }
 
@@ -581,6 +1035,10 @@ impl Printer {
         let p = &ev.event.payload;
         match ev.event.kind {
             EventKind::TurnStarted => self.current.clear(),
+            EventKind::ModelRequest => {
+                self.compacting =
+                    p.get("kind").and_then(Value::as_str) == Some(za_agent::COMPACT_KIND);
+            }
             EventKind::ModelDelta => {
                 if let Some(RunCrash::AfterDelta(n)) = self.crash
                     && p.get("turn").and_then(Value::as_u64) == Some(u64::from(n))
@@ -588,7 +1046,7 @@ impl Printer {
                     // D33: эквивалент `kill -9` посреди хода, событие уже в журнале.
                     std::process::abort();
                 }
-                if self.lagged {
+                if self.lagged || self.compacting {
                     return;
                 }
                 if let Some(t) = p.get("text").and_then(Value::as_str) {
@@ -601,6 +1059,18 @@ impl Printer {
                     }
                     self.current.clear();
                     eprintln!("zero-agent: повтор запроса к модели, ответ печатается заново");
+                }
+            }
+            // D96: исполненный вызов с путями вне проекта — строка на путь.
+            EventKind::BoundaryOutside => {
+                let tool = p.get("tool").and_then(Value::as_str).unwrap_or("?");
+                for path in p
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    outside_line(tool, path);
                 }
             }
             _ => {}
@@ -704,12 +1174,110 @@ async fn drive(
     outcome
 }
 
+/// Строка `zero-agent: вне проекта: <tool> <access> <path>` (D96) по элементу `paths`
+/// события `boundary.outside` или payload прерывания (`{path, access, …}`).
+fn outside_line(tool: &str, path: &Value) {
+    let access = path.get("access").and_then(Value::as_str).unwrap_or("?");
+    let shown = path
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|p| display_path(Path::new(p)))
+        .unwrap_or_default();
+    eprintln!("zero-agent: вне проекта: {tool} {access} {shown}");
+}
+
+/// Текст не длиннее `n` символов: длиннее — обрезка и `…`.
+fn cut_chars(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_owned(),
+    }
+}
+
+/// Подробности решения в stderr (D96): у одобрения — инструмент, аргументы (до
+/// [`ARGS_SHOWN_CHARS`] символов, с маской секретов), причины, метки необратимости и
+/// пути вне проекта; у запроса гранта — путь, режим и причина; у доверия — проект и
+/// доверенные файлы.
+fn decision_lines(kind: &str, p: &Value, masker: &SecretMasker) {
+    let list = |key: &str| -> Vec<String> {
+        p.get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if kind == InterruptKind::Trust.as_str() {
+        let project = p.get("project").and_then(Value::as_str).unwrap_or_default();
+        let files: Vec<String> = p
+            .get("files")
+            .and_then(Value::as_object)
+            .map(|f| f.keys().cloned().collect())
+            .unwrap_or_default();
+        eprintln!(
+            "zero-agent: нужна команда в недоверенном проекте {}: доверить проект один раз? доверенные файлы: {}",
+            display_path(Path::new(project)),
+            if files.is_empty() {
+                "нет".to_owned()
+            } else {
+                files.join(", ")
+            }
+        );
+        return;
+    }
+    if kind != InterruptKind::Approval.as_str() {
+        return;
+    }
+    let name = p.get("name").and_then(Value::as_str).unwrap_or("?");
+    if let Some(g) = p.get("grant") {
+        let path = g.get("path").and_then(Value::as_str).unwrap_or_default();
+        let mode = g.get("mode").and_then(Value::as_str).unwrap_or("?");
+        let reason = g.get("reason").and_then(Value::as_str).unwrap_or_default();
+        eprintln!(
+            "zero-agent: модель просит грант: {mode} {}: {}",
+            display_path(Path::new(path)),
+            cut_chars(&masker.mask(reason), ARGS_SHOWN_CHARS)
+        );
+    } else {
+        let args = p
+            .get("arguments")
+            .map(za_protocol::canonical_json)
+            .unwrap_or_default();
+        eprintln!(
+            "zero-agent: вызов: {name} {}",
+            cut_chars(&masker.mask(&args), ARGS_SHOWN_CHARS)
+        );
+    }
+    let reasons = list("reasons");
+    if !reasons.is_empty() {
+        eprintln!("zero-agent: причины: {}", reasons.join(", "));
+    }
+    let irreversible = list("irreversible");
+    if !irreversible.is_empty() {
+        eprintln!("zero-agent: необратимо: {}", irreversible.join(", "));
+    }
+    for path in p
+        .get("paths")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if path.get("inside").and_then(Value::as_bool) == Some(false) {
+            outside_line(name, path);
+        }
+    }
+}
+
 /// Причина паузы, требующая решения пользователя (код 3).
 fn needs_answer(reason: &str) -> bool {
     [
         pause_reason::NEEDS_INPUT,
         pause_reason::NEEDS_APPROVAL,
         pause_reason::NEEDS_DECISION,
+        pause_reason::NEEDS_TRUST,
     ]
     .contains(&reason)
 }
@@ -720,6 +1288,8 @@ fn answer_flags(kind: &str) -> &'static str {
         "--text \"<ответ>\""
     } else if kind == InterruptKind::Approval.as_str() {
         "--approve | --deny [--note \"<текст>\"]"
+    } else if kind == InterruptKind::Trust.as_str() {
+        "--approve | --deny"
     } else if kind == InterruptKind::UnknownOutcome.as_str() {
         "--done | --not-done"
     } else {
@@ -758,6 +1328,7 @@ async fn report(
     project: &Path,
     run: RunId,
     outcome: Result<LoopOutcome, LoopError>,
+    masker: &SecretMasker,
 ) -> Result<ExitCode, RunError> {
     let resume_hint = || {
         eprintln!(
@@ -819,6 +1390,9 @@ async fn report(
                         .and_then(Value::as_str)
                     {
                         eprintln!("zero-agent: вопрос модели: {q}");
+                    }
+                    if let Some(p) = row.as_ref().and_then(|r| r.payload.as_ref()) {
+                        decision_lines(&kind, p, masker);
                     }
                     eprintln!(
                         "zero-agent: ответьте: zero-agent answer --interrupt {id} --project {} {}",
@@ -889,7 +1463,7 @@ pub async fn cmd_answer(
         (Answer::Approve | Answer::Deny(_), k) if k == approval || k == trust => {
             let mut set = None;
             if k == trust && answer == Answer::Approve && row.status == INTERRUPT_OPEN {
-                let now = current_trust_set(&project).await?;
+                let now = current_set(&project).await?;
                 if !shown_trust_matches(row.payload.as_ref(), &now) {
                     return reask_trust(&store, &row, &project, now).await;
                 }
@@ -993,19 +1567,6 @@ fn deny_note(answer: &Answer) -> String {
         Answer::Deny(Some(n)) => n.clone(),
         _ => String::new(),
     }
-}
-
-/// Набор доверенных файлов проекта сейчас (`spawn_blocking`: обход ФС).
-async fn current_trust_set(project: &Path) -> Result<TrustSet, RunError> {
-    let dir = project.to_path_buf();
-    let err = |source| RunError::TrustSet {
-        path: project.to_path_buf(),
-        source,
-    };
-    tokio::task::spawn_blocking(move || trust_set(&dir))
-        .await
-        .map_err(|e| err(std::io::Error::other(e.to_string())))?
-        .map_err(err)
 }
 
 /// Совпадает ли набор `set` с показанным в payload прерывания доверия (ревью задачи 4,

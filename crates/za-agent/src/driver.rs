@@ -80,7 +80,7 @@ use crate::request::{
     FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message_with, freeze_for,
 };
 use crate::resume::state_block;
-use crate::state::{AtBoundary, Counters, LoopState, Next, PendingExit};
+use crate::state::{AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools};
 use crate::turn::{
     CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed, Signal,
@@ -164,6 +164,9 @@ pub struct LoopDeps {
     pub masker: Option<Arc<SecretMasker>>,
     /// Набор доверенных файлов для прерывания `Trust` (D83); `None` — пустой.
     pub trust_set: Option<TrustSetFn>,
+    /// Голова цепочки аудита на момент старта или продолжения (D91): пишется в снимок,
+    /// бинарник сверяет её при resume; `None` — без якоря.
+    pub audit_head: Option<AuditHead>,
 }
 
 impl LoopDeps {
@@ -186,6 +189,7 @@ impl LoopDeps {
             checkpointer: None,
             masker: None,
             trust_set: None,
+            audit_head: None,
         }
     }
 
@@ -543,6 +547,7 @@ async fn step_zero(
         } else {
             BTreeSet::from([taint_origin::UNTRUSTED_PROJECT.to_owned()])
         },
+        audit_head: deps.audit_head.clone(),
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)

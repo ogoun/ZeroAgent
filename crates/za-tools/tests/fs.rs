@@ -11,9 +11,8 @@ use za_core::paths::{ResolvedPath, Roots, classify, resolve};
 use za_core::{Access, Approval, RiskClass, Tool, ToolCx, ToolKind, ToolOutput};
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier};
 use za_tools::{
-    AgentHome, GLOB_MAX, READ_DEFAULT_LIMIT, READ_MAX_BYTES, ReadTracker, SEARCH_MAX, Shell,
-    TrackError, WalkLimits, bash_tool, edit_tool, glob_split, glob_tool, multi_edit_tool, nearest,
-    read_tool, search_in, search_tool,
+    GLOB_MAX, READ_DEFAULT_LIMIT, READ_MAX_BYTES, ReadTracker, SEARCH_MAX, TrackError, WalkLimits,
+    glob_split, glob_tool, nearest, read_tool, search_in, search_tool,
 };
 
 #[path = "../../../test-support/unique_dir.rs"]
@@ -818,68 +817,7 @@ fn contract_matches_d74() {
     }
 }
 
-/// `ZA_HOME` инструментов правки, которые не вызываются (только тексты).
-fn golden_home() -> AgentHome {
-    AgentHome {
-        za_home: PathBuf::from("no-home"),
-        project_id: "0".into(),
-    }
-}
-
-#[test]
-fn texts_match_golden() {
-    // D94: тексты для модели входят в хэш промптов; golden пишется только с
-    // ZA_UPDATE_GOLDEN=1.
-    let mut all = serde_json::Map::new();
-    // Один golden на все нативные инструменты: `read`, `search`, `glob` (задача 6) и
-    // `edit`, `multi_edit` (задача 7, D88), `bash` (задача 8).
-    let tools = [
-        read(),
-        search_tool(),
-        glob_tool(),
-        edit_tool(ReadTracker::new(), golden_home()),
-        multi_edit_tool(ReadTracker::new(), golden_home()),
-        // `bash` (задача 8, D85, D86): тексты от оболочки и ОС не зависят.
-        bash_tool(
-            Arc::new(za_jail::DirectRunner),
-            Shell {
-                program: PathBuf::from("no-shell"),
-                dialect: za_core::shell::Dialect::Bash,
-            },
-            golden_home(),
-        ),
-    ];
-    for tool in tools {
-        let texts = tool.texts();
-        assert!(!texts.is_empty(), "{}", tool.spec().schema.name);
-        for (name, text) in texts {
-            assert!(
-                name.starts_with("runtime/fs.")
-                    || name.starts_with("runtime/edit.")
-                    || name.starts_with("runtime/bash."),
-                "{name}"
-            );
-            assert!(text.is_ascii(), "{name}: {text}");
-            assert!(
-                all.insert(name.to_owned(), Value::String(text)).is_none(),
-                "{name}"
-            );
-        }
-    }
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/native_texts.json");
-    let actual = format!(
-        "{}\n",
-        serde_json::to_string_pretty(&Value::Object(all)).unwrap()
-    );
-    if std::env::var("ZA_UPDATE_GOLDEN").as_deref() == Ok("1") {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, &actual).unwrap();
-    }
-    let golden = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{}: {e}; ZA_UPDATE_GOLDEN=1", path.display()))
-        .replace("\r\n", "\n");
-    assert_eq!(golden, actual);
-}
+// Golden текстов нативных инструментов (D94) — `tests/native.rs` (по `native_capability`).
 
 // ---- трекер и подсказки ----
 

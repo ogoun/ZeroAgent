@@ -75,11 +75,12 @@ pub use policy::{
 };
 pub use prompt::{
     AGENTS_MD_LIMIT, BRANCH_MAX_CHARS, BudgetCase, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo,
-    LEFT_ANGLES, MODE_LIMIT, PROMPT_VERSION, RIGHT_ANGLES, TaskBlock, WorkMode, agents_md_budget,
-    approx_tokens, budget_cases, env_in_role_limit, escape_untrusted, fit_agents_md, git_branch,
-    max_env, mode_overlay, prompt_files, prompt_texts_hash, prompt_texts_hash_for, reasoning_for,
-    render_control, render_env, render_task, role_core, role_limit, runtime_texts,
-    runtime_texts_with, upper_tokens, utility_rules,
+    LEFT_ANGLES, MODE_LIMIT, PROMPT_VERSION, RIGHT_ANGLES, SMALL_PREFIX_LIMIT, SMALL_TOOLS_SLOT,
+    TaskBlock, WorkMode, agents_md_budget, approx_tokens, budget_cases, env_in_role_limit,
+    escape_untrusted, fit_agents_md, git_branch, max_env, mode_overlay, prompt_files,
+    prompt_texts_hash, prompt_texts_hash_for, reasoning_for, render_control, render_env,
+    render_task, role_core, role_limit, runtime_texts, runtime_texts_with, small_prefix_cases,
+    upper_tokens, utility_rules,
 };
 pub use request::{
     BlockHashes, BlockSizes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions,
@@ -87,14 +88,16 @@ pub use request::{
     request_hash,
 };
 pub use resume::{ResumeChange, resume_run, state_block};
-pub use state::{AtBoundary, Counters, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};
+pub use state::{
+    AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot,
+};
 pub use tools::{
     ASK_USER_TOOL, FINISH_TOOL, FinishArgs, REQUEST_GRANT_TOOL, ToolEnv, ToolsOutcome, TrustSetFn,
     UNTRUSTED_MARK, builtin_tools, request_grant_tool, run_tools,
 };
 pub use turn::{
-    COMPACT_EFFECT, CallVerdict, ControlFlags, DELTA_FLUSH_AFTER, DELTA_FLUSH_BYTES, DeltaBuffer,
-    HEARTBEAT_POSITION_EVERY, MODEL_EFFECT, PlannedCall, RequestRefs, Reviewed, Signal, SignalTx,
-    Signals, TurnError, TurnOutput, model_turn, model_turn_with, output_tps, report_parse_errors,
-    review, signal_channel,
+    COMPACT_EFFECT, COMPACT_KIND, CallVerdict, ControlFlags, DELTA_FLUSH_AFTER, DELTA_FLUSH_BYTES,
+    DeltaBuffer, HEARTBEAT_POSITION_EVERY, MODEL_EFFECT, PlannedCall, RequestRefs, Reviewed,
+    Signal, SignalTx, Signals, TurnError, TurnOutput, model_turn, model_turn_with, output_tps,
+    report_parse_errors, review, signal_channel,
 };

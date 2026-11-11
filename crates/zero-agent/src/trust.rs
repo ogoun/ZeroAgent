@@ -2,9 +2,13 @@
 //! проекта с хэшами их содержимого.
 //!
 //! Набор пишется в запись аудита `trust.granted` в момент ответа на прерывание доверия
-//! (`answer --interrupt trust-… --approve`, D91) и сверяется с набором из payload
-//! прерывания. Сравнение с набором на старте `run`, команда `trust` и чтение `AGENTS.md`
-//! у доверенного проекта добавляет задача 13 плана.
+//! (`answer --interrupt trust-… --approve`, D91) или командой `zero-agent trust`
+//! ([`cmd_trust`]) и сверяется с набором из payload прерывания. На старте `run` и при
+//! resume набор пересчитывается и сравнивается с доверенным ([`trust_state`]): отличие —
+//! проект не доверен, отличия ([`TrustDiff`]) печатаются. Доверенный проект читает
+//! `AGENTS.md`, а без него `CLAUDE.md` (CAP-084), и `.zero-agent/config.toml` — только
+//! через [`read_trusted`]: тем же разрешением пути, что набор, и со сверкой хэша
+//! прочитанного с доверенным значением.
 //!
 //! Хэш описывает ровно то, что потом прочтёт рантайм (ревью задачи 4, I1, I2):
 //! - обычный файл — BLAKE3 содержимого (потоково, блоками), значение — hex;
@@ -28,10 +32,17 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use std::io::Read;
+use std::process::ExitCode;
+
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use za_core::Access;
 use za_core::paths::{self, Roots};
-use za_protocol::canonical_json;
+use za_protocol::{audit_action, canonical_json};
+use za_store::{AuditNew, ProjectStore, StoreError};
+
+use crate::run::{RunError, canonical_project, display_path};
 
 /// Доверенные файлы в корне проекта.
 pub const TRUSTED_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".zero-agent/config.toml"];
@@ -98,6 +109,294 @@ pub fn trust_set(project: &Path) -> io::Result<TrustSet> {
         }
     }
     Ok(TrustSet { files })
+}
+
+/// Отличие нынешнего набора от доверенного: пути изменённых, новых и удалённых файлов
+/// (деревья — одним путём), по возрастанию.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustDiff {
+    pub changed: Vec<String>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl TrustDiff {
+    /// Отличие `now` от доверенного `granted`.
+    pub fn between(granted: &TrustSet, now: &TrustSet) -> TrustDiff {
+        let mut d = TrustDiff {
+            changed: Vec::new(),
+            added: Vec::new(),
+            removed: Vec::new(),
+        };
+        for (path, v) in &now.files {
+            match granted.files.get(path) {
+                Some(old) if old == v => {}
+                Some(_) => d.changed.push(path.clone()),
+                None => d.added.push(path.clone()),
+            }
+        }
+        for path in granted.files.keys() {
+            if !now.files.contains_key(path) {
+                d.removed.push(path.clone());
+            }
+        }
+        d
+    }
+
+    /// Отличий нет.
+    pub fn is_empty(&self) -> bool {
+        self.changed.is_empty() && self.added.is_empty() && self.removed.is_empty()
+    }
+
+    /// Текст для stderr: «изменены: AGENTS.md; новые: …; удалены: …».
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        for (name, list) in [
+            ("изменены", &self.changed),
+            ("новые", &self.added),
+            ("удалены", &self.removed),
+        ] {
+            if !list.is_empty() {
+                parts.push(format!("{name}: {}", list.join(", ")));
+            }
+        }
+        parts.join("; ")
+    }
+}
+
+/// Итог проверки доверия: доверен ли проект, отличия от доверенного набора, набор сейчас
+/// и признаки отзыва и разрыва цепочки аудита.
+#[derive(Debug, Clone)]
+pub struct TrustCheck {
+    pub trusted: bool,
+    pub diff: Option<TrustDiff>,
+    pub set: TrustSet,
+    /// Последнее решение — `trust.revoked` (доверие отозвано явно).
+    pub revoked: bool,
+    /// Цепочка аудита не сходится (`StoreError::Corrupt` при чтении): доверие не действует.
+    pub chain_broken: bool,
+}
+
+/// Доверен ли проект сейчас (D83): последняя запись аудита доверия — `trust.granted`, и
+/// её набор совпадает с нынешним. Иначе — не доверен; если доверие было дано, а набор
+/// изменился, второе значение называет отличия. Последняя запись `trust.revoked` или
+/// записей нет — не доверен без отличий.
+pub async fn trust_state(
+    store: &ProjectStore,
+    project: &Path,
+) -> Result<(bool, Option<TrustDiff>), RunError> {
+    let c = trust_check(store, project).await?;
+    Ok((c.trusted, c.diff))
+}
+
+/// [`trust_state`] с набором и признаками (набор считается один раз на команду). Разрыв
+/// цепочки аудита — не ошибка команды, а «не доверен» с признаком: доверию из
+/// испорченной цепочки верить нельзя.
+pub async fn trust_check(store: &ProjectStore, project: &Path) -> Result<TrustCheck, RunError> {
+    let mut c = TrustCheck {
+        trusted: false,
+        diff: None,
+        set: current_set(project).await?,
+        revoked: false,
+        chain_broken: false,
+    };
+    let last = match store.last_audit("trust.").await {
+        Ok(l) => l,
+        Err(StoreError::Corrupt(e)) => {
+            tracing::warn!(error = %e, "цепочка аудита не сходится: доверие не действует");
+            c.chain_broken = true;
+            return Ok(c);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let Some(last) = last else { return Ok(c) };
+    if last.action != audit_action::TRUST_GRANTED {
+        c.revoked = last.action == audit_action::TRUST_REVOKED;
+        return Ok(c);
+    }
+    // Запись не того формата — как пустой доверенный набор (все файлы — новые).
+    let granted: TrustSet = serde_json::from_value(last.payload).unwrap_or_default();
+    if granted == c.set {
+        c.trusted = true;
+    } else {
+        c.diff = Some(TrustDiff::between(&granted, &c.set));
+    }
+    Ok(c)
+}
+
+/// Набор доверенных файлов проекта сейчас (`spawn_blocking`: обход ФС).
+pub async fn current_set(project: &Path) -> Result<TrustSet, RunError> {
+    let dir = project.to_path_buf();
+    let err = |source| RunError::TrustSet {
+        path: project.to_path_buf(),
+        source,
+    };
+    tokio::task::spawn_blocking(move || trust_set(&dir))
+        .await
+        .map_err(|e| err(io::Error::other(e.to_string())))?
+        .map_err(err)
+}
+
+/// Предел чтения доверенного файла, байты: больше — файл не читается (`warn`).
+pub const TRUSTED_READ_LIMIT: u64 = 4 << 20;
+
+/// Текст доверенного файла `rel` (из [`TRUSTED_FILES`]) по доверенному набору `set`: нет
+/// в наборе или значение [`EXTERNAL_LINK`] — `None`, как отсутствующий. Файл разрешается
+/// и открывается так же, как при расчёте набора (без следования ссылке, со сверкой
+/// дескриптора), а хэш прочитанного сверяется со значением набора: изменился после
+/// проверки доверия — `None` с `warn`. Больше [`TRUSTED_READ_LIMIT`] — `None` с `warn`.
+/// Не UTF-8 — с заменой символов. Блокирующая.
+pub fn read_trusted(project: &Path, set: &TrustSet, rel: &str) -> io::Result<Option<String>> {
+    let Some(value) = set.files.get(rel) else {
+        return Ok(None);
+    };
+    if value == EXTERNAL_LINK {
+        return Ok(None);
+    }
+    let expected = value.strip_prefix(LINK_PREFIX).unwrap_or(value);
+    let roots = Roots::canonical(project, project)?;
+    let Ok(lex) = paths::classify(&roots.project, rel) else {
+        return Ok(None);
+    };
+    let Ok(resolved) = paths::resolve(&roots, &lex, Access::Read) else {
+        return Ok(None);
+    };
+    if !resolved.inside {
+        return Ok(None);
+    }
+    let file = match paths::open_checked(&resolved, false) {
+        Ok(f) => f,
+        Err(e) if is_missing(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    file.take(TRUSTED_READ_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > TRUSTED_READ_LIMIT {
+        tracing::warn!(
+            file = rel,
+            limit = TRUSTED_READ_LIMIT,
+            "доверенный файл больше предела и не читается"
+        );
+        return Ok(None);
+    }
+    if blake3::hash(&bytes).to_hex().as_str() != expected {
+        tracing::warn!(
+            file = rel,
+            "доверенный файл изменился после проверки доверия и не читается"
+        );
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// Файлы инструкций проекта по порядку (CAP-084): `AGENTS.md`, без него — `CLAUDE.md`.
+pub const INSTRUCTION_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
+/// Инструкции доверенного проекта (CAP-084, D83): первый из [`INSTRUCTION_FILES`], что
+/// есть в наборе и читается; имя файла и текст. Блокирующая.
+pub fn project_instructions(
+    project: &Path,
+    set: &TrustSet,
+) -> io::Result<Option<(&'static str, String)>> {
+    for name in INSTRUCTION_FILES {
+        if let Some(text) = read_trusted(project, set, name)? {
+            return Ok(Some((name, text)));
+        }
+    }
+    Ok(None)
+}
+
+/// Ошибка команды `trust`.
+#[derive(Debug, thiserror::Error)]
+pub enum TrustCmdError {
+    /// Журнал держит запущенный run (D91).
+    #[error("журнал проекта занят запущенным run; повторите после его остановки")]
+    Busy,
+    #[error(transparent)]
+    Run(RunError),
+    #[error(transparent)]
+    Store(StoreError),
+}
+
+impl From<StoreError> for TrustCmdError {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::Locked => Self::Busy,
+            e => Self::Store(e),
+        }
+    }
+}
+
+impl From<RunError> for TrustCmdError {
+    fn from(e: RunError) -> Self {
+        match e {
+            RunError::Store(s) => s.into(),
+            e => Self::Run(e),
+        }
+    }
+}
+
+/// Actor записей аудита команды `trust`: решение пользователя (как у `answer`).
+const TRUST_ACTOR: &str = "user";
+
+/// `zero-agent trust --project P [--revoke]` (D83, D91): доверие проекту заранее — запись
+/// `trust.granted` с набором доверенных файлов сейчас; `--revoke` — запись
+/// `trust.revoked`. Журнал проекта создаётся, если run в проекте ещё не было. Уже
+/// доверен с тем же набором (или уже не доверен при `--revoke`) — новой записи нет.
+pub async fn cmd_trust(
+    za_home: &Path,
+    project: &Path,
+    revoke: bool,
+) -> Result<ExitCode, TrustCmdError> {
+    let project = canonical_project(project)?;
+    let dir = crate::home::journal_dir(za_home, &project).map_err(|source| RunError::Io {
+        what: "каталог проекта",
+        path: project.clone(),
+        source,
+    })?;
+    let store = ProjectStore::open(&dir)?;
+    let check = trust_check(&store, &project).await?;
+    let shown = display_path(&project);
+    if revoke {
+        if !check.trusted && check.diff.is_none() && !check.chain_broken {
+            eprintln!("zero-agent: проект {shown} и так не доверен");
+            return Ok(ExitCode::SUCCESS);
+        }
+        store
+            .append_audit(AuditNew {
+                actor: TRUST_ACTOR.to_owned(),
+                action: audit_action::TRUST_REVOKED.to_owned(),
+                target: shown.clone(),
+                payload: json!({}),
+            })
+            .await?;
+        eprintln!("zero-agent: доверие к проекту {shown} отозвано");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if check.trusted {
+        eprintln!("zero-agent: проект {shown} уже доверен, доверенные файлы не менялись");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let payload = serde_json::to_value(&check.set)
+        .map_err(|e| StoreError::Serde(format!("набор доверенных файлов: {e}")))?;
+    store
+        .append_audit(AuditNew {
+            actor: TRUST_ACTOR.to_owned(),
+            action: audit_action::TRUST_GRANTED.to_owned(),
+            target: shown.clone(),
+            payload,
+        })
+        .await?;
+    let files: Vec<&str> = check.set.files.keys().map(String::as_str).collect();
+    eprintln!(
+        "zero-agent: проект {shown} доверен; доверенные файлы: {}",
+        if files.is_empty() {
+            "нет".to_owned()
+        } else {
+            files.join(", ")
+        }
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Где лежит доверенный путь `rel`.

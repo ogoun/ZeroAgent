@@ -12,6 +12,11 @@ serde_json.workspace = true
 tiktoken-rs.workspace = true
 za-agent = { path = "../crates/za-agent" }
 za-protocol = { path = "../crates/za-protocol" }
+# Случаи бюджета промптов с настоящими нативными инструментами (R1-C1 D93, D99):
+# `za_tools::native_capability`, раннер — только для сборки инструментов, не вызывается.
+za-tools = { path = "../crates/za-tools" }
+za-core = { path = "../crates/za-core" }
+za-jail = { path = "../crates/za-jail" }
 
 [lints]
 workspace = true

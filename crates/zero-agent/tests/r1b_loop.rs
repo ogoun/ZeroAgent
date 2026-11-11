@@ -235,16 +235,16 @@ fn resume_extends_duration_budget() {
     assert_eq!(r.stdout, "ок\n", "{r:?}");
 }
 
-/// Первая строка stderr — `run <id>` раньше любых предупреждений (D28): `--agents-md`
-/// без файла предупреждает уже после неё.
+/// Первая строка stderr — `run <id>` раньше любых предупреждений (D28): сообщение о
+/// недоверенном проекте (R1-C1 D83) идёт уже после неё.
 #[test]
 fn run_line_precedes_warnings() {
     let srv = fake(paris);
     let e = env("first_line", &llama_config(&srv.base));
-    let o = e.run_cmd(&["--agents-md", "Столица Франции?"]);
+    let o = e.run_cmd(&["Столица Франции?"]);
     assert_eq!(o.code(), Some(0), "{o:?}");
     assert!(o.stderr.starts_with("run "), "{o:?}");
-    assert!(o.stderr.contains("AGENTS.md"), "{o:?}");
+    assert!(o.stderr.contains("проект не доверен"), "{o:?}");
     // Resume к недоступному эндпоинту: логи шлюза — после `run <id>`.
     let id = run_id(&o).to_string();
     let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -335,7 +335,7 @@ fn inspect_and_stats_read_journal() {
     assert_eq!(j.code(), Some(0), "{j:?}");
     let v: Value = serde_json::from_str(&j.stdout).unwrap();
     assert_eq!(v["turn"], 1);
-    assert_eq!(v["input"], 12);
+    assert_eq!(v["input"], 2048);
     assert_eq!(v["n_ctx"], 32768);
     assert_eq!(v["blocks"].as_array().unwrap().len(), 8);
 
@@ -358,7 +358,7 @@ fn inspect_and_stats_read_journal() {
     );
     assert_eq!(
         (m["input"].clone(), m["output"].clone()),
-        (json!(12), json!(3))
+        (json!(2048), json!(3))
     );
     let s = e.run(&["stats", "--project", p, "--run", &run]);
     assert_eq!(s.code(), Some(0), "{s:?}");

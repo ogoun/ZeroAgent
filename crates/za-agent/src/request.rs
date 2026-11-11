@@ -20,7 +20,7 @@ use za_llm::{
 };
 use za_protocol::{Priority, RunMode, RunRole, Tier, canonical_json};
 
-use crate::context::ContextConfig;
+use crate::context::{ContextBudget, ContextConfig};
 use crate::conversation::Conversation;
 use crate::prompt::{
     ENV_LIMIT, EnvInfo, PROMPT_VERSION, WorkMode, agents_md_budget, approx_tokens,
@@ -138,8 +138,8 @@ fn overlay_in_role_limit(role: RunRole, tier: Tier) -> bool {
 /// Инструкции — переменный текст: считаются верхней оценкой (байты, `upper_tokens`) с
 /// разделителем. Берутся по порядку `caps` целиком; не помещающаяся отбрасывается с
 /// `warn`, следующие ещё пробуются, — результат детерминирован. У top small инструкции
-/// не входят в system вовсе: на small они придут в описаниях инструментов (решение
-/// контроллера, задача 7; перенос — R1-C). Возвращает текст блока 2 и занятые байты.
+/// не входят в system вовсе: они дописываются к описанию инструмента capability
+/// ([`small_instructions`], R1-C1 D93). Возвращает текст блока 2 и занятые байты.
 fn core_block(setup: &RunSetup, caps: &[Capability], budget: u32) -> (String, u32) {
     let mut core = role_core(setup.role).to_string();
     let mut used = 0u32;
@@ -149,10 +149,7 @@ fn core_block(setup: &RunSetup, caps: &[Capability], budget: u32) -> (String, u3
         .filter(|(_, i)| !i.trim().is_empty());
     for (name, text) in instructions {
         if setup.role == RunRole::Top && setup.tier == Tier::Small {
-            tracing::warn!(
-                capability = name,
-                "инструкции capability на top small не входят в system (R1-C: в описаниях инструментов)"
-            );
+            // R1-C1 D93: на top small — в описании инструмента ([`small_instructions`]).
             continue;
         }
         let cost = SEP.saturating_add(upper_tokens(text));
@@ -171,6 +168,51 @@ fn core_block(setup: &RunSetup, caps: &[Capability], budget: u32) -> (String, u3
         core.push_str(text);
     }
     (core, used)
+}
+
+/// Инструкции capability на top small (R1-C1 D93, Carry 1): дописываются к описанию
+/// первого по имени инструмента этой capability из набора run (`tools` уже отсортированы
+/// по имени) через пустую строку, а не в system. Инструмента capability в наборе нет —
+/// инструкции опущены. Если оценка [`approx_tokens`] описаний (`render_tools`) с ними
+/// выходит за слот Tools окна ([`ContextBudget::for_context`]`(n_ctx).tools`; у окна
+/// 64k+ слота нет — без проверки), инструкции опускаются с `warn`. Capability берутся по
+/// порядку, каждая проверяется поверх уже принятых: результат детерминирован.
+fn small_instructions(setup: &RunSetup, tools: &mut [ToolSchema], caps: &[Capability]) {
+    let slot = ContextBudget::for_context(setup.n_ctx).tools;
+    for c in caps {
+        let Some(text) = c.instructions.as_deref().filter(|i| !i.trim().is_empty()) else {
+            continue;
+        };
+        let names: Vec<&str> = c
+            .tools
+            .iter()
+            .map(|t| t.spec().schema.name.as_str())
+            .collect();
+        let Some(i) = tools.iter().position(|t| names.contains(&t.name.as_str())) else {
+            tracing::warn!(
+                capability = %c.name,
+                "инструкции capability на top small опущены: её инструментов нет в наборе run"
+            );
+            continue;
+        };
+        let before = tools[i].description.clone();
+        tools[i].description = format!("{before}\n\n{text}");
+        if let Some(slot) = slot {
+            let used = approx_tokens(&render_tools(&PromptBlocks {
+                tools: tools.to_vec(),
+                ..PromptBlocks::default()
+            }));
+            if used > slot {
+                tracing::warn!(
+                    capability = %c.name,
+                    used,
+                    slot,
+                    "инструкции capability не помещаются в слот описаний инструментов и опущены"
+                );
+                tools[i].description = before;
+            }
+        }
+    }
 }
 
 /// Замораживает префикс run.
@@ -224,6 +266,9 @@ pub fn freeze(
         // Фиксированные тексты проверяет CI-счётчик (PRM-007); оценка байты / 4 их
         // завышает, поэтому здесь только `debug`.
         tracing::debug!(fixed, limit, "оценка фиксированных блоков выше лимита роли");
+    }
+    if role == RunRole::Top && tier == Tier::Small {
+        small_instructions(setup, &mut tools, caps);
     }
     let caps_budget = limit
         .saturating_sub(fixed)

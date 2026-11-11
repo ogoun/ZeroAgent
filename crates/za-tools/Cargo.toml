@@ -39,5 +39,8 @@ tracing.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+# Golden описаний нативных инструментов — тот же канонический JSON, что в префиксе
+# запроса (`za_llm::render_tools`, D97); без функций по умолчанию.
+za-llm = { path = "../za-llm", default-features = false }
 # `test-util` — тест предела чекпоинта на остановленных часах (`start_paused`).
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }

@@ -101,6 +101,74 @@ pub enum AppConfigError {
     /// Правило `[[policy.rules]]` без полей или с неверным шаблоном (D80).
     #[error("{file}: {0}", file = CONFIG_FILE)]
     PolicyRules(PolicyError),
+    /// Ошибка проектной конфигурации `.zero-agent/config.toml` (D80, D83): текст — как у
+    /// ошибок глобальной (место, категория, путь поля), без фрагментов исходника.
+    #[error("{file} проекта: {0}", file = PROJECT_CONFIG)]
+    Project(String),
+}
+
+/// Проектная конфигурация в каталоге проекта (D80, D83): читается только у доверенного
+/// проекта.
+pub const PROJECT_CONFIG: &str = ".zero-agent/config.toml";
+
+/// Проектная конфигурация (R1-C1 D80, ARC-041): действует только раздел `[policy]`, и в
+/// нём — правила `ask` и `deny` (проектные `allow`, `allow_bypass` и `[[policy.grants]]`
+/// отбрасывает `PolicySnapshot::build` с `warn`). Прочие разделы не действуют — `warn`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProjectConfig {
+    pub policy: PolicyConfig,
+}
+
+/// Разделы глобальной конфигурации, которые в проектной не действуют: их имена `warn`
+/// называет; прочие — без имени (ключ может оказаться секретом).
+const GLOBAL_ONLY_SECTIONS: &[&str] = &["models", "resources", "budgets", "context"];
+
+/// Разбор текста `.zero-agent/config.toml` (D80): `[policy]` — тем же разбором, что
+/// глобальный, прочие разделы — `warn` без ошибки. Правила проверяются (шаблоны, `..`).
+pub fn parse_project_config(src: &str) -> Result<ProjectConfig, AppConfigError> {
+    let table = toml::from_str::<toml::Table>(src).map_err(|e| {
+        AppConfigError::Project(
+            ConfigParseError::from_message(e.message(), e.span().map(|s| s.start), src).to_string(),
+        )
+    })?;
+    let mut out = ProjectConfig::default();
+    for (key, value) in table {
+        if key == "policy" {
+            out.policy = parse_policy(value).map_err(project_error)?;
+        } else if let Some(name) = GLOBAL_ONLY_SECTIONS.iter().find(|s| **s == key) {
+            tracing::warn!(
+                section = *name,
+                "раздел проектной конфигурации не действует: только [policy] (ARC-041)"
+            );
+            eprintln!(
+                "zero-agent: {PROJECT_CONFIG}: раздел [{name}] в проекте не действует, только [policy]"
+            );
+        } else {
+            tracing::warn!("незнакомый раздел проектной конфигурации не действует");
+            eprintln!(
+                "zero-agent: {PROJECT_CONFIG}: незнакомый раздел не действует, только [policy]"
+            );
+        }
+    }
+    // Только проверка правил: отбрасывание проектных `allow` (с `warn`) — при сборке
+    // снимка run.
+    PolicySnapshot::build(&out.policy, None).map_err(|e| AppConfigError::Project(e.to_string()))?;
+    Ok(out)
+}
+
+/// Ошибка глобального разбора — как ошибка проектной конфигурации (без имени файла
+/// глобальной).
+fn project_error(e: AppConfigError) -> AppConfigError {
+    match e {
+        AppConfigError::Policy { at, reason } => AppConfigError::Project(format!("{at}: {reason}")),
+        AppConfigError::PolicyRules(p) => AppConfigError::Project(p.to_string()),
+        other => AppConfigError::Project(
+            other
+                .to_string()
+                .trim_start_matches(&format!("{CONFIG_FILE}: "))
+                .to_owned(),
+        ),
+    }
 }
 
 /// Читает `home/config.toml`; `LLAMA_URL` — из окружения.

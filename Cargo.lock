@@ -2095,7 +2095,10 @@ dependencies = [
  "serde_json",
  "tiktoken-rs",
  "za-agent",
+ "za-core",
+ "za-jail",
  "za-protocol",
+ "za-tools",
 ]
 
 [[package]]
@@ -2268,6 +2271,7 @@ dependencies = [
  "tracing",
  "za-core",
  "za-jail",
+ "za-llm",
  "za-protocol",
 ]
 

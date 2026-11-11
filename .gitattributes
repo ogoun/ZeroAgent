@@ -14,3 +14,5 @@ crates/za-agent/tests/golden/*.hash -text
 crates/za-agent/tests/golden/r1b1_v1/** -text
 # Золотая трасса дрейфа префикса (R1-B2 CTX-002): байты не трогать.
 crates/za-agent/tests/golden/*.json -text
+# Golden описаний и текстов нативных инструментов (D94, D97): байты не трогать.
+crates/za-tools/tests/golden/*.json -text

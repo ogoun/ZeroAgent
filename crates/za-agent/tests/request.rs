@@ -673,3 +673,84 @@ fn prefix_is_byte_stable_across_turns() {
     let again = freeze(&s, &[tool("read"), tool("write")], &[], Some("rule one"));
     assert_eq!(again, f);
 }
+
+/// Инструмент-заглушка с описанием `tool <name>` (не вызывается).
+fn cap_tool(name: &str) -> std::sync::Arc<dyn za_core::Tool> {
+    struct Stub(za_core::ToolSpec);
+    impl za_core::Tool for Stub {
+        fn spec(&self) -> &za_core::ToolSpec {
+            &self.0
+        }
+        fn call(
+            &self,
+            _args: Value,
+            _cx: za_core::ToolCx,
+        ) -> za_core::BoxFuture<'static, za_core::ToolOutput> {
+            Box::pin(async { za_core::ToolOutput::ok("") })
+        }
+    }
+    std::sync::Arc::new(Stub(za_core::ToolSpec {
+        schema: tool(name),
+        class: za_protocol::EffectClass::ReadOnly,
+        kind: za_core::ToolKind::Read,
+        approval: za_core::Approval::Mode,
+        risk: za_core::RiskClass::Read,
+        roles: vec![RunRole::Top],
+        min_tier: Tier::Small,
+        timeout: std::time::Duration::from_secs(1),
+        output_limit: None,
+        tainted: false,
+    }))
+}
+
+/// R1-C1 D93 (Carry 1): на top small инструкции capability — в описании её первого по
+/// имени инструмента, а не в system; на standard — в system; не помещаются в слот Tools
+/// окна 8k (`ContextBudget::for_context(8192).tools`) — опущены.
+#[test]
+fn small_capability_instructions_go_to_tool_description() {
+    let caps = [Capability {
+        name: "c".into(),
+        tools: vec![cap_tool("b"), cap_tool("a")],
+        instructions: Some("X".into()),
+        ..Capability::default()
+    }];
+    let schemas = [tool("b"), tool("a"), tool("other")];
+    let small = freeze(
+        &setup(RunRole::Top, Tier::Small, None),
+        &schemas,
+        &caps,
+        None,
+    );
+    assert!(!small.system.contains('X'), "{}", small.system);
+    let desc = |f: &FrozenPrefix, n: &str| {
+        f.tools
+            .iter()
+            .find(|t| t.name == n)
+            .unwrap()
+            .description
+            .clone()
+    };
+    assert_eq!(desc(&small, "a"), "tool a\n\nX");
+    assert_eq!(desc(&small, "b"), "tool b");
+    assert_eq!(desc(&small, "other"), "tool other");
+    // Standard: инструкции в system, описания не меняются.
+    let std = freeze(
+        &setup(RunRole::Top, Tier::Standard, None),
+        &schemas,
+        &caps,
+        None,
+    );
+    assert!(std.system.ends_with("\n\nX"), "{}", std.system);
+    assert_eq!(desc(&std, "a"), "tool a");
+    // Не помещаются в слот Tools окна 8192 (550): опущены, префикс как без инструкций.
+    let slot = za_agent::ContextBudget::for_context(8192).tools.unwrap();
+    let big = [Capability {
+        instructions: Some("y".repeat(slot as usize * 4 + 8)),
+        ..caps[0].clone()
+    }];
+    let s = setup(RunRole::Top, Tier::Small, None);
+    assert_eq!(s.n_ctx, 8192);
+    let f = freeze(&s, &schemas, &big, None);
+    assert_eq!(desc(&f, "a"), "tool a");
+    assert_eq!(f, freeze(&s, &schemas, &[], None));
+}

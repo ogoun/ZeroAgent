@@ -1,10 +1,11 @@
 //! Бинарник `zero-agent`: `doctor`, `demo-run`, `replay` (R0), `models`, `ask`,
 //! `resources` (R1-A), `run`, `answer` (R1-B1), `inspect`, `stats` (R1-B2), `audit`,
-//! `journal export`, `checkpoints`, `secret list` (R1-C1).
+//! `journal export`, `checkpoints`, `secret list`, `trust` (R1-C1).
 //!
 //! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы, ошибка
 //! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя;
-//! у `run` ещё 4 — пауза или `blocked_on_budget`, 5 — `blocked`, 6 — `cancelled` (D28).
+//! у `run` ещё 4 — пауза или `blocked_on_budget`, 5 — `blocked`, 6 — `cancelled` (D28),
+//! 2 — удалённый флаг `--agents-md` (D83).
 //! Журнал проекта лежит в
 //! `ZA_HOME/projects/<project_id>/` (ARC-020), `log.txt` демонстрации — в
 //! каталоге проекта.
@@ -21,7 +22,7 @@ use std::time::Duration;
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
-use za_agent::WorkMode;
+use za_agent::{GrantMode, WorkMode, parse_grant_flag};
 use za_core::{CrashPoint, DemoConfig, DemoOutcome, EffectError, replay_hash, run_demo};
 use za_protocol::{Priority, RunId, RunMode, Tier};
 use za_store::{ProjectStore, StoreError};
@@ -38,6 +39,7 @@ use zero_agent::run::{
     ResumeArgs, RunAction, RunArgs, RunCrash, RunError, parse_run_crash, parse_usd,
 };
 use zero_agent::secret::{StoreSecrets, cmd_secret_list};
+use zero_agent::trust::{TrustCmdError, cmd_trust};
 /// Переменная окружения с фильтром логов; без неё читается `RUST_LOG`.
 const LOG_ENV: &str = "ZA_LOG";
 /// Фильтр логов по умолчанию.
@@ -45,6 +47,8 @@ const DEFAULT_LOG: &str = "warn";
 /// Сколько runtime ждёт фоновые задачи при выходе: зависший замер тома (`statvfs`) или
 /// обход каталога отменить нельзя, команда не должна из-за них висеть.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Код выхода удалённого флага (`run --agents-md`, D83): как ошибка аргументов.
+const EXIT_REMOVED_FLAG: u8 = 2;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -175,6 +179,17 @@ enum Cmd {
         #[command(subcommand)]
         action: JournalCmd,
     },
+    /// Доверие к проекту заранее (D83): AGENTS.md, CLAUDE.md, .zero-agent/config.toml и
+    /// скиллы читаются, команды выполняются по режиму; набор доверенных файлов пишется в
+    /// журнал аудита. Изменение этих файлов снимает доверие до нового.
+    Trust {
+        /// Каталог проекта.
+        #[arg(long)]
+        project: PathBuf,
+        /// Отозвать доверие.
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Секреты агента: имена и задан ли секрет, без значений.
     Secret {
         #[command(subcommand)]
@@ -257,9 +272,13 @@ struct RunCli {
     /// Предел активного времени run, с, поверх `[budgets.run]` (`duration_ms`).
     #[arg(long, value_name = "СЕК")]
     max_duration: Option<u64>,
-    /// Добавить `AGENTS.md` проекта в промпт.
-    #[arg(long, conflicts_with = "resume")]
+    /// Удалён (D83): `AGENTS.md` читается у доверенного проекта (`zero-agent trust`).
+    #[arg(long, hide = true)]
     agents_md: bool,
+    /// Грант доступа вне проекта: `<путь>[=ro|=rw]` (по умолчанию `ro`); можно повторять.
+    /// С `--resume` — добавляется к грантам run.
+    #[arg(long = "grant", value_name = "ПУТЬ[=ro|=rw]", value_parser = parse_grant_flag)]
+    grants: Vec<(PathBuf, GrantMode)>,
     /// Ввод пользователя для продолжаемого run.
     #[arg(long, requires = "resume")]
     input: Option<String>,
@@ -279,6 +298,9 @@ enum ModeArg {
     Ask,
     AcceptEdits,
     Auto,
+    /// Без вопросов, кроме необратимых и путей вне проекта; только при
+    /// `[policy] allow_bypass = true` глобальной конфигурации (D80).
+    Bypass,
 }
 
 impl From<ModeArg> for RunMode {
@@ -289,6 +311,7 @@ impl From<ModeArg> for RunMode {
             ModeArg::Ask => RunMode::Ask,
             ModeArg::AcceptEdits => RunMode::AcceptEdits,
             ModeArg::Auto => RunMode::Auto,
+            ModeArg::Bypass => RunMode::Bypass,
         }
     }
 }
@@ -344,7 +367,6 @@ fn run_args(r: RunCli) -> RunArgs {
             work_mode: r.work_mode.map(Into::into),
             tier: r.tier.map(Into::into),
             max_wait: r.max_wait.map(Duration::from_secs),
-            agents_md: r.agents_md,
             task: r.task.unwrap_or_default(),
         }),
     };
@@ -358,6 +380,7 @@ fn run_args(r: RunCli) -> RunArgs {
             gpu_ms: r.max_gpu_ms,
             duration_secs: r.max_duration,
         },
+        grants: r.grants,
         crash: r.crash_at,
     }
 }
@@ -471,6 +494,8 @@ enum AppError {
     Audit(#[from] AuditCmdError),
     #[error(transparent)]
     Checkpoints(#[from] CheckpointsCmdError),
+    #[error(transparent)]
+    Trust(#[from] TrustCmdError),
 }
 
 fn parse_run(s: &str) -> Result<RunId, String> {
@@ -591,6 +616,14 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             Ok(resources::cmd_resources(&home, json, watch).await?)
         }
         Cmd::Run(r) => {
+            if r.agents_md {
+                // D83: флаг удалён, инструкции проекта — по доверию.
+                eprintln!(
+                    "zero-agent: флаг --agents-md удалён: AGENTS.md (или CLAUDE.md) читается у доверенного проекта; доверие: zero-agent trust --project \"{}\"",
+                    r.project.display()
+                );
+                return Ok(ExitCode::from(EXIT_REMOVED_FLAG));
+            }
             let home = home::za_home()?;
             Ok(agent_run::cmd_run(&home, run_args(r)).await?)
         }
@@ -659,6 +692,10 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             let home = home::za_home()?;
             let masker = StoreSecrets::from_env().masker();
             Ok(audit_cmd::cmd_journal_export(&home, &project, run, &masker).await?)
+        }
+        Cmd::Trust { project, revoke } => {
+            let home = home::za_home()?;
+            Ok(cmd_trust(&home, &project, revoke).await?)
         }
         Cmd::Secret {
             action: SecretCmd::List,
@@ -770,6 +807,72 @@ mod tests {
         assert!(parse_crash("execute").is_err());
         assert!(parse_crash("receipt:1").is_err());
         assert!(parse_crash("intent:-1").is_err());
+    }
+
+    /// D78: `--grant <путь>=rw` — режим rw, без режима — ro; повтор флага — несколько
+    /// грантов, `=` отделяет режим от пути Windows с `:`.
+    #[test]
+    fn grant_flag_parsed() {
+        let cli = Cli::try_parse_from([
+            "zero-agent",
+            "run",
+            "--project",
+            "p",
+            "--grant",
+            r"D:\data=rw",
+            "--grant",
+            "/srv/ro",
+            "задача",
+        ])
+        .unwrap();
+        let Cmd::Run(r) = cli.cmd else { panic!() };
+        let args = run_args(r);
+        assert_eq!(args.grants.len(), 2);
+        assert_eq!(args.grants[0], (PathBuf::from(r"D:\data"), GrantMode::Rw));
+        assert_eq!(args.grants[1].1, GrantMode::Ro);
+        // С `--resume` грант допустим (добавляется с границы, D92).
+        let id = RunId::new().to_string();
+        assert!(
+            Cli::try_parse_from([
+                "zero-agent",
+                "run",
+                "--project",
+                "p",
+                "--resume",
+                &id,
+                "--grant",
+                "/x"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "zero-agent",
+                "run",
+                "--project",
+                "p",
+                "--grant",
+                "/x=wr",
+                "t"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bypass_mode_parses() {
+        let cli = Cli::try_parse_from([
+            "zero-agent",
+            "run",
+            "--project",
+            "p",
+            "--mode",
+            "bypass",
+            "t",
+        ])
+        .unwrap();
+        let Cmd::Run(r) = cli.cmd else { panic!() };
+        assert_eq!(r.mode.map(RunMode::from), Some(RunMode::Bypass));
     }
 
     #[test]

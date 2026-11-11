@@ -32,6 +32,8 @@
 //! хуков, fsmonitor и фильтров со своим индексом и скрытой ссылкой
 //! [`CHECKPOINT_REF_PREFIX`], без git и в недоверенном проекте — копия затронутых файлов
 //! в `ZA_HOME`; восстановление — только внутри проекта, без следования ссылкам.
+//!
+//! Все нативные инструменты одним набором — [`native_capability`] (D74, D93).
 
 mod bash;
 mod checkpoint;
@@ -39,6 +41,7 @@ mod digest;
 mod edit;
 mod fs;
 mod home;
+mod native;
 mod nearest;
 mod patch;
 mod rules;
@@ -64,6 +67,7 @@ pub use fs::{
     WalkLimits, glob_in, glob_split, glob_tool, read_at, read_tool, search_in, search_tool,
 };
 pub use home::AgentHome;
+pub use native::{NATIVE_CAPABILITY, NativeDeps, native_capability};
 pub use nearest::nearest;
 pub use patch::{MatchLevel, PatchError, apply, match_steps, shrink_guard};
 pub use tracker::{ReadTracker, TrackError};

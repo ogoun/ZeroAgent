@@ -1,0 +1,173 @@
+[
+  {
+    "description": "Run a shell command in the project directory. PowerShell on Windows, bash elsewhere; see shell in <env>. A non-zero exit code is reported in the result, it is not a tool error.",
+    "name": "bash",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "cmd": {
+          "description": "Command to run",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "Working directory, relative to the project root (default: the root)",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Timeout in seconds (default 120)",
+          "maximum": 600,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cmd"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Replace the only occurrence of old with new in a file. Read the file first. Empty old creates a new file.",
+    "name": "edit",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_shrink": {
+          "description": "Allow removing more than half of the lines of a file with 20+ lines",
+          "type": "boolean"
+        },
+        "new": {
+          "description": "Replacement text",
+          "type": "string"
+        },
+        "old": {
+          "description": "Exact text to replace, with enough lines to be unique",
+          "type": "string"
+        },
+        "path": {
+          "description": "File path, relative to the project root",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "old",
+        "new"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "List files matching a glob pattern, e.g. src/**/*.rs. Returns sorted paths, up to 500. Skips files ignored by .gitignore.",
+    "name": "glob",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "description": "Glob pattern, relative to the project root",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Apply several edit replacements to one file in order. All or nothing: if any edit fails, the file is not changed.",
+    "name": "multi_edit",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_shrink": {
+          "description": "Allow removing more than half of the lines of a file with 20+ lines",
+          "type": "boolean"
+        },
+        "edits": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "new": {
+                "description": "Replacement text",
+                "type": "string"
+              },
+              "old": {
+                "description": "Text to replace (not empty)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "old",
+              "new"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "path": {
+          "description": "File path, relative to the project root",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "edits"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Read a text file. Returns numbered lines: line number, tab, text.",
+    "name": "read",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "Number of lines (default 500)",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path": {
+          "description": "File path, relative to the project root",
+          "type": "string"
+        },
+        "start": {
+          "description": "First line (default 1)",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search file contents with a regular expression. Returns path:line:text, up to 200 matches. Skips files ignored by .gitignore.",
+    "name": "search",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "glob": {
+          "description": "Only files matching this glob, e.g. *.rs",
+          "type": "string"
+        },
+        "path": {
+          "description": "File or directory (default: project root)",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Regular expression",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    }
+  }
+]

@@ -606,7 +606,7 @@ pub fn env_in_role_limit(role: RunRole, tier: Tier) -> bool {
 
 /// Слот описаний инструментов в префиксе top small, токены: строка 8k таблицы 2.3
 /// части 02 (D64).
-const SMALL_TOOLS_SLOT: u32 = 550;
+pub const SMALL_TOOLS_SLOT: u32 = 550;
 
 /// Случай CI-проверки лимита промптов (PRM-007, D64): имя, текст и лимит в токенах.
 #[derive(Debug, Clone, PartialEq)]
@@ -664,14 +664,8 @@ fn system_of(role: RunRole, overlay: Option<WorkMode>) -> String {
 ///   `"\n\n"` и `render_env(max_env())` (2000, 3000);
 /// - `orchestrator`, `orchestrator/{mode}` (500), `worker`, `worker/{mode}` (300) — Core
 ///   вместе с overlay;
-/// - `top/small/prefix/{mode}` — Core top, overlay режима и схема `finish`
-///   (`render_tools`), лимит 800 + 500 + 550 = 1850 (Core, слот overlay, Tools строки 8k
-///   таблицы 2.3). Случай на каждый overlay, а не на самый длинный: самый длинный по
-///   токенам у разных токенизаторов может различаться (M-3 ревью задачи 5). Схема
-///   `finish` — заглушка слота Tools: top small встроенных инструментов не получает
-///   (`finish` — у worker и orchestrator, `ask_user` — со standard), а настоящих
-///   инструментов small ещё нет; когда появятся — брать набор реестра
-///   `for_run(Top, Small)` (M-2).
+/// - префикс top small с настоящими инструментами — [`small_prefix_cases`]: набор
+///   инструментов собирает `xtask` (R1-C1 D93), `za-agent` от `za-tools` не зависит.
 pub fn budget_cases() -> Vec<BudgetCase> {
     let case = |name: String, text: String, limit: u32| BudgetCase { name, text, limit };
     let env = render_env(&max_env());
@@ -714,21 +708,53 @@ pub fn budget_cases() -> Vec<BudgetCase> {
             ));
         }
     }
-    let tools = crate::tools::builtin_tools()
+    out
+}
+
+/// Предел префикса top small, токены: Core, слот overlay и слот Tools вместе (часть 02,
+/// §4: 1800; R1-C1 D93 — вместо прежней суммы 800 + 500 + 550).
+pub const SMALL_PREFIX_LIMIT: u32 = 1800;
+
+/// Случаи CI-лимита префикса top small с настоящими инструментами (R1-C1 D93, Carry
+/// M-2): набор — встроенные инструменты ([`crate::builtin_tools`]) и `tools` (нативная
+/// capability, её собирает `xtask`) так, как его видит run, — `for_run(Top, Small)`.
+/// - `top/small/tools` — `render_tools` набора, лимит [`SMALL_TOOLS_SLOT`] (550, строка 8k
+///   таблицы 2.3 части 02);
+/// - `top/small/prefix/{mode}` — Core top, overlay режима и `render_tools` набора, лимит
+///   [`SMALL_PREFIX_LIMIT`]. Случай на каждый overlay: самый длинный по токенам у разных
+///   токенизаторов может различаться (M-3 ревью задачи 5).
+///
+/// Повтор имени (инструмент уже среди встроенных) не добавляется — как в реестре run.
+pub fn small_prefix_cases(tools: &[std::sync::Arc<dyn za_core::Tool>]) -> Vec<BudgetCase> {
+    let mut reg = za_core::ToolRegistry::default();
+    for t in crate::tools::builtin_tools()
+        .into_iter()
+        .chain(tools.iter().cloned())
+    {
+        if let Err(e) = reg.register(t) {
+            tracing::debug!(tool = %e.0, "инструмент уже в наборе");
+        }
+    }
+    let schemas = reg
+        .for_run(RunRole::Top, Tier::Small)
         .iter()
-        .filter(|t| t.spec().min_tier <= Tier::Small)
         .map(|t| t.spec().schema.clone())
         .collect();
     let tools = za_llm::render_tools(&za_llm::PromptBlocks {
-        tools,
+        tools: schemas,
         ..Default::default()
     });
+    let mut out = vec![BudgetCase {
+        name: "top/small/tools".into(),
+        text: tools.clone(),
+        limit: SMALL_TOOLS_SLOT,
+    }];
     for (m, name) in MODES {
-        out.push(case(
-            format!("top/small/prefix/{name}"),
-            format!("{}\n\n{tools}", system_of(RunRole::Top, Some(m))),
-            role_limit(RunRole::Top, Tier::Small) + MODE_LIMIT + SMALL_TOOLS_SLOT,
-        ));
+        out.push(BudgetCase {
+            name: format!("top/small/prefix/{name}"),
+            text: format!("{}\n\n{tools}", system_of(RunRole::Top, Some(m))),
+            limit: SMALL_PREFIX_LIMIT,
+        });
     }
     out
 }

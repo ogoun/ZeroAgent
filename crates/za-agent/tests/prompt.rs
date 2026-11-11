@@ -5,10 +5,11 @@ use std::path::Path;
 use za_agent::{
     AGENTS_MD_LIMIT, BudgetCase, COMPACT_RUBRIC, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo,
     LEFT_ANGLES, MODE_LIMIT, MemoryLevel, MemoryPort, NoMemory, PROMPT_VERSION, RIGHT_ANGLES,
-    Recall, TaskBlock, WorkMode, agents_md_budget, approx_tokens, budget_cases, env_in_role_limit,
-    escape_untrusted, fit_agents_md, git_branch, max_env, memory_budget, mode_overlay,
-    prompt_files, prompt_texts_hash, reasoning_for, render_control, render_env, render_task,
-    role_core, role_limit, runtime_texts, upper_tokens, utility_rules,
+    Recall, SMALL_PREFIX_LIMIT, SMALL_TOOLS_SLOT, TaskBlock, WorkMode, agents_md_budget,
+    approx_tokens, budget_cases, env_in_role_limit, escape_untrusted, fit_agents_md, git_branch,
+    max_env, memory_budget, mode_overlay, prompt_files, prompt_texts_hash, reasoning_for,
+    render_control, render_env, render_task, role_core, role_limit, runtime_texts,
+    small_prefix_cases, upper_tokens, utility_rules,
 };
 use za_llm::{Effort, ReasoningMode};
 use za_protocol::{RunId, RunRole, Tier};
@@ -790,11 +791,9 @@ fn cases_cover_roles_tiers_modes() {
     assert!(has("orchestrator/writer", 500));
     assert!(has("worker", 300));
     assert!(has("worker/researcher", 300));
-    // M-3 ревью задачи 5: префикс top small — на каждый overlay (вместо брифового
-    // одного `top/small/prefix` с самым длинным по байтам).
-    for m in ["coder", "researcher", "operator", "writer"] {
-        assert!(has(&format!("top/small/prefix/{m}"), 1850), "{m}");
-    }
+    // R1-C1 D93: префикс top small с настоящими инструментами считает `xtask`
+    // (`small_prefix_cases`), заглушки `finish` здесь нет.
+    assert!(!c.iter().any(|x| x.name.starts_with("top/small/prefix")));
     assert_eq!(c.iter().filter(|x| x.name.starts_with("mode/")).count(), 4);
     assert!(
         c.iter()
@@ -804,8 +803,8 @@ fn cases_cover_roles_tiers_modes() {
             .contains("<env>")
     );
     // Полный набор: top/small/core, env/max, 4 overlay, top standard и full по 5,
-    // orchestrator и worker по 5, top/small/prefix по 4 — 30 случаев с разными именами.
-    assert_eq!(c.len(), 30);
+    // orchestrator и worker по 5 — 26 случаев с разными именами.
+    assert_eq!(c.len(), 26);
     let mut names: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
     names.sort_unstable();
     names.dedup();
@@ -832,16 +831,66 @@ fn cases_cover_roles_tiers_modes() {
         top_std.text,
         format!("{}\n\n{}", role_core(RunRole::Top), render_env(&max_env()))
     );
-    // Префикс top small: Core, overlay режима и схема finish (заглушка слота Tools).
-    let prefix = &c
-        .iter()
-        .find(|x| x.name == "top/small/prefix/researcher")
-        .unwrap()
-        .text;
+    // Префикс top small: Core, overlay режима и `render_tools` набора `for_run(Top, Small)`.
+    let small = small_prefix_cases(&[
+        stub_tool("zz_small", Tier::Small),
+        stub_tool("zz_std", Tier::Standard),
+    ]);
+    let names: Vec<&str> = small.iter().map(|x| x.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "top/small/tools",
+            "top/small/prefix/coder",
+            "top/small/prefix/researcher",
+            "top/small/prefix/operator",
+            "top/small/prefix/writer"
+        ]
+    );
+    assert_eq!(small[0].limit, SMALL_TOOLS_SLOT);
+    assert!(small[1..].iter().all(|x| x.limit == SMALL_PREFIX_LIMIT));
+    let prefix = &small[2].text;
     assert!(prefix.starts_with(&format!(
         "{}\n\n{}\n\n",
         role_core(RunRole::Top),
         mode_overlay(WorkMode::Researcher)
     )));
-    assert!(prefix.contains("\"name\":\"finish\""));
+    assert!(prefix.ends_with(&small[0].text));
+    // Инструмент small входит, standard — нет; `finish` (у субагентов) — нет.
+    assert!(small[0].text.contains("\"name\":\"zz_small\""));
+    assert!(!small[0].text.contains("zz_std"));
+    assert!(!small[0].text.contains("\"name\":\"finish\""));
+}
+
+/// Инструмент-заглушка тира `tier` для случаев бюджета (не вызывается).
+fn stub_tool(name: &str, tier: Tier) -> std::sync::Arc<dyn za_core::Tool> {
+    struct Stub(za_core::ToolSpec);
+    impl za_core::Tool for Stub {
+        fn spec(&self) -> &za_core::ToolSpec {
+            &self.0
+        }
+        fn call(
+            &self,
+            _args: serde_json::Value,
+            _cx: za_core::ToolCx,
+        ) -> za_core::BoxFuture<'static, za_core::ToolOutput> {
+            Box::pin(async { za_core::ToolOutput::ok("") })
+        }
+    }
+    std::sync::Arc::new(Stub(za_core::ToolSpec {
+        schema: za_llm::ToolSchema {
+            name: name.into(),
+            description: format!("tool {name}"),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        class: za_protocol::EffectClass::ReadOnly,
+        kind: za_core::ToolKind::Read,
+        approval: za_core::Approval::Mode,
+        risk: za_core::RiskClass::Read,
+        roles: vec![RunRole::Top],
+        min_tier: tier,
+        timeout: std::time::Duration::from_secs(1),
+        output_limit: None,
+        tainted: false,
+    }))
 }

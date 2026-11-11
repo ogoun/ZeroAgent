@@ -1,13 +1,13 @@
-//! Чтение `ZA_HOME/config.toml` и запасной эндпоинт из `LLAMA_URL`.
+//! Чтение `ZA_HOME/config.toml` и запасной эндпоинт из `LLAMA_URL`; проектная
+//! конфигурация, режим `bypass` и флаг `--grant` команды `run` (R1-C1 D78, D80).
 
 use std::path::PathBuf;
 
 use za_llm::{BackendKind, EndpointId};
 use zero_agent::config::{AgentConfig, CONFIG_FILE, load_config_with};
 
-#[path = "../../../test-support/unique_dir.rs"]
-mod unique_dir;
-use unique_dir::unique_dir;
+mod support;
+use support::process::unique_dir;
 
 fn home(name: &str) -> PathBuf {
     unique_dir("config", name)
@@ -166,4 +166,102 @@ fn context_section_is_parsed_and_validated() {
     std::fs::write(h.join(CONFIG_FILE), "[context]\ncompact_after = 0.75\n").unwrap();
     let e = load_config_with(&h, None).unwrap_err();
     assert!(matches!(e, AppConfigError::Parse(_)), "{e}");
+}
+
+// ---- Проектная конфигурация, bypass и гранты (R1-C1 задача 13) ----
+
+/// D80, ARC-041: проектная конфигурация — только `[policy]`; правила разбираются тем же
+/// разбором, прочие разделы не действуют (без ошибки), ошибка называет файл проекта и
+/// путь поля.
+#[test]
+fn project_config_policy_only() {
+    let cfg = zero_agent::config::parse_project_config(
+        "[models]\ndefault = \"x\"\n\n[policy]\nallow_bypass = true\n\n[[policy.rules]]\naction = \"deny\"\ntool = \"bash\"\n\n[[policy.rules]]\naction = \"allow\"\ncommand = \"rm *\"\n\n[[policy.grants]]\npath = \"/etc\"\nmode = \"rw\"\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.policy.rules.len(), 2);
+    // Снимок run: проектное allow, allow_bypass и гранты не действуют.
+    let snap =
+        za_agent::PolicySnapshot::build(&za_agent::PolicyConfig::default(), Some(&cfg.policy))
+            .unwrap();
+    assert_eq!(snap.rules.len(), 1);
+    assert_eq!(snap.ignored.len(), 1);
+    assert!(!snap.allow_bypass);
+    let e = zero_agent::config::parse_project_config(
+        "[[policy.rules]]\naction = \"deny\"\ntol = \"bash\"\n",
+    )
+    .unwrap_err();
+    let shown = e.to_string();
+    assert!(
+        shown.starts_with(".zero-agent/config.toml проекта"),
+        "{shown}"
+    );
+    assert!(shown.contains("policy.rules[0]"), "{shown}");
+    let e = zero_agent::config::parse_project_config("[[policy.rules]]\naction = \"deny\"\n")
+        .unwrap_err();
+    assert!(e.to_string().contains("tool, path или command"), "{e}");
+}
+
+/// D80: `run --mode bypass` без `[policy] allow_bypass = true` глобальной конфигурации —
+/// ошибка конфигурации, код 1, текст `PolicyError::BypassDisabled`; с флагом режим
+/// принимается (дальше — обычная проверка моделей).
+#[test]
+fn bypass_requires_global_flag() {
+    let e = support::process::env_in("config-run", "bypass", "");
+    let o = e.run_cmd(&["--mode", "bypass", "Задача"]);
+    assert_eq!(o.code(), Some(1), "{o:?}");
+    let want = za_agent::PolicyError::BypassDisabled.to_string();
+    assert!(o.stderr.contains(&want), "{o:?}");
+    let e = support::process::env_in("config-run", "bypass-on", "[policy]\nallow_bypass = true\n");
+    let o = e.run_cmd(&["--mode", "bypass", "Задача"]);
+    assert_eq!(o.code(), Some(1), "{o:?}");
+    assert!(!o.stderr.contains(&want), "{o:?}");
+}
+
+fn paris(_: &[serde_json::Value]) -> axum::response::Response {
+    support::fake_llama::text_reply(&["Париж"])
+}
+
+/// D78: `--grant <путь>=rw` даёт грант run с каноническим путём и режимом rw
+/// (`RunSpec.grants` → снимок), источник `cli`, запись аудита `grant.added`; путь из
+/// глобальной конфигурации — тоже грант (`config`). Сетевой путь — ошибка, код 1.
+#[test]
+fn grant_flag_reaches_run() {
+    let srv = support::fake_llama::Fake::start(32768, true, paris);
+    let root = unique_dir("config-run", "grant-data");
+    let data = root.join("data");
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    let cfg = format!(
+        "{}\n[[policy.grants]]\npath = {:?}\nreason = \"общий каталог\"\n",
+        support::fake_llama::llama_config(&srv.base),
+        shared.to_str().unwrap()
+    );
+    let e = support::process::env_in("config-run", "grant", &cfg);
+    let arg = format!("{}=rw", data.display());
+    let o = e.run_cmd(&["--grant", &arg, "Вопрос"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let snap = e.snapshot(support::process::run_id(&o));
+    let grants = snap["grants"].as_array().unwrap();
+    assert_eq!(grants.len(), 2, "{snap}");
+    assert_eq!(grants[0]["mode"], "rw", "{snap}");
+    assert_eq!(grants[0]["source"], "cli", "{snap}");
+    let canon = std::fs::canonicalize(&data).unwrap();
+    let canon = canon.to_string_lossy();
+    let canon = canon.strip_prefix(r"\\?\").unwrap_or(&canon);
+    assert_eq!(grants[0]["path"], canon, "{snap}");
+    assert_eq!(grants[1]["mode"], "ro", "{snap}");
+    assert_eq!(grants[1]["source"], "config", "{snap}");
+    // Первое сообщение top — блок <grants> с обоими путями.
+    let first = serde_json::to_string(&srv.bodies()[0]["messages"]).unwrap();
+    assert!(first.contains("<grants>"), "{first}");
+    assert!(first.contains("(rw)"), "{first}");
+    let audit = e.last_audit("grant.").unwrap();
+    assert_eq!(audit.payload["mode"], "rw", "{audit:?}");
+    if cfg!(windows) {
+        let o = e.run_cmd(&["--grant", r"\\192.0.2.1\share=ro", "Вопрос"]);
+        assert_eq!(o.code(), Some(1), "{o:?}");
+        assert!(o.stderr.contains("грант"), "{o:?}");
+    }
 }
