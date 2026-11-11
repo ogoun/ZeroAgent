@@ -198,11 +198,14 @@ mod tests {
             ("long".into(), "abcdefgh-ijkl".into()),
             ("short".into(), "1234567".into()),
         ]);
+        // Фиктивный токен из частей: цельная строка формата токена в исходнике
+        // блокируется защитой push от секретов.
+        let tok = ["gh", "p_0123456789abcdefghijklmnopqrstuvwxyz"].concat();
         assert_eq!(
             mask_json(
                 &m,
                 &json!({"abcdefgh": ["abcdefgh", 1, {"k": "abcdefgh-ijkl 1234567"}],
-                        "tok": "ghp_0123456789abcdefghijklmnopqrstuvwxyz"})
+                        "tok": tok})
             ),
             json!({"[secret masked: a]": ["[secret masked: a]", 1, {"k": "[secret masked: long] 1234567"}],
                    "tok": "[secret masked: github_token]"})

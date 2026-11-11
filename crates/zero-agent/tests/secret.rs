@@ -74,3 +74,23 @@ fn doctor_names_secret_source() {
     );
     assert!(!o.stdout.contains(VALUE_A), "{}", o.stdout);
 }
+
+/// Значение короче 8 символов маска не ищет: `secret list` и `doctor` предупреждают
+/// (ревью задачи 10, m3), значение не печатают.
+#[test]
+fn short_value_is_warned_not_printed() {
+    const SHORT: &str = "pin4567";
+    let e = env_in("zero-agent-secret", "short", "");
+    let o = e.run_with(&["secret", "list"], &[("ZA_SECRET_PIN", SHORT)]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert!(o.stdout.contains("короче 8 символов"), "{}", o.stdout);
+    assert!(!o.stdout.contains(SHORT), "{}", o.stdout);
+    let o = e.run_with(&["doctor"], &[("ZA_SECRET_PIN", SHORT)]);
+    assert!(
+        o.stdout
+            .contains("значения короче 8 символов не маскируются: pin"),
+        "{}",
+        o.stdout
+    );
+    assert!(!o.stdout.contains(SHORT), "{}", o.stdout);
+}

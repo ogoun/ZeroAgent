@@ -17,7 +17,7 @@ use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query
 
 use crate::config::{AgentConfig, AppConfigError, LLAMA_URL_ENDPOINT, load_config};
 use crate::models::{PROBE_WAIT, start_gateway, state_text};
-use crate::secret::source_text;
+use crate::secret::{StoreSecrets, source_text};
 
 /// Переменная окружения с адресом `llama-server`.
 pub const LLAMA_URL_ENV: &str = "LLAMA_URL";
@@ -141,16 +141,25 @@ pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
         sqlite: check_sqlite(za_store::sqlite_library_version(), za_store::MIN_SQLITE),
         llama,
         gpu,
-        secrets: check_secrets(),
+        secrets: check_secrets(&StoreSecrets::from_env().short_names()),
         models,
         rust: rust_version(),
     }
 }
 
 /// Источник секретов: «источник секретов: переменные ZA_SECRET_* (Vault памяти — с
-/// клиентом ZeroAIMemory)». Значения и имена секретов не читаются.
-pub fn check_secrets() -> Check {
-    Check::Ok(format!("источник секретов: {}", source_text("env")))
+/// клиентом ZeroAIMemory)». `short` — имена секретов со значением короче 8 символов: они
+/// не маскируются, это `Warn` с именами (значения не печатаются).
+pub fn check_secrets(short: &[String]) -> Check {
+    let text = format!("источник секретов: {}", source_text("env"));
+    if short.is_empty() {
+        Check::Ok(text)
+    } else {
+        Check::Warn(format!(
+            "{text}; значения короче 8 символов не маскируются: {}",
+            short.join(", ")
+        ))
+    }
 }
 
 /// GPU и модели по конфигурации `home`.
@@ -374,12 +383,22 @@ mod tests {
     }
 
     #[test]
+    fn short_secrets_are_a_warning() {
+        let c = check_secrets(&["pin".to_owned()]);
+        assert!(
+            matches!(&c, Check::Warn(d) if d.contains("pin") && d.contains("короче 8")),
+            "{c:?}"
+        );
+        assert!(matches!(check_secrets(&[]), Check::Ok(_)));
+    }
+
+    #[test]
     fn failure_only_from_fail() {
         let mut r = DoctorReport {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
             gpu: Check::Warn("нет".to_owned()),
-            secrets: check_secrets(),
+            secrets: check_secrets(&[]),
             models: vec![("local".to_owned(), Check::Warn("inactive".to_owned()))],
             rust: rust_version(),
         };
@@ -398,7 +417,7 @@ mod tests {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
             gpu: Check::Ok("RTX".to_owned()),
-            secrets: check_secrets(),
+            secrets: check_secrets(&[]),
             models: vec![("local".to_owned(), Check::Ok("ready".to_owned()))],
             rust: "rustc 1.99.1".to_owned(),
         };

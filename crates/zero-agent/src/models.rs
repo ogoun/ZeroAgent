@@ -312,6 +312,9 @@ pub async fn cmd_ask(home: &Path, args: AskArgs) -> Result<ExitCode, CommandErro
     let cfg = load_config(home)?;
     models_of(&cfg).ok_or(CommandError::NoModels)?;
     let s = start_gateway(home, &cfg, true).await?;
+    // Ответ печатается через маску секретов (D90, ревью задачи 10, m7): дельты — по
+    // отдельности, итог вне терминала — целиком.
+    let masker = s.secrets.masker();
     let g = &s.gateway;
     let id = g.select(&Selection {
         run_choice: args.model.map(EndpointId),
@@ -359,7 +362,7 @@ pub async fn cmd_ask(home: &Path, args: AskArgs) -> Result<ExitCode, CommandErro
     while let Some(ev) = stream.next().await {
         match ev {
             Ok(StreamEvent::TextDelta(t)) if live => {
-                let _ = out.write_all(t.as_bytes());
+                let _ = out.write_all(masker.mask(&t).as_bytes());
                 let _ = out.flush();
             }
             Ok(StreamEvent::Queued(q)) => {
@@ -398,7 +401,7 @@ pub async fn cmd_ask(home: &Path, args: AskArgs) -> Result<ExitCode, CommandErro
                             _ => None,
                         })
                         .collect();
-                    let _ = out.write_all(text.as_bytes());
+                    let _ = out.write_all(masker.mask(&text).as_bytes());
                     let _ = out.flush();
                 }
                 eprintln!(

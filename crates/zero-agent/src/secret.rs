@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use serde_json::Value;
 use za_llm::config::secret_env_name;
 use za_llm::{Secret, SecretSource};
-use za_secrets::{EnvStore, SecretMasker, SecretStore, known_values};
+use za_secrets::{EnvStore, MIN_SECRET_LEN, SecretMasker, SecretStore, known_values};
 
 use crate::config::load_config;
 
@@ -52,6 +52,16 @@ impl StoreSecrets {
     /// Маскировщик по известным значениям кэша и шаблонам D90.
     pub fn masker(&self) -> SecretMasker {
         SecretMasker::new(known_values(self))
+    }
+
+    /// Имена секретов со значением короче [`MIN_SECRET_LEN`] символов: маска их не
+    /// ищет (D90), `secret list` и `doctor` об этом предупреждают (ревью задачи 10, m3).
+    pub fn short_names(&self) -> Vec<String> {
+        self.cache
+            .iter()
+            .filter(|(_, v)| v.chars().count() < MIN_SECRET_LEN)
+            .map(|(n, _)| n.clone())
+            .collect()
     }
 
     /// Значение по `key_ref` в любом написании, дающем ту же переменную
@@ -99,10 +109,12 @@ impl fmt::Debug for StoreSecrets {
 }
 
 /// Значение JSON, в котором замаскированы все строки и ключи объектов (D90, D100):
-/// аргументы вызовов, payload событий, записи аудита.
+/// аргументы вызовов, payload событий, записи аудита. Маскируются декодированные
+/// значения строк; при выводе `serde_json` кодирует их обратно. Строка, которая сама —
+/// текст JSON (`raw_arguments`), обрабатывается [`mask_str`].
 pub fn mask_json(m: &SecretMasker, v: &Value) -> Value {
     match v {
-        Value::String(s) => Value::String(m.mask(s).into_owned()),
+        Value::String(s) => Value::String(mask_str(m, s)),
         Value::Array(a) => Value::Array(a.iter().map(|x| mask_json(m, x)).collect()),
         Value::Object(o) => Value::Object(
             o.iter()
@@ -113,6 +125,35 @@ pub fn mask_json(m: &SecretMasker, v: &Value) -> Value {
     }
 }
 
+/// Строка, которая может быть текстом JSON (ревью задачи 10, I2). Сначала маска сырого
+/// текста: экранирование JSON сканер считает границей слова, байты текста сохраняются.
+/// Если строка — объект или массив JSON, проверяются и её декодированные строки: секрет,
+/// скрытый экранированием (`\u0067hp_…`), маскируется, и текст кодируется заново из
+/// маскированного значения.
+fn mask_str(m: &SecretMasker, s: &str) -> String {
+    let raw = m.mask(s).into_owned();
+    let t = s.trim_start();
+    if !(t.starts_with('{') || t.starts_with('[')) {
+        return raw;
+    }
+    let Ok(decoded) = serde_json::from_str::<Value>(s) else {
+        return raw;
+    };
+    let reencode = |v: &Value| serde_json::to_string(v).unwrap_or_else(|_| raw.clone());
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(parsed) => {
+            let again = mask_json(m, &parsed);
+            if again == parsed {
+                raw
+            } else {
+                reencode(&again)
+            }
+        }
+        // Маска сломала текст JSON (блок PEM без END до конца строки): из декодированного.
+        Err(_) => reencode(&mask_json(m, &decoded)),
+    }
+}
+
 /// Строка списка `secret list`: имя, задан ли, переменная окружения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListEntry {
@@ -120,11 +161,18 @@ pub struct ListEntry {
     pub set: bool,
     /// Имя упомянуто как `key_ref` в `config.toml`.
     pub in_config: bool,
+    /// Значение короче 8 символов: не маскируется.
+    pub short: bool,
 }
 
 /// Список `secret list`: `key_ref` из конфигурации и имена секретов хранилища, без
 /// повторов (одна переменная — одна строка, написание из конфигурации), по имени.
 pub fn list_entries(key_refs: &[String], secrets: &StoreSecrets) -> Vec<ListEntry> {
+    let short = |k: &str| {
+        secrets
+            .lookup(k)
+            .is_some_and(|v| v.chars().count() < MIN_SECRET_LEN)
+    };
     let mut by_var: BTreeMap<String, ListEntry> = BTreeMap::new();
     for k in key_refs {
         by_var
@@ -133,12 +181,14 @@ pub fn list_entries(key_refs: &[String], secrets: &StoreSecrets) -> Vec<ListEntr
                 name: k.clone(),
                 set: secrets.lookup(k).is_some(),
                 in_config: true,
+                short: short(k),
             });
     }
     for n in SecretStore::names(secrets) {
         by_var
             .entry(secret_env_name(&n))
             .or_insert_with(|| ListEntry {
+                short: short(&n),
                 name: n,
                 set: true,
                 in_config: false,
@@ -162,11 +212,13 @@ pub fn render_list(entries: &[ListEntry], kind: &str) -> String {
         } else {
             "не задан"
         };
-        let note = if e.in_config {
-            ""
-        } else {
-            "  (нет в config.toml)"
-        };
+        let mut note = String::new();
+        if !e.in_config {
+            note.push_str("  (нет в config.toml)");
+        }
+        if e.short {
+            note.push_str(SHORT_NOTE);
+        }
         out.push_str(&format!(
             "  {:<20} {:<9} {}{note}\n",
             e.name,
@@ -176,6 +228,9 @@ pub fn render_list(entries: &[ListEntry], kind: &str) -> String {
     }
     out
 }
+
+/// Пометка `secret list` у значения короче 8 символов.
+const SHORT_NOTE: &str = "  (короче 8 символов — не маскируется)";
 
 /// Описание источника секретов для `secret list` и `doctor`.
 pub fn source_text(kind: &str) -> String {
@@ -325,6 +380,64 @@ mod tests {
         );
     }
 
+    /// Фиктивный токен GitHub, собранный из частей: цельная строка формата токена в
+    /// исходнике блокируется защитой push от секретов.
+    fn ghp() -> String {
+        ["gh", "p_0123456789abcdefghijklmnopqrstuvwxyz"].concat()
+    }
+
+    /// `raw_arguments` — текст JSON в строке (ревью задачи 10, I2): токен после `\n`
+    /// маскируется без переписывания текста; токен, скрытый `g`, — через
+    /// декодирование и новое кодирование.
+    #[test]
+    fn mask_json_raw_arguments() {
+        let m = SecretMasker::new(vec![]);
+        let tok = ghp();
+        // Порядок ключей и пробелы сохраняются: маска сырого текста.
+        let raw = format!(r#"{{"z": 1, "cmd": "cd x\nexport GH={tok}\nrun"}}"#);
+        let v = mask_json(&m, &json!({"raw_arguments": raw}));
+        assert_eq!(
+            v["raw_arguments"],
+            json!(r#"{"z": 1, "cmd": "cd x\nexport GH=[secret masked: github_token]\nrun"}"#)
+        );
+        let raw = format!(r#"{{"c":"a\n{tok}"}}"#);
+        let v = mask_json(&m, &json!({"raw_arguments": raw}));
+        assert_eq!(
+            v["raw_arguments"],
+            json!(r#"{"c":"a\n[secret masked: github_token]"}"#)
+        );
+        // `g` в виде `g`: в сыром тексте префикса нет, в декодированном — есть.
+        let hidden = format!(r#"{{"c":"g{}"}}"#, &tok[1..]);
+        let v = mask_json(&m, &json!({"raw_arguments": hidden}));
+        let out = v["raw_arguments"].as_str().unwrap();
+        assert!(!out.contains(&tok[1..]), "{out}");
+        assert_eq!(
+            serde_json::from_str::<Value>(out).unwrap(),
+            json!({"c": "[secret masked: github_token]"})
+        );
+        // Не JSON и неразбираемый JSON — только маска текста.
+        let v = mask_json(&m, &json!(["{not json", format!("{{\"a\": \"{tok}")]));
+        assert_eq!(
+            v,
+            json!(["{not json", "{\"a\": \"[secret masked: github_token]"])
+        );
+    }
+
+    #[test]
+    fn short_values_are_reported() {
+        let s = env(&[
+            ("ZA_SECRET_PIN", "1234567"),
+            ("ZA_SECRET_LONG", "long-enough-1"),
+        ]);
+        assert_eq!(s.short_names(), vec!["pin".to_owned()]);
+        let e = list_entries(&[], &s);
+        assert!(e.iter().any(|x| x.name == "pin" && x.short));
+        assert!(e.iter().any(|x| x.name == "long" && !x.short));
+        let text = render_list(&e, "env");
+        assert!(text.contains("короче 8 символов"), "{text}");
+        assert!(!text.contains("1234567"), "{text}");
+    }
+
     #[test]
     fn list_merges_config_and_store_without_values() {
         let s = env(&[
@@ -343,17 +456,20 @@ mod tests {
                 ListEntry {
                     name: "anthropic".into(),
                     set: true,
-                    in_config: true
+                    in_config: true,
+                    short: false,
                 },
                 ListEntry {
                     name: "extra-key".into(),
                     set: true,
-                    in_config: false
+                    in_config: false,
+                    short: false,
                 },
                 ListEntry {
                     name: "open-router".into(),
                     set: false,
-                    in_config: true
+                    in_config: true,
+                    short: false,
                 },
             ]
         );

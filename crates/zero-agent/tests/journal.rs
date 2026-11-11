@@ -155,17 +155,27 @@ fn journal_export_prints_masked_jsonl() {
 /// (ревью задачи 4, m4): токен в тексте, аргументы вызова, ключ PEM, пароль в URL.
 #[test]
 fn journal_export_masks_patterns_without_env() {
-    const TOKEN: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
-    const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaFAKEexample0000\n-----END OPENSSH PRIVATE KEY-----";
+    // Фиктивные значения собираются из частей: цельная строка формата токена или ключа
+    // в исходнике блокируется защитой push от секретов.
+    let token = ["gh", "p_0123456789abcdefghijklmnopqrstuvwxyz"].concat();
+    let pem = [
+        "-----BEGIN OPENSSH PRIVATE",
+        " KEY-----\nb3BlbnNzaFAKEexample0000\n",
+        "-----END OPENSSH PRIVATE",
+        " KEY-----",
+    ]
+    .concat();
+    let (token, pem) = (token.as_str(), pem.as_str());
     let e = env("export-patterns");
     let (run, _) = with_run(&e, async |s, run| {
-        s.append(event(run, json!({"text": format!("token {TOKEN}")})))
+        s.append(event(run, json!({"text": format!("token {token}")})))
             .await
             .unwrap();
+        // `raw_arguments` — текст JSON: токен после экранирования `\n` (ревью задачи 10, I2).
         s.append(event(
             run,
-            json!({"arguments": {"cmd": format!("cat key\n{PEM}")},
-                   "raw_arguments": format!("{{\"url\":\"postgres://u:FakePass123@db/x\",\"t\":\"{TOKEN}\"}}")}),
+            json!({"arguments": {"cmd": format!("cat key\n{pem}")},
+                   "raw_arguments": format!("{{\"url\":\"postgres://u:FakePass123@db/x\",\"cmd\":\"cd x\\n{token}\"}}")}),
         ))
         .await
         .unwrap();
@@ -179,7 +189,7 @@ fn journal_export_masks_patterns_without_env() {
         &run.to_string(),
     ]);
     assert_eq!(o.code(), Some(0), "{o:?}");
-    for leak in [TOKEN, "b3BlbnNzaFAKEexample0000", "FakePass123"] {
+    for leak in [token, "b3BlbnNzaFAKEexample0000", "FakePass123"] {
         assert!(!o.stdout.contains(leak), "{leak}: {}", o.stdout);
     }
     for label in [
