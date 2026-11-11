@@ -304,6 +304,15 @@ fn powershell_encoded_wraps_utf16le_base64() {
     let script = String::from_utf16(&units).unwrap();
     assert!(script.contains("& {\nWrite-Output 1\n"), "{script}");
     assert!(script.starts_with("$ProgressPreference='SilentlyContinue'; "));
+    // m1: начальное значение до блока, пустая строка перед `}` (конечный `` ` ``).
+    assert!(
+        script.contains("$global:ZaLastOk = $true; & {\n"),
+        "{script}"
+    );
+    assert!(
+        script.contains("\nWrite-Output 1\n\n$global:ZaLastOk = $?\n}"),
+        "{script}"
+    );
     assert!(script.contains("[Console]::OutputEncoding=[Text.Encoding]::UTF8"));
     assert!(script.ends_with(
         "}; if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $global:ZaLastOk) { exit 1 }"
@@ -405,7 +414,8 @@ async fn spawn_failure_is_error() {
     .await;
     assert!(o.is_error);
     assert!(o.content.starts_with("failed to start"), "{}", o.content);
-    assert!(o.content.contains("program not found"), "{}", o.content);
+    // m2: модели — вид ошибки (английский), не локализованный текст ОС.
+    assert!(o.content.ends_with(": entity not found"), "{}", o.content);
 }
 
 #[tokio::test]
@@ -501,6 +511,91 @@ async fn taint_only_for_network_reads_and_outside_paths() {
         let o = call_with(&tool, &root, json!({"cmd": cmd}), Duration::from_secs(10)).await;
         assert_eq!(o.taint.as_deref(), want, "{cmd}");
     }
+    // m10: `cwd` вне проекта — тоже внешний путь. Каталог существует: `../` от проекта —
+    // каталог теста с `h` и `p`.
+    for (cwd, want) in [("..", Some(taint_origin::OUTSIDE_PROJECT)), (".", None)] {
+        let o = call_with(
+            &tool,
+            &root,
+            json!({"cmd": "ls", "cwd": cwd}),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(!o.is_error, "{}", o.content);
+        assert_eq!(o.taint.as_deref(), want, "{cwd}");
+    }
+}
+
+#[tokio::test]
+async fn too_long_command_is_rejected_before_start() {
+    // m3: предел командной строки Windows (32767) и аргумента Linux (128 КиБ).
+    let root = unique_dir("too-long");
+    let rec = Arc::new(Recorder::default());
+    for (d, n) in [(Dialect::PowerShell, 13_000), (Dialect::Bash, 200_000)] {
+        let tool = bash_tool(rec.clone(), fake_shell(d), home(&root));
+        let cmd = format!("echo {}", "x".repeat(n));
+        let o = call_with(&tool, &root, json!({"cmd": cmd}), Duration::from_secs(10)).await;
+        assert!(o.is_error, "{d:?}");
+        assert!(
+            o.content
+                .starts_with("invalid arguments: cmd is too long for the command line ("),
+            "{}",
+            o.content
+        );
+        assert!(o.content.ends_with("write a script file and run it"));
+    }
+    assert!(rec.specs.lock().unwrap().is_empty());
+    // В пределе — запуск.
+    let tool = bash_tool(rec.clone(), fake_shell(Dialect::PowerShell), home(&root));
+    let o = call_with(
+        &tool,
+        &root,
+        json!({"cmd": format!("echo {}", "x".repeat(5_000))}),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(!o.is_error, "{}", o.content);
+}
+
+/// Linux, umask 002 (I1): каталог реестра групп — 0700, запись реестра передаётся.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn registry_dir_is_private_under_umask_002() {
+    use nix::sys::stat::{Mode, umask};
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_dir("umask");
+    let h = home(&root);
+    let dir = h.za_home.join("projects").join(&h.project_id).join("procs");
+    let rec = Arc::new(Recorder::default());
+    let tool = bash_tool(rec.clone(), fake_shell(Dialect::Bash), h);
+    let old = umask(Mode::from_bits_truncate(0o002));
+    let o = call_with(
+        &tool,
+        &root,
+        json!({"cmd": "echo x"}),
+        Duration::from_secs(10),
+    )
+    .await;
+    umask(old);
+    assert!(!o.is_error, "{}", o.content);
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "{mode:o}");
+    let specs = rec.specs.lock().unwrap();
+    let left = specs[0].leftover.as_ref().expect("запись реестра");
+    assert_eq!(left.file.parent(), Some(dir.as_path()));
+    // Свой каталог, открытый на запись группе (старый агент), закрывается до 0700.
+    drop(specs);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+    call_with(
+        &tool,
+        &root,
+        json!({"cmd": "echo x"}),
+        Duration::from_secs(10),
+    )
+    .await;
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "{mode:o}");
+    assert!(rec.specs.lock().unwrap()[1].leftover.is_some());
 }
 
 // ---- предметы вызова и контракт ----
@@ -551,6 +646,121 @@ fn subjects_powershell_dialect() {
     let s = tool.subjects(&json!({"cmd": r"Get-Content C:\Windows\win.ini; iwr https://x"}));
     assert_eq!(s.paths[0].arg, r"C:\Windows\win.ini");
     assert!(s.network);
+    assert!(s.irreversible.is_empty());
+}
+
+/// C1 ревью задачи 8: команды, которые лексер раньше видел не так, как PowerShell.
+/// Теперь видны метка удаления и внешний путь, а страховка ставит `unparsed`.
+#[test]
+fn c1_subjects_powershell_quotes_cr_spaces() {
+    let tool = bash_tool(
+        Arc::new(DirectRunner),
+        fake_shell(Dialect::PowerShell),
+        home(Path::new("/p/x")),
+    );
+    for c in [
+        "Write-Output 'x\u{2019}; Remove-Item -Recurse -Force ../../victim; Write-Output \u{2019}y'",
+        "Write-Output \"q\u{201D}; Remove-Item -Recurse -Force ../v; Write-Output \u{201C}z\"",
+        "Write-Output a\rRemove-Item -Recurse -Force ../victim",
+        "Remove-Item\u{2028}-Recurse\u{2028}-Force\u{2028}../victim",
+        "Remove-Item\u{0b}-Recurse\u{0c}-Force\u{85}../victim",
+    ] {
+        let s = tool.subjects(&json!({ "cmd": c }));
+        assert!(
+            s.irreversible.contains(&"delete"),
+            "{c:?}: {:?}",
+            s.irreversible
+        );
+        assert!(s.irreversible.contains(&"unparsed"), "{c:?}");
+        assert!(s.paths.iter().any(|p| p.arg.starts_with("..")), "{c:?}");
+        assert!(s.segments.iter().all(|g| g.unparsed), "{c:?}");
+    }
+}
+
+/// Страховка для bash: управляющие символы и Unicode-пробелы — `unparsed`, сжатия нет.
+#[tokio::test]
+async fn suspicious_bash_command_is_unparsed() {
+    let root = unique_dir("suspicious");
+    let rec = Arc::new(Recorder::default());
+    let tool = bash_tool(rec, fake_shell(Dialect::Bash), home(&root));
+    for c in [
+        "echo a\rrm -rf ../x",
+        "rm\u{a0}-rf ../x",
+        "echo '{}'\u{200b}",
+    ] {
+        let s = tool.subjects(&json!({ "cmd": c }));
+        assert!(s.irreversible.contains(&"unparsed"), "{c:?}");
+    }
+    assert!(
+        tool.subjects(&json!({"cmd": "cargo test"}))
+            .irreversible
+            .is_empty()
+    );
+    let o = call_with(
+        &tool,
+        &root,
+        json!({"cmd": "cat x.json\u{a0}"}),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(o.digest, None);
+}
+
+/// Windows: то, что видит политика, совпадает с тем, что исполняет PowerShell. Команды
+/// безобидные: вместо удаления — `Write-Output INJ`.
+#[cfg(windows)]
+#[tokio::test]
+async fn c1_lexer_matches_powershell_execution() {
+    if shell().dialect != Dialect::PowerShell {
+        return;
+    }
+    for (name, cmd, lines) in [
+        (
+            "c1-sq",
+            "Write-Output 'x\u{2019}; Write-Output INJ; Write-Output \u{2019}y'",
+            vec!["x", "INJ", "y"],
+        ),
+        (
+            "c1-dq",
+            "Write-Output \"q\u{201D}; Write-Output INJ; Write-Output \u{201C}z\"",
+            vec!["q", "INJ", "z"],
+        ),
+        (
+            "c1-cr",
+            "Write-Output a\rWrite-Output INJ",
+            vec!["a", "INJ"],
+        ),
+        (
+            "c1-ls",
+            "Write-Output a\u{2028}INJ\u{85}b\u{0b}c",
+            vec!["a", "INJ", "b", "c"],
+        ),
+    ] {
+        let segs = za_core::shell::segments(cmd, Dialect::PowerShell);
+        let seen: Vec<String> = segs
+            .iter()
+            .flat_map(|s| s.argv.iter().skip(1).cloned())
+            .collect();
+        assert_eq!(seen, lines, "лексер: {cmd:?}");
+        let o = bash(name, json!({ "cmd": cmd })).await;
+        let want = format!("exit code: 0\n--- stdout ---\n{}\n", lines.join("\n"));
+        assert_eq!(o.content, want, "PowerShell: {cmd:?}");
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_return_and_trailing_backtick() {
+    if shell().dialect != Dialect::PowerShell {
+        return;
+    }
+    // m1: `return` — выход из блока, не ошибка.
+    let o = bash("ps-return", json!({ "cmd": "Write-Output hi; return" })).await;
+    assert_eq!(o.content, "exit code: 0\n--- stdout ---\nhi\n");
+    // Конечный `` ` `` не тянет текст обёртки в вывод.
+    let o = bash("ps-backtick", json!({ "cmd": "Write-Output a `" })).await;
+    assert!(!o.content.contains("ZaLastOk"), "{}", o.content);
+    assert!(!o.content.contains("True"), "{}", o.content);
 }
 
 #[test]

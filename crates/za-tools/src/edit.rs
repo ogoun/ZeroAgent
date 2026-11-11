@@ -11,7 +11,8 @@
 //!    обошёл бы `chmod a-w` и сменил бы владельца.
 //! 2. Маркер повтора `ZA_HOME/projects/<project_id>/edits/<file_stem>.json` ([`AgentHome`],
 //!    m11): вне проекта, поэтому `bash` его не подделает. Каталог — через
-//!    [`home_dir`], на Unix он принадлежит текущему пользователю и закрыт на запись
+//!    [`private_home_dir`] (на Unix 0700 при любом umask) и проверку
+//!    [`za_jail::check_registry`]: принадлежит текущему пользователю и закрыт на запись
 //!    группе и прочим. Файл уже равен `after` — результат маркера; равен `before` —
 //!    правка продолжается (проверку трекера прерванная попытка уже прошла на этом
 //!    содержимом, Ruling 1); иначе — ошибка. Отказ после записи маркера удаляет его,
@@ -41,9 +42,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 use za_core::paths::{
-    LexPath, ResolvedPath, Roots, classify, create_parents_checked, display, home_dir,
-    open_checked, read_dir_checked, remove_checked, replace_checked, resolve, stat_checked, within,
-    work_dir,
+    LexPath, ResolvedPath, Roots, classify, create_parents_checked, display, open_checked,
+    private_home_dir, read_dir_checked, remove_checked, replace_checked, resolve, stat_checked,
+    within, work_dir,
 };
 use za_core::{
     Access, Approval, BoxFuture, Postcondition, RawPath, RiskClass, Subjects, Tool, ToolCx,
@@ -68,10 +69,6 @@ const EDITS_DIR: &str = "edits";
 /// Временный файл правки старше этого — сирота прошлого сбоя (m3): правка длится не
 /// дольше тайм-аута вызова (30 с).
 const LEFTOVER_AGE: Duration = Duration::from_secs(120);
-/// Права, с которыми временный файл создаётся (m4, N2): содержимое правки и маркера не
-/// доступно другим ни в один момент.
-#[cfg(unix)]
-const TMP_MODE: u32 = 0o600;
 /// Права нового файла до umask (N4), как у обычного создания файла.
 #[cfg(unix)]
 const NEW_FILE_MODE: u32 = 0o666;
@@ -731,13 +728,14 @@ impl Job {
     }
 
     /// Маркер `ZA_HOME/projects/<project_id>/edits/<file_stem>.json` (m11). Каталог —
-    /// [`home_dir`] от канонического `ZA_HOME`, на Unix — свой и закрытый ([`check_private`]).
+    /// [`private_home_dir`] от канонического `ZA_HOME`, на Unix — свой и закрытый
+    /// ([`za_jail::check_registry`]).
     fn marker_path(&self, za_home: &Path) -> io::Result<ResolvedPath> {
-        let dir = home_dir(
+        let dir = private_home_dir(
             za_home,
             &format!("projects/{}/{EDITS_DIR}", self.home.project_id),
         )?;
-        check_private(&dir)?;
+        za_jail::check_registry(&dir)?;
         Ok(ResolvedPath {
             path: dir.join(format!("{}.json", self.stem)),
             inside: false,
@@ -911,32 +909,6 @@ fn drop_marker(marker: &ResolvedPath, r: &ResolvedPath, after: &str) {
     }
 }
 
-/// Каталог маркеров (Unix): настоящий каталог текущего пользователя, закрытый на запись
-/// группе и прочим (как реестр групп `za-jail`, N4 задачи 5).
-#[cfg(unix)]
-fn check_private(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let m = std::fs::symlink_metadata(dir)?;
-    let me = nix::unistd::geteuid().as_raw();
-    if !m.file_type().is_dir() || m.uid() != me || m.mode() & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "каталог маркеров правок {}: не свой каталог или доступен на запись другим (uid {}, права {:o})",
-                dir.display(),
-                m.uid(),
-                m.mode() & 0o777
-            ),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_private(_dir: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 /// Файл можно заменить (I2): Windows — не только для чтения; Unix — право записи
 /// владельца и владелец — текущий пользователь.
 fn writable(meta: &std::fs::Metadata) -> bool {
@@ -1017,7 +989,7 @@ fn write_tmp(
     gid: Option<u32>,
 ) -> io::Result<()> {
     #[cfg(unix)]
-    create_private(&tmp.path)?;
+    za_core::paths::create_private_file(&tmp.path)?;
     let mut f = open_checked(tmp, true)?;
     f.set_len(0)?;
     f.write_all(bytes)?;
@@ -1034,24 +1006,6 @@ fn write_tmp(
         f.set_permissions(p)?;
     }
     Ok(())
-}
-
-/// Создаёт пустой файл 0600 без перехода по ссылке; уже есть — ничего (его проверит
-/// [`open_checked`]).
-#[cfg(unix)]
-fn create_private(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(TMP_MODE)
-        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
-        .open(path)
-    {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
-    }
 }
 
 /// Удаляет временный файл; нет его — ничего, не удалось — `warn`.

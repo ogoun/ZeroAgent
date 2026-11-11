@@ -208,8 +208,14 @@ fn tests(stdout: &str, stderr: &str, limit: usize) -> String {
     let hits: Vec<usize> = (0..tail_start)
         .filter(|&i| FAIL_MARKS.iter().any(|m| lines[i].contains(m)))
         .collect();
+    // В заголовке — все совпадения, и в хвосте тоже (m8 ревью).
+    let total_hits = hits.len()
+        + lines[tail_start..]
+            .iter()
+            .filter(|l| FAIL_MARKS.iter().any(|m| l.contains(m)))
+            .count();
     let mut b = Budget::new(limit);
-    b.push(tests_header(lines.len(), hits.len()));
+    b.push(tests_header(lines.len(), total_hits));
     // Участки: совпадение ± CONTEXT, без захода в хвост.
     let match_limit = limit * MATCH_SHARE / 100;
     let mut shown_to = 0usize; // первая строка после последней показанной
@@ -228,10 +234,14 @@ fn tests(stdout: &str, stderr: &str, limit: usize) -> String {
         if b.used + need > match_limit {
             // Без контекста — только сама строка ошибки, если помещается.
             let line = short(lines[h]);
-            if b.used + line.len() + GAP.len() + 2 > match_limit {
+            let gap = h > shown_to;
+            let need = line.len() + 1 + if gap { GAP.len() + 1 } else { 0 };
+            if b.used + need > match_limit {
                 break;
             }
-            b.push(GAP.to_owned());
+            if gap {
+                b.push(GAP.to_owned());
+            }
             b.push(line);
             shown_to = h + 1;
             shown_hits += 1;

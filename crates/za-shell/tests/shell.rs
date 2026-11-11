@@ -963,3 +963,86 @@ fn n6_git_restore_and_checkout_file_are_symmetric() {
     // `--staged` только снимает из индекса — не откат рабочей копии.
     assert!(labels("git restore --staged src/main.rs", B).is_empty());
 }
+
+// ---- C1 ревью задачи 8: кавычки, разделители и пробелы PowerShell ----
+
+/// Типографские кавычки закрывают строку PowerShell: команда за ними — отдельный сегмент.
+#[test]
+fn c1_powershell_typographic_quotes_close_strings() {
+    for c in [
+        "Write-Output 'x\u{2019}; Remove-Item -Recurse -Force ../../victim; Write-Output \u{2019}y'",
+        "Write-Output \u{2018}x'; Remove-Item -Recurse -Force ../v",
+        "Write-Output 'x\u{201A}; Remove-Item -Recurse -Force ../v",
+        "Write-Output 'x\u{201B}; Remove-Item -Recurse -Force ../v",
+        "Write-Output \"q\u{201D}; Remove-Item -Recurse -Force ../v; Write-Output \u{201C}z\"",
+        "Write-Output \u{201C}q\"; Remove-Item -Recurse -Force ../v",
+        "Write-Output \"q\u{201E}; Remove-Item -Recurse -Force ../v",
+    ] {
+        assert!(labels(c, P).contains(&"delete"), "{c:?}");
+        let segs = segments(c, P);
+        assert!(
+            segs.iter()
+                .any(|s| path_words(s, P).iter().any(|w| w.starts_with(".."))),
+            "{c:?}"
+        );
+    }
+    // Внутри строки типографская кавычка другого вида — обычный символ, как в PowerShell.
+    let s = seg0("Write-Output 'a\u{201C}b'", P);
+    assert_eq!(s.argv, ["Write-Output", "a\"b"]);
+    // Удвоенная кавычка любого вида — сама кавычка.
+    let s = seg0("Write-Output 'it\u{2019}\u{2019}s'", P);
+    assert_eq!(s.argv, ["Write-Output", "it's"]);
+    // В bash типографские кавычки — обычные символы.
+    assert_eq!(
+        segments("echo 'x\u{2019}; rm -rf ../v; echo \u{2019}y'", B).len(),
+        1
+    );
+}
+
+/// Одиночный `\r` — перевод строки PowerShell, то есть разделитель операторов.
+#[test]
+fn c1_powershell_lone_cr_separates_statements() {
+    for c in [
+        "Write-Output a\rRemove-Item -Recurse -Force ../victim",
+        "Write-Output a\r\nRemove-Item -Recurse -Force ../victim",
+    ] {
+        let segs = segments(c, P);
+        assert_eq!(segs.len(), 2, "{c:?}");
+        assert_eq!(argv0(&segs[1]).as_deref(), Some("remove-item"));
+        assert!(labels(c, P).contains(&"delete"), "{c:?}");
+    }
+    // Комментарий кончается на `\r`.
+    assert_eq!(segments("# note\rRemove-Item -Recurse x", P).len(), 1);
+    assert!(labels("# note\rRemove-Item -Recurse x", P).contains(&"delete"));
+    // Перенос строки обратной кавычкой и `\r`.
+    assert_eq!(
+        segments("Write-Output a `\rb", P)[0].argv,
+        ["Write-Output", "a", "b"]
+    );
+}
+
+/// Пробелы Unicode, `\v`, `\f` и U+0085 разделяют слова PowerShell (проверено на 5.1).
+#[test]
+fn c1_powershell_unicode_spaces_split_words() {
+    for sp in [
+        '\u{0b}', '\u{0c}', '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2007}', '\u{200a}',
+        '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}', '\0',
+    ] {
+        let c = format!("Remove-Item{sp}-Recurse{sp}-Force{sp}../victim");
+        let s = seg0(&c, P);
+        assert_eq!(
+            s.argv,
+            ["Remove-Item", "-Recurse", "-Force", "../victim"],
+            "{sp:?}"
+        );
+        assert!(labels(&c, P).contains(&"delete"), "{sp:?}");
+        assert_eq!(path_words(&s, P), ["../victim"], "{sp:?}");
+    }
+    // `iwr` так же не прячется от метки сети.
+    assert!(is_network(&seg0("iwr\u{2028}https://x", P), P));
+    // Невидимые символы нулевой ширины — часть слова, как в PowerShell.
+    assert_eq!(
+        seg0("Write-Output a\u{200b}b", P).argv,
+        ["Write-Output", "a\u{200b}b"]
+    );
+}

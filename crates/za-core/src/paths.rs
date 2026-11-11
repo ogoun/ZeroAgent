@@ -711,11 +711,52 @@ pub fn work_dir(root: &Path, sub: &str) -> io::Result<PathBuf> {
 /// быть символической ссылкой или junction, канонический путь итога — внутри
 /// канонического `home`. Возвращает путь от `home`.
 pub fn home_dir(home: &Path, sub: &str) -> io::Result<PathBuf> {
+    home_dir_with(home, sub, false)
+}
+
+/// [`home_dir`] для закрытых каталогов агента (реестр групп процессов, маркеры правок;
+/// ревью задачи 8, I1): на Unix новые компоненты создаются с правами 0700 при любом
+/// umask, а у последнего уже существующего снимаются права группы и прочих. Чужой
+/// каталог так не исправить: его отвергнет проверка вызывающего
+/// (`za_jail::check_registry`). На прочих ОС — как [`home_dir`].
+pub fn private_home_dir(home: &Path, sub: &str) -> io::Result<PathBuf> {
+    let dir = home_dir_with(home, sub, true)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::symlink_metadata(&dir)?;
+        if m.is_dir() && m.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(dir)
+}
+
+/// Создаёт пустой файл с правами 0600 (Unix) без перехода по ссылке на последнем
+/// компоненте (`O_NOFOLLOW`, `create_new`); уже есть — `Ok` (его проверит
+/// [`open_checked`]). Временные файлы правки (m4 задачи 7). Блокирующая.
+#[cfg(unix)]
+pub fn create_private_file(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn home_dir_with(home: &Path, sub: &str, private: bool) -> io::Result<PathBuf> {
     let parts = sub_parts(sub)?;
     let mut dir = home.to_path_buf();
     for part in parts {
         dir.push(part);
-        make_dir(&dir)?;
+        make_dir_with(&dir, private)?;
     }
     let canon_home = std::fs::canonicalize(home)?;
     let real = std::fs::canonicalize(&dir)?;
@@ -746,8 +787,27 @@ fn sub_parts(sub: &str) -> io::Result<Vec<&str>> {
 
 /// Создаёт каталог, если его нет; путь не ссылка и не junction.
 fn make_dir(dir: &Path) -> io::Result<()> {
+    make_dir_with(dir, false)
+}
+
+/// [`make_dir`]; `private` — новый каталог 0700 на Unix (umask права не расширит).
+fn make_dir_with(dir: &Path, private: bool) -> io::Result<()> {
     not_link(dir)?;
-    match std::fs::create_dir(dir) {
+    #[cfg(unix)]
+    let b = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = std::fs::DirBuilder::new();
+        if private {
+            b.mode(0o700);
+        }
+        b
+    };
+    #[cfg(not(unix))]
+    let b = {
+        let _ = private;
+        std::fs::DirBuilder::new()
+    };
+    match b.create(dir) {
         Ok(()) => Ok(()),
         // Уже есть (или создан параллельно) — проверить ещё раз.
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {

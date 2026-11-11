@@ -1173,17 +1173,20 @@ async fn unix_modes_of_new_and_owner_only_files() {
         .await;
     assert_eq!(o.content, "cannot write rx.sh: permission denied");
     assert_eq!(bytes(&root, "rx.sh"), b"a\n");
-    // Каталог маркеров закрыт на запись другим.
+    // Каталог маркеров — 0700 (ревью задачи 8).
     let m = std::fs::metadata(markers(&root))
         .unwrap()
         .permissions()
         .mode();
-    assert_eq!(m & 0o022, 0, "{m:o}");
+    assert_eq!(m & 0o777, 0o700, "{m:o}");
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn writable_by_others_marker_dir_is_refused() {
+async fn own_marker_dir_writable_by_others_is_closed() {
+    // Ревью задачи 8: свой каталог маркеров, открытый на запись другим (старый агент,
+    // umask 002), закрывается до 0700, а не отключает правку. Чужой каталог отвергает
+    // `za_jail::check_registry` (без root его не создать — проверено в za-jail).
     use std::os::unix::fs::PermissionsExt;
     let root = unique_dir("marker_dir_mode");
     std::fs::create_dir_all(markers(&root)).unwrap();
@@ -1194,8 +1197,13 @@ async fn writable_by_others_marker_dir_is_refused() {
     let o = k
         .edit(json!({"path": "a.txt", "old": "1", "new": "2"}))
         .await;
-    assert_eq!(o.content, "internal error: edit tool failed");
-    assert_eq!(bytes(&root, "a.txt"), b"1\n");
+    assert!(!o.is_error, "{}", o.content);
+    assert_eq!(bytes(&root, "a.txt"), b"2\n");
+    let m = std::fs::metadata(markers(&root))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(m & 0o777, 0o700, "{m:o}");
 }
 
 #[test]

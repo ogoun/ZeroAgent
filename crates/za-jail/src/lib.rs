@@ -24,6 +24,7 @@ mod reap;
 
 pub use direct::DirectRunner;
 pub use env::child_env;
+pub use reap::check_registry;
 
 /// Future, которую возвращает [`Runner::run`].
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;

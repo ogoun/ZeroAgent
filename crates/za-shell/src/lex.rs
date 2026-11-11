@@ -5,7 +5,11 @@ use crate::{Lang, MAX_NEST, Segment};
 
 /// Сегменты кода; `interp` — уровень вложенной интерпретации, `nest` — подстановок.
 pub(crate) fn lex_code(code: &str, lang: Lang, interp: u8, nest: u8) -> Vec<Segment> {
-    let chars: Vec<char> = code.chars().collect();
+    let chars: Vec<char> = if lang == Lang::Pwsh {
+        pwsh_chars(code)
+    } else {
+        code.chars().collect()
+    };
     let raws = Lexer {
         s: &chars,
         i: 0,
@@ -58,6 +62,32 @@ pub(crate) fn lex_code(code: &str, lang: Lang, interp: u8, nest: u8) -> Vec<Segm
         if let Some((c, l)) = nested_code {
             out.extend(lex_code(&c, l, interp + 1, nest));
         }
+    }
+    out
+}
+
+/// Текст PowerShell в символах, равнозначных для его токенайзера (C1 ревью задачи 8):
+/// типографские кавычки U+2018–U+201B открывают и закрывают строку как `'`, U+201C–U+201E
+/// — как `"`; одиночный `\r` и `\r\n` — перевод строки (разделитель операторов); пробелы
+/// Unicode (Zs, Zl, Zp, NBSP, U+0085), `\v`, `\f` и NUL разделяют слова, как пробел.
+/// Тексты сегментов и слова берутся из этого вида.
+fn pwsh_chars(code: &str) -> Vec<char> {
+    let mut out = Vec::with_capacity(code.len());
+    let mut it = code.chars().peekable();
+    while let Some(c) = it.next() {
+        out.push(match c {
+            '\u{2018}'..='\u{201B}' => '\'',
+            '\u{201C}'..='\u{201E}' => '"',
+            '\r' => {
+                if it.peek() == Some(&'\n') {
+                    it.next();
+                }
+                '\n'
+            }
+            '\0' => ' ',
+            c if c.is_whitespace() && c != '\n' => ' ',
+            c => c,
+        });
     }
     out
 }

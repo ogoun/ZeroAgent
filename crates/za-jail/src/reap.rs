@@ -90,9 +90,11 @@ pub(crate) fn parse_stat(text: &str) -> Option<Stat> {
 }
 
 /// Каталог реестра групп годится (Unix, ревью задачи 5, N4): настоящий каталог (не
-/// ссылка), владелец — текущий пользователь, запись группе и прочим запрещена.
-#[cfg(target_os = "linux")]
-pub(crate) fn check_registry(dir: &Path) -> std::io::Result<()> {
+/// ссылка), владелец — текущий пользователь, запись группе и прочим запрещена. Ту же
+/// проверку проходят закрытые каталоги агента в `ZA_HOME` у `za-tools` (маркеры правок,
+/// ревью задачи 8). На прочих ОС — `Ok`.
+#[cfg(unix)]
+pub fn check_registry(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::symlink_metadata(dir)?;
     let bad = |why: String| {
@@ -117,6 +119,12 @@ pub(crate) fn check_registry(dir: &Path) -> std::io::Result<()> {
             m.mode() & 0o777
         )));
     }
+    Ok(())
+}
+
+/// См. [`check_registry`] (Unix).
+#[cfg(not(unix))]
+pub fn check_registry(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

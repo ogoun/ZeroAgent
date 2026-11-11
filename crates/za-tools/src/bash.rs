@@ -70,10 +70,14 @@ const LEX_ROOT: &str = "/za-project-root";
 
 /// Начало обёртки PowerShell (D85). `$ProgressPreference` глушит записи прогресса: без
 /// него PowerShell 5.1 пишет их в stderr как CLIXML.
+/// `$global:ZaLastOk = $true` до блока: `return` в команде выходит из блока раньше
+/// строки, запоминающей `$?`, и без начального значения давал бы код 1 (m1 ревью).
 const PS_PREFIX: &str = "$ProgressPreference='SilentlyContinue'; \
-    [Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8; & {";
+    [Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8; \
+    $global:ZaLastOk = $true; & {";
 /// Конец обёртки: `$?` последней команды запоминается внутри блока (после `}` его уже
 /// сбросило бы условие `if`); `}` — на своей строке, чтобы `#` в команде не съел скобку.
+/// Перед ним — пустая строка: конечный `` ` `` команды не продолжит её текстом обёртки.
 const PS_SUFFIX: &str = "$global:ZaLastOk = $?\n}; \
     if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $global:ZaLastOk) { exit 1 }";
 
@@ -84,6 +88,24 @@ const DESCRIPTION: &str = "Run a shell command in the project directory. \
 const STDOUT_HEADER: &str = "--- stdout ---";
 const BACKGROUND_KILLED: &str = "[background processes killed]";
 const EMPTY_CMD: &str = "cmd is empty";
+/// Предел длины командной строки Windows (`CreateProcess`), символов UTF-16.
+const WINDOWS_CMDLINE_MAX: usize = 32_767;
+/// Предел длины одного аргумента Linux (`MAX_ARG_STRLEN`) без завершающего NUL.
+const UNIX_ARG_MAX: usize = 128 * 1024 - 1;
+
+fn too_long_text(n: usize, max: usize) -> String {
+    invalid_args_text(&format!(
+        "cmd is too long for the command line ({n} of {max} allowed); write a script file and run it"
+    ))
+}
+
+/// Ошибка ОС для модели: вид и код, без локализованного текста (m2 ревью, D23).
+fn os_error_text(e: &io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("{} (os error {code})", e.kind()),
+        None => e.kind().to_string(),
+    }
+}
 
 fn exit_text(code: i32) -> String {
     format!("exit code: {code}")
@@ -162,6 +184,62 @@ impl Shell {
         }
     }
 
+    /// Длина команды в единицах предела ОС и сам предел (m3 ревью): Windows — вся
+    /// командная строка с `-EncodedCommand`, Unix — один аргумент `-c`.
+    fn length(&self, cmd: &str) -> (usize, usize) {
+        match self.dialect {
+            Dialect::PowerShell => {
+                let line: usize = self.args(cmd).iter().map(|a| a.len() + 1).sum::<usize>()
+                    + self.program.as_os_str().len()
+                    + 2;
+                (line, WINDOWS_CMDLINE_MAX)
+            }
+            Dialect::Bash => (cmd.len(), UNIX_ARG_MAX),
+        }
+    }
+
+    /// Команда, которую лексер может разобрать не так, как оболочка (C1 ревью):
+    /// управляющие символы (кроме табуляции, перевода строки и `\r\n`), нестандартные
+    /// кавычки, пробелы Unicode, символы нулевой ширины и направления текста; у `sh`
+    /// вместо `bash` — ещё `$'…'` (dash разбирает его иначе, m7).
+    fn suspicious(&self, cmd: &str) -> bool {
+        let mut it = cmd.chars().peekable();
+        while let Some(c) = it.next() {
+            let bad = match c {
+                '\t' | '\n' | ' ' => false,
+                '\r' => it.peek() != Some(&'\n'),
+                '\u{2018}'..='\u{201F}'
+                | '\u{2032}'..='\u{2037}'
+                | '\u{00AB}'
+                | '\u{00BB}'
+                | '\u{02BC}'
+                | '\u{2039}'
+                | '\u{203A}'
+                | '\u{300C}'..='\u{300F}'
+                | '\u{301D}'..='\u{301F}'
+                | '\u{FF02}'
+                | '\u{FF07}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}' => true,
+                c => c.is_control() || c.is_whitespace(),
+            };
+            if bad {
+                return true;
+            }
+        }
+        self.dialect == Dialect::Bash && !self.is_bash() && cmd.contains("$'")
+    }
+
+    /// Программа — именно `bash` (не `sh`).
+    fn is_bash(&self) -> bool {
+        self.program
+            .file_stem()
+            .is_some_and(|n| n.eq_ignore_ascii_case("bash"))
+    }
+
     /// Аргументы запуска команды.
     fn args(&self, cmd: &str) -> Vec<OsString> {
         match self.dialect {
@@ -182,7 +260,7 @@ impl Shell {
 /// Обёртка PowerShell (D85) → UTF-16LE → base64 для `-EncodedCommand`: кавычки команды
 /// не проходят через разбор командной строки `CreateProcess`.
 pub fn powershell_encoded(cmd: &str) -> String {
-    let script = format!("{PS_PREFIX}\n{cmd}\n{PS_SUFFIX}");
+    let script = format!("{PS_PREFIX}\n{cmd}\n\n{PS_SUFFIX}");
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     base64(&bytes)
 }
@@ -257,9 +335,12 @@ fn head(o: &Output, timeout_s: u64) -> String {
 
 /// PowerShell 5.1 с `-EncodedCommand` пишет записи ошибок в stderr как CLIXML
 /// (`#< CLIXML` и `<Objs>…</Objs>`): из них берётся текст потоков `<S S="…">`, записи
-/// прогресса и прочие объекты отбрасываются. Остальной текст stderr не меняется.
+/// прогресса и прочие объекты отбрасываются. Разбирается только правильно сформированный
+/// блок (m4 ревью): маркер в начале строки, сразу за ним `<Objs `, конец `</Objs>`;
+/// иначе текст — недоверенный вывод команды — остаётся как есть.
 fn decode_clixml(stderr: &str) -> String {
     const MARK: &str = "#< CLIXML\n";
+    const OPEN: &str = "<Objs ";
     const END: &str = "</Objs>";
     if !stderr.contains(MARK) {
         return stderr.to_owned();
@@ -267,21 +348,21 @@ fn decode_clixml(stderr: &str) -> String {
     let mut out = String::new();
     let mut rest = stderr;
     while let Some(at) = rest.find(MARK) {
-        out.push_str(&rest[..at]);
         let xml = &rest[at + MARK.len()..];
-        let Some(end) = xml.find(END) else {
-            // Обрыв (тайм-аут, предел захвата): что есть — как текст.
-            out.push_str(&clixml_text(xml));
-            rest = "";
-            break;
+        let line_start = at == 0 || rest[..at].ends_with('\n');
+        let (true, true, Some(end)) = (line_start, xml.starts_with(OPEN), xml.find(END)) else {
+            // Не блок обёртки: маркер — обычный текст.
+            out.push_str(&rest[..at + MARK.len()]);
+            rest = xml;
+            continue;
         };
-        out.push_str(&clixml_text(&xml[..end]));
-        rest = xml[end + END.len()..]
-            .strip_prefix('\n')
-            .unwrap_or(&xml[end + END.len()..]);
+        out.push_str(&rest[..at]);
+        out.push_str(&clixml_text(&xml[..end]).replace("\r\n", "\n"));
+        let after = &xml[end + END.len()..];
+        rest = after.strip_prefix('\n').unwrap_or(after);
     }
     out.push_str(rest);
-    out.replace("\r\n", "\n")
+    out
 }
 
 /// Текст элементов `<S S="…">…</S>` фрагмента CLIXML по порядку.
@@ -429,8 +510,16 @@ fn outside_lex(root: &Path, w: &str) -> bool {
 }
 
 impl BashTool {
+    /// Сегменты команды; команда, которую лексер может разобрать не так, как оболочка
+    /// ([`Shell::suspicious`]), — все сегменты неразобраны (Ask, D81).
     fn segments(&self, cmd: &str) -> Vec<Segment> {
-        shell::segments(cmd, self.shell.dialect)
+        let mut segs = shell::segments(cmd, self.shell.dialect);
+        if self.shell.suspicious(cmd) {
+            for s in &mut segs {
+                s.unparsed = true;
+            }
+        }
+        segs
     }
 
     /// Происхождение недоверенного вывода (D82): сеть — по `reads_network`, иначе путь
@@ -486,38 +575,33 @@ fn prepare(
     })
 }
 
-/// Запись реестра групп D84 (только Linux). Каталог не создался или он не свой и
-/// доступен на запись другим (`za-jail` такой реестр отвергнет) — запуск без записи и
-/// `warn`: дерево всё равно убивается при броске future, теряется только уборка после
-/// смерти агента.
+/// Запись реестра групп D84 (только Linux). Каталог не создался или он не свой
+/// (`za_jail::check_registry`) — запуск без записи и `warn`: дерево всё равно убивается
+/// при броске future, теряется только уборка после смерти агента.
 #[cfg(target_os = "linux")]
 fn leftover(home: &AgentHome, run: &str, stem: &str) -> Option<za_jail::Leftover> {
-    use std::os::unix::fs::MetadataExt;
-    let dir = za_core::paths::home_dir(
+    // Каталог 0700 при любом umask (ревью задачи 8, I1), проверка — та же, что у
+    // `za-jail` при записи (без повтора здесь).
+    let dir = za_core::paths::private_home_dir(
         &home.za_home,
         &format!("projects/{}/{PROCS_DIR}", home.project_id),
     )
-    .and_then(|dir| {
-        let m = std::fs::symlink_metadata(&dir)?;
-        if m.uid() != nix::unistd::geteuid().as_raw() || m.mode() & 0o022 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "{}: не свой каталог или доступен на запись другим (права {:o})",
-                    dir.display(),
-                    m.mode() & 0o777
-                ),
-            ));
-        }
-        Ok(dir)
-    });
+    .and_then(|dir| za_jail::check_registry(&dir).map(|()| dir));
     match dir {
         Ok(dir) => Some(za_jail::Leftover {
             file: dir.join(format!("{stem}.json")),
             run: run.to_owned(),
         }),
         Err(e) => {
-            tracing::warn!(error = %e, "реестр групп процессов недоступен, запуск без записи");
+            // Один `warn` на процесс (m9): дальше — `debug`.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            let mut first = false;
+            WARNED.call_once(|| first = true);
+            if first {
+                tracing::warn!(error = %e, "реестр групп процессов недоступен, запуск без записи");
+            } else {
+                tracing::debug!(error = %e, "реестр групп процессов недоступен");
+            }
             None
         }
     }
@@ -527,6 +611,36 @@ fn leftover(home: &AgentHome, run: &str, stem: &str) -> Option<za_jail::Leftover
 #[cfg(not(target_os = "linux"))]
 fn leftover(_home: &AgentHome, _run: &str, _stem: &str) -> Option<za_jail::Leftover> {
     None
+}
+
+/// Текст результата, сжатое представление и признак ошибки по выводу процесса.
+fn finish(
+    o: &Output,
+    dialect: Dialect,
+    segs: &[Segment],
+    secs: u64,
+) -> (String, Option<String>, bool) {
+    let stderr = match dialect {
+        Dialect::PowerShell => decode_clixml(&o.stderr),
+        Dialect::Bash => o.stderr.clone(),
+    };
+    let content = render(o, &stderr, secs);
+    let header = head(o, secs);
+    let digest = digest(
+        segs,
+        &o.stdout,
+        &stderr,
+        OUTPUT_LIMIT.saturating_sub(header.len() + BACKGROUND_KILLED.len() + 2),
+    )
+    .map(|d| {
+        let mut s = format!("{header}\n{d}");
+        if o.background_killed {
+            s.push('\n');
+            s.push_str(BACKGROUND_KILLED);
+        }
+        s
+    });
+    (content, digest, o.exit == Exit::Timeout)
 }
 
 impl Tool for BashTool {
@@ -555,6 +669,10 @@ impl Tool for BashTool {
             if req.cmd.trim().is_empty() {
                 return ToolOutput::error(invalid_args_text(EMPTY_CMD));
             }
+            let (len, max) = shell.length(&req.cmd);
+            if len > max {
+                return ToolOutput::error(too_long_text(len, max));
+            }
             let secs = req.timeout.unwrap_or(BASH_DEFAULT_TIMEOUT_S);
             if !(1..=BASH_MAX_TIMEOUT_S).contains(&secs) {
                 return ToolOutput::error(timeout_range_text());
@@ -580,37 +698,33 @@ impl Tool for BashTool {
             spec.leftover = prep.leftover;
             let o = match runner.run(spec).await {
                 Ok(o) => o,
+                // Сообщение ОС локализовано: модели — вид и код ошибки, полный текст — в
+                // лог (m2 ревью, D23).
                 Err(RunnerError::Spawn { program, source }) => {
-                    return ToolOutput::error(failed_text(&format!("{program}: {source}")));
+                    tracing::warn!(%program, error = %source, "оболочка не запустилась");
+                    return ToolOutput::error(failed_text(&format!(
+                        "{program}: {}",
+                        os_error_text(&source)
+                    )));
                 }
-                Err(e) => return ToolOutput::error(failed_text(&e.to_string())),
-            };
-            let stderr = match shell.dialect {
-                Dialect::PowerShell => decode_clixml(&o.stderr),
-                Dialect::Bash => o.stderr.clone(),
-            };
-            let content = render(&o, &stderr, secs);
-            let header = head(&o, secs);
-            let digest = digest(
-                &segs,
-                &o.stdout,
-                &stderr,
-                OUTPUT_LIMIT.saturating_sub(header.len() + BACKGROUND_KILLED.len() + 2),
-            )
-            .map(|d| {
-                let mut s = format!("{header}\n{d}");
-                if o.background_killed {
-                    s.push('\n');
-                    s.push_str(BACKGROUND_KILLED);
+                Err(RunnerError::Io(e)) => {
+                    tracing::warn!(error = %e, "сбой ввода-вывода команды");
+                    return ToolOutput::error(failed_text(&format!("io: {}", os_error_text(&e))));
                 }
-                s
-            });
-            ToolOutput {
-                content,
-                is_error: o.exit == Exit::Timeout,
-                taint,
-                digest,
-                post: Vec::new(),
+            };
+            // Разбор CLIXML и сжатие вывода до 32 МиБ — вне потоков tokio (m6 ревью).
+            let dialect = shell.dialect;
+            let post = tokio::task::spawn_blocking(move || finish(&o, dialect, &segs, secs)).await;
+            match post {
+                Ok((content, digest, is_error)) => ToolOutput {
+                    content,
+                    is_error,
+                    taint,
+                    digest,
+                    post: Vec::new(),
+                },
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => ToolOutput::error(failed_text(&e.to_string())),
             }
         })
     }
@@ -621,7 +735,10 @@ impl Tool for BashTool {
         };
         let cwd = args.get("cwd").and_then(Value::as_str);
         let d = self.shell.dialect;
-        let segs = self.segments(cmd);
+        // Метки — по разбору лексера (их видно пользователю в вопросе); страховка
+        // добавляет `unparsed` и снимает применимость `allow` ко всем сегментам.
+        let mut segs = shell::segments(cmd, d);
+        let suspicious = self.shell.suspicious(cmd);
         let root = Path::new(LEX_ROOT);
         // `cwd` вне проекта сдвигает и относительные пути: граница — от него.
         let outside = |w: &str| match cwd {
@@ -636,17 +753,27 @@ impl Tool for BashTool {
                 irreversible.push(l);
             }
         }
+        let paths = path_args(&segs, d, cwd)
+            .into_iter()
+            .map(|arg| RawPath {
+                arg,
+                access: Access::Read,
+            })
+            .collect();
+        let network = segs.iter().any(|s| shell::is_network(s, d));
+        if suspicious {
+            if !irreversible.contains(&shell::label::UNPARSED) {
+                irreversible.push(shell::label::UNPARSED);
+            }
+            for s in &mut segs {
+                s.unparsed = true;
+            }
+        }
         Subjects {
-            paths: path_args(&segs, d, cwd)
-                .into_iter()
-                .map(|arg| RawPath {
-                    arg,
-                    access: Access::Read,
-                })
-                .collect(),
+            paths,
             cwd: cwd.map(str::to_owned),
             command: Some(cmd.to_owned()),
-            network: segs.iter().any(|s| shell::is_network(s, d)),
+            network,
             irreversible,
             segments: segs,
         }
@@ -673,13 +800,17 @@ impl Tool for BashTool {
             ("runtime/bash.exit", exit_text(3)),
             (
                 "runtime/bash.failed",
-                failed_text("pwsh: program not found"),
+                failed_text("pwsh: entity not found (os error 2)"),
             ),
             ("runtime/bash.signal", signal_text(9)),
             ("runtime/bash.stderr", STDERR_HEADER.to_owned()),
             ("runtime/bash.stdout", STDOUT_HEADER.to_owned()),
             ("runtime/bash.timeout", timeout_text(10)),
             ("runtime/bash.timeout_range", timeout_range_text()),
+            (
+                "runtime/bash.too_long",
+                too_long_text(40_000, WINDOWS_CMDLINE_MAX),
+            ),
             (
                 "runtime/bash.tmp_error",
                 tmp_error_text(io::ErrorKind::PermissionDenied),
@@ -718,9 +849,73 @@ mod tests {
         );
         // Суррогатная пара кодами `_xHHHH_`.
         assert_eq!(unescape_xml("_xD83D__xDE00_"), "\u{1F600}");
-        // Без маркера — как есть, обрыв — текст до конца.
+        // Без маркера — как есть.
         assert_eq!(decode_clixml("a_x000D_b"), "a_x000D_b");
-        assert_eq!(decode_clixml("#< CLIXML\n<Objs><S S=\"Error\">cut"), "cut");
+        // m4: неправильно сформированный блок (обрыв, не `<Objs `, маркер не в начале
+        // строки) — недоверенный текст команды, остаётся как есть.
+        for raw in [
+            "#< CLIXML\n<Objs Version=\"1\"><S S=\"Error\">cut",
+            "#< CLIXML\nerror: real line\n<S S=\"Error\">x</S></Objs>\n",
+            "log: #< CLIXML\n<Objs V=\"1\"><S S=\"Error\">x</S></Objs>\n",
+        ] {
+            assert_eq!(decode_clixml(raw), raw, "{raw}");
+        }
+        // Текст до блока обёртки сохраняется, блок разбирается.
+        assert_eq!(
+            decode_clixml(
+                "err\n#< CLIXML\n<Objs V=\"1\"><S S=\"Error\">boom_x000D__x000A_</S></Objs>"
+            ),
+            "err\nboom\n"
+        );
+    }
+
+    #[test]
+    fn suspicious_commands() {
+        let ps = Shell {
+            program: PathBuf::from("powershell.exe"),
+            dialect: Dialect::PowerShell,
+        };
+        let bash = Shell {
+            program: PathBuf::from("/bin/bash"),
+            dialect: Dialect::Bash,
+        };
+        let sh = Shell {
+            program: PathBuf::from("/bin/sh"),
+            dialect: Dialect::Bash,
+        };
+        for c in [
+            "echo a\rrm -rf x",
+            "echo 'x\u{2019}; rm x'",
+            "echo \u{201C}x\u{201D}",
+            "echo \u{ab}x\u{bb}",
+            "rm\u{a0}-rf x",
+            "rm\u{2028}-rf x",
+            "rm\u{3000}-rf x",
+            "rm\u{0b}-rf x",
+            "rm\u{0c}-rf x",
+            "rm\u{85}-rf x",
+            "rm\0-rf x",
+            "rm\u{1b}[0m x",
+            "echo a\u{200b}b",
+            "echo \u{202e}x",
+            "echo \u{feff}x",
+        ] {
+            assert!(ps.suspicious(c), "{c:?}");
+            assert!(bash.suspicious(c), "{c:?}");
+        }
+        for c in [
+            "cargo test -p za-core",
+            "echo 'привет, мир'",
+            "a\tb\nc\r\nd",
+            "git commit -m \"fix: it's done\"",
+        ] {
+            assert!(!ps.suspicious(c), "{c:?}");
+            assert!(!bash.suspicious(c), "{c:?}");
+        }
+        // m7: `$'…'` у `sh` — неразобрано, у `bash` — нет.
+        let c = r"echo $'\'; rm -rf ../x; echo \''";
+        assert!(sh.suspicious(c));
+        assert!(!bash.suspicious(c));
     }
 
     #[test]
