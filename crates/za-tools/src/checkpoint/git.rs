@@ -58,7 +58,12 @@ const STAT_V: u32 = 3;
 /// Кэш stat проекта (объекты своего репозитория живут дольше run).
 const STAT_FILE: &str = "stat.json";
 /// Свой голый репозиторий в каталоге чекпоинтов проекта.
-const REPO_DIR: &str = "repo.git";
+pub(super) const REPO_DIR: &str = "repo.git";
+/// Сколько новых байт самое большее пишет за вызов наполнение базового снимка (N11):
+/// порция укладывается в предел времени вызова и на медленном диске.
+const BASE_PORTION: u64 = 32 << 20;
+/// Файлов в одном `hash-object -w` наполнения: между порциями проверяется дедлайн.
+const BASE_CHUNK_FILES: usize = 64;
 /// Идентичность коммитов чекпоинтов (Ruling 5.4).
 const IDENTITY: &str = "zero-agent";
 /// Строки сообщения коммита.
@@ -73,9 +78,10 @@ pub(super) struct Repo {
     pub top: PathBuf,
 }
 
-/// Сделанный (или найденный) чекпоинт git.
+/// Сделанный (или найденный) чекпоинт git и пути, вошедшие в его дерево.
 pub(super) struct Made {
     pub cp: Checkpoint,
+    pub included: HashSet<String>,
 }
 
 /// Пропуск чекпоинта git с причиной (`checkpoint_reason`).
@@ -240,7 +246,26 @@ impl Session {
             return Ok(());
         }
         let safe = self.safe().await.map_err(|e| GitFail::Io(e.to_string()))?;
-        if std::fs::symlink_metadata(safe.git_dir.join("HEAD")).is_err() {
+        let has_head = std::fs::symlink_metadata(safe.git_dir.join("HEAD")).is_ok();
+        let healthy = has_head
+            && self
+                .exec(repo, &["rev-parse", "--git-dir"], Call::default(), &[])
+                .await
+                .is_ok();
+        if !healthy {
+            let empty = std::fs::read_dir(&safe.git_dir).is_ok_and(|mut d| d.next().is_none());
+            if !empty {
+                // Повреждённое хранилище (N12): в сторону, не удаляется молча.
+                let aside = safe
+                    .git_dir
+                    .with_file_name(format!("{REPO_DIR}.broken-{}", now_ns()));
+                tracing::warn!(from = %safe.git_dir.display(), to = %aside.display(), "своё хранилище чекпоинтов повреждено, отложено в сторону");
+                std::fs::rename(&safe.git_dir, &aside)
+                    .map_err(|e| GitFail::Io(format!("хранилище не отложено: {e}")))?;
+                self.safe = None;
+            }
+            let safe = self.safe().await.map_err(|e| GitFail::Io(e.to_string()))?;
+            reset_cache(&safe);
             let dir = safe.git_dir.to_string_lossy().into_owned();
             let call = Call {
                 init: true,
@@ -274,7 +299,7 @@ impl Session {
         let safe = self.safe().await.map_err(|e| GitFail::Io(e.to_string()))?;
         let mut spec = CommandSpec::new(&self.program, &safe.root, self.timeout);
         let mut full: Vec<OsString> = vec!["--no-pager".into()];
-        let opts: [(&str, OsString); 25] = [
+        let opts: [(&str, OsString); 27] = [
             ("core.fsmonitor", "false".into()),
             ("core.useBuiltinFSMonitor", "false".into()),
             ("core.hooksPath", safe.hooks.clone().into_os_string()),
@@ -301,6 +326,9 @@ impl Session {
             ("core.askPass", "".into()),
             ("credential.helper", "".into()),
             ("fetch.recurseSubmodules", "false".into()),
+            // Объекты переживают сбой питания вместе с кэшем stat (N12).
+            ("core.fsync", "loose-object,reference".into()),
+            ("core.fsyncMethod", "batch".into()),
         ];
         for (k, v) in opts {
             let mut kv = OsString::from(k);
@@ -408,18 +436,23 @@ impl Session {
     async fn project_rels(&self, repo: &Repo) -> Result<Vec<String>, Skip> {
         let (top, timeout) = (repo.top.clone(), self.timeout);
         let (files, stopped) = blocking(move || {
-            let (files, stopped) = crate::fs::project_files(&top, Instant::now() + timeout);
+            let walk = crate::fs::project_files(&top, Instant::now() + timeout);
             Ok((
-                files
+                walk.files
                     .iter()
                     .map(|p| display(&top, p))
                     .collect::<Vec<String>>(),
-                stopped,
+                (walk.stopped, walk.over_budget),
             ))
         })
         .await?;
-        if stopped {
+        if stopped.0 {
             return Err(Skip(checkpoint_reason::SLOW));
+        }
+        if stopped.1 {
+            // Правила игнорирования не загружены целиком: список неполон (N15).
+            tracing::warn!("правила игнорирования сверх бюджета: чекпоинт git не делается");
+            return Err(Skip(checkpoint_reason::GIT_ERROR));
         }
         Ok(files)
     }
@@ -491,6 +524,7 @@ impl Session {
         req: &CheckpointRequest,
         id: &str,
         stem: &str,
+        deadline: Instant,
     ) -> Result<Made, Skip> {
         let git_ref = format!("{CHECKPOINT_REF_PREFIX}/{id}");
         // Повтор после сбоя: ссылка уже есть.
@@ -503,10 +537,41 @@ impl Session {
             blocking(move || agent_dir(&home, Some(&run))).await?
         };
 
-        // 1. Список файлов строит агент; 2. stat, кэш проекта и пределы.
-        let rels = self.project_rels(repo).await?;
+        // 1. Список файлов строит агент; правимые файлы — явно, даже игнорируемые (N10).
+        let mut rels = self.project_rels(repo).await?;
+        let mut seen: HashSet<String> = rels.iter().cloned().collect();
+        for p in &req.paths {
+            if za_core::paths::within(&repo.top, p) && *p != repo.top {
+                let rel = display(&repo.top, p);
+                if seen.insert(rel.clone()) {
+                    rels.push(rel);
+                }
+            }
+        }
+        // 2. stat, кэш проекта и пределы.
         let (top, cache_path) = (repo.top.clone(), safe.root.join(STAT_FILE));
         let mut plan = blocking(move || plan_entries(&top, &cache_path, rels)).await?;
+        // Объекты из кэша должны быть в хранилище (N12): нет — хэшируются заново.
+        let known_oids: Vec<String> = plan.known.values().map(|(_, o)| o.clone()).collect();
+        let known_have = self.present(repo, &known_oids).await?;
+        let lost: Vec<String> = plan
+            .known
+            .iter()
+            .filter(|(_, (_, o))| !known_have.contains(o))
+            .map(|(r, _)| r.clone())
+            .collect();
+        if !lost.is_empty() {
+            tracing::warn!(
+                lost = lost.len(),
+                "объектов из кэша stat нет в хранилище: хэшируются заново"
+            );
+        }
+        for rel in lost {
+            if let Some((st, _)) = plan.known.remove(&rel) {
+                let abs = join_rel(&repo.top, &rel).to_string_lossy().into_owned();
+                plan.hash.push((rel, abs, st));
+            }
+        }
         let mut oids = std::mem::take(&mut plan.known);
         let paths: Vec<String> = plan.hash.iter().map(|(_, abs, _)| abs.clone()).collect();
         let hashed = self.hash_paths(repo, &paths, false).await?;
@@ -521,8 +586,49 @@ impl Session {
             }
         }
         if new_bytes > self.max_total {
-            tracing::warn!(new_bytes, "новых байт больше предела чекпоинта");
-            return Err(Skip(checkpoint_reason::TOO_LARGE));
+            // Базовый снимок (N11): порция новых объектов в пределах объёма и времени
+            // вызова, кэш — для записанных; следующие чекпоинты продолжат.
+            let base = !self.has_checkpoints(repo).await?;
+            if !base {
+                tracing::warn!(new_bytes, "новых байт больше предела чекпоинта");
+                return Err(Skip(checkpoint_reason::TOO_LARGE));
+            }
+            let budget = self.max_total.min(BASE_PORTION);
+            let mut part: Vec<usize> = Vec::new();
+            let mut taken = 0u64;
+            for &i in &fresh {
+                let size = plan.hash[i].2.size;
+                if taken + size > budget {
+                    continue;
+                }
+                taken += size;
+                part.push(i);
+            }
+            let mut done: Vec<(String, Stat, String)> = Vec::new();
+            for chunk in part.chunks(BASE_CHUNK_FILES) {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                let ps: Vec<String> = chunk.iter().map(|&i| paths[i].clone()).collect();
+                let w = self.hash_paths(repo, &ps, true).await?;
+                for (&i, oid) in chunk.iter().zip(w) {
+                    done.push((plan.hash[i].0.clone(), plan.hash[i].2.clone(), oid));
+                }
+            }
+            tracing::info!(
+                written = done.len(),
+                new_bytes,
+                "базовый снимок наполняется порциями"
+            );
+            let mut entries: BTreeMap<String, StatEntry> = oids
+                .into_iter()
+                .map(|(rel, (st, oid))| (rel, StatEntry { st, oid }))
+                .collect();
+            for (rel, st, oid) in done {
+                entries.insert(rel, StatEntry { st, oid });
+            }
+            save_cache(&safe, entries).await;
+            return Err(Skip(checkpoint_reason::BASE_PENDING));
         }
         let fresh_paths: Vec<String> = fresh.iter().map(|&i| paths[i].clone()).collect();
         let written = self.hash_paths(repo, &fresh_paths, true).await?;
@@ -564,11 +670,39 @@ impl Session {
             self.run(repo, &["update-index", "-z", "--index-info"], call, &[])
                 .await?;
         }
+        // Что индекс принял: git молча отвергает некоторые пути (`GIT~1`, `.GIT`, N13).
+        let call = Call {
+            index: Some(index.clone()),
+            capture: Some(LIST_CAPTURE),
+            ..Call::default()
+        };
+        let listed = self.run(repo, &["ls-files", "-z", "-c"], call, &[]).await?;
+        let included: HashSet<String> = listed
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|r| !r.is_empty())
+            .filter_map(|r| std::str::from_utf8(r).ok())
+            .map(str::to_owned)
+            .collect();
+        for rel in oids.keys() {
+            if !included.contains(rel) {
+                tracing::warn!(path = %rel, "git отверг путь: в чекпоинт не входит");
+                plan.skipped.push(rel.clone());
+            }
+        }
         let call = Call {
             index: Some(index.clone()),
             ..Call::default()
         };
-        let tree = self.run(repo, &["write-tree"], call, &[]).await?;
+        let tree = match self.run(repo, &["write-tree"], call, &[]).await {
+            Ok(t) => t,
+            Err(e) => {
+                // Хранилище и кэш разошлись: кэш сбрасывается, следующий чекпоинт
+                // строит снимок заново (N12).
+                reset_cache(&safe);
+                return Err(e.into());
+            }
+        };
         let tree = String::from_utf8_lossy(&tree.stdout).trim().to_owned();
         if !is_oid(&tree) {
             return Err(GitFail::Failed("write-tree: неожиданный вывод".into()).into());
@@ -606,27 +740,17 @@ impl Session {
         }
 
         // Кэш stat проекта и свой индекс.
-        let cache = StatCache {
-            v: STAT_V,
-            at_ns: now_ns(),
-            entries: oids
-                .into_iter()
+        save_cache(
+            &safe,
+            oids.into_iter()
                 .map(|(rel, (st, oid))| (rel, StatEntry { st, oid }))
                 .collect(),
-        };
-        let root = safe.root.clone();
-        if let Err(e) = blocking(move || {
-            let json = serde_json::to_vec(&cache).map_err(io::Error::other)?;
-            write_private(&root.join(STAT_FILE), &json)?;
-            let _ = remove_checked(&private(index));
-            Ok(())
-        })
-        .await
-        {
-            tracing::warn!(error = %e, "кэш stat чекпоинтов не сохранён");
-        }
+        )
+        .await;
+        let _ = blocking(move || remove_checked(&private(index))).await;
         Ok(Made {
             cp: git_cp(id, git_ref, commit),
+            included,
         })
     }
 
@@ -649,7 +773,14 @@ impl Session {
         }
         match self.refs(repo, Some(id)).await {
             Ok(v) => match v.into_iter().next() {
-                Some(r) => Ok(Some(Made { cp: r.cp })),
+                Some(r) => {
+                    let commit = r.cp.commit.clone().unwrap_or_default();
+                    let included = self.tree_names(repo, &commit).await.map_err(|e| {
+                        tracing::warn!(error = %e, "дерево чекпоинта не прочитано");
+                        Skip(checkpoint_reason::GIT_ERROR)
+                    })?;
+                    Ok(Some(Made { cp: r.cp, included }))
+                }
                 None => {
                     tracing::warn!(id, "ссылка чекпоинта занята другим проектом");
                     Err(Skip(checkpoint_reason::GIT_ERROR))
@@ -660,6 +791,22 @@ impl Session {
                 Err(Skip(checkpoint_reason::GIT_ERROR))
             }
         }
+    }
+
+    /// Есть ли в своём хранилище хоть один чекпоинт (иначе идёт базовый снимок, N11).
+    async fn has_checkpoints(&mut self, repo: &Repo) -> Result<bool, GitFail> {
+        let out = self
+            .simple(
+                repo,
+                &[
+                    "for-each-ref",
+                    "--count=1",
+                    "--format=%(objectname)",
+                    &format!("{CHECKPOINT_REF_PREFIX}/"),
+                ],
+            )
+            .await?;
+        Ok(!out.stdout.is_empty())
     }
 
     /// Последний (по шагу и номеру) чекпоинт run.
@@ -789,7 +936,10 @@ impl Session {
                 RestoreError::Git(format!("обход файлов проекта не завершён: {r}"))
             })?;
             for rel in rels {
-                if !rel.contains('\n') && !in_cp.contains(&rel) && !skipped.contains(&rel) {
+                if !rel.chars().any(char::is_control)
+                    && !in_cp.contains(&rel)
+                    && !skipped.contains(&rel)
+                {
                     extra.push(rel);
                 }
             }
@@ -1066,6 +1216,33 @@ fn parse_message(body: &[u8]) -> Option<Message> {
 
 // ---- stat ----
 
+/// Сохраняет кэш stat проекта; сбой — `warn`.
+async fn save_cache(safe: &SafePaths, entries: BTreeMap<String, StatEntry>) {
+    let cache = StatCache {
+        v: STAT_V,
+        at_ns: now_ns(),
+        entries,
+    };
+    let root = safe.root.clone();
+    if let Err(e) = blocking(move || {
+        let json = serde_json::to_vec(&cache).map_err(io::Error::other)?;
+        write_private(&root.join(STAT_FILE), &json)
+    })
+    .await
+    {
+        tracing::warn!(error = %e, "кэш stat чекпоинтов не сохранён");
+    }
+}
+
+/// Сбрасывает кэш stat проекта (хранилище пересоздано или разошлось с кэшем, N12).
+fn reset_cache(safe: &SafePaths) {
+    match remove_checked(&private(safe.root.join(STAT_FILE))) {
+        Ok(()) => tracing::warn!("кэш stat чекпоинтов сброшен"),
+        Err(e) if is_missing(&e) => {}
+        Err(e) => tracing::warn!(error = %e, "кэш stat чекпоинтов не сброшен"),
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StatCache {
     v: u32,
@@ -1145,8 +1322,10 @@ fn plan_entries(top: &Path, cache_path: &Path, rels: Vec<String>) -> io::Result<
         skipped: Vec::new(),
     };
     for rel in rels {
-        if rel.contains('\n') {
-            tracing::warn!(path = %rel, "имя с переводом строки: в чекпоинт не входит");
+        if rel.chars().any(char::is_control) {
+            // `--stdin-paths` снимает `\r` и режет по `\n` (N14).
+            tracing::warn!(path = %rel, "имя с управляющим символом: в чекпоинт не входит");
+            plan.skipped.push(rel);
             continue;
         }
         let abs = join_rel(top, &rel);

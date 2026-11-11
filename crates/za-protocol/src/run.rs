@@ -173,6 +173,9 @@ pub mod checkpoint_reason {
     pub const IO_ERROR: &str = "io_error";
     /// Новых байт больше предела чекпоинта.
     pub const TOO_LARGE: &str = "too_large";
+    /// Базовый снимок своего хранилища ещё наполняется порциями: следующие чекпоинты
+    /// продолжат.
+    pub const BASE_PENDING: &str = "base_pending";
 }
 
 /// Действия журнала аудита (R1-C1 D91): поле `action` записи `audit`.

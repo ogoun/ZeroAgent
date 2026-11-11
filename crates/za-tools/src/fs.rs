@@ -662,11 +662,20 @@ fn walk_files(
     end(&rules)
 }
 
+/// Итог обхода файлов проекта для чекпоинта.
+pub(crate) struct ProjectWalk {
+    /// Абсолютные пути по порядку обхода.
+    pub files: Vec<PathBuf>,
+    /// Остановлен по дедлайну.
+    pub stopped: bool,
+    /// Часть правил игнорирования не загружена (бюджет памяти): список неполон.
+    pub over_budget: bool,
+}
+
 /// Файлы проекта для чекпоинта (D89): тот же обход, что у `search` и `glob` — правила
 /// игнорирования читает агент сам, без ссылок и junction, без `.git` и `.zero-agent`;
-/// файл `.git` (gitdir) тоже не входит. Абсолютные пути по порядку обхода и признак
-/// остановки по `deadline`.
-pub(crate) fn project_files(root: &Path, deadline: Instant) -> (Vec<PathBuf>, bool) {
+/// файл `.git` (gitdir) тоже не входит.
+pub(crate) fn project_files(root: &Path, deadline: Instant) -> ProjectWalk {
     let limits = WalkLimits::new(deadline);
     let base = ResolvedPath {
         path: root.to_path_buf(),
@@ -679,7 +688,11 @@ pub(crate) fn project_files(root: &Path, deadline: Instant) -> (Vec<PathBuf>, bo
             out.push(p.to_path_buf());
         }
     });
-    (out, end.stopped)
+    ProjectWalk {
+        files: out,
+        stopped: end.stopped,
+        over_budget: end.rules_over_budget,
+    }
 }
 
 /// Итог обхода: остановлен ли он пределами и все ли правила загружены.

@@ -97,9 +97,12 @@ impl Case {
     }
 
     /// Чекпоинтер на настоящем git с потолком поиска репозитория.
+    /// Предел чекпоинта — 120 с × `ZA_TEST_TIME_SCALE`: 20 тестов параллельно запускают
+    /// git на Windows, а `CHECKPOINT_TIMEOUT` (20 с) проверяет отдельный тест на заглушке.
     fn ck(&self) -> GitCheckpointer {
         GitCheckpointer::new(Arc::new(DirectRunner), self.home.clone())
             .with_base_env(vec![("GIT_CEILING_DIRECTORIES".into(), ceiling())])
+            .with_create_timeout_for_tests(Duration::from_secs(120) * scale())
     }
 
     fn req(&self, kind: ToolKind, trusted: bool, run: RunId, step: u64) -> CheckpointRequest {
@@ -207,7 +210,7 @@ impl Case {
 }
 
 async fn create(ck: &GitCheckpointer, req: CheckpointRequest) -> Checkpoint {
-    within(Duration::from_secs(60), "чекпоинт", ck.create(req)).await
+    within(Duration::from_secs(180), "чекпоинт", ck.create(req)).await
 }
 
 /// Заглушка `Runner`: считает вызовы; `hang` — не отвечает никогда.
@@ -1252,5 +1255,160 @@ async fn files_over_limit_are_skipped_and_kept() {
     assert_eq!(
         std::fs::metadata(&big_path).unwrap().len(),
         CHECKPOINT_MAX_FILE + 1
+    );
+}
+
+// ---- раунд 3: правимые файлы, базовый снимок, самовосстановление ----
+
+/// N10: правимый файл попадает в снимок, даже если он игнорируется (в том числе
+/// отслеживаемый); правку можно откатить. Не помещается в снимок (сверх предела) —
+/// копия правимых файлов.
+#[tokio::test]
+async fn edited_ignored_file_is_always_restorable() {
+    let c = case("edit-ignored");
+    c.init();
+    c.write(".gitignore", "secret.env\n");
+    c.write("secret.env", "KEY=old\n");
+    c.write("a.txt", "a\n");
+    c.git(&["add", "-f", "secret.env", ".gitignore", "a.txt"]);
+    c.git(&["commit", "-q", "-m", "init"]);
+    let ck = c.ck();
+    let cp = create(&ck, c.req_edit(&["secret.env"], true, RunId::new())).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    let names = c.ours(&[
+        "ls-tree",
+        "-r",
+        "--name-only",
+        cp.commit.as_deref().unwrap(),
+    ]);
+    assert!(names.lines().any(|l| l == "secret.env"), "{names}");
+    c.write("secret.env", "KEY=new\n");
+    let root = c.root();
+    within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &root, &cp, false, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.read("secret.env"), b"KEY=old\n");
+
+    // Правимый файл сверх предела в снимок не входит — копия правимых файлов.
+    let small = c.ck();
+    let big = c.project.join("big.bin");
+    let f = std::fs::File::create(&big).unwrap();
+    f.set_len(CHECKPOINT_MAX_FILE + 1).unwrap();
+    drop(f);
+    let r = create(
+        &small,
+        c.req_edit(&["big.bin", "a.txt"], true, RunId::new()),
+    )
+    .await;
+    assert_eq!(r.kind, checkpoint_kind::FILES, "{r:?}");
+    let r = create(&small, c.req_edit(&["a.txt"], true, RunId::new())).await;
+    assert_eq!(r.kind, checkpoint_kind::GIT, "{r:?}");
+}
+
+/// N11: проект больше предела. Пока базовый снимок наполняется, правка получает копию
+/// (откатывается); через несколько чекпоинтов появляется снимок git.
+#[tokio::test]
+async fn base_snapshot_fills_gradually() {
+    let c = case("base");
+    c.init();
+    for i in 0..6 {
+        c.write(&format!("f{i}.txt"), format!("{i}").repeat(1000));
+    }
+    let ck = c.ck().with_max_total_for_tests(2500);
+    let first = create(&ck, c.req_edit(&["f0.txt"], true, RunId::new())).await;
+    assert_eq!(first.kind, checkpoint_kind::FILES, "{first:?}");
+    let s = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(
+        s.reason.as_deref(),
+        Some(checkpoint_reason::BASE_PENDING),
+        "{s:?}"
+    );
+    c.write("f0.txt", "edited");
+    within(
+        Duration::from_secs(60),
+        "восстановление копии",
+        restore(&ck, &c.root(), &first, false, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.read("f0.txt"), "0".repeat(1000).as_bytes());
+    let mut got = None;
+    for step in 2..10 {
+        let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), step)).await;
+        if cp.kind == checkpoint_kind::GIT {
+            got = Some(cp);
+            break;
+        }
+        assert_eq!(
+            cp.reason.as_deref(),
+            Some(checkpoint_reason::BASE_PENDING),
+            "{cp:?}"
+        );
+    }
+    let cp = got.expect("базовый снимок так и не собрался");
+    let names = c.ours(&[
+        "ls-tree",
+        "-r",
+        "--name-only",
+        cp.commit.as_deref().unwrap(),
+    ]);
+    assert_eq!(
+        names.lines().filter(|l| l.starts_with('f')).count(),
+        6,
+        "{names}"
+    );
+}
+
+/// N12: объекты из кэша stat пропали (сбой питания), хранилище удалено или повреждено —
+/// следующий чекпоинт успешен, повреждённое хранилище отложено в сторону.
+#[tokio::test]
+async fn store_self_heals() {
+    let c = case("heal");
+    c.init();
+    c.write("a.txt", "one\n");
+    c.write("b.txt", "bee\n");
+    let ck = c.ck();
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT);
+    let objects = c.own_repo().join("objects");
+    // 1. Пропали все объекты, кэш stat остался.
+    for e in std::fs::read_dir(&objects).unwrap() {
+        let p = e.unwrap().path();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        if name.len() == 2 {
+            std::fs::remove_dir_all(&p).unwrap();
+        }
+    }
+    let cp2 = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp2.kind, checkpoint_kind::GIT, "{cp2:?}");
+    assert_eq!(
+        c.ours(&["show", &format!("{}:a.txt", cp2.commit.as_deref().unwrap())]),
+        "one\n"
+    );
+    // 2. Хранилище удалено целиком.
+    std::fs::remove_dir_all(c.own_repo()).unwrap();
+    let cp3 = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp3.kind, checkpoint_kind::GIT, "{cp3:?}");
+    // 3. Хранилище повреждено: отложено в сторону, снимок строится заново.
+    std::fs::write(c.own_repo().join("HEAD"), "garbage\n").unwrap();
+    let cp4 = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp4.kind, checkpoint_kind::GIT, "{cp4:?}");
+    let parent = c.own_repo().parent().unwrap().to_path_buf();
+    let aside = std::fs::read_dir(&parent)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("repo.git.broken-")
+        });
+    assert!(aside, "повреждённое хранилище не отложено");
+    assert_eq!(
+        c.ours(&["show", &format!("{}:b.txt", cp4.commit.as_deref().unwrap())]),
+        "bee\n"
     );
 }

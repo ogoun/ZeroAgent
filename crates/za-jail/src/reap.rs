@@ -43,17 +43,24 @@ pub(crate) struct Record {
 }
 
 /// Разбор записи своего формата: версия, лидер — лидер своей группы, `starttime` > 0,
-/// непустые `boot_id` и маркер. Иначе `None` (чужой файл).
+/// непустые `boot_id` и маркер. Предварительная запись (до запуска лидера) — `pgid`,
+/// `leader_pid` и `starttime` все нули: убираются только процессы с маркером. Иначе
+/// `None` (чужой файл).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn parse_record(bytes: &[u8]) -> Option<Record> {
     let r: Record = serde_json::from_slice(bytes).ok()?;
-    let ok = r.v == RECORD_VERSION
-        && r.pgid > 1
-        && r.leader_pid == r.pgid
-        && r.leader_starttime > 0
-        && !r.boot_id.trim().is_empty()
-        && !r.marker.is_empty();
+    let leader = (r.pgid > 1 && r.leader_pid == r.pgid && r.leader_starttime > 0) || r.is_pending();
+    let ok =
+        r.v == RECORD_VERSION && leader && !r.boot_id.trim().is_empty() && !r.marker.is_empty();
     ok.then_some(r)
+}
+
+impl Record {
+    /// Предварительная запись: лидер ещё не запущен.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pgid == 0 && self.leader_pid == 0 && self.leader_starttime == 0
+    }
 }
 
 /// Поля `/proc/<pid>/stat`, нужные дереву.
@@ -171,6 +178,12 @@ fn linux_reap(dir: &Path) -> usize {
         let path = entry.path();
         // `DirEntry::file_type` не идёт по ссылке: ссылка на файл — не наш файл.
         let regular = entry.file_type().is_ok_and(|t| t.is_file());
+        if regular && path.extension().is_some_and(|e| e == "tmp") && own_and_stale(&entry, me) {
+            // Временный файл оборванной записи (N17).
+            tracing::warn!(file = %path.display(), "временный файл реестра старше суток удалён");
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
         if !regular || path.extension().is_none_or(|e| e != "json") {
             continue;
         }
@@ -192,7 +205,14 @@ fn linux_reap(dir: &Path) -> usize {
             _ => None,
         };
         let Some(rec) = rec else {
-            tracing::warn!(file = %path.display(), "чужой файл в реестре групп, не тронут");
+            // Своя неразобранная запись старше суток (обрыв записи при сбое ОС, N17) —
+            // удаляется, иначе копилась бы навсегда.
+            if own_and_stale(&entry, me) {
+                tracing::warn!(file = %path.display(), "битая запись реестра старше суток удалена");
+                let _ = std::fs::remove_file(&path);
+            } else {
+                tracing::warn!(file = %path.display(), "чужой файл в реестре групп, не тронут");
+            }
             continue;
         };
         if rec.boot_id.trim() == boot {
@@ -207,6 +227,24 @@ fn linux_reap(dir: &Path) -> usize {
     killed
 }
 
+/// Свой (владелец — `me`) обычный файл реестра старше [`STALE`].
+#[cfg(target_os = "linux")]
+fn own_and_stale(entry: &std::fs::DirEntry, me: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    entry.metadata().is_ok_and(|m| {
+        m.is_file()
+            && m.uid() == me
+            && m.modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE)
+    })
+}
+
+/// Возраст, после которого своя неразобранная запись реестра считается брошенной.
+#[cfg(target_os = "linux")]
+const STALE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// Убивает дерево записи, если группа — та самая (см. модуль). Возвращает число процессов,
 /// получивших сигнал.
 #[cfg(target_os = "linux")]
@@ -215,6 +253,19 @@ fn kill_recorded(rec: &Record) -> usize {
 
     let procs = linux::snapshot();
     let mut roots = Vec::new();
+    if rec.is_pending() {
+        // Предварительная запись: лидер неизвестен — только процессы с маркером.
+        roots.extend(
+            procs
+                .iter()
+                .filter(|p| linux::has_marker(p.pid, &rec.marker))
+                .map(|p| p.pid),
+        );
+        let targets = linux::targets(&procs, &roots, None, 0);
+        let n = linux::kill_all(&targets);
+        tracing::info!(run = %rec.run, killed = n, "убраны остатки дерева по маркеру");
+        return n;
+    }
     // Лидер жив и его `starttime` совпал — группа наша. Лидер мёртв — номер группы мог
     // достаться чужому процессу (двойной `fork` демона), поэтому группа не в счёт:
     // только процессы с маркером записи и их потомки (ревью задачи 5, N1).
@@ -269,9 +320,14 @@ mod tests {
     fn record_format_is_strict() {
         let good = r#"{"v":1,"run":"r1","pgid":100,"leader_pid":100,"leader_starttime":5,"boot_id":"b","marker":"m"}"#;
         assert!(parse_record(good.as_bytes()).is_some());
+        // Предварительная запись до запуска лидера: только маркер.
+        let pending = r#"{"v":1,"run":"r1","pgid":0,"leader_pid":0,"leader_starttime":0,"boot_id":"b","marker":"m"}"#;
+        assert!(parse_record(pending.as_bytes()).is_some_and(|r| r.is_pending()));
         for bad in [
             // Старый формат и чужие поля.
             r#"{"pgid":100,"starttime":0}"#,
+            r#"{"v":1,"run":"r1","pgid":0,"leader_pid":100,"leader_starttime":0,"boot_id":"b","marker":"m"}"#,
+            r#"{"v":1,"run":"r1","pgid":0,"leader_pid":0,"leader_starttime":0,"boot_id":"b","marker":""}"#,
             r#"{"v":1,"run":"r1","pgid":100,"leader_pid":100,"leader_starttime":5,"boot_id":"b","marker":"m","x":1}"#,
             // starttime 0 — неизвестен.
             r#"{"v":1,"run":"r1","pgid":100,"leader_pid":100,"leader_starttime":0,"boot_id":"b","marker":"m"}"#,

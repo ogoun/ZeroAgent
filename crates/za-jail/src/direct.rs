@@ -178,6 +178,16 @@ async fn run_raw(mut spec: CommandSpec) -> Result<Raw, RunnerError> {
         Some(f) => Some(tokio::fs::File::from_std(f.try_clone()?)),
         None => None,
     };
+    // Linux: предварительная запись реестра с маркером дерева — до запуска, чтобы смерть
+    // агента между запуском и полной записью не оставила дерево без записи (ревью
+    // задачи 9, раунд 3). pid и `starttime` лидера допишет `write_leftover`.
+    #[cfg(target_os = "linux")]
+    let pending = match &spec.leftover {
+        Some(left) => unix::write_pending(left, &marker)
+            .await
+            .map_err(RunnerError::Io)?,
+        None => false,
+    };
     let spawned = {
         // Linux: запуск и регистрация лидера — под замком сбора зомби, чтобы субрипер не
         // собрал лидера, которого ждёт tokio.
@@ -190,6 +200,13 @@ async fn run_raw(mut spec: CommandSpec) -> Result<Raw, RunnerError> {
         }
         r
     };
+    #[cfg(target_os = "linux")]
+    if spawned.is_err()
+        && pending
+        && let Some(left) = &spec.leftover
+    {
+        unix::remove_record(&left.file);
+    }
     let mut child = spawned.map_err(|source| RunnerError::Spawn {
         program: spec.program.display().to_string(),
         source,
@@ -204,6 +221,9 @@ async fn run_raw(mut spec: CommandSpec) -> Result<Raw, RunnerError> {
     let mut guard = windows_guard::Guard;
     #[cfg(target_os = "linux")]
     if let Some(left) = &spec.leftover {
+        if pending {
+            guard.own_record(left.file.clone());
+        }
         guard.write_leftover(left).await.map_err(RunnerError::Io)?;
     }
 
@@ -496,6 +516,12 @@ mod unix {
             Ok(())
         }
 
+        /// Запись реестра этого вызова (предварительная): удаляется вместе со стражем.
+        #[cfg(target_os = "linux")]
+        pub(super) fn own_record(&mut self, file: PathBuf) {
+            self.file = Some(file);
+        }
+
         /// Tokio собрал лидера: его номер больше не наш.
         pub(super) fn leader_reaped(&mut self) {
             self.leader_alive = false;
@@ -535,6 +561,44 @@ mod unix {
             {
                 tracing::warn!(file = %file.display(), error = %e, "запись реестра групп не удалена");
             }
+        }
+    }
+
+    /// Предварительная запись реестра до запуска: только маркер дерева (pid и
+    /// `starttime` нули — `reap` убивает по маркеру). Нет `boot_id` — запись не пишется,
+    /// `false`.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn write_pending(
+        left: &crate::Leftover,
+        marker: &str,
+    ) -> std::io::Result<bool> {
+        let Some(boot_id) = crate::linux::boot_id() else {
+            return Ok(false);
+        };
+        let rec = crate::reap::Record {
+            v: crate::reap::RECORD_VERSION,
+            run: left.run.clone(),
+            pgid: 0,
+            leader_pid: 0,
+            leader_starttime: 0,
+            boot_id,
+            marker: marker.to_owned(),
+        };
+        let text = serde_json::to_vec(&rec).map_err(std::io::Error::other)?;
+        let file = left.file.clone();
+        tokio::task::spawn_blocking(move || write_record(&file, &text))
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(true)
+    }
+
+    /// Удаляет запись реестра; ошибка — `warn`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn remove_record(file: &std::path::Path) {
+        if let Err(e) = std::fs::remove_file(file)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(file = %file.display(), error = %e, "запись реестра не удалена");
         }
     }
 

@@ -100,6 +100,9 @@ pub struct GitCheckpointer {
     backup_timeout: Duration,
     /// Предел новых байт на чекпоинт (тесты сокращают).
     max_total: u64,
+    /// Предел чекпоинта git при вызове инструмента ([`CHECKPOINT_TIMEOUT`]; тесты под
+    /// нагрузкой станции увеличивают).
+    create_timeout: Duration,
     /// Run, у которых git не уложился в предел.
     slow: Arc<Mutex<HashSet<RunId>>>,
     /// Чекпоинты одного процесса идут по одному: общий кэш stat и каталоги run.
@@ -131,6 +134,7 @@ impl GitCheckpointer {
             base_env: Vec::new(),
             backup_timeout: RESTORE_TIMEOUT,
             max_total: CHECKPOINT_MAX_TOTAL,
+            create_timeout: CHECKPOINT_TIMEOUT,
             slow: Arc::new(Mutex::new(HashSet::new())),
             lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -139,6 +143,13 @@ impl GitCheckpointer {
     /// Для тестов: переменные, добавляемые к окружению каждого вызова git.
     pub fn with_base_env(mut self, env: Vec<(OsString, OsString)>) -> Self {
         self.base_env = env;
+        self
+    }
+
+    /// Только для тестов: предел чекпоинта git при вызове инструмента.
+    #[doc(hidden)]
+    pub fn with_create_timeout_for_tests(mut self, d: Duration) -> Self {
+        self.create_timeout = d;
         self
     }
 
@@ -190,6 +201,25 @@ impl GitCheckpointer {
         }
     }
 
+    /// Проект для чтения своего хранилища: только если хранилище уже есть.
+    async fn own_repo(&self, project: &Path) -> Option<git::Repo> {
+        let (p, h, home) = (
+            project.to_path_buf(),
+            self.home.za_home.clone(),
+            self.home.clone(),
+        );
+        blocking(move || {
+            let roots = Roots::canonical(&p, &h)?;
+            let dir = home::agent_dir(&home, None)?.join(git::REPO_DIR);
+            Ok(std::fs::symlink_metadata(dir.join("HEAD"))
+                .is_ok()
+                .then_some(git::Repo { top: roots.project }))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Чекпоинт git: `Ok` — сделан (или найден), `Err` — причина пропуска.
     async fn git_checkpoint(
         &self,
@@ -206,7 +236,10 @@ impl GitCheckpointer {
         };
         let repo = self.repo(&req.project_dir).await?;
         let session = self.session(program, timeout);
-        match tokio::time::timeout(timeout, session.checkpoint(&repo, req, id, stem)).await {
+        // Наполнение базового снимка останавливается раньше общего предела (N11).
+        let deadline = std::time::Instant::now() + timeout * 3 / 4;
+        let work = session.checkpoint(&repo, req, id, stem, deadline);
+        match tokio::time::timeout(timeout, work).await {
             Ok(Ok(made)) => Ok(made),
             Ok(Err(git::Skip(r))) => {
                 if r == checkpoint_reason::SLOW {
@@ -229,10 +262,30 @@ impl GitCheckpointer {
         // Недоверенный проект: git не вызывается (D83).
         let reason = if req.trusted {
             match self
-                .git_checkpoint(&req, &id, &stem, CHECKPOINT_TIMEOUT)
+                .git_checkpoint(&req, &id, &stem, self.create_timeout)
                 .await
             {
-                Ok(made) => return made.cp,
+                Ok(made) if !edit => return made.cp,
+                Ok(made) => {
+                    // N10: каждый существующий правимый файл должен быть в снимке; иначе
+                    // (сверх предела, отвергнут git) — копия правимых файлов.
+                    let (paths, root) = (req.paths.clone(), req.project_dir.clone());
+                    let included = made.included;
+                    let uncovered = blocking(move || {
+                        Ok(paths.iter().any(|p| {
+                            za_core::paths::within(&root, p)
+                                && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
+                                && !included.contains(&za_core::paths::display(&root, p))
+                        }))
+                    })
+                    .await
+                    .unwrap_or(true);
+                    if !uncovered {
+                        return made.cp;
+                    }
+                    tracing::warn!(id = %id, "правимого файла нет в снимке git: копия файлов");
+                    checkpoint_reason::GIT_ERROR
+                }
                 Err(r) => r,
             }
         } else {
@@ -299,13 +352,9 @@ impl GitCheckpointer {
             return None;
         }
         let program = self.git.clone()?;
-        match self.repo(project).await {
-            Ok(repo) => Some((self.session(program, RESTORE_TIMEOUT), repo)),
-            Err(r) => {
-                tracing::debug!(reason = r, "git для чекпоинтов проекта не используется");
-                None
-            }
-        }
+        // Чтение своего хранилища не зависит от `.git` проекта (N16), но и не создаёт его.
+        let repo = self.own_repo(project).await?;
+        Some((self.session(program, RESTORE_TIMEOUT), repo))
     }
 
     /// Чекпоинты проекта `project` (канонический корень): скрытые ссылки этого проекта
@@ -498,10 +547,11 @@ async fn git_parts(
         .git
         .clone()
         .ok_or_else(|| RestoreError::Git("git не найден в PATH".into()))?;
+    // Своё хранилище, без требования `.git` у проекта (N16).
     let repo = ck
-        .repo(project)
+        .own_repo(project)
         .await
-        .map_err(|r| RestoreError::Git(format!("репозиторий проекта не используется: {r}")))?;
+        .ok_or_else(|| RestoreError::NotFound(cp.id.clone()))?;
     let mut s = ck.session(program, RESTORE_TIMEOUT);
     let ours = s.refs(&repo, Some(&cp.id)).await?;
     if !ours
