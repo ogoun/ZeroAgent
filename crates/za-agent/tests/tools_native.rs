@@ -250,7 +250,8 @@ async fn read_outside_asks_then_taints() {
     let fin = of_kind(&evs, EventKind::ToolFinished);
     assert_eq!(fin.last().unwrap().payload["tainted"], true);
     assert!(fin.last().unwrap().tainted);
-    // Следующий bash в помеченном run — с вопросом `tainted`.
+    // Следующий bash в помеченном run идёт без вопроса (решение заказчика 2026-11-11:
+    // метка — происхождение данных, на запуск команд не влияет); метка остаётся.
     let mut env2 = env.clone();
     env2.taint = out.taint.clone();
     let out = b
@@ -261,7 +262,8 @@ async fn read_outside_asks_then_taints() {
             &[pc("c2", "bash", json!({"cmd": "echo hi"}))],
         )
         .await;
-    assert_eq!(reasons(&out), ["tainted"]);
+    assert!(out.suspend.is_none(), "{:?}", out.suspend);
+    assert!(!content(&out, 0).1);
 }
 
 #[tokio::test]

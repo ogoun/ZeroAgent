@@ -13,11 +13,15 @@
 //! 4. `Exec` в недоверенном проекте — [`Decision::Trust`], после отказа —
 //!    `Deny("untrusted project")` (D83).
 //! 5. Причины `Ask` собираются все: `irreversible` (не снимается ничем), `outside_project`
-//!    (снимают только грант или глобальное `allow` с `path`), `rule`, `mode` и `tainted`
-//!    (последние два снимают глобальное `allow` и `bypass`).
+//!    (снимают только грант или глобальное `allow` с `path`), `rule` и `mode` (снимают
+//!    глобальное `allow` и `bypass`, кроме `Approval::Always`).
+//!
+//! Метка недоверенного содержимого run ([`PolicyCx::taint`], D82) вопроса не даёт
+//! (решение заказчика 2026-11-11: чтение из сети на запуск команд не влияет). Она —
+//! происхождение данных в журнале и аудите.
 //!
 //! Классификатор необратимых команд — дополнительный слой (D81): основная защита —
-//! граница проекта, чекпоинты, метка `tainted` и режимы с подтверждением.
+//! граница проекта, чекпоинты и режимы с подтверждением.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -208,6 +212,14 @@ fn check_rule(i: usize, r: &Rule) -> Result<(), PolicyError> {
         built.map_err(|e| bad(field, e.to_string()))?;
         if field == "command" {
             text_glob(&argv0_pattern(pat), true).map_err(|e| bad(field, e.to_string()))?;
+            // Слова шаблона по отдельности (нормализованная команда, I2): `echo {a b}`
+            // — верный glob целиком, но не по словам (N1 повторного ревью).
+            if CommandWords::new(pat).is_none() {
+                return Err(bad(
+                    field,
+                    "каждое слово шаблона должно быть верным шаблоном glob".to_owned(),
+                ));
+            }
         }
         if field == "path" && slashed(pat).split('/').any(|c| c == "..") {
             return Err(bad(
@@ -700,7 +712,8 @@ pub struct PolicyCx<'a> {
     pub trusted: bool,
     /// Пользователь отказал проекту в доверии.
     pub trust_refused: bool,
-    /// Происхождения недоверенного содержимого run (D82).
+    /// Происхождения недоверенного содержимого run (D82). На решение не влияют (решение
+    /// заказчика 2026-11-11); поле остаётся частью контекста для R1-C2 (Rule of Two).
     pub taint: &'a BTreeSet<String>,
     pub grants: &'a [Grant],
 }
@@ -768,7 +781,6 @@ pub fn decide(
     }
     // 5. Причины Ask.
     let allowed = rules.iter().any(|r| r.allows(&call));
-    let risk = effective_risk(spec, s);
     // `Approval::Always` — поправка инструмента: её не снимают ни `bypass`, ни `allow`
     // (I3 ревью, контракт `gate`).
     let always = spec.approval == Approval::Always;
@@ -783,8 +795,6 @@ pub fn decide(
                     || !(covers(cx.grants, &p.path, p.cover)
                         || rules.iter().any(|r| r.allows_path(&call, p))))
         });
-    // Метку run снимает только `bypass`; `allow` снимает лишь вопрос режима (C1 ревью).
-    let want_tainted = !cx.taint.is_empty() && risk >= RiskClass::Exec && !bypass;
     let want_irreversible = !s.irreversible.is_empty()
         || s.segments.iter().any(|seg| seg.unparsed)
         || spec.risk >= RiskClass::Irreversible;
@@ -792,7 +802,6 @@ pub fn decide(
         (want_mode, approval_reason::MODE),
         (want_rule, approval_reason::RULE),
         (want_outside, approval_reason::OUTSIDE_PROJECT),
-        (want_tainted, approval_reason::TAINTED),
         (want_irreversible, approval_reason::IRREVERSIBLE),
     ]
     .into_iter()
@@ -803,22 +812,6 @@ pub fn decide(
     } else {
         Decision::Ask { reasons }
     }
-}
-
-/// Риск вызова: класс инструмента, повышенный разбором команды (D81): метки
-/// необратимости — `Irreversible`, сеть — `Network`, запуск команды — не ниже `Exec`.
-fn effective_risk(spec: &ToolSpec, s: &Subjects) -> RiskClass {
-    let mut risk = spec.risk;
-    if spec.kind == ToolKind::Exec {
-        risk = risk.max(RiskClass::Exec);
-    }
-    if s.network {
-        risk = risk.max(RiskClass::Network);
-    }
-    if !s.irreversible.is_empty() {
-        risk = risk.max(RiskClass::Irreversible);
-    }
-    risk
 }
 
 // ---- Тексты для модели ----
