@@ -18,6 +18,17 @@
 - **Корень `bash` (Carry задачи 8).** `Tool::subjects_in(root, args)` в `za-core`, `bash` считает границу от настоящего корня; `subjects` остаётся с корнем-заглушкой.
 - **Бинарник (минимум до задачи 13).** `LoopDeps::new` + маска ответа модели; `RunSpec.trusted = false` (нативных команд в наборе ещё нет), гранты и набор доверия — задача 13. Уборка (`clean_edit_leftovers`, `tmp/<run>`, `reap_leftovers` после доверия) — бинарник, задача 13: `za-agent` не зависит от `za-tools`/`za-jail` (D73).
 
+## 2026-11-11. R1-C1, задача 11, раунд исправлений 1: allow не снимает метки у bash, запись по грантам, нормализованная команда, Always
+
+- **C1.** Для `Exec` глобальное `allow` применяется только с полем `command` (и строгой проверкой каждого сегмента): правило по `path` или `tool` больше не разрешает произвольную команду и не покрывает её внешние пути. `allow` снимает только вопрос режима: `tainted`, необратимость и `unparsed` им не снимаются (`tainted` снимает лишь `bypass`). Случай 8 брифа (`allow command = "cargo test"` при метке → `Allow`) по Ruling C1 стал `Ask{[tainted]}`.
+- **I1.** Пути команды покрываются грантом как запись: нужен `rw` (`cp`, `tee`, `sed -i` через грант `ro` больше не проходят; `cat` с `ro` теперь спрашивает).
+- **I2.** `deny`/`ask` с `command` сверяются ещё и с нормализованной командой `shell::command_args`: имя без обёрток, пути, регистра и `.exe`, слова шаблона после имени — подпоследовательностью аргументов (`git push*` ловит `git  push`, `git -C . push`, `sudo`/`env`/`timeout`, `GIT push`, `bash -c "git push"`).
+- **I3.** `Approval::Always` не снимают ни `bypass`, ни `allow`.
+- **Ruling (слова bash).** `deny` с `path` сверяется со всеми словами-аргументами и целями перенаправлений сегментов (лексически, от `cwd`): `deny path = ".env"` ловит `cat .env`.
+- **Minor.** m2 — шаблон `tool` без учёта регистра; m4 — управляющие символы пути в `<grants>` пишутся `\u{..}`; m6 — `\` в шаблонах — обычный символ на всех ОС. m1 (контракт `&[ResolvedPath]`, его использует задача 12), m3 (кэш шаблонов), m5 (источник ошибки проектного правила — задача 13) не трогались.
+- Тест задачи 12 `recorded_decision_survives_policy_change` переведён на `allow tool = "bash", command = "echo"`: правило без `command` для bash больше не действует.
+- Находка: `cargo --locked publish --dry-run` классификатор za-shell не помечает `publish` (опция между `cargo` и `publish`); политика это не чинит — дополнительный слой D81.
+
 ## 2026-11-11. R1-C1, задача 11: движок политики
 
 - **`za_agent::policy`.** `decide(cx, spec, subjects, paths)` — чистая функция (D30, D92), порядок D80: защищённый путь → `deny` → запрет режима → доверие (`Trust`, после отказа `denied: untrusted project`) → причины `Ask` в порядке `approval_reason` (`mode`, `rule`, `outside_project`, `tainted`, `irreversible`). `PolicySnapshot::build` (проектные `allow`, `allow_bypass` и гранты отбрасываются с `warn`), хэш — BLAKE3 канонического JSON `{allow_bypass, rules, grants}`; `check_mode` — `bypass` только при `allow_bypass`.

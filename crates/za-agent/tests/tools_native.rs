@@ -584,7 +584,8 @@ async fn recorded_decision_survives_policy_change() {
                 action: RuleAction::Allow,
                 tool: Some("bash".into()),
                 path: None,
-                command: None,
+                // Для bash allow действует только с `command` (Ruling C1 задачи 11).
+                command: Some("echo".into()),
             }],
             ..PolicyConfig::default()
         },

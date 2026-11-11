@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use za_core::paths::{self, ResolvedPath, Roots};
 use za_core::shell::{self, Segment};
-use za_core::{Access, Gate, RawPath, RiskClass, Subjects, ToolKind, ToolSpec, gate};
+use za_core::{Access, Approval, Gate, RawPath, RiskClass, Subjects, ToolKind, ToolSpec, gate};
 use za_protocol::{RunMode, approval_reason, canonical_json, deny_reason};
 
 use crate::prompt::escape_untrusted;
@@ -244,16 +244,19 @@ fn path_glob(pat: &str) -> Result<(GlobMatcher, bool), globset::Error> {
     let m = GlobBuilder::new(&norm)
         .literal_separator(true)
         .case_insensitive(cfg!(windows))
+        .backslash_escape(false)
         .build()?
         .compile_matcher();
     Ok((m, is_absolute_pattern(&norm)))
 }
 
-/// Шаблон текста (имя инструмента, сегмент команды): `*` пересекает любые символы.
+/// Шаблон текста (имя инструмента, сегмент команды): `*` пересекает любые символы,
+/// `\` — обычный символ на всех ОС (пути Windows в командах, m6 ревью).
 fn text_glob(pat: &str, case_insensitive: bool) -> Result<GlobMatcher, globset::Error> {
     Ok(GlobBuilder::new(pat)
         .literal_separator(false)
         .case_insensitive(case_insensitive)
+        .backslash_escape(false)
         .build()?
         .compile_matcher())
 }
@@ -265,6 +268,46 @@ fn argv0_pattern(pat: &str) -> String {
     p.strip_suffix(".exe").map(str::to_owned).unwrap_or(p)
 }
 
+/// Шаблон `command` для `deny` и `ask` по нормализованной команде (I2 ревью):
+/// имя — как у [`shell::command_args`] (без обёрток, пути, регистра и `.exe`), слова
+/// шаблона после имени — по порядку среди аргументов, между ними допускаются другие
+/// (опции git, флаги).
+struct CommandWords {
+    name: GlobMatcher,
+    rest: Vec<GlobMatcher>,
+}
+
+impl CommandWords {
+    fn new(pat: &str) -> Option<Self> {
+        let mut words = pat.split_whitespace();
+        let name = text_glob(&argv0_pattern(words.next()?), true).ok()?;
+        let rest = words
+            .map(|w| text_glob(w, false).ok())
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { name, rest })
+    }
+
+    fn matches(&self, seg: &Segment) -> bool {
+        let Some((name, args)) = shell::command_args(seg) else {
+            return false;
+        };
+        if !self.name.is_match(&name) {
+            return false;
+        }
+        let mut args = args.iter();
+        self.rest
+            .iter()
+            .all(|w| args.by_ref().any(|a| w.is_match(a)))
+    }
+}
+
+/// Шаблон `command` правила: текст сегмента, имя команды и нормализованная команда.
+struct CommandMatch {
+    text: GlobMatcher,
+    argv0: GlobMatcher,
+    words: CommandWords,
+}
+
 /// Скомпилированное правило. Неверный шаблон (снимок из журнала, собранный не через
 /// [`PolicySnapshot::build`]) — в безопасную сторону: `deny` и `ask` срабатывают,
 /// `allow` — нет.
@@ -273,7 +316,7 @@ struct Compiled<'a> {
     rule: &'a Rule,
     tool: Option<Option<GlobMatcher>>,
     path: Option<Option<(GlobMatcher, bool)>>,
-    command: Option<Option<(GlobMatcher, GlobMatcher)>>,
+    command: Option<Option<CommandMatch>>,
 }
 
 impl<'a> Compiled<'a> {
@@ -282,16 +325,19 @@ impl<'a> Compiled<'a> {
         Self {
             source,
             rule,
-            tool: rule.tool.as_deref().map(|p| text_glob(p, false).ok()),
+            // Имена инструментов — в нижнем регистре: шаблон без учёта регистра (m2).
+            tool: rule.tool.as_deref().map(|p| text_glob(p, true).ok()),
             path: rule.path.as_deref().map(|p| {
                 path_glob(p)
                     .ok()
                     .filter(|_| !p.is_empty() && !has_dotdot(p))
             }),
             command: rule.command.as_deref().map(|p| {
-                text_glob(p, false)
-                    .ok()
-                    .zip(text_glob(&argv0_pattern(p), true).ok())
+                Some(CommandMatch {
+                    text: text_glob(p, false).ok()?,
+                    argv0: text_glob(&argv0_pattern(p), true).ok()?,
+                    words: CommandWords::new(p)?,
+                })
             }),
         }
     }
@@ -311,17 +357,18 @@ impl<'a> Compiled<'a> {
         let cmd_ok = match &self.command {
             None => true,
             Some(None) => false,
-            Some(Some((text, argv0))) => {
+            Some(Some(m)) => {
                 if !call.has_command || call.segments.is_empty() {
                     false
                 } else if strict {
                     call.segments
                         .iter()
-                        .all(|s| allow_segment(s) && text.is_match(&s.text))
+                        .all(|s| allow_segment(s) && m.text.is_match(&s.text))
                 } else {
                     call.segments.iter().any(|s| {
-                        text.is_match(&s.text)
-                            || shell::argv0(s).is_some_and(|a| argv0.is_match(&a))
+                        m.text.is_match(&s.text)
+                            || shell::argv0(s).is_some_and(|a| m.argv0.is_match(&a))
+                            || m.words.matches(s)
                     })
                 }
             }
@@ -351,17 +398,28 @@ impl<'a> Compiled<'a> {
         }
         let path_ok = match &self.path {
             None => true,
-            Some(_) => call.paths.iter().any(|p| self.path_matches(p)),
+            Some(_) => {
+                call.paths.iter().any(|p| self.path_matches(p))
+                    || (self.rule.action == RuleAction::Deny
+                        && call.words.iter().any(|p| self.path_matches(p)))
+            }
         };
         path_ok && self.tool_and_command(call, false)
     }
 
+    /// Глобальное `allow` применимо к вызову: правило глобальное, шаблоны целы, а у
+    /// команды (`Exec`) задано поле `command` (C1 ревью: правило по `path` или `tool` не
+    /// разрешает произвольную команду).
+    fn allow_applies(&self, call: &Call<'_>) -> bool {
+        !self.broken()
+            && self.source == RuleSource::Global
+            && self.rule.action == RuleAction::Allow
+            && (!call.exec || self.rule.command.is_some())
+    }
+
     /// Глобальное `allow` совпало с вызовом целиком: `path` — с каждым путём (и пути есть).
     fn allows(&self, call: &Call<'_>) -> bool {
-        if self.broken()
-            || self.source != RuleSource::Global
-            || self.rule.action != RuleAction::Allow
-        {
+        if !self.allow_applies(call) {
             return false;
         }
         let path_ok = match &self.path {
@@ -373,11 +431,7 @@ impl<'a> Compiled<'a> {
 
     /// Глобальное `allow` с `path` покрывает внешний путь (D77): явное указание пользователя.
     fn allows_path(&self, call: &Call<'_>, p: &CallPath) -> bool {
-        !self.broken()
-            && self.source == RuleSource::Global
-            && self.rule.action == RuleAction::Allow
-            && self.path_matches(p)
-            && self.tool_and_command(call, true)
+        self.allow_applies(call) && self.path_matches(p) && self.tool_and_command(call, true)
     }
 }
 
@@ -393,7 +447,8 @@ fn allow_segment(s: &Segment) -> bool {
 struct CallPath {
     /// Канонический путь.
     path: PathBuf,
-    access: Access,
+    /// Доступ для покрытия грантом: у команды — запись (I1 ревью).
+    cover: Access,
     /// Абсолютный путь через `/`.
     abs: String,
     /// Внутри проекта — относительный через `/`.
@@ -408,9 +463,14 @@ struct CallPath {
 
 struct Call<'a> {
     tool: &'a str,
+    /// Вызов запускает команду (`ToolKind::Exec`).
+    exec: bool,
     has_command: bool,
     segments: &'a [Segment],
     paths: Vec<CallPath>,
+    /// Все слова-аргументы и цели перенаправлений сегментов команды, разобранные
+    /// лексически: по ним сверяются правила `deny` с `path` (Ruling: слова bash).
+    words: Vec<CallPath>,
     /// Разрешение не соответствует [`subject_paths`]: граница неизвестна.
     unresolved: bool,
 }
@@ -453,18 +513,69 @@ fn call_of<'a>(
                 pinned: tilde || home,
                 protected: p.protected
                     || (r.access == Access::Write && paths::protected_place(cx.roots, &p.path)),
-                access: r.access,
+                // Команда с путём может в него писать (`cp`, `tee`, `sed -i`): грант `ro`
+                // её не покрывает (I1 ревью, решение заказчика (а)).
+                cover: if exec { Access::Write } else { r.access },
                 path: p.path.clone(),
             }
         })
         .collect();
     Call {
         tool: &spec.schema.name,
+        exec,
         has_command: s.command.is_some(),
         segments: &s.segments,
         paths,
+        words: if exec {
+            command_words(cx, s)
+        } else {
+            Vec::new()
+        },
         unresolved: raw.len() != resolved.len(),
     }
+}
+
+/// Слова сегментов команды как пути (лексически, без ввода-вывода): относительные — от
+/// `cwd`, если он задан. Слово, которое [`paths::classify`] отвергает, пропускается.
+/// Только для сверки `deny` с `path`: граница считается по [`subject_paths`].
+fn command_words(cx: &PolicyCx<'_>, s: &Subjects) -> Vec<CallPath> {
+    let project = &cx.roots.project;
+    let base = s
+        .cwd
+        .as_deref()
+        .and_then(|c| paths::classify(project, c).ok())
+        .map_or_else(|| project.clone(), |l| l.as_path().to_path_buf());
+    let mut out: Vec<CallPath> = Vec::new();
+    for seg in &s.segments {
+        let redirects = seg
+            .redirects
+            .iter()
+            .map(|r| r.trim_start_matches(|c: char| c.is_ascii_digit() || "<>&|".contains(c)));
+        for w in seg.argv.iter().map(String::as_str).chain(redirects) {
+            if w.is_empty() {
+                continue;
+            }
+            let Ok(lex) = paths::classify(&base, w) else {
+                continue;
+            };
+            let path = lex.as_path().to_path_buf();
+            let inside = paths::within(project, &path);
+            let abs = slashed(&path.to_string_lossy());
+            if out.iter().any(|p| p.abs == abs) {
+                continue;
+            }
+            out.push(CallPath {
+                abs,
+                rel: inside.then(|| paths::display(project, &path)),
+                outside: !inside,
+                pinned: false,
+                protected: false,
+                cover: Access::Write,
+                path,
+            });
+        }
+    }
+    out
 }
 
 // ---- Гранты ----
@@ -551,12 +662,26 @@ pub fn grants_text(grants: &[Grant], root: &Path) -> String {
         .map(|g| {
             format!(
                 "{} ({})",
-                escape_untrusted(&paths::display(root, &g.path)),
+                escape_controls(&escape_untrusted(&paths::display(root, &g.path))),
                 g.mode.as_str()
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Управляющие символы пути — видимой записью `\u{..}`: перевод строки в имени не
+/// дорисует ложную строку блока `<grants>` (m4 ревью).
+fn escape_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `grants_text` без грантов.
@@ -644,7 +769,10 @@ pub fn decide(
     // 5. Причины Ask.
     let allowed = rules.iter().any(|r| r.allows(&call));
     let risk = effective_risk(spec, s);
-    let want_mode = by_mode == Gate::Ask && !allowed && !bypass;
+    // `Approval::Always` — поправка инструмента: её не снимают ни `bypass`, ни `allow`
+    // (I3 ревью, контракт `gate`).
+    let always = spec.approval == Approval::Always;
+    let want_mode = by_mode == Gate::Ask && (always || (!allowed && !bypass));
     let want_rule = rules
         .iter()
         .any(|r| r.rule.action == RuleAction::Ask && r.fires(&call));
@@ -652,10 +780,11 @@ pub fn decide(
         || call.paths.iter().any(|p| {
             p.outside
                 && (p.pinned
-                    || !(covers(cx.grants, &p.path, p.access)
+                    || !(covers(cx.grants, &p.path, p.cover)
                         || rules.iter().any(|r| r.allows_path(&call, p))))
         });
-    let want_tainted = !cx.taint.is_empty() && risk >= RiskClass::Exec && !allowed && !bypass;
+    // Метку run снимает только `bypass`; `allow` снимает лишь вопрос режима (C1 ревью).
+    let want_tainted = !cx.taint.is_empty() && risk >= RiskClass::Exec && !bypass;
     let want_irreversible = !s.irreversible.is_empty()
         || s.segments.iter().any(|seg| seg.unparsed)
         || spec.risk >= RiskClass::Irreversible;
