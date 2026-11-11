@@ -1252,3 +1252,106 @@ async fn endpoint_change_refused_on_started_step() {
         }
     ));
 }
+
+// ---- R1-C2, задача 1: невидимые символы во вводе (D102, SEC-051) ----
+
+/// Инструмент, который на вызове пишет ввод пользователя в журнал run (как
+/// `RunControl::input` в режиме `Queue`): следующая граница его прочитает.
+struct Inputter {
+    spec: ToolSpec,
+    store: ProjectStore,
+    text: String,
+}
+
+impl Tool for Inputter {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, _args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        let (store, text) = (self.store.clone(), self.text.clone());
+        Box::pin(async move {
+            za_agent::submit_input(&store, cx.run, &text, za_agent::InputMode::Queue)
+                .await
+                .unwrap();
+            ToolOutput::ok("sent")
+        })
+    }
+}
+
+#[tokio::test]
+async fn task_with_tag_chars_is_cleaned_and_logged() {
+    let mut f = fx("task_tag_chars", scripted());
+    f.model.push(answer("ок"));
+    let mut s = spec(RunRole::Top);
+    s.task = "fix\u{E0069}\u{E0067} bug".into();
+    let out = start(&mut f, s).await.unwrap();
+    assert!(matches!(
+        out,
+        LoopOutcome::Finished {
+            status: RunStatus::Done,
+            ..
+        }
+    ));
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let conv = history(&f.store, &snap).await;
+    let first = text_of(&conv.messages()[0]);
+    assert!(first.contains("fix bug"), "{first}");
+    assert!(!first.contains('\u{E0069}'), "{first:?}");
+    // Модель видит очищенную задачу.
+    let sent = text_of(&f.model.calls()[0].request.messages[0]);
+    assert!(sent.contains("fix bug"), "{sent}");
+    let evs = events(&f.store, f.run).await;
+    let cleaned = of_kind(&evs, EventKind::InputCleaned);
+    assert_eq!(cleaned.len(), 1, "{cleaned:?}");
+    assert_eq!(cleaned[0].payload, json!({"source": "task", "removed": 2}));
+    assert_eq!(cleaned[0].actor, Actor::Runtime);
+}
+
+#[tokio::test]
+async fn clean_task_logs_nothing() {
+    let mut f = fx("task_clean", scripted());
+    f.model.push(answer("ок"));
+    start(&mut f, spec(RunRole::Top)).await.unwrap();
+    let evs = events(&f.store, f.run).await;
+    assert!(of_kind(&evs, EventKind::InputCleaned).is_empty());
+}
+
+#[tokio::test]
+async fn inbox_input_is_cleaned() {
+    let store = ProjectStore::open_with(&dir("inbox_cleaned"), StoreOptions::default()).unwrap();
+    let inputter: Arc<dyn Tool> = Arc::new(Inputter {
+        spec: tool_spec("send_input", ToolKind::Read, EffectClass::ReadOnly),
+        store: store.clone(),
+        text: "abc\u{202E}def \u{1F468}\u{200D}\u{1F469}".into(),
+    });
+    let mut f = fx_on(store, scripted(), vec![inputter]);
+    f.model
+        .push(vec![calls(vec![call_part("c1", "send_input", json!({}))])]);
+    f.model.push(answer("ок"));
+    let out = start(&mut f, spec(RunRole::Top)).await.unwrap();
+    assert!(matches!(
+        out,
+        LoopOutcome::Finished {
+            status: RunStatus::Done,
+            ..
+        }
+    ));
+    // Ввод дошёл до модели без U+202E, ZWJ в эмодзи остался.
+    let msgs = &f.model.calls()[1].request.messages;
+    let user: Vec<String> = msgs
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(text_of)
+        .collect();
+    assert!(
+        user.iter()
+            .any(|t| t == "abcdef \u{1F468}\u{200D}\u{1F469}"),
+        "{user:?}"
+    );
+    assert!(user.iter().all(|t| !t.contains('\u{202E}')), "{user:?}");
+    let evs = events(&f.store, f.run).await;
+    let cleaned = of_kind(&evs, EventKind::InputCleaned);
+    assert_eq!(cleaned.len(), 1, "{cleaned:?}");
+    assert_eq!(cleaned[0].payload, json!({"source": "input", "removed": 1}));
+}

@@ -140,6 +140,46 @@ pub mod taint_origin {
     pub const NETWORK: &str = "network";
     /// Инструмент сам пометил результат недоверенным.
     pub const TOOL: &str = "tool";
+    /// Содержимое из сети, полученное через шлюз `za-web` (R1-C2 D110).
+    pub const WEB: &str = "web";
+}
+
+/// Исход обращения сетевого шлюза (R1-C2 D112): поле `outcome` события `web.request`.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod net_outcome {
+    /// Ответ получен.
+    pub const OK: &str = "ok";
+    /// Обращение отклонено до соединения: адрес, порт, правило, `robots.txt`.
+    pub const BLOCKED: &str = "blocked";
+    /// Сбой соединения, тайм-аут или ошибка ответа.
+    pub const ERROR: &str = "error";
+}
+
+/// Источник скилла (R1-C2): поле `source` каталога и событий `skill.*`.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod skill_source {
+    /// `ZA_HOME/skills`.
+    pub const USER: &str = "user";
+    /// Поставка: core pack.
+    pub const BUNDLED: &str = "bundled";
+    /// Дополнительный каталог из глобальной конфигурации.
+    pub const EXTRA: &str = "extra";
+    /// Доверенное дерево проекта.
+    pub const PROJECT: &str = "project";
+}
+
+/// Источник очищенного ввода (R1-C2 D102): поле `source` события `input.cleaned`.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod input_source {
+    /// Задача run.
+    pub const TASK: &str = "task";
+    /// Ввод пользователя или поправка из `inbox`.
+    pub const INPUT: &str = "input";
+    /// Текст `AGENTS.md` проекта.
+    pub const AGENTS_MD: &str = "agents_md";
 }
 
 /// Вид чекпоинта (R1-C1 D89): поле `kind` события `checkpoint.created`.
@@ -194,6 +234,9 @@ pub mod audit_action {
     pub const POLICY_LOADED: &str = "policy.loaded";
     /// Рабочая копия восстановлена из чекпоинта.
     pub const CHECKPOINT_RESTORED: &str = "checkpoint.restored";
+    /// Экспозиция Rule of Two (R1-C2 D106): запись аудита, не причина одобрения —
+    /// вызов идёт по режиму (решение заказчика 2026-11-11).
+    pub const RULE_OF_TWO: &str = "rule_of_two";
 }
 
 /// Детекторы зацикливания: поле `detector` события `loop.detected` (R1-B2 D63) и

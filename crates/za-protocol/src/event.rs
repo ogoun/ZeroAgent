@@ -65,6 +65,16 @@ pub enum EventKind {
     CheckpointCreated,
     /// Инструмент изменил файл проекта.
     FileChanged,
+    /// Из ввода удалены невидимые символы (R1-C2 D102): `source`, `removed`.
+    InputCleaned,
+    /// Обращение сетевого шлюза (R1-C2 D112): `url`, `outcome`.
+    WebRequest,
+    /// Изменилась экспозиция Rule of Two (R1-C2 D106).
+    ExposureChanged,
+    /// Каталог скиллов run собран (R1-C2): найденные и пропущенные.
+    SkillCatalog,
+    /// Скилл загружен в контекст (R1-C2).
+    SkillActivated,
     Unknown(String),
 }
 
@@ -99,6 +109,11 @@ impl EventKind {
             Self::GrantAdded => "grant.added",
             Self::CheckpointCreated => "checkpoint.created",
             Self::FileChanged => "file.changed",
+            Self::InputCleaned => "input.cleaned",
+            Self::WebRequest => "web.request",
+            Self::ExposureChanged => "exposure.changed",
+            Self::SkillCatalog => "skill.catalog",
+            Self::SkillActivated => "skill.activated",
             Self::Unknown(s) => s,
         }
     }
@@ -133,6 +148,11 @@ impl EventKind {
             "grant.added" => Self::GrantAdded,
             "checkpoint.created" => Self::CheckpointCreated,
             "file.changed" => Self::FileChanged,
+            "input.cleaned" => Self::InputCleaned,
+            "web.request" => Self::WebRequest,
+            "exposure.changed" => Self::ExposureChanged,
+            "skill.catalog" => Self::SkillCatalog,
+            "skill.activated" => Self::SkillActivated,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -243,6 +263,21 @@ mod tests {
             (GrantAdded, "grant.added"),
             (CheckpointCreated, "checkpoint.created"),
             (FileChanged, "file.changed"),
+        ] {
+            assert_eq!(k.as_str(), name);
+            assert_eq!(EventKind::parse(name), k);
+        }
+    }
+
+    #[test]
+    fn r1c2_kinds_round_trip() {
+        use EventKind::*;
+        for (k, name) in [
+            (InputCleaned, "input.cleaned"),
+            (WebRequest, "web.request"),
+            (ExposureChanged, "exposure.changed"),
+            (SkillCatalog, "skill.catalog"),
+            (SkillActivated, "skill.activated"),
         ] {
             assert_eq!(k.as_str(), name);
             assert_eq!(EventKind::parse(name), k);

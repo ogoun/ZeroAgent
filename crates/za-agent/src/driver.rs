@@ -53,7 +53,7 @@ use za_llm::{
 use za_protocol::{
     Actor, BlobHash, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId,
     RunMode, RunRole, RunStatus, Seq, Tier, alert_kind, canonical_json, detector, detector_action,
-    fail_reason, pause_reason, taint_origin,
+    fail_reason, input_source, pause_reason, taint_origin,
 };
 use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
@@ -88,6 +88,7 @@ use crate::turn::{
 };
 use za_core::Checkpointer;
 use za_core::paths::Roots;
+use za_core::text::{Clean, clean_invisible};
 use za_secrets::SecretMasker;
 
 /// Точки «сбоя» для тестов и --crash-at (D33).
@@ -410,7 +411,7 @@ pub async fn start_run(
 async fn step_zero(
     deps: &LoopDeps,
     run: RunId,
-    spec: RunSpec,
+    mut spec: RunSpec,
     ctl: ControlRx,
     generation: u64,
 ) -> Result<LoopState, LoopError> {
@@ -437,6 +438,18 @@ async fn step_zero(
     };
     let mut ctx = RunCtx::new(store.clone(), run);
     let mut last_seq = None;
+    // D102, SEC-051: задача — без невидимых символов до первого сообщения, снимка и
+    // разбора `/имя`; число удалённых — `input.cleaned`.
+    if let Some((task, removed)) = clean_input(&spec.task) {
+        spec.task = task;
+        last_seq = Some(input_cleaned(&deps.journal, run, input_source::TASK, removed).await?);
+    }
+    // Текст `AGENTS.md` (или `CLAUDE.md`) — до `fit_agents_md` и замороженного префикса.
+    // Чистит драйвер, а не бинарник: событие пишется в журнал уже созданного run.
+    if let Some((md, removed)) = spec.agents_md.as_deref().and_then(clean_input) {
+        spec.agents_md = Some(md);
+        last_seq = Some(input_cleaned(&deps.journal, run, input_source::AGENTS_MD, removed).await?);
+    }
 
     // Снимок памяти — эффект: внешнее значение входит в цикл только так (D9, D24).
     let budget_tokens = memory_budget(n_ctx);
@@ -1074,22 +1087,33 @@ async fn push_inbox(
                     tracing::warn!(seq, "пустой ввод пользователя пропущен");
                     continue;
                 }
+                // D102: невидимые символы — до истории и до разбора `/имя`.
+                let text = clean_inbox(deps, st, text).await?;
+                if text.is_empty() {
+                    tracing::warn!(
+                        seq,
+                        "ввод пользователя из одних невидимых символов пропущен"
+                    );
+                    continue;
+                }
                 // Текст пользователя — как есть, только управляющий тег экранируется:
                 // ввод не выдаёт себя за голос рантайма (D23).
-                let text = escape_untrusted(text);
+                let text = escape_untrusted(&text);
                 st.conv.push_user(text.clone())?;
                 push_input(&store_of(deps), st, &text, false).await?;
                 // Ввод пользователя сбрасывает окно повтора (Ruling I-3 ревью задачи 6).
                 st.detectors.on_user_input();
             }
             Inbox::Correct { note, command, .. } => {
+                // D102: поправка — тоже ввод пользователя.
+                let note = clean_inbox(deps, st, note).await?;
                 st.conv.push_user(render_control(
                     ControlFrom::User,
                     ControlAction::Correct,
                     command,
-                    note,
+                    &note,
                 ))?;
-                push_input(&store_of(deps), st, &escape_untrusted(note), true).await?;
+                push_input(&store_of(deps), st, &escape_untrusted(&note), true).await?;
                 st.detectors.on_user_input();
                 // D36: тот же `command`, что в `control.requested`.
                 st.last_seq = append(
@@ -1104,6 +1128,44 @@ async fn push_inbox(
         }
     }
     Ok(())
+}
+
+/// Очистка ввода `inbox` (D102, `Clean::Input`): удалённые символы — `input.cleaned
+/// {source: "input"}`. Реплей границы повторяет событие, как `control.applied`.
+async fn clean_inbox(deps: &LoopDeps, st: &mut LoopState, text: &str) -> Result<String, LoopError> {
+    match clean_input(text) {
+        Some((clean, removed)) => {
+            st.last_seq =
+                input_cleaned(&deps.journal, st.run, input_source::INPUT, removed).await?;
+            Ok(clean)
+        }
+        None => Ok(text.to_owned()),
+    }
+}
+
+/// Текст без невидимых символов уровня `Clean::Input` и их число; `None` — текст чист.
+fn clean_input(text: &str) -> Option<(String, usize)> {
+    match clean_invisible(text, Clean::Input) {
+        (_, 0) => None,
+        (clean, removed) => Some((clean.into_owned(), removed)),
+    }
+}
+
+/// Событие `input.cleaned {source, removed}` (D102).
+async fn input_cleaned(
+    j: &Journal,
+    run: RunId,
+    source: &str,
+    removed: usize,
+) -> Result<Seq, StoreError> {
+    append(
+        j,
+        run,
+        Actor::Runtime,
+        EventKind::InputCleaned,
+        json!({ "source": source, "removed": removed }),
+    )
+    .await
 }
 
 /// Повторное чтение ввода после компакции на границе (Ruling I-2): эффект `inbox`

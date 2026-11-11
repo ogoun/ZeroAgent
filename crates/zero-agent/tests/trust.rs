@@ -390,6 +390,39 @@ fn claude_md_is_fallback() {
     assert!(!system.contains(&format!("{MARK} claude")), "{system}");
 }
 
+/// D102, SEC-051: невидимые символы `AGENTS.md` доверенного проекта удаляются до
+/// system; число удалённых — `input.cleaned {source: "agents_md"}`.
+#[test]
+fn agents_md_hidden_chars_removed() {
+    let (srv, e) = run_env("agents-md-hidden", paris);
+    std::fs::write(
+        e.project.join("AGENTS.md"),
+        format!("{MARK} a\u{E0041}\u{E0042}b"),
+    )
+    .unwrap();
+    e.trust();
+    let o = e.run_cmd(&["Вопрос"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let run = run_id(&o);
+    let system = e.snapshot(run)["frozen"]["system"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(system.contains(&format!("{MARK} ab")), "{system}");
+    assert!(!system.contains('\u{E0041}'), "{system:?}");
+    assert!(!system_of(&srv.bodies()[0]).contains('\u{E0041}'));
+    let cleaned: Vec<Value> = e
+        .events(run)
+        .into_iter()
+        .filter(|(k, _)| *k == za_protocol::EventKind::InputCleaned)
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(
+        cleaned,
+        [serde_json::json!({"source": "agents_md", "removed": 2})]
+    );
+}
+
 #[test]
 fn agents_md_flag_gives_hint() {
     let e = env_in("zero-agent-trust-run", "agents-md-flag", "");

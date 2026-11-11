@@ -36,7 +36,6 @@
 //! Квитанция эффекта — [`ToolOutput`] с признаками пакета ([`Receipt`]); в результат для
 //! модели текст идёт через [`escape_untrusted`] (D23, D94).
 
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -51,6 +50,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use za_core::interrupt::{self, InterruptState};
 use za_core::paths::{self, PathError, ResolvedPath, Roots};
+use za_core::text::{Clean, clean_invisible};
 use za_core::{
     Access, Approval, CheckpointRequest, Checkpointer, EffectError, EffectSlot, EffectSpec, Gate,
     Interrupt, InterruptKind, Journal, Postcondition, RawPath, RiskClass, RunCtx, Subjects, Tool,
@@ -1850,10 +1850,16 @@ impl Live {
         // (10) Метки происхождения и невидимые символы (D82, SEC-051).
         let origins = origins_of(&spec, &subjects, &raw, &now, &roots, out.taint.as_deref());
         let tainted = !origins.is_empty();
-        out.content = clean_invisible(&out.content, tainted).into_owned();
+        // D102: прежнее поведение — теги из любого результата, остальное — из помеченного.
+        let level = if tainted {
+            Clean::Untrusted
+        } else {
+            Clean::Tags
+        };
+        out.content = clean_invisible(&out.content, level).0.into_owned();
         out.digest = out
             .digest
-            .map(|d| clean_invisible(&d, tainted).into_owned());
+            .map(|d| clean_invisible(&d, level).0.into_owned());
         if tainted {
             out.content = format!("{}\n{}", untrusted_line(&origins), out.content);
         }
@@ -1905,30 +1911,6 @@ fn origins_of(
         set.insert(taint_origin::NETWORK.to_owned());
     }
     set.into_iter().collect()
-}
-
-/// Невидимые символы (SEC-051): теги U+E0000–U+E007F — из любого результата; нулевой
-/// ширины и bidi — из помеченного (U+FEFF в самом начале остаётся: это BOM).
-fn clean_invisible(s: &str, tainted: bool) -> Cow<'_, str> {
-    let drop = |i: usize, c: char| {
-        let u = c as u32;
-        (0xE0000..=0xE007F).contains(&u)
-            || (tainted
-                && ((0x200B..=0x200F).contains(&u)
-                    || (0x2060..=0x2064).contains(&u)
-                    || (u == 0xFEFF && i > 0)
-                    || (0x202A..=0x202E).contains(&u)
-                    || (0x2066..=0x2069).contains(&u)))
-    };
-    if !s.char_indices().any(|(i, c)| drop(i, c)) {
-        return Cow::Borrowed(s);
-    }
-    Cow::Owned(
-        s.char_indices()
-            .filter(|&(i, c)| !drop(i, c))
-            .map(|(_, c)| c)
-            .collect(),
-    )
 }
 
 /// Проверка постусловий (TOOL-004) в `spawn_blocking`; итог — описания нарушенных.
@@ -2191,15 +2173,6 @@ mod tests {
     fn finish_status_checked() {
         assert!(finish_args(&json!({"status": "done", "result": "r"})).is_ok());
         assert!(finish_args(&json!({"status": "ok", "result": "r"})).is_err());
-    }
-
-    #[test]
-    fn invisible_chars_cleaned() {
-        let tag = "a\u{E0041}b";
-        assert_eq!(clean_invisible(tag, false), "ab");
-        let zw = "\u{FEFF}x\u{200B}y\u{202E}z\u{FEFF}";
-        assert_eq!(clean_invisible(zw, false), zw);
-        assert_eq!(clean_invisible(zw, true), "\u{FEFF}xyz");
     }
 
     #[test]

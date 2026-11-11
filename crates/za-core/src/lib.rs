@@ -22,6 +22,9 @@
 //! и классифицирует необратимые и сетевые (D77, D81), [`Checkpointer`] — контракт чекпоинта рабочей
 //! копии (D89).
 //!
+//! Модуль [`text`] удаляет невидимые символы Unicode из результатов инструментов,
+//! ввода пользователя и `AGENTS.md` (SEC-051, D102).
+//!
 //! [`run_demo`] — детерминированный демонстрационный run для сквозной проверки
 //! журнала и протокола эффектов, [`replay_hash`] — хэш его значимых событий.
 
@@ -34,6 +37,7 @@ pub mod interrupt;
 pub mod paths;
 mod recovery;
 mod runtime;
+pub mod text;
 mod tool;
 
 pub use bus::{AgentEvent, EventBus, Journal};
