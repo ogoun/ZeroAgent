@@ -117,6 +117,7 @@ impl Cx {
             project_dir: self.root.clone(),
             call_id: format!("c{}", self.step),
             effect_key: EffectKey::derive(self.run, self.step, 1),
+            paths: Vec::new(),
         }
     }
 }

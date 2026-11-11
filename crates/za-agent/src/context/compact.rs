@@ -226,6 +226,11 @@ pub struct CompactInput<'a> {
     pub last_next_step: &'a str,
     /// Аварийный вход (D49) сразу; иначе — только после `ContextOverflow` запроса.
     pub emergency: bool,
+    /// Текст блока `<grants>` run (R1-C1 D78, `grants_text`): рецитация после компакции
+    /// повторяет гранты, в том числе выданные посреди run; `None` — без блока.
+    pub grants: Option<&'a str>,
+    /// Маска секретов сводки модели до квитанции (D100).
+    pub masker: Option<&'a za_secrets::SecretMasker>,
 }
 
 /// Итог компакции: история новой эпохи и её данные.
@@ -325,6 +330,7 @@ pub async fn compact(
             sig,
             CallKind::Compact,
             None,
+            input.masker,
         )
         .await
         {
@@ -388,12 +394,16 @@ pub async fn compact(
         let text = users.last().map_or(input.goal, |(t, _)| t.as_str());
         clip(text, n_ctx / USER_MESSAGES_DIVISOR)
     };
-    let recitation = render_control(
+    let mut recitation = render_control(
         ControlFrom::Runtime,
         ControlAction::Reminder,
         "",
         &format!("{RECITATION}{current}"),
     );
+    if let Some(g) = input.grants {
+        recitation.push_str("\n\n");
+        recitation.push_str(&crate::request::grants_block(g));
+    }
     let conv = input
         .conv
         .rebased(

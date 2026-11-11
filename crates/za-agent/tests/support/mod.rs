@@ -42,6 +42,9 @@ pub async fn within_for<T>(base: Duration, what: &str, f: impl Future<Output = T
         .unwrap_or_else(|_| panic!("не дождались в срок: {what}"))
 }
 
+/// Заглушки нативных инструментов с контрактом D74 (R1-C1 задача 12).
+pub mod stub;
+
 #[path = "../../../../test-support/unique_dir.rs"]
 mod unique;
 

@@ -8,8 +8,10 @@
 //! шаблоны `<env>`, `<task>` и `<control>` (PRM-006).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use za_core::Tool;
 use za_llm::{Effort, ReasoningMode};
 use za_protocol::{RunId, RunRole, Tier};
 
@@ -128,6 +130,10 @@ const RUNTIME_TEXTS: &[(&str, &str)] = &[
         "runtime/driver.truncated_nudge",
         crate::driver::TRUNCATED_NUDGE,
     ),
+    (
+        "runtime/spill.digest_pointer",
+        crate::context::SPILL_DIGEST_POINTER,
+    ),
     ("runtime/spill.not_saved", crate::context::SPILL_NOT_SAVED),
     ("runtime/spill.omitted", crate::context::SPILL_OMITTED),
     ("runtime/spill.search", crate::context::SPILL_SEARCH),
@@ -170,9 +176,31 @@ pub fn runtime_texts() -> Vec<(&'static str, String)> {
 /// (`*.txt`) и текстов рантайма (`runtime/…`) не пересекаются. В `v1` (R1-B1) текстов
 /// рантайма не было.
 pub fn prompt_texts_hash() -> String {
+    prompt_texts_hash_for(&[])
+}
+
+/// [`runtime_texts`] и тексты инструментов run (`Tool::texts`, R1-C1 D94) в порядке имён;
+/// одноимённые тексты двух инструментов — один раз (первый по порядку `tools`).
+pub fn runtime_texts_with(tools: &[Arc<dyn Tool>]) -> Vec<(&'static str, String)> {
+    let mut out = runtime_texts();
+    for t in tools {
+        for (name, text) in t.texts() {
+            if !out.iter().any(|(n, _)| *n == name) {
+                out.push((name, text));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(b.0));
+    out
+}
+
+/// [`prompt_texts_hash`] с текстами инструментов run (D94): `freeze` пишет его в
+/// `FrozenPrefix.texts_hash`. Без инструментов с текстами — то же, что
+/// [`prompt_texts_hash`].
+pub fn prompt_texts_hash_for(tools: &[Arc<dyn Tool>]) -> String {
     let mut h = blake3::Hasher::new();
     h.update(b"za-prompts-v2\0");
-    let runtime = runtime_texts();
+    let runtime = runtime_texts_with(tools);
     let files = PROMPT_FILES.iter().map(|(n, t)| (*n, *t));
     for (name, text) in files.chain(runtime.iter().map(|(n, t)| (*n, t.as_str()))) {
         for part in [name.as_bytes(), text.as_bytes()] {
@@ -293,6 +321,8 @@ pub struct TaskBlock {
     pub handoff: String,
     /// `{zam_brief}` шаблона.
     pub memory: String,
+    /// `{grants}` шаблона: текст `grants_text` без тегов (R1-C1 D78) — теги `<grants>`
+    /// даёт сам шаблон, удвоения нет.
     pub grants: String,
 }
 

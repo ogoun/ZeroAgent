@@ -27,8 +27,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use za_agent::{
-    EnvInfo, LoopDeps, LoopError, LoopOutcome, NoMemory, ResumeChange, RunSpec, WorkMode,
-    builtin_tools, control_channel, git_branch, resume_run, start_run,
+    EnvInfo, LoopDeps, LoopError, LoopOutcome, ResumeChange, RunSpec, WorkMode, builtin_tools,
+    control_channel, git_branch, resume_run, start_run,
 };
 use za_core::{
     AgentEvent, EventBus, InterruptKind, Journal, ToolRegistry, UnknownDecision, resolve_unknown,
@@ -466,8 +466,12 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 agents_md,
                 env: env_info(&project),
                 context: cfg.context.clone(),
+                // Доверие и гранты бинарник подаёт в задаче 13 (D83, D78); до неё нативных
+                // команд в наборе нет, а консервативное «не доверен» ничего не открывает.
+                trusted: false,
+                grants: Vec::new(),
             };
-            let (deps, bus) = deps(&store, &gateway, tools);
+            let (deps, bus) = deps(&store, &gateway, tools, &masker);
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
             let outcome = drive(&bus, fut, &ctl, args.crash, masker).await;
@@ -493,7 +497,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             } else {
                 None
             };
-            let (deps, bus) = deps(&store, &gateway, tools);
+            let (deps, bus) = deps(&store, &gateway, tools, &masker);
             // Новый канал управления на каждый resume: `start_run` и `resume_run` забирают
             // `ControlRx`, а Ctrl+C управляет этим `RunControl` (Carry M2 задачи 12).
             let (ctl, rx) = control_channel(store.clone(), r.run);
@@ -502,6 +506,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 budget,
                 input: r.input,
                 run_mode: None,
+                ..ResumeChange::default()
             };
             let fut = resume_run(&deps, r.run, change, rx);
             let outcome = drive(&bus, fut, &ctl, args.crash, masker).await;
@@ -521,17 +526,16 @@ fn deps(
     store: &ProjectStore,
     gateway: &Arc<za_llm::Gateway>,
     tools: ToolRegistry,
+    masker: &SecretMasker,
 ) -> (LoopDeps, EventBus) {
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
-    let deps = LoopDeps {
-        journal: Journal::new(store.clone(), bus.clone()),
-        model: Arc::clone(gateway) as Arc<dyn za_llm::ModelPort>,
-        tools: Arc::new(tools),
-        capabilities: Vec::new(),
-        memory: Arc::new(NoMemory),
-        crash: None,
-        fault: None,
-    };
+    let mut deps = LoopDeps::new(
+        Journal::new(store.clone(), bus.clone()),
+        Arc::clone(gateway) as Arc<dyn za_llm::ModelPort>,
+        Arc::new(tools),
+    );
+    // D100: ответ модели и результаты инструментов маскируются до квитанции.
+    deps.masker = Some(Arc::new(masker.clone()));
     (deps, bus)
 }
 

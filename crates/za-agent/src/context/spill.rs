@@ -124,6 +124,48 @@ pub fn spill(
     Ok(r)
 }
 
+/// Начало строки-указателя после сжатого представления вывода (R1-C1 D75, D86).
+pub(crate) const DIGEST_POINTER: &str = "[output digest; full output: ";
+
+/// Выгрузка вывода со сжатым представлением (R1-C1 D86): в файл — исходный вывод `raw`,
+/// в контекст — `digest` (экранированный, при длине сверх лимита — голова и хвост) и
+/// строка `[output digest; full output: search <путь>]`. `save = false` — файла нет
+/// (`ToolEnv::spill = None`): строка `[output digest; full output: full output not saved]`.
+pub(crate) fn spill_digest(
+    project_dir: Option<&Path>,
+    name: &str,
+    digest: &str,
+    raw: &str,
+    limit_bytes: usize,
+) -> io::Result<SpillResult> {
+    let (pointer, path) = match project_dir {
+        Some(dir) => {
+            write_spill(dir, name, raw.as_bytes())?;
+            let path = spill_path(name);
+            (format!("{SEARCH}{path}"), Some(path))
+        }
+        None => (NOT_SAVED.to_owned(), None),
+    };
+    let line = format!("{DIGEST_POINTER}{pointer}]");
+    let budget = limit_bytes.saturating_sub(line.len() + 1);
+    let body = if digest.len() <= budget {
+        digest.to_owned()
+    } else {
+        cut(digest, budget, &pointer).content
+    };
+    let mut content = body;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&line);
+    Ok(SpillResult {
+        content,
+        path,
+        omitted_lines: 0,
+        omitted_bytes: 0,
+    })
+}
+
 /// Голова, строка пропуска и хвост текста длиннее `limit` (D44). Строка пропуска —
 /// `… omitted N lines; {pointer}` или `… omitted N bytes; {pointer}`; `path` итога — `None`.
 pub(crate) fn cut(s: &str, limit: usize, pointer: &str) -> SpillResult {

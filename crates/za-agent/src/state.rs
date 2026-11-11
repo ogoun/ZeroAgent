@@ -4,7 +4,7 @@
 //! сохраняемая часть: история хранится блобами по BLAKE3 и в снимке остаётся
 //! списком хэшей (D4), поэтому снимок на каждой границе не растёт как O(n²).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use za_core::RunCtx;
@@ -15,13 +15,16 @@ use crate::context::{ContextMeter, UserInput};
 use crate::conversation::Conversation;
 use crate::detect::DetectorState;
 use crate::exit::LoopExit;
+use crate::policy::{Grant, PolicySnapshot};
 use crate::request::{FrozenPrefix, RunSetup};
 use crate::tools::FinishArgs;
 use crate::turn::{Reviewed, Signals};
 
-/// Версия формата снимка: 2 — R1-B2 (D66). Снимок версии 1 (R1-B1) читается: новые
-/// поля — по умолчанию, `resume` восстанавливает их разбором истории.
-pub const SNAPSHOT_V: u32 = 2;
+/// Версия формата снимка: 3 — R1-C1 (D92: политика, доверие, гранты, метки). Снимки
+/// версий 2 (R1-B2) и 1 (R1-B1) читаются: новые поля — по умолчанию (проект не доверен,
+/// меток и грантов нет, политика пустая), у версии 1 `resume` восстанавливает поля R1-B2
+/// разбором истории.
+pub const SNAPSHOT_V: u32 = 3;
 
 /// С чего resume продолжает run (D4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +84,21 @@ pub struct Snapshot {
     /// Состояние детекторов повтора, цикла и застоя (D54–D56).
     #[serde(default)]
     pub detectors: DetectorState,
+    /// Снимок политики run (R1-C1 D80, D92).
+    #[serde(default)]
+    pub policy: PolicySnapshot,
+    /// Проект доверен (D83).
+    #[serde(default)]
+    pub trusted: bool,
+    /// Пользователь отказал проекту в доверии (D83).
+    #[serde(default)]
+    pub trust_refused: bool,
+    /// Гранты run (D78).
+    #[serde(default)]
+    pub grants: Vec<Grant>,
+    /// Происхождения недоверенного содержимого (D82).
+    #[serde(default)]
+    pub taint: BTreeSet<String>,
 }
 
 /// Счётчики цикла, переживающие resume.
@@ -127,6 +145,12 @@ pub struct AtBoundary {
     /// `boundary`): блок — в конце границы этого шага, ключ после записанных эффектов
     /// (R1-C1, Ruling I1).
     pub state_late: Option<u64>,
+    /// Политика resume со снимка `Model` (R1-C1 D92): с границы.
+    pub policy: Option<PolicySnapshot>,
+    /// Доверие resume со снимка `Model`: с границы.
+    pub trusted: Option<bool>,
+    /// Гранты resume со снимка `Model`: с границы.
+    pub grants_add: Vec<Grant>,
 }
 
 /// Состояние цикла в памяти; узлы графа работают над ним (S в Graph<S, LoopError>).
@@ -186,9 +210,53 @@ pub struct LoopState {
     pub last_next_step: String,
     /// Состояние детекторов (D54–D56).
     pub detectors: DetectorState,
+    /// Снимок политики run (R1-C1 D80, D92).
+    pub policy: PolicySnapshot,
+    /// Проект доверен (D83).
+    pub trusted: bool,
+    /// Пользователь отказал проекту в доверии (D83).
+    pub trust_refused: bool,
+    /// Гранты run (D78).
+    pub grants: Vec<Grant>,
+    /// Происхождения недоверенного содержимого run (D82).
+    pub taint: BTreeSet<String>,
 }
 
 impl LoopState {
+    /// Изменения политики, доверия и грантов (resume, D92). Доверие снимает метку
+    /// `untrusted_project` (D82) и прежний отказ; отказ в доверии — `trust_refused`.
+    pub fn apply_policy_change(
+        &mut self,
+        policy: Option<PolicySnapshot>,
+        trusted: Option<bool>,
+        grants_add: Vec<Grant>,
+    ) {
+        if let Some(p) = policy {
+            self.policy = p;
+        }
+        match trusted {
+            Some(true) => self.trust_granted(),
+            Some(false) => {
+                self.trusted = false;
+                self.trust_refused = true;
+            }
+            None => {}
+        }
+        for g in grants_add {
+            if !self.grants.contains(&g) {
+                self.grants.push(g);
+            }
+        }
+    }
+
+    /// Доверие дано (D83): метка недоверенного проекта снимается.
+    pub fn trust_granted(&mut self) {
+        self.trusted = true;
+        self.trust_refused = false;
+        self.taint
+            .remove(za_protocol::taint_origin::UNTRUSTED_PROJECT);
+    }
+
     /// Снимок текущего состояния; v = [`SNAPSHOT_V`]. История — `refs` последнего `persist`.
     pub fn snapshot(&self, next: Next, exit: Option<PendingExit>) -> Snapshot {
         Snapshot {
@@ -212,6 +280,11 @@ impl LoopState {
             epoch: self.epoch,
             last_next_step: self.last_next_step.clone(),
             detectors: self.detectors.clone(),
+            policy: self.policy.clone(),
+            trusted: self.trusted,
+            trust_refused: self.trust_refused,
+            grants: self.grants.clone(),
+            taint: self.taint.clone(),
         }
     }
 }

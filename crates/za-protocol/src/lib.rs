@@ -6,6 +6,7 @@ pub mod canonical;
 pub mod effect;
 pub mod event;
 pub mod ids;
+pub mod mask;
 pub mod mode;
 pub mod resource;
 pub mod run;
@@ -15,6 +16,7 @@ pub use canonical::canonical_json;
 pub use effect::{EffectClass, EffectKey};
 pub use event::{Actor, Event, EventKind, NewEvent, SCHEMA_V};
 pub use ids::{BlobHash, EventId, RunId, Seq};
+pub use mask::{mask_json_with, mask_str_with};
 pub use mode::{RunMode, Tier};
 pub use resource::Priority;
 pub use run::{

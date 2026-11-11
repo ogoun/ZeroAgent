@@ -116,13 +116,15 @@ fn fx(name: &str) -> Fx {
     }))
     .unwrap();
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), bus.clone()),
-        model: model.clone(),
-        tools: Arc::new(reg),
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
         fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), bus.clone()),
+            model.clone(),
+            Arc::new(reg),
+        )
     };
     let run = RunId::new();
     let (ctl, rx) = control_channel(store.clone(), run);
@@ -164,6 +166,8 @@ fn spec() -> RunSpec {
             branch: "main".into(),
         },
         context: za_agent::ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 

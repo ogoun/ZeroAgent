@@ -745,6 +745,12 @@ impl Tool for BashTool {
     }
 
     fn subjects(&self, args: &Value) -> Subjects {
+        self.subjects_in(Path::new(LEX_ROOT), args)
+    }
+
+    /// Предметы относительно настоящего корня проекта (пакет вызовов, D77): абсолютный
+    /// путь внутри проекта — не внешний, перенаправление в него — не `overwrite`.
+    fn subjects_in(&self, root: &Path, args: &Value) -> Subjects {
         let Some(cmd) = args.get("cmd").and_then(Value::as_str) else {
             return Subjects::default();
         };
@@ -754,7 +760,6 @@ impl Tool for BashTool {
         // добавляет `unparsed` и снимает применимость `allow` ко всем сегментам.
         let mut segs = shell::segments(cmd, d);
         let suspicious = self.shell.suspicious(cmd);
-        let root = Path::new(LEX_ROOT);
         // `cwd` вне проекта сдвигает и относительные пути: граница — от него.
         let outside = |w: &str| match cwd {
             Some(c) if is_relative(w) => outside_lex(root, &format!("{c}/{w}")),

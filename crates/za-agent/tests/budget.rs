@@ -148,13 +148,15 @@ fn fx(name: &str) -> Fx {
     .unwrap();
     let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
-        model: model.clone(),
-        tools: Arc::new(reg),
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
         fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
+            model.clone(),
+            Arc::new(reg),
+        )
     };
     Fx {
         store,
@@ -190,6 +192,8 @@ fn spec(budget: Budget) -> RunSpec {
             branch: "main".into(),
         },
         context: za_agent::ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 

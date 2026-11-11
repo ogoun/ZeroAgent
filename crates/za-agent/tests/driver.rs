@@ -147,13 +147,11 @@ fn fx_on(store: ProjectStore, model: ScriptedModel, extra: Vec<Arc<dyn Tool>>) -
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
     let journal = Journal::new(store.clone(), bus.clone());
     let deps = LoopDeps {
-        journal,
-        model: model.clone(),
-        tools: Arc::new(registry(extra)),
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
         fault: None,
+        ..LoopDeps::new(journal, model.clone(), Arc::new(registry(extra)))
     };
     let run = RunId::new();
     let (ctl, rx) = control_channel(store.clone(), run);
@@ -202,6 +200,8 @@ fn spec(role: RunRole) -> RunSpec {
             branch: "main".into(),
         },
         context: za_agent::ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 

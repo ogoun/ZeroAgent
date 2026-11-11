@@ -562,13 +562,15 @@ fn fx_with(name: &str, model: ScriptedModel) -> Fx {
     }
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), bus.clone()),
-        model: timed.clone(),
-        tools: Arc::new(reg),
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
         fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), bus.clone()),
+            timed.clone(),
+            Arc::new(reg),
+        )
     };
     Fx {
         store,
@@ -610,6 +612,8 @@ fn spec_mode(role: RunRole, run_mode: RunMode) -> RunSpec {
             branch: "main".into(),
         },
         context: ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 

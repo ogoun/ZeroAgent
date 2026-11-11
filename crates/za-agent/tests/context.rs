@@ -44,13 +44,15 @@ fn fx(name: &str, model: ScriptedModel) -> Fx {
         reg.register(t).unwrap();
     }
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
-        model: model.clone(),
-        tools: Arc::new(reg),
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
         fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
+            model.clone(),
+            Arc::new(reg),
+        )
     };
     Fx {
         store,
@@ -90,6 +92,8 @@ fn spec() -> RunSpec {
             branch: "main".into(),
         },
         context: ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 

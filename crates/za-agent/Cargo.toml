@@ -13,6 +13,8 @@ workspace = true
 za-protocol = { path = "../za-protocol" }
 za-store = { path = "../za-store" }
 za-core = { path = "../za-core" }
+# Маска секретов результатов и ответа модели (R1-C1 D90, D100); разрешено политикой D73.
+za-secrets = { path = "../za-secrets" }
 # Без функций по умолчанию: без HTTP и `Gateway`, модель — только через `ModelPort`
 # (проверяется `cargo xtask policy` и шагом CI `cargo check -p za-agent`).
 za-llm = { path = "../za-llm", default-features = false }

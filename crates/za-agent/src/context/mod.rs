@@ -29,8 +29,8 @@ pub use compact::{COMPACT_RUBRIC, CompactInput, Compacted, compact, summary_bloc
 pub use prune::prune;
 pub(crate) use prune::{PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES};
 pub(crate) use spill::{
-    NOT_SAVED as SPILL_NOT_SAVED, OMITTED as SPILL_OMITTED, SEARCH as SPILL_SEARCH,
-    cut as spill_cut,
+    DIGEST_POINTER as SPILL_DIGEST_POINTER, NOT_SAVED as SPILL_NOT_SAVED, OMITTED as SPILL_OMITTED,
+    SEARCH as SPILL_SEARCH, cut as spill_cut, spill_digest,
 };
 pub use spill::{SPILL_DIR, SpillCfg, SpillResult, spill, spill_limit_bytes, spill_name};
 

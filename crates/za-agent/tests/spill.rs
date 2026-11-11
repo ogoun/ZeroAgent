@@ -231,16 +231,16 @@ async fn spill_survives_replay() {
         calls: Arc::clone(&calls),
     }))
     .unwrap();
-    let env = ToolEnv {
+    let env = ToolEnv::new(
         run,
-        project_dir: d.clone(),
-        mode: RunMode::Ask,
-        parallel: false,
-        spill: Some(SpillCfg {
+        d.clone(),
+        RunMode::Ask,
+        false,
+        Some(SpillCfg {
             n_ctx: 8192,
             share: 0.15,
         }),
-    };
+    );
     let planned = [PlannedCall {
         call: ToolCall {
             id: "c1".into(),
@@ -565,6 +565,8 @@ fn run_spec(project: &Path) -> RunSpec {
             branch: "main".into(),
         },
         context: ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 
@@ -617,13 +619,15 @@ async fn threshold_run(
     }))
     .unwrap();
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
-        model: model.clone(),
-        tools: Arc::new(reg),
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
         fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
+            model.clone(),
+            Arc::new(reg),
+        )
     };
     // Ходы 1–5 без расхода (базы нет, оценка всего запроса мала); ход 6 сообщает
     // input 2400: на границе 7 оценка = 2400 + 4000 / 100 + 4 = 2444.
@@ -868,16 +872,16 @@ async fn linked_work_dir_output_not_saved() {
         calls: Arc::new(AtomicUsize::new(0)),
     }))
     .unwrap();
-    let env = ToolEnv {
+    let env = ToolEnv::new(
         run,
-        project_dir: project.clone(),
-        mode: RunMode::Ask,
-        parallel: false,
-        spill: Some(SpillCfg {
+        project.clone(),
+        RunMode::Ask,
+        false,
+        Some(SpillCfg {
             n_ctx: 8192,
             share: 0.15,
         }),
-    };
+    );
     let planned = [PlannedCall {
         call: ToolCall {
             id: "c1".into(),

@@ -333,13 +333,15 @@ fn fx(name: &str) -> Fx {
     }
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), bus),
-        model: model.clone(),
-        tools: Arc::new(reg),
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
         fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), bus),
+            model.clone(),
+            Arc::new(reg),
+        )
     };
     Fx {
         store,
@@ -375,6 +377,8 @@ fn spec() -> RunSpec {
             branch: "main".into(),
         },
         context: ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 

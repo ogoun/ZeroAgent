@@ -77,17 +77,19 @@ pub use prompt::{
     AGENTS_MD_LIMIT, BRANCH_MAX_CHARS, BudgetCase, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo,
     LEFT_ANGLES, MODE_LIMIT, PROMPT_VERSION, RIGHT_ANGLES, TaskBlock, WorkMode, agents_md_budget,
     approx_tokens, budget_cases, env_in_role_limit, escape_untrusted, fit_agents_md, git_branch,
-    max_env, mode_overlay, prompt_files, prompt_texts_hash, reasoning_for, render_control,
-    render_env, render_task, role_core, role_limit, runtime_texts, upper_tokens, utility_rules,
+    max_env, mode_overlay, prompt_files, prompt_texts_hash, prompt_texts_hash_for, reasoning_for,
+    render_control, render_env, render_task, role_core, role_limit, runtime_texts,
+    runtime_texts_with, upper_tokens, utility_rules,
 };
 pub use request::{
     BlockHashes, BlockSizes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions,
-    build_request, first_message, freeze, request_hash,
+    build_request, first_message, first_message_with, freeze, grants_block, request_hash,
 };
 pub use resume::{ResumeChange, resume_run, state_block};
 pub use state::{AtBoundary, Counters, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};
 pub use tools::{
-    ASK_USER_TOOL, FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, builtin_tools, run_tools,
+    ASK_USER_TOOL, FINISH_TOOL, FinishArgs, REQUEST_GRANT_TOOL, ToolEnv, ToolsOutcome, TrustSetFn,
+    UNTRUSTED_MARK, builtin_tools, request_grant_tool, run_tools,
 };
 pub use turn::{
     COMPACT_EFFECT, CallVerdict, ControlFlags, DELTA_FLUSH_AFTER, DELTA_FLUSH_BYTES, DeltaBuffer,

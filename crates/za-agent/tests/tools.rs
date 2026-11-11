@@ -210,13 +210,7 @@ fn planned(id: &str, name: &str, args: Value) -> PlannedCall {
 }
 
 fn env(run: RunId, mode: RunMode, parallel: bool) -> ToolEnv {
-    ToolEnv {
-        run,
-        project_dir: PathBuf::from("."),
-        mode,
-        parallel,
-        spill: None,
-    }
+    ToolEnv::new(run, PathBuf::from("."), mode, parallel, None)
 }
 
 fn result_of(p: &Part) -> (&str, &str, bool) {
@@ -386,7 +380,8 @@ async fn tool_events_written_live_only() {
     );
     assert_eq!(
         ev[0].2,
-        json!({"call_id": "c1", "name": "echo", "effect_key": format!("{run}:0:0")})
+        json!({"call_id": "c1", "name": "echo", "effect_key": format!("{run}:0:0"),
+            "arguments": {"x": 1}, "decision": {"action": "allow"}})
     );
     assert_eq!((&ev[1].0, ev[1].1), (&EventKind::ToolFinished, Actor::Tool));
     assert_eq!(ev[1].2["call_id"], "c1");

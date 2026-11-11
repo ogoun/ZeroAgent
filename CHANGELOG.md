@@ -5,6 +5,10 @@
 ## Не выпущено
 
 ### Добавлено
+- `za-agent` (R1-C1, задача 12): пакет вызовов под политикой. Решение — перед каждым вызовом, после предыдущих вызовов пакета (ссылка, созданная `bash` в том же ответе, учитывается); путь разрешается ещё раз в слоте, сменивший класс путь даёт `path changed since planning; call again`. Внешний путь без гранта — вопрос `outside_project` (и для чтения), защищённый путь через ссылку или junction — `denied: protected path`. Недоверенный проект: чтение и правки по режиму, первая команда — прерывание `trust-…` с `{project, files, set_hash}`; отказ — `denied: untrusted project` у каждой команды без нового вопроса. Метка `[untrusted content: …]` у результатов с внешним путём, сетевой командой или меткой инструмента, `tool.finished.tainted`; невидимые символы (теги, нулевой ширины, bidi) снимаются. Чекпоинт перед `Edit`/`Exec` (`checkpoint.created`), `boundary.outside`, `file.changed`, постусловия результата, `digest` вместо головы и хвоста при выгрузке, `output_limit` без выгрузки. Секреты маскируются в результатах, ответе модели (до квитанции), `tool.started.arguments`, payload одобрения и `model.delta`.
+- `za-agent`: встроенный инструмент `request_grant(path, mode, reason)` (top, тир standard): прерывание одобрения с причиной `grant`, результат `granted: <mode> access to <path>`, событие и аудит `grant.added`; гранты — в снимке run, в блоке `<grants>` первого сообщения top и в рецитации после компакции.
+- `za-agent`: `LoopDeps::new`, `ToolEnv::new` с умолчаниями R1-B; `LoopDeps.{policy, roots, checkpointer, masker, trust_set}`, `RunSpec.{trusted, grants}`, `ResumeChange.{policy, trusted, grants_add}` (со снимка посреди шага — с ближайшей границы), `CrashPoint::InTool`, `prompt_texts_hash_for`, `runtime_texts_with`.
+- `za-core`: `ToolCx.paths` (разрешённые пакетом пути вызова), `Tool::subjects_in` (предметы от настоящего корня проекта). `za-protocol`: `mask_json_with`, `mask_str_with` — общий обход маски строк JSON.
 - `za-agent` (R1-C1, задача 11): движок политики `decide` — правила `allow`/`ask`/`deny` по инструменту, пути и разобранной команде, гранты доступа вне проекта (`ro`/`rw`), защищённые места (`ZA_HOME`, `.zero-agent/` кроме `work/`, `.git/`), вопрос о доверии перед командами недоверенного проекта, метка `tainted`, режим `bypass` (не снимает необратимое и путь вне проекта). `PolicySnapshot` с хэшем, `grants_text`, `parse_grant_flag`. Подключение к пакету вызовов — задача 12.
 - `zero-agent`: раздел `[policy]` глобального `config.toml` — `allow_bypass`, `[[policy.rules]]`, `[[policy.grants]]`; ошибки с путём поля (`policy.rules[0]`).
 - `za-core`: `paths::protected_place`, `paths::in_za_home`.
@@ -16,6 +20,8 @@
 - `za-protocol`: `checkpoint_reason` — причины пропуска чекпоинта.
 
 ### Изменено
+- `za-agent`: снимок run версии 3 (политика, доверие, отказ в доверии, гранты, метки); снимки версий 1 и 2 читаются (проект не доверен, меток и грантов нет, политика пустая). Решение политики, оставившее след в журнале (намерение эффекта вызова, прерывание доверия или одобрения), при реплее берётся из журнала, а не вычисляется заново. Хэш текстов промптов (`r1c1.1`) включает тексты пакета и тексты инструментов run (`Tool::texts`); первое сообщение top содержит `<grants>`.
+- `za-tools`: `bash` считает лексическую границу команды от настоящего корня проекта (`subjects_in`): абсолютный путь внутри проекта больше не даёт лишнего вопроса.
 - `za-agent`: версия промптов `r1c1.1` — в хэш промптов вошли тексты политики для модели (`denied: protected path`, `denied: policy rule`, `denied: untrusted project`, блок `<grants>`).
 - `zero-agent`: ключи `Gateway` берутся из кэша `StoreSecrets`, прочитанного при старте команды, вместо `EnvSecrets`; для пользователя правило `ZA_SECRET_<KEY_REF>` прежнее. `journal export` и `audit` маскируют и шаблоны ключей, а не только значения `ZA_SECRET_*` из окружения выгрузки (ревью задачи 4, m4); печать ответа `run` проходит ту же маску.
 

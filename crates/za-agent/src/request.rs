@@ -275,7 +275,28 @@ pub fn freeze(
 /// текст задачи top или готовый блок `<task>` субагента (уже экранирован
 /// `render_task`) и вставляется как есть.
 pub fn first_message(env: &EnvInfo, memory: Option<&str>, task: &str) -> String {
+    first_message_with(env, None, memory, task)
+}
+
+/// Блок `<grants>` (R1-C1 D78): `text` — [`crate::grants_text`] (пути уже экранированы).
+pub fn grants_block(text: &str) -> String {
+    format!("<grants>\n{text}\n</grants>")
+}
+
+/// [`first_message`] с блоком `<grants>` после `<env>` (D78, у top): `grants` — текст
+/// [`crate::grants_text`] без тегов. Worker и orchestrator получают гранты в слоте
+/// `<grants>` своего `<task>` (`render_task`), поэтому им `None`.
+pub fn first_message_with(
+    env: &EnvInfo,
+    grants: Option<&str>,
+    memory: Option<&str>,
+    task: &str,
+) -> String {
     let mut out = render_env(env);
+    if let Some(g) = grants {
+        out.push_str("\n\n");
+        out.push_str(&grants_block(g));
+    }
     if let Some(m) = memory.filter(|m| !m.trim().is_empty()) {
         out.push_str("\n\n<memory>\n");
         out.push_str(&escape_untrusted(m));

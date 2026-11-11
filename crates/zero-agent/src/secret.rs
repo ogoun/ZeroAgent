@@ -111,47 +111,9 @@ impl fmt::Debug for StoreSecrets {
 /// Значение JSON, в котором замаскированы все строки и ключи объектов (D90, D100):
 /// аргументы вызовов, payload событий, записи аудита. Маскируются декодированные
 /// значения строк; при выводе `serde_json` кодирует их обратно. Строка, которая сама —
-/// текст JSON (`raw_arguments`), обрабатывается [`mask_str`].
+/// текст JSON (`raw_arguments`), обходит общий [`za_protocol::mask_json_with`].
 pub fn mask_json(m: &SecretMasker, v: &Value) -> Value {
-    match v {
-        Value::String(s) => Value::String(mask_str(m, s)),
-        Value::Array(a) => Value::Array(a.iter().map(|x| mask_json(m, x)).collect()),
-        Value::Object(o) => Value::Object(
-            o.iter()
-                .map(|(k, x)| (m.mask(k).into_owned(), mask_json(m, x)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-/// Строка, которая может быть текстом JSON (ревью задачи 10, I2). Сначала маска сырого
-/// текста: экранирование JSON сканер считает границей слова, байты текста сохраняются.
-/// Если строка — объект или массив JSON, проверяются и её декодированные строки: секрет,
-/// скрытый экранированием (`\u0067hp_…`), маскируется, и текст кодируется заново из
-/// маскированного значения.
-fn mask_str(m: &SecretMasker, s: &str) -> String {
-    let raw = m.mask(s).into_owned();
-    let t = s.trim_start();
-    if !(t.starts_with('{') || t.starts_with('[')) {
-        return raw;
-    }
-    let Ok(decoded) = serde_json::from_str::<Value>(s) else {
-        return raw;
-    };
-    let reencode = |v: &Value| serde_json::to_string(v).unwrap_or_else(|_| raw.clone());
-    match serde_json::from_str::<Value>(&raw) {
-        Ok(parsed) => {
-            let again = mask_json(m, &parsed);
-            if again == parsed {
-                raw
-            } else {
-                reencode(&again)
-            }
-        }
-        // Маска сломала текст JSON (блок PEM без END до конца строки): из декодированного.
-        Err(_) => reencode(&mask_json(m, &decoded)),
-    }
+    za_protocol::mask_json_with(&|s: &str| m.mask(s).into_owned(), v)
 }
 
 /// Строка списка `secret list`: имя, задан ли, переменная окружения.

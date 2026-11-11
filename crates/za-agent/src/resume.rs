@@ -32,6 +32,7 @@ use crate::driver::{
     BOUNDARY, DEFAULT_N_CTX, LoopDeps, LoopError, LoopOutcome, MODEL, STATE_EFFECT, fail,
     n_ctx_changed, n_ctx_unknown, run_graph, run_registry, run_tools_of,
 };
+use crate::policy::{Grant, PolicySnapshot};
 use crate::prompt::escape_untrusted;
 use crate::state::{AtBoundary, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};
 use crate::turn::{COMPACT_EFFECT, MODEL_EFFECT};
@@ -47,6 +48,12 @@ pub struct ResumeChange {
     /// Ввод пользователя: `turn.input` (`queue`) до первой границы.
     pub input: Option<String>,
     pub run_mode: Option<RunMode>,
+    /// Новый снимок политики (R1-C1 D92): со снимка `Model` — с ближайшей границы.
+    pub policy: Option<PolicySnapshot>,
+    /// Доверие к проекту (D83): `Some(true)` снимает `untrusted_project`; с границы.
+    pub trusted: Option<bool>,
+    /// Новые гранты (`run --grant` при resume, D78): с границы.
+    pub grants_add: Vec<Grant>,
 }
 
 /// Длина аргументов вызова в блоке `<state>`, символы.
@@ -55,6 +62,8 @@ const STATE_ARGS_CHARS: usize = 120;
 const STATE_PAGE: usize = 512;
 /// Версия снимка R1-B1 (D66): читается.
 const SNAPSHOT_V1: u32 = 1;
+/// Версия снимка R1-B2 (R1-C1 D92): читается, поля R1-C1 — по умолчанию.
+const SNAPSHOT_V2: u32 = 2;
 /// Начало управляющего сообщения рантайма: не ввод пользователя (D66).
 pub(crate) const RUNTIME_CONTROL: &str = "<control from=\"runtime\"";
 /// Начало поправки пользователя (A.6, `prompts/control.txt`).
@@ -131,7 +140,10 @@ pub async fn resume_run(
         return Err(fail_broken(deps, run, status, generation, e).await);
     };
     let ver = v.get("v").and_then(Value::as_u64);
-    if ver != Some(u64::from(SNAPSHOT_V)) && ver != Some(u64::from(SNAPSHOT_V1)) {
+    if ![SNAPSHOT_V, SNAPSHOT_V2, SNAPSHOT_V1]
+        .iter()
+        .any(|v| ver == Some(u64::from(*v)))
+    {
         let shown = ver.map_or_else(|| "?".to_owned(), |n| n.to_string());
         return Err(LoopError::Snapshot(format!("версия снимка {shown}")));
     }
@@ -198,6 +210,9 @@ pub async fn resume_run(
                 run_mode: change.run_mode,
                 resume_note: false,
                 state_late: None,
+                policy: change.policy,
+                trusted: change.trusted,
+                grants_add: change.grants_add,
             };
             MODEL
         }
@@ -231,6 +246,7 @@ pub async fn resume_run(
             if let Some(m) = change.run_mode {
                 st.setup.run_mode = m;
             }
+            st.apply_policy_change(change.policy, change.trusted, change.grants_add);
             st.at_boundary.resume_note = true;
             st.at_boundary.state_late = late;
             BOUNDARY
@@ -355,6 +371,11 @@ async fn restore(
         user_inputs,
         epoch: snap.epoch,
         last_next_step: snap.last_next_step,
+        policy: snap.policy,
+        trusted: snap.trusted,
+        trust_refused: snap.trust_refused,
+        grants: snap.grants,
+        taint: snap.taint,
         detectors: {
             // D62: кэш сервера за время паузы или на новом эндпоинте не тот, что был.
             let mut d = snap.detectors;
@@ -388,6 +409,13 @@ fn split_first_message(text: &str) -> (String, String) {
     };
     let env = text[..end].to_owned();
     let mut rest = text[end..].strip_prefix("\n\n").unwrap_or(&text[end..]);
+    // Блок `<grants>` top (R1-C1 D78): пути в нём экранированы, `\n</grants>` не встречается.
+    if let Some(g) = rest.strip_prefix("<grants>\n")
+        && let Some(i) = g.find("\n</grants>")
+    {
+        let after = &g[i + "\n</grants>".len()..];
+        rest = after.strip_prefix("\n\n").unwrap_or(after);
+    }
     if let Some(m) = rest.strip_prefix("<memory>\n")
         && let Some(i) = m.find("\n</memory>")
     {

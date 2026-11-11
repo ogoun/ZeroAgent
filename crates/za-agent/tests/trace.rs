@@ -150,13 +150,15 @@ fn fx(name: &str) -> Fx {
         inner: ScriptedModel::new(default_caps(BackendKind::LlamaCpp)).with_context(N_CTX),
     });
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
-        model: model.clone(),
-        tools: Arc::new(registry()),
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
         fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
+            model.clone(),
+            Arc::new(registry()),
+        )
     };
     Fx {
         store,
@@ -193,6 +195,8 @@ fn spec(project: &std::path::Path) -> RunSpec {
             branch: "main".into(),
         },
         context: ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 

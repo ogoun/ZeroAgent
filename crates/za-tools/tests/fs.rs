@@ -85,6 +85,7 @@ fn cx(root: &Path, run: RunId) -> ToolCx {
         project_dir: root.to_path_buf(),
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 1, 1),
+        paths: Vec::new(),
     }
 }
 

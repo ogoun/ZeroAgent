@@ -193,13 +193,15 @@ fn fx_in(d: &std::path::Path) -> Fx {
     }))
     .unwrap();
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), bus.clone()),
-        model: model.clone(),
-        tools: Arc::new(reg),
         capabilities: Vec::new(),
         memory: Arc::new(NoMemory),
         crash: None,
         fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), bus.clone()),
+            model.clone(),
+            Arc::new(reg),
+        )
     };
     Fx {
         store,
@@ -240,6 +242,8 @@ fn spec(mode: RunMode, budget: Budget) -> RunSpec {
             branch: "main".into(),
         },
         context: ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 
@@ -1071,12 +1075,12 @@ async fn broken_snapshot_fails_other_version_does_not() {
     // Снимок другой версии: статус не меняется, его может прочитать новая версия.
     let (f, last, _) = paused_run("other_version").await;
     f.store
-        .save_snapshot(f.run, last, json!({"v": 3}))
+        .save_snapshot(f.run, last, json!({"v": 4}))
         .await
         .unwrap();
     let err = resume(&f, ResumeChange::default()).await.unwrap_err();
     assert!(
-        matches!(&err, LoopError::Snapshot(s) if s == "версия снимка 3"),
+        matches!(&err, LoopError::Snapshot(s) if s == "версия снимка 4"),
         "{err:?}"
     );
     assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
@@ -1111,7 +1115,7 @@ async fn snapshot_v1_boundary_continues() {
     };
     assert_eq!(resume(&f, change).await.unwrap(), paused("provider"));
     let (_, snap) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(snap.v, 2);
+    assert_eq!(snap.v, 3);
     assert_eq!(snap.next, Next::Boundary);
     assert_eq!(snap.user_inputs.len(), 1);
     let v1 = as_v1(&snap);
@@ -1124,7 +1128,7 @@ async fn snapshot_v1_boundary_continues() {
         done("ок")
     );
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 2);
+    assert_eq!(after.v, 3);
     assert_eq!(after.task, "Задача");
     assert!(after.env_text.starts_with("<env>\n"), "{}", after.env_text);
     assert!(after.env_text.ends_with("\n</env>"), "{}", after.env_text);
@@ -1187,7 +1191,7 @@ async fn snapshot_v1_mid_step_continues() {
         EffectKey::derive(f.run, 1, 1).0
     );
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 2);
+    assert_eq!(after.v, 3);
     assert_eq!(after.task, "Задача");
     // PRM-010 (ревью задачи 5): run R1-B1 продолжает с версией своего префикса.
     for r in &reqs {
@@ -1220,7 +1224,7 @@ async fn snapshot_v1_approval_continues() {
     assert_eq!(cs.len(), 1, "ход R1-B1 вызван заново");
     assert!(cs[0].request.max_output_tokens.is_some());
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 2);
+    assert_eq!(after.v, 3);
     // Новый ход после обновления — с версией замороженного префикса R1-B1 (PRM-010).
     let evs = events(&f.store, f.run).await;
     let reqs = of_kind(&evs, EventKind::ModelRequest);

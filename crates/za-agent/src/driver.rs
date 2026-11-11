@@ -53,7 +53,7 @@ use za_llm::{
 use za_protocol::{
     Actor, BlobHash, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId,
     RunMode, RunRole, RunStatus, Seq, Tier, alert_kind, canonical_json, detector, detector_action,
-    fail_reason, pause_reason,
+    fail_reason, pause_reason, taint_origin,
 };
 use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
@@ -71,20 +71,25 @@ use crate::detect::{
 };
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
+use crate::policy::{Grant, PolicySnapshot, grants_text};
+use crate::prompt::prompt_texts_hash_for;
 use crate::prompt::{
     ControlAction, ControlFrom, EnvInfo, WorkMode, escape_untrusted, reasoning_for, render_control,
     render_control_trusted, render_env,
 };
 use crate::request::{
-    FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message, freeze,
+    FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message_with, freeze,
 };
 use crate::resume::state_block;
 use crate::state::{AtBoundary, Counters, LoopState, Next, PendingExit};
-use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, run_tools_with};
+use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools};
 use crate::turn::{
     CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed, Signal,
-    TurnError, TurnOutput, model_turn_with, output_tps, report_parse_errors, review,
+    TurnError, TurnOutput, model_turn_masked, output_tps, report_parse_errors, review,
 };
+use za_core::Checkpointer;
+use za_core::paths::Roots;
+use za_secrets::SecretMasker;
 
 /// Точки «сбоя» для тестов и --crash-at (D33).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +112,9 @@ pub enum CrashPoint {
     /// эффект `inbox` шага (ввод после компакции на границе) записан, снимка `Model`
     /// ещё нет (R1-C1, Ruling I1)
     AfterInbox { step: u64 },
+    /// внутри слота вызова шага (R1-C1 D92): `tool.started` записан; при `after_call` —
+    /// инструмент уже вызван. Future слота бросается: квитанции нет
+    InTool { step: u64, after_call: bool },
 }
 
 /// true — драйвер немедленно возвращает Err(LoopError::Halted) без единой записи.
@@ -146,6 +154,50 @@ pub struct LoopDeps {
     pub crash: Option<CrashHook>,
     /// Разовые сбои журнала в тестах (D72); в продукте `None`.
     pub fault: Option<FaultHook>,
+    /// Политика нового run (R1-C1 D80); resume берёт её из снимка (D92).
+    pub policy: PolicySnapshot,
+    /// Канонические корни run (D76); пустой проект — корни из `RunSpec.project_dir` без
+    /// канонизации ([`crate::tools::fallback_roots`]).
+    pub roots: Roots,
+    /// Чекпоинт перед `Edit` и `Exec` (D89); `None` — без чекпоинтов.
+    pub checkpointer: Option<Arc<dyn Checkpointer>>,
+    /// Маска секретов (D90, D100); `None` — без маски.
+    pub masker: Option<Arc<SecretMasker>>,
+    /// Набор доверенных файлов для прерывания `Trust` (D83); `None` — пустой.
+    pub trust_set: Option<TrustSetFn>,
+}
+
+impl LoopDeps {
+    /// Зависимости с умолчаниями R1-B: без capability, памяти, крюков, политики,
+    /// чекпоинтов и маски; корни — от `RunSpec.project_dir`.
+    pub fn new(journal: Journal, model: Arc<dyn ModelPort>, tools: Arc<ToolRegistry>) -> Self {
+        Self {
+            journal,
+            model,
+            tools,
+            capabilities: Vec::new(),
+            memory: Arc::new(crate::memory::NoMemory),
+            crash: None,
+            fault: None,
+            policy: PolicySnapshot::default(),
+            roots: Roots {
+                project: PathBuf::new(),
+                za_home: PathBuf::new(),
+            },
+            checkpointer: None,
+            masker: None,
+            trust_set: None,
+        }
+    }
+
+    /// Корни run: заданные или [`crate::tools::fallback_roots`] от корня проекта.
+    pub(crate) fn roots_for(&self, project_dir: &std::path::Path) -> Roots {
+        if self.roots.project.as_os_str().is_empty() {
+            crate::tools::fallback_roots(project_dir)
+        } else {
+            self.roots.clone()
+        }
+    }
 }
 
 /// Параметры нового run.
@@ -169,6 +221,10 @@ pub struct RunSpec {
     /// Раздел `[context]` (R1-B2 D65): замораживается на run в `RunSetup.context`.
     /// Тир: `tier` (флаг `--tier`) важнее `context.tier`, тот — размера окна.
     pub context: ContextConfig,
+    /// Проект доверен (D83); недоверенный run стартует с меткой `untrusted_project`.
+    pub trusted: bool,
+    /// Гранты run (`--grant`, `[[policy.grants]]`, D78).
+    pub grants: Vec<Grant>,
 }
 
 /// Итог цикла.
@@ -414,12 +470,14 @@ async fn step_zero(
 
     let registry = run_registry(deps)?;
     let (tools, classes) = run_tools_of(&registry, spec.role, tier);
-    let frozen = freeze(
+    let mut frozen = freeze(
         &setup,
         &tools,
         &deps.capabilities,
         spec.agents_md.as_deref(),
     )?;
+    // D94: тексты инструментов run (`Tool::texts`) входят в хэш промптов.
+    frozen.texts_hash = prompt_texts_hash_for(&registry.for_run(spec.role, tier));
     let frozen_ref = put_json(&store, &frozen).await?;
 
     let mut env = spec.env.clone();
@@ -427,8 +485,16 @@ async fn step_zero(
     env.n_ctx = n_ctx;
     env.budget = budget_text(&spec.budget);
     let env_text = render_env(&env);
+    let roots = deps.roots_for(&spec.project_dir);
+    // D78: top получает `<grants>` после `<env>`; субагент — в слоте своего `<task>`.
+    let grants = (spec.role == RunRole::Top).then(|| grants_text(&spec.grants, &roots.project));
     let mut conv = Conversation::default();
-    conv.push_user(first_message(&env, memory_text.as_deref(), &spec.task))?;
+    conv.push_user(first_message_with(
+        &env,
+        grants.as_deref(),
+        memory_text.as_deref(),
+        &spec.task,
+    ))?;
     let refs = conv.persist(&store).await?.refs;
 
     let last_seq = match last_seq {
@@ -469,6 +535,16 @@ async fn step_zero(
         epoch: 0,
         last_next_step: String::new(),
         detectors: DetectorState::default(),
+        policy: deps.policy.clone(),
+        trusted: spec.trusted,
+        trust_refused: false,
+        grants: spec.grants,
+        // D82, Ruling 7.20: недоверенный проект помечен с шага 0.
+        taint: if spec.trusted {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([taint_origin::UNTRUSTED_PROJECT.to_owned()])
+        },
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
@@ -674,7 +750,12 @@ async fn apply_exit(
     let j = &deps.journal;
     let run = st.run;
     let ab = &st.at_boundary;
-    if ab.budget.is_some() || ab.run_mode.is_some() {
+    if ab.budget.is_some()
+        || ab.run_mode.is_some()
+        || ab.policy.is_some()
+        || ab.trusted.is_some()
+        || !ab.grants_add.is_empty()
+    {
         // Resume со снимка `Model` отложил их до границы, а run остановился раньше:
         // изменения не применены и в снимок не попали (M1 ревью задачи 15).
         tracing::warn!(run = %run, budget = ?ab.budget, run_mode = ?ab.run_mode,
@@ -888,6 +969,10 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     if let Some(m) = st.at_boundary.run_mode.take() {
         st.setup.run_mode = m;
     }
+    // Политика, доверие и гранты resume (D92) — тоже с границы.
+    let (policy, trusted) = (st.at_boundary.policy.take(), st.at_boundary.trusted.take());
+    let grants_add = std::mem::take(&mut st.at_boundary.grants_add);
+    st.apply_policy_change(policy, trusted, grants_add);
     // Шаг R1-B1 доработан: следующие ходы — с параметрами R1-B2 (D66).
     st.legacy_step = false;
     // (1) Сигналы до шага (D9): Input отброшен — ввод прочитает сама граница.
@@ -1415,6 +1500,9 @@ async fn run_compaction(
     reason: &str,
 ) -> Result<CompactStep, LoopError> {
     let deps = &sh.deps;
+    // D78: рецитация после компакции повторяет гранты top (и выданные посреди run).
+    let recite_grants = (st.setup.role == RunRole::Top)
+        .then(|| grants_text(&st.grants, &deps.roots_for(&st.setup.project_dir).project));
     let r = compact(
         &mut st.ctx,
         &deps.journal,
@@ -1430,6 +1518,8 @@ async fn run_compaction(
             user_inputs: &st.user_inputs,
             last_next_step: &st.last_next_step,
             emergency,
+            grants: recite_grants.as_deref(),
+            masker: deps.masker.as_deref(),
         },
         st.turn,
         &mut st.sig,
@@ -1747,7 +1837,7 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             prompt_version: st.frozen.prompt_version.clone(),
         };
         let mut watch = stream_watch(st, &call.request.reasoning);
-        let r = model_turn_with(
+        let r = model_turn_masked(
             &mut st.ctx,
             &deps.journal,
             deps.model.as_ref(),
@@ -1757,6 +1847,7 @@ async fn model_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             &mut st.sig,
             Some(&mut watch),
             attempt,
+            deps.masker.as_deref(),
         )
         .await;
         // Квитанция эффекта записана (успех, ошибка модели или обрыв) — точка сбоя D33.
@@ -2079,19 +2170,30 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             n_ctx: st.setup.n_ctx,
             share: st.setup.context.spill_share,
         }),
+        policy: Arc::new(st.policy.clone()),
+        roots: Arc::new(deps.roots_for(&st.setup.project_dir)),
+        trusted: st.trusted,
+        trust_refused: st.trust_refused,
+        taint: st.taint.clone(),
+        grants: Arc::new(st.grants.clone()),
+        checkpointer: deps.checkpointer.clone(),
+        masker: deps.masker.clone(),
+        crash: deps.crash.clone(),
+        fault: deps.fault.clone(),
+        step: st.ctx.step(),
+        trust_set: deps.trust_set.clone(),
     };
     // Флаги наблюдаются рядом с пакетом (D26): `pausing`/`cancelling` пишутся сразу,
     // не дожидаясь конца идущего инструмента. На сигналы пакет реагирует сам.
     let mut flags = st.sig.flags();
     let r = {
-        let batch = run_tools_with(
+        let batch = run_tools(
             &mut st.ctx,
             &deps.journal,
             &sh.registry,
             &env,
             &rev.calls,
             &mut st.sig,
-            deps.fault.clone(),
         );
         tokio::pin!(batch);
         let mut watching = true;
@@ -2127,13 +2229,25 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             }
         }
     };
-    let out = match r {
+    let mut out = match r {
         Ok(o) => o,
         Err(e) => {
             st.exit = Some(effect_exit(e)?);
             return Ok(Transition::Done);
         }
     };
+    // Точка сбоя внутри слота (D92): ни одной записи после неё.
+    if out.halted {
+        return Err(LoopError::Halted);
+    }
+    // Состояние пакета (D78, D82, D83): метки, гранты, доверие.
+    st.taint.append(&mut out.taint);
+    st.grants.append(&mut out.grants);
+    match out.trusted {
+        Some(true) => st.trust_granted(),
+        Some(false) => st.trust_refused = true,
+        None => {}
+    }
     // `ToolsOutcome` не различает Pause и Input: решают флаги (Carry к задаче 12/14).
     let flags = *st.sig.flags().borrow();
     let verdict = tools_verdict(&out, flags)?;
@@ -3051,22 +3165,17 @@ mod tests {
         LoopState,
     ) {
         use crate::control::control_channel;
-        use crate::memory::NoMemory;
         use za_core::EventBus;
         use za_llm::{BackendKind, ScriptedModel, default_caps};
 
         let dir = unit_dir(name);
         let store = ProjectStore::open(&dir).unwrap();
         let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
-        let deps = LoopDeps {
-            journal: Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
-            model: model.clone(),
-            tools: Arc::new(ToolRegistry::default()),
-            capabilities: Vec::new(),
-            memory: Arc::new(NoMemory),
-            crash: None,
-            fault: None,
-        };
+        let deps = LoopDeps::new(
+            Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
+            model.clone(),
+            Arc::new(ToolRegistry::default()),
+        );
         let run = RunId::new();
         let spec = RunSpec {
             project_id: "p".into(),
@@ -3093,6 +3202,8 @@ mod tests {
                 branch: "main".into(),
             },
             context: ContextConfig::default(),
+            trusted: true,
+            grants: Vec::new(),
         };
         store
             .create_run(NewRun {

@@ -159,13 +159,15 @@ fn fx_in(d: &Path, model: ScriptedModel, memory: Arc<dyn MemoryPort>) -> Fx {
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
     let release = Arc::new(Semaphore::new(0));
     let deps = LoopDeps {
-        journal: Journal::new(store.clone(), bus.clone()),
-        model: model.clone(),
-        tools: Arc::new(registry(&release)),
         capabilities: Vec::new(),
         memory,
         crash: None,
         fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), bus.clone()),
+            model.clone(),
+            Arc::new(registry(&release)),
+        )
     };
     Fx {
         store,
@@ -224,6 +226,8 @@ fn spec() -> RunSpec {
             branch: "main".into(),
         },
         context: ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
     }
 }
 
@@ -877,6 +881,8 @@ async fn emergency_input_fits_window() {
                 user_inputs: &[],
                 last_next_step: "",
                 emergency: true,
+                grants: None,
+                masker: None,
             },
             0,
             &mut sig,
@@ -1396,6 +1402,8 @@ async fn direct_compact(
                 user_inputs: &user_inputs,
                 last_next_step: "",
                 emergency,
+                grants: None,
+                masker: None,
             },
             0,
             &mut sig,

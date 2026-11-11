@@ -34,6 +34,7 @@ use za_llm::{
     StreamEvent, ToolCall, ToolSchema, Usage, WaitState,
 };
 use za_protocol::{Actor, BlobHash, EffectClass, EventKind, NewEvent, RunId};
+use za_secrets::SecretMasker;
 use za_store::{StoreError, UsageRow};
 
 use crate::detect::{Degenerate, StreamWatch};
@@ -442,8 +443,59 @@ pub async fn model_turn_with(
             attempt: turn_attempt,
         },
         watch,
+        None,
     )
     .await
+}
+
+/// [`model_turn_with`] с маскировкой секретов ответа до квитанции (R1-C1 D100).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn model_turn_masked(
+    ctx: &mut RunCtx,
+    j: &Journal,
+    model: &dyn ModelPort,
+    call: ModelCall,
+    refs: &RequestRefs,
+    turn: u32,
+    sig: &mut Signals,
+    watch: Option<&mut StreamWatch>,
+    turn_attempt: u32,
+    masker: Option<&SecretMasker>,
+) -> Result<TurnOutput, TurnError> {
+    model_call(
+        ctx,
+        j,
+        model,
+        call,
+        refs,
+        turn,
+        sig,
+        CallKind::Turn {
+            attempt: turn_attempt,
+        },
+        watch,
+        masker,
+    )
+    .await
+}
+
+/// Маска ответа модели (D100): текст, рассуждение, аргументы вызовов (`arguments` и
+/// `raw_arguments`). Всё, что строится из истории, дальше уже маскировано.
+pub(crate) fn mask_message(m: &SecretMasker, msg: &mut Message) {
+    let text = |s: &str| m.mask(s).into_owned();
+    for p in &mut msg.parts {
+        match p {
+            Part::Text(t) => *t = text(t),
+            Part::Reasoning { text: t, .. } => *t = text(t),
+            Part::ToolCall(c) => {
+                c.arguments = za_protocol::mask_json_with(&text, &c.arguments);
+                if let Some(raw) = &c.raw_arguments {
+                    c.raw_arguments = Some(za_protocol::mask_str_with(&text, raw));
+                }
+            }
+            Part::ToolResult { content, .. } => *content = text(content),
+        }
+    }
 }
 
 /// Вид вызова модели (R1-B2 D46, D67).
@@ -471,6 +523,7 @@ pub(crate) async fn model_call(
     sig: &mut Signals,
     kind: CallKind,
     watch: Option<&mut StreamWatch>,
+    masker: Option<&SecretMasker>,
 ) -> Result<TurnOutput, TurnError> {
     // До резервирования: ошибка хэша не занимает ключ эффекта.
     let request = request_hash(&call.request).map_err(TurnError::Request)?;
@@ -510,6 +563,7 @@ pub(crate) async fn model_call(
         key: &key,
         request: &request,
         refs,
+        masker,
     };
     let mut store_failure: Option<StoreError> = None;
     let failure = &mut store_failure;
@@ -518,9 +572,16 @@ pub(crate) async fn model_call(
     let (r, source) = slot
         .run_fallible(spec, move || async move {
             match live.run(model, call, sig, watch).await {
-                Ok(out) => serde_json::to_value(&out).map_err(|e| {
-                    EffectFailure::Transient(format!("итог хода не сериализуется: {e}"))
-                }),
+                Ok(mut out) => {
+                    // D100: квитанция хранит маскированный ответ, реплей от набора
+                    // секретов не зависит.
+                    if let Some(m) = masker {
+                        mask_message(m, &mut out.message);
+                    }
+                    serde_json::to_value(&out).map_err(|e| {
+                        EffectFailure::Transient(format!("итог хода не сериализуется: {e}"))
+                    })
+                }
                 Err(Live::Model { error, last_wait }) => {
                     let body = ModelFailure { error, last_wait };
                     match serde_json::to_string(&body) {
@@ -638,6 +699,8 @@ struct LiveTurn<'a> {
     key: &'a str,
     request: &'a str,
     refs: &'a RequestRefs,
+    /// Маска дельт `model.delta` по фрагментам (D100, best effort).
+    masker: Option<&'a SecretMasker>,
 }
 
 /// Состояние стрима одного хода.
@@ -909,6 +972,10 @@ impl LiveTurn<'_> {
 
     async fn write_delta(&self, attempt: u32, field: &str, chunk: String) -> Result<(), Live> {
         let mut payload = json!({"turn": self.turn, "effect_key": self.key, "attempt": attempt});
+        let chunk = match self.masker {
+            Some(m) => m.mask(&chunk).into_owned(),
+            None => chunk,
+        };
         payload[field] = Value::String(chunk);
         self.append(Actor::Model, EventKind::ModelDelta, payload)
             .await
