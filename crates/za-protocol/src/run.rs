@@ -161,7 +161,7 @@ pub mod checkpoint_kind {
 pub mod checkpoint_reason {
     /// git не уложился в `CHECKPOINT_TIMEOUT`; до конца run чекпоинты git не делаются.
     pub const SLOW: &str = "slow";
-    /// Проект не в репозитории git, игнорируется git или недоверен (`Exec`).
+    /// В корне проекта нет `.git` или проект недоверен (`Exec`).
     pub const NO_GIT: &str = "no_git";
     /// git нет в `PATH`.
     pub const GIT_NOT_FOUND: &str = "git_not_found";
@@ -171,9 +171,6 @@ pub mod checkpoint_reason {
     pub const GIT_ERROR: &str = "git_error";
     /// Сбой ввода-вывода при копии файлов (подробности — в логе).
     pub const IO_ERROR: &str = "io_error";
-    /// Репозиторий не прошёл статическую проверку (подключение файлов, частичный клон,
-    /// ключи-команды, данные вне проекта, сетевые пути): git не вызывается.
-    pub const GIT_REPO_UNSAFE: &str = "git_repo_unsafe";
     /// Новых байт больше предела чекпоинта.
     pub const TOO_LARGE: &str = "too_large";
 }

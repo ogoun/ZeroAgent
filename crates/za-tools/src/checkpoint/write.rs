@@ -169,15 +169,17 @@ fn finish_inner(
         create_parents_checked(&t.r)?;
         None
     };
-    if let Some(p) = target_perms(old.as_ref(), mode) {
-        file.set_permissions(p)?;
-    }
+    // Сначала группа, потом права: `chown` не-root на Linux снимает setgid и setuid
+    // (N9), поэтому права ставятся последними — как у `edit`.
     #[cfg(unix)]
     if let Some(m) = &old {
         use std::os::unix::fs::MetadataExt;
         if let Err(e) = std::os::unix::fs::fchown(&file, None, Some(m.gid())) {
             tracing::warn!(path = %t.r.path.display(), error = %e, "группа файла не сохранена");
         }
+    }
+    if let Some(p) = target_perms(old.as_ref(), mode) {
+        file.set_permissions(p)?;
     }
     let perms = file.metadata()?.permissions();
     drop(file);

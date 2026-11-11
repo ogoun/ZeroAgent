@@ -173,6 +173,11 @@ async fn run_raw(mut spec: CommandSpec) -> Result<Raw, RunnerError> {
     }
     // Обязательна: без неё Job Object не получает `KILL_ON_JOB_CLOSE` (D73).
     cmd.wrap(KillOnDrop);
+    // Дескриптор файла вывода — до запуска: ошибка не оставляет живого процесса (N8).
+    let mut out_file = match &spec.stdout_file {
+        Some(f) => Some(tokio::fs::File::from_std(f.try_clone()?)),
+        None => None,
+    };
     let spawned = {
         // Linux: запуск и регистрация лидера — под замком сбора зомби, чтобы субрипер не
         // собрал лидера, которого ждёт tokio.
@@ -206,10 +211,6 @@ async fn run_raw(mut spec: CommandSpec) -> Result<Raw, RunnerError> {
     let stderr = child.stderr().take();
     // Вход забирается из спецификации, а не копируется (M9 ревью задачи 9).
     let stdin = child.stdin().take().zip(spec.stdin.take());
-    let mut out_file = match &spec.stdout_file {
-        Some(f) => Some(tokio::fs::File::from_std(f.try_clone()?)),
-        None => None,
-    };
     let mut out = Capture::default();
     let mut err = Capture::default();
     let deadline = started
@@ -563,10 +564,10 @@ mod unix {
             .mode(0o600)
             .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
             .open(&tmp)
-            .and_then(|mut f| {
-                f.write_all(text)?;
-                f.sync_all()
-            })
+            // Без `fsync` (регрессия CI на 84bfdb2): запись нужна после смерти агента, а
+            // не после сбоя ОС (тогда умирает и дерево), а `fsync` удлинял окно между
+            // запуском лидера и появлением записи — быстрый процесс её не находил.
+            .and_then(|mut f| f.write_all(text))
             .and_then(|()| std::fs::rename(&tmp, file));
         if r.is_err() {
             let _ = std::fs::remove_file(&tmp);

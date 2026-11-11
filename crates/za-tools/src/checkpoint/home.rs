@@ -97,24 +97,6 @@ pub(super) fn read_private(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Подкаталог закрытого каталога агента (0700 на Unix), не ссылка.
-pub(super) fn make_private_dir(dir: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(()),
-        Ok(_) => Err(io::Error::other(format!("{} не каталог", dir.display()))),
-        Err(e) if is_missing(&e) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new().mode(0o700).create(dir)
-            }
-            #[cfg(not(unix))]
-            std::fs::create_dir(dir)
-        }
-        Err(e) => Err(e),
-    }
-}
-
 pub(super) fn is_missing(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound
 }

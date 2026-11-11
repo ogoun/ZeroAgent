@@ -1,43 +1,47 @@
-//! Чекпоинт git и восстановление из него — только plumbing через `za_jail::Runner`
-//! (D89, Ruling 7.15; ревью задачи 9: C1, I3, M1–M5).
+//! Чекпоинт git и восстановление из него — в **собственном** голом репозитории агента
+//! `ZA_HOME/projects/<project_id>/checkpoints/repo.git` (D89 после ревью задачи 9,
+//! раунд 2). Репозиторий пользователя и `.git` проекта git не читает и не меняет: каждый
+//! вызов идёт с `GIT_DIR` на свой репозиторий и `GIT_WORK_TREE` на проект, из каталога
+//! агента, и получает только те файлы, что агент передал сам.
 //!
-//! Создание: `ls-files -z -s -c` и `-z -o --exclude-standard` (индекс пользователя только
-//! читается) → `hash-object --no-filters -w --stdin-paths` для файлов, чей stat отличается
-//! от кэша прошлого чекпоинта run (`size`, `mtime`, режим, на Unix ещё `ctime` и `ino`;
-//! запись моложе 2 с до сохранения кэша не доверяется) → `update-index -z --index-info` в
-//! свой индекс → `write-tree` → `commit-tree` → `update-ref <ref> <commit> ""`. Сообщение
-//! коммита несёт `zero-agent-project: <project_id>` и `zero-agent-skipped: <путь>` для
-//! файлов сверх [`CHECKPOINT_MAX_FILE`]: такие файлы восстановление не трогает и не
-//! удаляет.
+//! Создание: список файлов проекта строит агент (`crate::fs::project_files`: правила
+//! игнорирования читаются через `open_checked`, без ссылок и junction, без `.git` и
+//! `.zero-agent`) → stat сверяется с кэшем проекта (`stat.json`: `size`, `mtime`, режим,
+//! на Unix ещё `ctime` и `ino`; запись моложе 2 с до сохранения кэша не доверяется) →
+//! для изменившихся `hash-object --no-filters --stdin-paths` без записи и
+//! `cat-file --batch-check`: в хранилище пишутся только **новые** объекты, их объём
+//! ограничен `CHECKPOINT_MAX_TOTAL` (N5) → `hash-object -w` для новых →
+//! `update-index -z --index-info` в свой индекс → `write-tree` → `commit-tree` →
+//! `update-ref <ref> <commit> ""`. Сообщение коммита несёт `zero-agent-project:
+//! <project_id>` и `zero-agent-skipped: <путь>` для файлов сверх [`CHECKPOINT_MAX_FILE`].
 //!
 //! Восстановление: `ls-tree -r -z -l --full-tree`, мелкие объекты — `cat-file --batch`
-//! порциями, крупные (больше [`STREAM_FROM`]) — `cat-file blob` прямо во временный файл
-//! (`CommandSpec::stdout_file`), без удержания в памяти.
+//! порциями, крупные (больше [`STREAM_FROM`]) — `cat-file blob` прямо во временный файл.
 //!
 //! Каждый вызов: `EnvMode::Clear`, `GIT_CONFIG_NOSYSTEM=1`, пустой глобальный конфиг, свой
-//! `HOME`, `GIT_CEILING_DIRECTORIES` — родитель корня проекта (поиск не выходит выше),
-//! `GIT_NO_LAZY_FETCH=1`, `GIT_PROTOCOL_FROM_USER=0`, `--no-pager` и опции `-c`, которые
-//! отключают fsmonitor, хуки (`core.hooksPath` — несуществующий путь), сеть
-//! (`protocol.allow=never`), помощников учётных данных, журнал ссылок и разделённый индекс.
+//! `HOME`, `GIT_NO_LAZY_FETCH=1`, `GIT_PROTOCOL_FROM_USER=0`, `--no-pager` и опции `-c`:
+//! fsmonitor выключен, хуки — несуществующий путь, сеть запрещена (`protocol.allow` и
+//! `protocol.<вид>.allow`), помощников учётных данных нет, `core.excludesFile` и
+//! `core.attributesFile` — пустой файл, журнал ссылок и разделённый индекс выключены.
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use za_core::paths::{Roots, remove_checked};
+use za_core::paths::{Roots, display, remove_checked};
 use za_core::{Checkpoint, CheckpointRequest};
 use za_jail::{CommandSpec, EnvMode, Exit, Runner, RunnerError};
 use za_protocol::{RunId, checkpoint_kind, checkpoint_reason};
 
-use super::home::{agent_dir, is_missing, make_private_dir, private, read_private, write_private};
+use super::home::{agent_dir, is_missing, private, read_private, write_private};
 use super::write::{Mode, Target, Tmp, fill, finish, target};
 use super::{
-    CHECKPOINT_MAX_FILE, CHECKPOINT_MAX_TOTAL, CHECKPOINT_REF_PREFIX, RestoreError, blocking,
-    is_oid, join_rel, sort_key, valid_id,
+    CHECKPOINT_MAX_FILE, CHECKPOINT_REF_PREFIX, RestoreError, blocking, is_oid, join_rel, sort_key,
+    valid_id,
 };
 use crate::AgentHome;
 
@@ -50,11 +54,11 @@ const STREAM_FROM: u64 = 1 << 20;
 /// Запись кэша stat моложе этого (до сохранения кэша) не доверяется («racy git»).
 const RACY: Duration = Duration::from_secs(2);
 /// Версия кэша stat.
-const STAT_V: u32 = 2;
-/// Файл кэша stat в каталоге run.
+const STAT_V: u32 = 3;
+/// Кэш stat проекта (объекты своего репозитория живут дольше run).
 const STAT_FILE: &str = "stat.json";
-/// Временные файлы с целями ссылок (содержимое blob ссылки).
-const LINKS_DIR: &str = "links";
+/// Свой голый репозиторий в каталоге чекпоинтов проекта.
+const REPO_DIR: &str = "repo.git";
 /// Идентичность коммитов чекпоинтов (Ruling 5.4).
 const IDENTITY: &str = "zero-agent";
 /// Строки сообщения коммита.
@@ -63,18 +67,15 @@ const SKIPPED_TRAILER: &str = "zero-agent-skipped: ";
 /// Файловые режимы git.
 const MODE_FILE: &str = "100644";
 const MODE_EXEC: &str = "100755";
-const MODE_LINK: &str = "120000";
-const MODE_GITLINK: &str = "160000";
 
-/// Репозиторий проекта: корень рабочего дерева — корень проекта (статическая проверка).
+/// Проект: корень рабочего дерева (канонический).
 pub(super) struct Repo {
     pub top: PathBuf,
 }
 
-/// Сделанный чекпоинт git и пропущенные (сверх предела) пути.
+/// Сделанный (или найденный) чекпоинт git.
 pub(super) struct Made {
     pub cp: Checkpoint,
-    pub skipped: HashSet<String>,
 }
 
 /// Пропуск чекпоинта git с причиной (`checkpoint_reason`).
@@ -106,7 +107,6 @@ impl GitFail {
             GitFail::Failed(e) if e.contains("dubious ownership") => {
                 checkpoint_reason::GIT_UNSAFE_DIRECTORY
             }
-            GitFail::Failed(e) if e.contains("not a git repository") => checkpoint_reason::NO_GIT,
             GitFail::Failed(_) => checkpoint_reason::GIT_ERROR,
         }
     }
@@ -139,10 +139,12 @@ impl From<io::Error> for Skip {
     }
 }
 
-/// Безопасные пути вызовов git: пустой глобальный конфиг, несуществующий каталог хуков,
-/// `HOME`.
+/// Пути агента для вызовов git: каталог чекпоинтов проекта (cwd), свой репозиторий,
+/// пустой конфиг и файл правил, несуществующий каталог хуков, `HOME`.
 #[derive(Clone)]
 struct SafePaths {
+    root: PathBuf,
+    git_dir: PathBuf,
     empty: PathBuf,
     hooks: PathBuf,
     home: PathBuf,
@@ -152,11 +154,14 @@ struct SafePaths {
 #[derive(Default)]
 struct Call {
     stdin: Option<Vec<u8>>,
-    /// Свой индекс (`GIT_INDEX_FILE`); без него — индекс пользователя (только чтение).
+    /// Свой индекс (`GIT_INDEX_FILE`).
     index: Option<PathBuf>,
     capture: Option<usize>,
     /// stdout — в этот файл.
     stdout_file: Option<Arc<std::fs::File>>,
+    /// Создание своего репозитория (`init --bare <путь>`): без `GIT_DIR` и
+    /// `GIT_WORK_TREE`.
+    init: bool,
 }
 
 /// Сеанс вызовов git одного чекпоинта или восстановления.
@@ -166,13 +171,16 @@ pub(super) struct Session {
     home: AgentHome,
     base_env: Vec<(OsString, OsString)>,
     timeout: Duration,
+    /// Предел новых байт на чекпоинт.
+    max_total: u64,
     safe: Option<SafePaths>,
+    /// Свой репозиторий уже создан в этом сеансе.
+    ready: bool,
 }
 
 /// Чекпоинт из скрытой ссылки этого проекта.
 pub(super) struct RefCp {
     pub cp: Checkpoint,
-    pub skipped: HashSet<String>,
 }
 
 impl Session {
@@ -182,6 +190,7 @@ impl Session {
         home: AgentHome,
         base_env: Vec<(OsString, OsString)>,
         timeout: Duration,
+        max_total: u64,
     ) -> Self {
         Self {
             runner,
@@ -189,11 +198,13 @@ impl Session {
             home,
             base_env,
             timeout,
+            max_total,
             safe: None,
+            ready: false,
         }
     }
 
-    /// Каталоги безопасного запуска (один раз на сеанс).
+    /// Каталоги агента (один раз на сеанс): все — закрытые (0700 на Unix), свои.
     async fn safe(&mut self) -> io::Result<SafePaths> {
         if let Some(s) = &self.safe {
             return Ok(s.clone());
@@ -201,6 +212,7 @@ impl Session {
         let home = self.home.clone();
         let s = blocking(move || {
             let root = agent_dir(&home, None)?;
+            let git_dir = agent_dir(&home, Some(REPO_DIR))?;
             // Хуки — несуществующий путь внутри своего закрытого каталога (M1).
             let hooks = agent_dir(&home, Some("no-hooks"))?.join("none");
             let git_home = agent_dir(&home, Some("home"))?;
@@ -209,6 +221,8 @@ impl Session {
                 write_private(&empty, b"")?;
             }
             Ok(SafePaths {
+                root,
+                git_dir,
                 empty,
                 hooks,
                 home: git_home,
@@ -219,6 +233,26 @@ impl Session {
         Ok(s)
     }
 
+    /// Свой голый репозиторий: создаётся при первом обращении (`init --bare` в закрытом
+    /// каталоге агента).
+    async fn ready(&mut self, repo: &Repo) -> Result<(), GitFail> {
+        if self.ready {
+            return Ok(());
+        }
+        let safe = self.safe().await.map_err(|e| GitFail::Io(e.to_string()))?;
+        if std::fs::symlink_metadata(safe.git_dir.join("HEAD")).is_err() {
+            let dir = safe.git_dir.to_string_lossy().into_owned();
+            let call = Call {
+                init: true,
+                ..Call::default()
+            };
+            self.exec(repo, &["init", "--bare", "-q", &dir], call, &[])
+                .await?;
+        }
+        self.ready = true;
+        Ok(())
+    }
+
     async fn run(
         &mut self,
         repo: &Repo,
@@ -226,10 +260,21 @@ impl Session {
         call: Call,
         ok: &[i32],
     ) -> Result<GitOut, GitFail> {
+        self.ready(repo).await?;
+        self.exec(repo, args, call, ok).await
+    }
+
+    async fn exec(
+        &mut self,
+        repo: &Repo,
+        args: &[&str],
+        call: Call,
+        ok: &[i32],
+    ) -> Result<GitOut, GitFail> {
         let safe = self.safe().await.map_err(|e| GitFail::Io(e.to_string()))?;
-        let mut spec = CommandSpec::new(&self.program, &repo.top, self.timeout);
+        let mut spec = CommandSpec::new(&self.program, &safe.root, self.timeout);
         let mut full: Vec<OsString> = vec!["--no-pager".into()];
-        let opts: [(&str, OsString); 18] = [
+        let opts: [(&str, OsString); 25] = [
             ("core.fsmonitor", "false".into()),
             ("core.useBuiltinFSMonitor", "false".into()),
             ("core.hooksPath", safe.hooks.clone().into_os_string()),
@@ -242,9 +287,16 @@ impl Session {
             ("core.autocrlf", "false".into()),
             ("core.safecrlf", "false".into()),
             ("core.attributesFile", safe.empty.clone().into_os_string()),
+            ("core.excludesFile", safe.empty.clone().into_os_string()),
             ("submodule.recurse", "false".into()),
-            // Сеть и ленивая догрузка объектов (C1).
+            // Сеть и ленивая догрузка объектов (C1, N4).
             ("protocol.allow", "never".into()),
+            ("protocol.ext.allow", "never".into()),
+            ("protocol.file.allow", "never".into()),
+            ("protocol.ssh.allow", "never".into()),
+            ("protocol.git.allow", "never".into()),
+            ("protocol.http.allow", "never".into()),
+            ("protocol.https.allow", "never".into()),
             ("core.sshCommand", "".into()),
             ("core.askPass", "".into()),
             ("credential.helper", "".into()),
@@ -262,17 +314,14 @@ impl Session {
         spec.env_mode = EnvMode::Clear;
         let mut env = self.base_env.clone();
         let home = safe.home.clone().into_os_string();
-        let ceiling = repo
-            .top
-            .parent()
-            .map(|p| p.as_os_str().to_owned())
-            .unwrap_or_default();
         let vars: Vec<(&str, OsString)> = vec![
+            // Свой репозиторий и проект как рабочее дерево: `.git` проекта не читается.
+            ("GIT_DIR", safe.git_dir.clone().into_os_string()),
+            ("GIT_WORK_TREE", repo.top.clone().into_os_string()),
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
             ("GIT_CONFIG_GLOBAL", safe.empty.clone().into_os_string()),
             ("HOME", home.clone()),
             ("XDG_CONFIG_HOME", home),
-            ("GIT_CEILING_DIRECTORIES", ceiling),
             ("GIT_NO_LAZY_FETCH", "1".into()),
             ("GIT_PROTOCOL_FROM_USER", "0".into()),
             ("GIT_ASKPASS", "".into()),
@@ -293,6 +342,9 @@ impl Session {
         ];
         for (k, v) in vars {
             env.retain(|(n, _)| !n.eq_ignore_ascii_case(k));
+            if call.init && (k == "GIT_DIR" || k == "GIT_WORK_TREE") {
+                continue;
+            }
             env.push((k.into(), v));
         }
         if let Some(i) = &call.index {
@@ -352,7 +404,87 @@ impl Session {
         self.run(repo, args, call, &[]).await
     }
 
-    /// Чекпоинт git (D89).
+    /// Файлы проекта (от корня, через `/`) — обход агента, не git.
+    async fn project_rels(&self, repo: &Repo) -> Result<Vec<String>, Skip> {
+        let (top, timeout) = (repo.top.clone(), self.timeout);
+        let (files, stopped) = blocking(move || {
+            let (files, stopped) = crate::fs::project_files(&top, Instant::now() + timeout);
+            Ok((
+                files
+                    .iter()
+                    .map(|p| display(&top, p))
+                    .collect::<Vec<String>>(),
+                stopped,
+            ))
+        })
+        .await?;
+        if stopped {
+            return Err(Skip(checkpoint_reason::SLOW));
+        }
+        Ok(files)
+    }
+
+    /// oid файлов `paths` (абсолютные пути) без записи в хранилище.
+    async fn hash_paths(
+        &mut self,
+        repo: &Repo,
+        paths: &[String],
+        write: bool,
+    ) -> Result<Vec<String>, GitFail> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stdin = Vec::new();
+        for p in paths {
+            stdin.extend_from_slice(p.as_bytes());
+            stdin.push(b'\n');
+        }
+        let mut args = vec!["hash-object", "--no-filters"];
+        if write {
+            args.push("-w");
+        }
+        args.push("--stdin-paths");
+        let call = Call {
+            stdin: Some(stdin),
+            capture: Some(LIST_CAPTURE),
+            ..Call::default()
+        };
+        let out = self.run(repo, &args, call, &[]).await?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let got: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+        if got.len() != paths.len() || !got.iter().all(|o| is_oid(o)) {
+            return Err(GitFail::Failed("hash-object: неожиданный вывод".into()));
+        }
+        Ok(got)
+    }
+
+    /// Какие из `oids` уже есть в своём хранилище.
+    async fn present(&mut self, repo: &Repo, oids: &[String]) -> Result<HashSet<String>, GitFail> {
+        if oids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut stdin = Vec::new();
+        for o in oids {
+            stdin.extend_from_slice(o.as_bytes());
+            stdin.push(b'\n');
+        }
+        let call = Call {
+            stdin: Some(stdin),
+            capture: Some(LIST_CAPTURE),
+            ..Call::default()
+        };
+        let out = self
+            .run(repo, &["cat-file", "--batch-check"], call, &[])
+            .await?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.ends_with(" missing"))
+            .filter_map(|l| l.split(' ').next())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Чекпоинт git (D89) в своём репозитории.
     pub(super) async fn checkpoint(
         mut self,
         repo: &Repo,
@@ -361,60 +493,48 @@ impl Session {
         stem: &str,
     ) -> Result<Made, Skip> {
         let git_ref = format!("{CHECKPOINT_REF_PREFIX}/{id}");
-        // Повтор после сбоя: ссылка этого проекта уже есть.
+        // Повтор после сбоя: ссылка уже есть.
         if let Some(found) = self.existing(repo, id, &git_ref).await? {
             return Ok(found);
         }
+        let safe = self.safe().await?;
         let run_dir = {
             let (home, run) = (self.home.clone(), req.run.to_string());
             blocking(move || agent_dir(&home, Some(&run))).await?
         };
 
-        // 1. Список файлов (индекс пользователя только читается).
-        let tracked = self.listing(repo, &["ls-files", "-z", "-s", "-c"]).await?;
-        let untracked = self
-            .listing(repo, &["ls-files", "-z", "-o", "--exclude-standard"])
-            .await?;
-        let listed = parse_listing(&tracked.stdout, &untracked.stdout);
-
-        // 2. stat, кэш и пределы.
-        let (top, rd) = (repo.top.clone(), run_dir.clone());
-        let plan = blocking(move || plan_entries(&top, &rd, listed)).await?;
-        let total: u64 = plan.hash.iter().map(|(_, _, st)| st.size).sum();
-        if total > CHECKPOINT_MAX_TOTAL {
-            tracing::warn!(total, "новых байт больше предела чекпоинта");
+        // 1. Список файлов строит агент; 2. stat, кэш проекта и пределы.
+        let rels = self.project_rels(repo).await?;
+        let (top, cache_path) = (repo.top.clone(), safe.root.join(STAT_FILE));
+        let mut plan = blocking(move || plan_entries(&top, &cache_path, rels)).await?;
+        let mut oids = std::mem::take(&mut plan.known);
+        let paths: Vec<String> = plan.hash.iter().map(|(_, abs, _)| abs.clone()).collect();
+        let hashed = self.hash_paths(repo, &paths, false).await?;
+        let have = self.present(repo, &hashed).await?;
+        // 3. Новые объекты: объём — только их (N5).
+        let mut fresh: Vec<usize> = Vec::new();
+        let mut new_bytes = 0u64;
+        for (i, oid) in hashed.iter().enumerate() {
+            if !have.contains(oid) {
+                fresh.push(i);
+                new_bytes += plan.hash[i].2.size;
+            }
+        }
+        if new_bytes > self.max_total {
+            tracing::warn!(new_bytes, "новых байт больше предела чекпоинта");
             return Err(Skip(checkpoint_reason::TOO_LARGE));
         }
-        let mut oids = plan.known;
-        if !plan.hash.is_empty() {
-            let mut stdin = Vec::new();
-            for (_, abs, _) in &plan.hash {
-                stdin.extend_from_slice(abs.as_bytes());
-                stdin.push(b'\n');
-            }
-            let call = Call {
-                stdin: Some(stdin),
-                ..Call::default()
-            };
-            let out = self
-                .run(
-                    repo,
-                    &["hash-object", "--no-filters", "-w", "--stdin-paths"],
-                    call,
-                    &[],
-                )
-                .await?;
-            let text = String::from_utf8_lossy(&out.stdout);
-            let got: Vec<&str> = text.split_whitespace().collect();
-            if got.len() != plan.hash.len() || !got.iter().all(|o| is_oid(o)) {
-                return Err(GitFail::Failed("hash-object: неожиданный вывод".into()).into());
-            }
-            for ((rel, _, st), oid) in plan.hash.into_iter().zip(got) {
-                oids.insert(rel, (st, oid.to_owned()));
-            }
+        let fresh_paths: Vec<String> = fresh.iter().map(|&i| paths[i].clone()).collect();
+        let written = self.hash_paths(repo, &fresh_paths, true).await?;
+        let mut final_oids = hashed;
+        for (&i, oid) in fresh.iter().zip(written) {
+            final_oids[i] = oid;
+        }
+        for ((rel, _, st), oid) in plan.hash.into_iter().zip(final_oids) {
+            oids.insert(rel, (st, oid));
         }
 
-        // 3. Свой индекс и дерево.
+        // 4. Свой индекс и дерево.
         let index = run_dir.join(format!("{stem}.index"));
         {
             let i = index.clone();
@@ -454,7 +574,7 @@ impl Session {
             return Err(GitFail::Failed("write-tree: неожиданный вывод".into()).into());
         }
 
-        // 4. Коммит и ссылка (только создание).
+        // 5. Коммит и ссылка (только создание).
         let parent = self.last_of_run(repo, req.run).await?;
         let mut msg = format!(
             "zero-agent checkpoint {id}\n\n{PROJECT_TRAILER}{}\n",
@@ -485,22 +605,20 @@ impl Session {
             return Err(e.into());
         }
 
-        // Кэш stat и свой индекс.
+        // Кэш stat проекта и свой индекс.
         let cache = StatCache {
             v: STAT_V,
             at_ns: now_ns(),
             entries: oids
                 .into_iter()
-                .filter(|(_, (st, _))| st.cacheable)
                 .map(|(rel, (st, oid))| (rel, StatEntry { st, oid }))
                 .collect(),
         };
-        let rd = run_dir.clone();
+        let root = safe.root.clone();
         if let Err(e) = blocking(move || {
             let json = serde_json::to_vec(&cache).map_err(io::Error::other)?;
-            write_private(&rd.join(STAT_FILE), &json)?;
+            write_private(&root.join(STAT_FILE), &json)?;
             let _ = remove_checked(&private(index));
-            let _ = std::fs::remove_dir_all(rd.join(LINKS_DIR));
             Ok(())
         })
         .await
@@ -509,7 +627,6 @@ impl Session {
         }
         Ok(Made {
             cp: git_cp(id, git_ref, commit),
-            skipped: plan.skipped.into_iter().collect(),
         })
     }
 
@@ -532,10 +649,7 @@ impl Session {
         }
         match self.refs(repo, Some(id)).await {
             Ok(v) => match v.into_iter().next() {
-                Some(r) => Ok(Some(Made {
-                    cp: r.cp,
-                    skipped: r.skipped,
-                })),
+                Some(r) => Ok(Some(Made { cp: r.cp })),
                 None => {
                     tracing::warn!(id, "ссылка чекпоинта занята другим проектом");
                     Err(Skip(checkpoint_reason::GIT_ERROR))
@@ -627,7 +741,6 @@ impl Session {
             if meta.project.as_deref() == Some(self.home.project_id.as_str()) {
                 res.push(RefCp {
                     cp: git_cp(&id, name, oid),
-                    skipped: meta.skipped,
                 });
             }
         }
@@ -646,8 +759,8 @@ impl Session {
             .ok_or_else(|| RestoreError::Git(format!("коммит {commit} не чекпоинт")))
     }
 
-    /// Записи дерева и пути, которые тронет восстановление (запись и, с `delete_new`,
-    /// удаление).
+    /// Записи дерева и пути, которые восстановление удалит (с `delete_new`): файлы проекта
+    /// из того же обхода агента, которых нет в чекпоинте и которые не пропущены им (M5).
     async fn restore_set(
         &mut self,
         repo: &Repo,
@@ -657,7 +770,9 @@ impl Session {
         let tree = self
             .listing(repo, &["ls-tree", "-r", "-z", "-l", "--full-tree", commit])
             .await?;
-        let entries: Vec<TreeEntry> = parse_tree(&tree.stdout)?
+        let all = parse_tree(&tree.stdout)?;
+        let in_cp: HashSet<String> = all.iter().map(|e| e.rel.clone()).collect();
+        let entries: Vec<TreeEntry> = all
             .into_iter()
             .filter(|e| {
                 let ok = e.mode == MODE_FILE || e.mode == MODE_EXEC;
@@ -670,52 +785,87 @@ impl Session {
         let mut extra = Vec::new();
         if delete_new {
             let skipped = self.skipped_of(repo, commit).await?;
-            let all = self
-                .listing(
-                    repo,
-                    &["ls-tree", "-r", "-z", "--name-only", "--full-tree", commit],
-                )
-                .await?;
-            let in_cp: HashSet<String> = all
-                .stdout
-                .split(|b| *b == 0)
-                .filter_map(|r| std::str::from_utf8(r).ok())
-                .map(str::to_owned)
-                .collect();
-            let current = self
-                .listing(repo, &["ls-files", "-z", "-c", "-o", "--exclude-standard"])
-                .await?;
-            let mut seen = HashSet::new();
-            for rec in current.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-                // Удаляется только то, что чекпоинт разобрал бы тем же правилом (M5).
-                let Ok(rel) = std::str::from_utf8(rec) else {
-                    continue;
-                };
-                if rel.ends_with('/')
-                    || rel.contains('\n')
-                    || in_cp.contains(rel)
-                    || skipped.contains(rel)
-                    || !seen.insert(rel)
-                {
-                    continue;
+            let rels = self.project_rels(repo).await.map_err(|Skip(r)| {
+                RestoreError::Git(format!("обход файлов проекта не завершён: {r}"))
+            })?;
+            for rel in rels {
+                if !rel.contains('\n') && !in_cp.contains(&rel) && !skipped.contains(&rel) {
+                    extra.push(rel);
                 }
-                extra.push(rel.to_owned());
             }
         }
         Ok((entries, extra))
     }
 
-    /// Пути (от корня проекта), которые тронет восстановление `commit`.
-    pub(super) async fn plan_paths(
+    /// Пути (от корня проекта), которые восстановление `commit` действительно изменит:
+    /// файлы, чьё содержимое или бит исполнения отличается от чекпоинта, отсутствующие
+    /// (будут созданы) и удаляемые (`delete_new`). Это и только это должен покрыть
+    /// чекпоинт «до» (N5, N6).
+    pub(super) async fn change_set(
         &mut self,
         repo: &Repo,
         commit: &str,
         delete_new: bool,
     ) -> Result<Vec<String>, RestoreError> {
         let (entries, extra) = self.restore_set(repo, commit, delete_new).await?;
-        let mut v: Vec<String> = entries.into_iter().map(|e| e.rel).collect();
-        v.extend(extra);
-        Ok(v)
+        let top = repo.top.clone();
+        let rels: Vec<(String, String, bool)> = entries
+            .iter()
+            .map(|e| (e.rel.clone(), e.oid.clone(), e.mode == MODE_EXEC))
+            .collect();
+        // Существующие обычные файлы — на сверку oid; отсутствующие — в набор сразу.
+        let (present, mut out) = blocking(move || {
+            let mut present = Vec::new();
+            let mut out = Vec::new();
+            for (rel, oid, exec) in rels {
+                let abs = join_rel(&top, &rel);
+                match std::fs::symlink_metadata(&abs) {
+                    Ok(m) if m.is_file() => {
+                        if file_mode(&m) == MODE_EXEC && !exec
+                            || file_mode(&m) == MODE_FILE && exec && cfg!(unix)
+                        {
+                            out.push(rel);
+                        } else {
+                            present.push((rel, abs.to_string_lossy().into_owned(), oid));
+                        }
+                    }
+                    // Нет файла, каталог или ссылка на месте файла: восстановление тронет.
+                    _ => out.push(rel),
+                }
+            }
+            Ok((present, out))
+        })
+        .await?;
+        let paths: Vec<String> = present.iter().map(|(_, abs, _)| abs.clone()).collect();
+        let now = self.hash_paths(repo, &paths, false).await?;
+        for ((rel, _, want), got) in present.into_iter().zip(now) {
+            if want != got {
+                out.push(rel);
+            }
+        }
+        out.extend(extra);
+        Ok(out)
+    }
+
+    /// Пути дерева чекпоинта `commit`.
+    pub(super) async fn tree_names(
+        &mut self,
+        repo: &Repo,
+        commit: &str,
+    ) -> Result<HashSet<String>, RestoreError> {
+        let out = self
+            .listing(
+                repo,
+                &["ls-tree", "-r", "-z", "--name-only", "--full-tree", commit],
+            )
+            .await?;
+        Ok(out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|r| !r.is_empty())
+            .filter_map(|r| std::str::from_utf8(r).ok())
+            .map(str::to_owned)
+            .collect())
     }
 
     /// Восстановление рабочей копии из `commit`.
@@ -914,60 +1064,7 @@ fn parse_message(body: &[u8]) -> Option<Message> {
     Some(m)
 }
 
-// ---- список файлов и stat ----
-
-/// Запись списка: режим и oid из индекса (у отслеживаемых).
-struct Listed {
-    rel: String,
-    index_mode: Option<String>,
-    index_oid: Option<String>,
-}
-
-/// Разбор `ls-files -z -s` и `-z -o`: по пути одна запись (у конфликта — режим стадии
-/// 2 или любой); каталоги вложенных репозиториев (`x/`) пропускаются.
-fn parse_listing(tracked: &[u8], untracked: &[u8]) -> Vec<Listed> {
-    let mut by_path: BTreeMap<String, Listed> = BTreeMap::new();
-    for rec in tracked.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-        let Ok(rec) = std::str::from_utf8(rec) else {
-            tracing::warn!("путь не UTF-8: в чекпоинт не входит");
-            continue;
-        };
-        let Some((meta, path)) = rec.split_once('\t') else {
-            continue;
-        };
-        let mut it = meta.split(' ');
-        let (Some(mode), Some(oid), Some(stage)) = (it.next(), it.next(), it.next()) else {
-            continue;
-        };
-        let e = by_path.entry(path.to_owned()).or_insert_with(|| Listed {
-            rel: path.to_owned(),
-            index_mode: None,
-            index_oid: None,
-        });
-        if e.index_mode.is_none() || stage == "0" || stage == "2" {
-            e.index_mode = Some(mode.to_owned());
-            e.index_oid = (stage == "0").then(|| oid.to_owned());
-        }
-    }
-    for rec in untracked.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-        let Ok(path) = std::str::from_utf8(rec) else {
-            tracing::warn!("путь не UTF-8: в чекпоинт не входит");
-            continue;
-        };
-        if path.ends_with('/') {
-            continue;
-        }
-        by_path.entry(path.to_owned()).or_insert_with(|| Listed {
-            rel: path.to_owned(),
-            index_mode: None,
-            index_oid: None,
-        });
-    }
-    by_path
-        .into_values()
-        .filter(|l| !l.rel.is_empty())
-        .collect()
-}
+// ---- stat ----
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StatCache {
@@ -984,7 +1081,7 @@ struct StatEntry {
     oid: String,
 }
 
-/// stat записи дерева.
+/// stat обычного файла.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Stat {
     mode: String,
@@ -993,13 +1090,10 @@ struct Stat {
     /// Unix: `ctime` и `ino` (M4); прочие ОС — 0.
     ctime_ns: u64,
     ino: u64,
-    /// Входит ли в кэш (обычные файлы).
-    #[serde(skip)]
-    cacheable: bool,
 }
 
-/// План: известные oid (кэш, gitlink), файлы на хэширование `(rel, абсолютный путь,
-/// stat)` и пропущенные сверх предела.
+/// План: известные oid (кэш), файлы на хэширование `(rel, абсолютный путь, stat)` и
+/// пропущенные сверх предела.
 struct Plan {
     known: BTreeMap<String, (Stat, String)>,
     hash: Vec<(String, String, Stat)>,
@@ -1034,8 +1128,10 @@ fn ctime_ino(_m: &std::fs::Metadata) -> (u64, u64) {
     (0, 0)
 }
 
-fn plan_entries(top: &Path, run_dir: &Path, listed: Vec<Listed>) -> io::Result<Plan> {
-    let cache: StatCache = read_private(&run_dir.join(STAT_FILE), 256 << 20)
+/// План по файлам обхода `rels`: обычный файл (не ссылка — её обход не выдаёт, но файл
+/// мог смениться с тех пор), stat, кэш проекта, предел файла.
+fn plan_entries(top: &Path, cache_path: &Path, rels: Vec<String>) -> io::Result<Plan> {
+    let cache: StatCache = read_private(cache_path, 256 << 20)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .filter(|c: &StatCache| c.v == STAT_V)
@@ -1048,127 +1144,60 @@ fn plan_entries(top: &Path, run_dir: &Path, listed: Vec<Listed>) -> io::Result<P
         hash: Vec::new(),
         skipped: Vec::new(),
     };
-    let mut links = 0usize;
-    for l in listed {
-        if l.rel.contains('\n') {
-            tracing::warn!(path = %l.rel, "имя с переводом строки: в чекпоинт не входит");
+    for rel in rels {
+        if rel.contains('\n') {
+            tracing::warn!(path = %rel, "имя с переводом строки: в чекпоинт не входит");
             continue;
         }
-        let abs = join_rel(top, &l.rel);
+        let abs = join_rel(top, &rel);
         let Ok(meta) = std::fs::symlink_metadata(&abs) else {
-            // Удалён в рабочем дереве: в чекпоинте его нет.
             continue;
         };
-        let ft = meta.file_type();
-        if ft.is_dir() {
-            // Подмодуль: gitlink из индекса.
-            if let (Some(m), Some(oid)) = (&l.index_mode, &l.index_oid)
-                && m == MODE_GITLINK
-            {
-                plan.known.insert(l.rel, (gitlink_stat(), oid.clone()));
-            }
-            continue;
-        }
-        if ft.is_symlink() {
-            // Содержимое blob ссылки — её цель.
-            let target = std::fs::read_link(&abs)?;
-            let dir = run_dir.join(LINKS_DIR);
-            make_private_dir(&dir)?;
-            let tmp = dir.join(links.to_string());
-            links += 1;
-            write_private(&tmp, &link_bytes(&target))?;
-            let st = Stat {
-                mode: MODE_LINK.into(),
-                cacheable: false,
-                ..gitlink_stat()
-            };
-            plan.hash
-                .push((l.rel, tmp.to_string_lossy().into_owned(), st));
-            continue;
-        }
-        if !ft.is_file() {
+        if !meta.is_file() {
             continue;
         }
         if meta.len() > CHECKPOINT_MAX_FILE {
-            tracing::warn!(path = %l.rel, size = meta.len(), "файл больше предела: в чекпоинт не входит");
-            plan.skipped.push(l.rel);
+            tracing::warn!(path = %rel, size = meta.len(), "файл больше предела: в чекпоинт не входит");
+            plan.skipped.push(rel);
             continue;
         }
         let (ctime_ns, ino) = ctime_ino(&meta);
         let st = Stat {
-            mode: file_mode(&meta, l.index_mode.as_deref()),
+            mode: file_mode(&meta).into(),
             size: meta.len(),
             mtime_ns: mtime_ns(&meta),
             ctime_ns,
             ino,
-            cacheable: true,
         };
-        if let Some(c) = cache.entries.get(&l.rel)
-            && (Stat {
-                cacheable: true,
-                ..c.st.clone()
-            }) == st
+        if let Some(c) = cache.entries.get(&rel)
+            && c.st == st
             && st.mtime_ns < trusted_before
             && (st.ctime_ns == 0 || st.ctime_ns < trusted_before)
             && is_oid(&c.oid)
         {
             let oid = c.oid.clone();
-            plan.known.insert(l.rel, (st, oid));
+            plan.known.insert(rel, (st, oid));
             continue;
         }
         plan.hash
-            .push((l.rel, abs.to_string_lossy().into_owned(), st));
+            .push((rel, abs.to_string_lossy().into_owned(), st));
     }
     Ok(plan)
 }
 
-fn gitlink_stat() -> Stat {
-    Stat {
-        mode: MODE_GITLINK.into(),
-        size: 0,
-        mtime_ns: 0,
-        ctime_ns: 0,
-        ino: 0,
-        cacheable: false,
-    }
-}
-
-#[cfg(unix)]
-fn link_bytes(target: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    target.as_os_str().as_bytes().to_vec()
-}
-
-#[cfg(not(unix))]
-fn link_bytes(target: &Path) -> Vec<u8> {
-    target.to_string_lossy().replace('\\', "/").into_bytes()
-}
-
-/// Режим обычного файла: ссылка, записанная файлом (`core.symlinks=false`), остаётся
-/// ссылкой; Unix — бит исполнения владельца (`S_IXUSR`, как у git, M6); Windows — режим
-/// индекса.
-fn file_mode(meta: &std::fs::Metadata, index: Option<&str>) -> String {
-    if index == Some(MODE_LINK) {
-        return MODE_LINK.into();
-    }
+/// Режим обычного файла: Unix — бит исполнения владельца (`S_IXUSR`, как у git, M6);
+/// прочие ОС — обычный файл (без индекса пользователя режим неизвестен).
+fn file_mode(meta: &std::fs::Metadata) -> &'static str {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if meta.permissions().mode() & 0o100 != 0 {
-            MODE_EXEC.into()
-        } else {
-            MODE_FILE.into()
+            return MODE_EXEC;
         }
     }
     #[cfg(not(unix))]
-    {
-        let _ = meta;
-        if index == Some(MODE_EXEC) {
-            MODE_EXEC.into()
-        } else {
-            MODE_FILE.into()
-        }
-    }
+    let _ = meta;
+    MODE_FILE
 }
 
 // ---- разбор вывода ----
@@ -1246,24 +1275,6 @@ mod tests {
         let v = parse_batch(out).unwrap();
         assert_eq!(v, vec![Some(b"x\ny".to_vec()), None, Some(Vec::new())]);
         assert!(parse_batch(b"aa blob 5\nxy\n").is_err());
-    }
-
-    #[test]
-    fn listing_dedups_conflicts() {
-        let o1 = "a".repeat(40);
-        let o2 = "b".repeat(40);
-        let tracked =
-            format!("100644 {o1} 1\tf\0100755 {o2} 2\tf\0100644 {o1} 3\tf\0160000 {o2} 0\tm\0");
-        let l = parse_listing(tracked.as_bytes(), b"n\0nested/\0");
-        let names: Vec<_> = l
-            .iter()
-            .map(|x| (x.rel.as_str(), x.index_mode.as_deref()))
-            .collect();
-        assert_eq!(
-            names,
-            vec![("f", Some("100755")), ("m", Some("160000")), ("n", None)]
-        );
-        assert_eq!(l[0].index_oid, None, "у конфликта нет oid стадии 0");
     }
 
     #[test]

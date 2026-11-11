@@ -239,7 +239,13 @@ async fn linux_registry_record_lives_during_call() {
     let o = tokio::time::timeout(
         Duration::from_secs(60) * scale(),
         tool.call(
-            json!({ "cmd": format!("cat '{}'", file.display()) }),
+            // Запись пишется сразу после запуска лидера (ей нужны его pid и
+            // `starttime`), поэтому команда ждёт её появления, а не читает в первый
+            // миг: иначе тест — гонка (регрессия CI на 84bfdb2).
+            json!({ "cmd": format!(
+                "f='{}'; i=0; while [ ! -f \"$f\" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; cat \"$f\"",
+                file.display()
+            ) }),
             cx(&root, run),
         ),
     )

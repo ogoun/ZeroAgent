@@ -5,21 +5,19 @@
 //! `Exec`. Имя — от ключа эффекта: `id = "<run>/<step>-<seq>"` (без `:`); если такой
 //! чекпоинт уже есть (повтор после сбоя), возвращается он.
 //!
-//! **git** — только в доверенном проекте, у которого `.git` лежит в корне проекта и
-//! прошёл статическую проверку (модуль `repo`, C1): без следования ссылкам, `.git` или
-//! цель `gitdir:` внутри проекта, альтернативные хранилища объектов только внутри
-//! проекта, в конфиге нет `include`/`includeIf`, частичного клона и промисоров, ключей,
-//! исполняющих команды, и сетевых путей; сетевой путь отвергается лексически, до
-//! обращения. Не прошёл — git не вызывается, `Edit` получает копию файлов, `Exec` —
-//! `skipped` с причиной `git_repo_unsafe`. Поиск репозитория не выходит выше корня
-//! проекта (`GIT_CEILING_DIRECTORIES` — родитель корня). Только plumbing (модуль `git`),
-//! каждый вызов — через [`za_jail::Runner`] без сети и ленивой догрузки объектов
-//! (`GIT_NO_LAZY_FETCH=1`, `-c protocol.allow=never`). HEAD, индекс, ветки, stash и
-//! рабочее дерево пользователя не меняются; в репозиторий добавляются только объекты и
-//! скрытая ссылка [`CHECKPOINT_REF_PREFIX`]`/<run>/<step>-<seq>`.
+//! **git** — только в доверенном проекте, у которого в корне есть `.git` (только признак
+//! режима). Репозиторий пользователя не используется вовсе (раунд 2 ревью): у агента свой
+//! голый репозиторий `ZA_HOME/projects/<project_id>/checkpoints/repo.git` (закрытый
+//! каталог), git запускается с `GIT_DIR` на него и `GIT_WORK_TREE` на проект и не читает
+//! `.git` проекта — ни конфиг, ни хуки, ни `alternates`, ни `gitdir`, ни ссылки. Список
+//! файлов строит агент (обход с правилами игнорирования через `open_checked`), git
+//! получает только пути, которые агент передал сам. Только plumbing (модуль `git`),
+//! каждый вызов — через [`za_jail::Runner`], без сети и ленивой догрузки объектов. HEAD,
+//! индекс, ветки, stash, объекты и рабочее дерево пользователя не меняются. Ссылка
+//! чекпоинта — [`CHECKPOINT_REF_PREFIX`]`/<run>/<step>-<seq>` в своём репозитории.
 //!
 //! **Копия файлов** — для `Edit` в недоверенном проекте (git там не вызывается вовсе, D83)
-//! и там, где git недоступен или небезопасен: прежнее содержимое затронутых файлов внутри
+//! и там, где git недоступен: прежнее содержимое затронутых файлов внутри
 //! проекта копируется в `ZA_HOME/projects/<project_id>/checkpoints/<run>/<step>-<seq>/` с
 //! `manifest.json` (модуль `files`).
 //!
@@ -31,7 +29,8 @@
 //!
 //! **Восстановление** ([`restore`]) — только по чекпоинту, найденному для этого проекта, и
 //! только после успешного чекпоинта «до» ([`backup_before_restore`], I1): git — если
-//! получилось, иначе копии всех затрагиваемых файлов. Цели проверяются все до первой
+//! получилось и он покрывает все файлы, которые восстановление изменит (включая
+//! игнорируемые, N6), иначе копии ровно этих файлов (N5). Цели проверяются все до первой
 //! записи (модуль `write`); содержимое пишется потоком во временный файл и сравнивается с
 //! текущим потоком, без удержания файла в памяти.
 //!
@@ -41,7 +40,6 @@
 mod files;
 mod git;
 mod home;
-mod repo;
 mod write;
 
 use std::collections::HashSet;
@@ -98,10 +96,10 @@ pub struct GitCheckpointer {
     /// Дополнительные переменные каждого вызова git (тесты). Переменные безопасности их
     /// перекрывают.
     base_env: Vec<(OsString, OsString)>,
-    /// Статическая проверка репозитория (только тесты второго рубежа отключают её).
-    repo_check: bool,
     /// Предел чекпоинта «до» (тесты сокращают).
     backup_timeout: Duration,
+    /// Предел новых байт на чекпоинт (тесты сокращают).
+    max_total: u64,
     /// Run, у которых git не уложился в предел.
     slow: Arc<Mutex<HashSet<RunId>>>,
     /// Чекпоинты одного процесса идут по одному: общий кэш stat и каталоги run.
@@ -113,7 +111,6 @@ impl std::fmt::Debug for GitCheckpointer {
         f.debug_struct("GitCheckpointer")
             .field("git", &self.git)
             .field("home", &self.home)
-            .field("repo_check", &self.repo_check)
             .finish_non_exhaustive()
     }
 }
@@ -132,8 +129,8 @@ impl GitCheckpointer {
             git,
             home,
             base_env: Vec::new(),
-            repo_check: true,
             backup_timeout: RESTORE_TIMEOUT,
+            max_total: CHECKPOINT_MAX_TOTAL,
             slow: Arc::new(Mutex::new(HashSet::new())),
             lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -145,11 +142,10 @@ impl GitCheckpointer {
         self
     }
 
-    /// Только для тестов второго рубежа (опции и окружение git): без статической проверки
-    /// репозитория.
+    /// Только для тестов: предел новых байт на чекпоинт.
     #[doc(hidden)]
-    pub fn without_repo_check_for_tests(mut self) -> Self {
-        self.repo_check = false;
+    pub fn with_max_total_for_tests(mut self, bytes: u64) -> Self {
+        self.max_total = bytes;
         self
     }
 
@@ -174,24 +170,19 @@ impl GitCheckpointer {
             .insert(run);
     }
 
-    /// Репозиторий проекта для git или причина отказа (статическая проверка, C1).
+    /// Проект для чекпоинтов git: у корня есть `.git` (только признак режима, его
+    /// содержимое не читается — git работает со своим репозиторием агента).
     async fn repo(&self, project: &Path) -> Result<git::Repo, &'static str> {
-        let (p, h, check) = (
-            project.to_path_buf(),
-            self.home.za_home.clone(),
-            self.repo_check,
-        );
+        let (p, h) = (project.to_path_buf(), self.home.za_home.clone());
         let r = blocking(move || {
             let roots = Roots::canonical(&p, &h)?;
-            if !check {
-                return Ok(Ok(roots.project));
-            }
-            Ok(repo::check(&roots).map(|()| roots.project))
+            let has_git = std::fs::symlink_metadata(roots.project.join(".git")).is_ok();
+            Ok(has_git.then_some(roots.project))
         })
         .await;
         match r {
-            Ok(Ok(top)) => Ok(git::Repo { top }),
-            Ok(Err(reason)) => Err(reason),
+            Ok(Some(top)) => Ok(git::Repo { top }),
+            Ok(None) => Err(checkpoint_reason::NO_GIT),
             Err(e) => {
                 tracing::warn!(error = %e, "корень проекта не канонизирован");
                 Err(checkpoint_reason::IO_ERROR)
@@ -293,6 +284,7 @@ impl GitCheckpointer {
             self.home.clone(),
             self.base_env.clone(),
             timeout,
+            self.max_total,
         )
     }
 
@@ -395,11 +387,12 @@ pub async fn backup_before_restore(
         paths,
         trusted,
     };
-    let (id, stem) = names(&req(ToolKind::Edit, Vec::new(), false));
+    let (id, stem) = names(&req(ToolKind::Exec, Vec::new(), true));
     let paths: Vec<PathBuf> = match cp.kind.as_str() {
         checkpoint_kind::GIT => {
             let (mut s, repo, commit) = git_parts(ck, project, cp, trusted).await?;
-            let plan = s.plan_paths(&repo, &commit, delete_new).await?;
+            // Ровно то, что восстановление изменит (N5, N6).
+            let change = s.change_set(&repo, &commit, delete_new).await?;
             let made = ck
                 .git_checkpoint(
                     &req(ToolKind::Exec, Vec::new(), true),
@@ -409,11 +402,31 @@ pub async fn backup_before_restore(
                 )
                 .await;
             match made {
-                Ok(m) if plan.iter().all(|p| !m.skipped.contains(p)) => return Ok(m.cp),
-                Ok(_) => tracing::warn!("в чекпоинте git «до» нет больших файлов: копии файлов"),
+                Ok(m) => {
+                    // «До» покрывает каждый существующий файл набора: игнорируемые и
+                    // пропущенные по размеру в нём отсутствуют (N6).
+                    let names = s
+                        .tree_names(&repo, m.cp.commit.as_deref().unwrap_or(""))
+                        .await?;
+                    let top = repo.top.clone();
+                    let need = change.clone();
+                    let uncovered = blocking(move || {
+                        Ok(need
+                            .into_iter()
+                            .filter(|rel| !names.contains(rel))
+                            .any(|rel| std::fs::symlink_metadata(join_rel(&top, &rel)).is_ok()))
+                    })
+                    .await?;
+                    if !uncovered {
+                        return Ok(m.cp);
+                    }
+                    tracing::warn!(
+                        "чекпоинт git «до» не покрывает все изменяемые файлы: копии файлов"
+                    );
+                }
                 Err(r) => tracing::warn!(reason = r, "чекпоинт git «до» не сделан: копии файлов"),
             }
-            plan.iter().map(|rel| join_rel(project, rel)).collect()
+            change.iter().map(|rel| join_rel(project, rel)).collect()
         }
         checkpoint_kind::FILES => {
             let (home, cid) = (ck.home.clone(), cp.id.clone());
@@ -422,9 +435,11 @@ pub async fn backup_before_restore(
         }
         _ => return Err(RestoreError::NotFound(cp.id.clone())),
     };
-    let b = ck
-        .files(&req(ToolKind::Edit, paths, false), &id, &stem, true)
-        .await;
+    // Копия — под своим id (`0-1`), чтобы не совпасть со ссылкой git «до» (M8).
+    let mut files_req = req(ToolKind::Edit, paths, false);
+    files_req.effect_key = EffectKey::derive(run, 0, 1);
+    let (id, stem) = names(&files_req);
+    let b = ck.files(&files_req, &id, &stem, true).await;
     if b.kind == checkpoint_kind::FILES {
         Ok(b)
     } else {

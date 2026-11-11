@@ -662,6 +662,26 @@ fn walk_files(
     end(&rules)
 }
 
+/// Файлы проекта для чекпоинта (D89): тот же обход, что у `search` и `glob` — правила
+/// игнорирования читает агент сам, без ссылок и junction, без `.git` и `.zero-agent`;
+/// файл `.git` (gitdir) тоже не входит. Абсолютные пути по порядку обхода и признак
+/// остановки по `deadline`.
+pub(crate) fn project_files(root: &Path, deadline: Instant) -> (Vec<PathBuf>, bool) {
+    let limits = WalkLimits::new(deadline);
+    let base = ResolvedPath {
+        path: root.to_path_buf(),
+        inside: true,
+        protected: false,
+    };
+    let mut out = Vec::new();
+    let end = walk_files(root, &base, &limits, |p| {
+        if !p.file_name().is_some_and(|n| same_name(n, ".git")) {
+            out.push(p.to_path_buf());
+        }
+    });
+    (out, end.stopped)
+}
+
 /// Итог обхода: остановлен ли он пределами и все ли правила загружены.
 #[derive(Default)]
 struct WalkEnd {
