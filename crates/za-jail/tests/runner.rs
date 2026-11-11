@@ -703,6 +703,81 @@ mod linux {
         cleanup(c);
     }
 
+    /// Сбор зомби subreaper не перехватывает статусы детей процесса, запущенных мимо
+    /// `Runner` (раунд 3 ревью задачи 5: `Command::output` давал ECHILD). Параллельно с
+    /// вызовами, которые убивают деревья с усыновлёнными потомками, `std::process::Command`
+    /// и `tokio::process::Command` получают свои статусы.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreign_children_keep_their_status() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let project = dir("foreign_children");
+        // Чужие дети запускаются без перерыва, пока идут вызовы `Runner`.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_std = stop.clone();
+        let std_children = tokio::task::spawn_blocking(move || {
+            let mut i = 0;
+            while i < 10 || !stop_std.load(Ordering::Acquire) {
+                i += 1;
+                let out = std::process::Command::new(tree())
+                    .args(["--exit", "7"])
+                    .output()
+                    .unwrap_or_else(|e| panic!("std::process, запуск {i}: {e}"));
+                assert_eq!(out.status.code(), Some(7), "std::process, запуск {i}");
+            }
+        });
+        let stop_tokio = stop.clone();
+        let tokio_children = tokio::spawn(async move {
+            let mut i = 0;
+            while i < 10 || !stop_tokio.load(Ordering::Acquire) {
+                i += 1;
+                let out = tokio::process::Command::new(tree())
+                    .args(["--exit", "5"])
+                    .output()
+                    .await
+                    .unwrap_or_else(|e| panic!("tokio::process, запуск {i}: {e}"));
+                assert_eq!(out.status.code(), Some(5), "tokio::process, запуск {i}");
+            }
+        });
+        for i in 0..4 {
+            let file = project.join(format!("pids-{i}.txt"));
+            let file_s = file.display().to_string();
+            // Потомки в своих группах усыновляются агентом и убиваются по маркеру.
+            let s = spec(
+                &project,
+                &[
+                    "--depth",
+                    "2",
+                    "--background",
+                    "--newpgrp",
+                    "--pid-file",
+                    &file_s,
+                ],
+                Duration::from_secs(3600),
+            );
+            let out = within(
+                Duration::from_secs(30),
+                "вызов с усыновлёнными",
+                DirectRunner.run(s),
+            )
+            .await
+            .expect("запуск");
+            assert!(out.background_killed, "{out:?}");
+            all_dead(&pids(&out.stdout), "усыновлённые потомки").await;
+        }
+        stop.store(true, Ordering::Release);
+        within(Duration::from_secs(60), "дети std::process", std_children)
+            .await
+            .expect("std::process");
+        within(
+            Duration::from_secs(60),
+            "дети tokio::process",
+            tokio_children,
+        )
+        .await
+        .expect("tokio::process");
+    }
+
     /// Лидер записи мёртв, а номер его группы занят чужой группой (двойной `fork` демона):
     /// её участник без маркера записи не убит (ревью задачи 5, N1).
     #[tokio::test(flavor = "multi_thread")]
