@@ -122,31 +122,40 @@ impl SecretMasker {
         (Cow::Owned(render(s, &spans, s.len())), steps)
     }
 
-    /// Длина хвоста, который маска потока держит до следующего фрагмента (D100, ревью
-    /// задачи 12, I3): не меньше самого длинного известного значения и окна шаблонов.
-    pub fn window(&self) -> usize {
-        self.known
-            .iter()
-            .map(|n| n.pat.len())
-            .max()
-            .unwrap_or(0)
-            .max(STREAM_WINDOW)
-    }
-
     /// Маска потока текста по фрагментам (D100, I3): `s` — удержанный хвост и новый
     /// фрагмент. Возвращает маскированный текст, который можно отдать, и сколько байт `s`
-    /// он покрывает; остаток (последние [`SecretMasker::window`] байт, а если на границе
-    /// стоит находка — с её начала) вызывающий держит до следующего фрагмента. `last` —
-    /// конец потока: отдаётся всё. Секрет на стыке фрагментов так не проскакивает.
+    /// он покрывает; остаток вызывающий держит до следующего фрагмента. `last` — конец
+    /// потока: отдаётся всё. Секрет на стыке фрагментов так не проскакивает.
+    ///
+    /// Хвост держится только с самой ранней позиции, где может начинаться ещё не
+    /// законченная находка (повторное ревью задачи 12, N1), остальное отдаётся сразу:
+    /// - незаконченное слово в конце (токены и пароли в URL — без пробелов); слово перед
+    ///   переводом строки (хвост токена переносится на следующую строку) и слово `Bearer`
+    ///   перед пробелом (токен — в следующем фрагменте);
+    /// - частичное совпадение известного значения в конце (состояние КМП по тексту без
+    ///   переводов строки, поэтому учитываются и разрезанные переносом значения);
+    /// - находка, доходящая до конца текста (PEM без `END`, тело токена);
+    /// - граница внутри находки — на её начало.
     pub fn mask_stream(&self, s: &str, last: bool) -> (String, usize) {
         if last {
             return (self.mask(s).into_owned(), s.len());
         }
-        let mut cut = s.len().saturating_sub(self.window());
+        let mut cut = word_hold(s);
+        if !self.known.is_empty() && !s.is_empty() {
+            let skip = skip_mask(s.as_bytes());
+            for n in &self.known {
+                if let Some(p) = partial_tail(s.as_bytes(), &skip, n) {
+                    cut = cut.min(p);
+                }
+            }
+        }
         while !s.is_char_boundary(cut) {
             cut -= 1;
         }
         let spans = self.merged(s, &mut 0);
+        if let Some(sp) = spans.iter().find(|sp| sp.end >= s.len() && sp.start < cut) {
+            cut = sp.start;
+        }
         // Находки слиты и не пересекаются: граница внутри находки — на её начало.
         if let Some(sp) = spans.iter().find(|sp| sp.start < cut && cut < sp.end) {
             cut = sp.start;
@@ -179,9 +188,52 @@ impl SecretMasker {
     }
 }
 
-/// Окно шаблонов для маски потока: тело шаблона проверяется не дальше [`CHECK_WINDOW`],
-/// плюс запас на префикс и границу слова.
-const STREAM_WINDOW: usize = CHECK_WINDOW + 64;
+/// Начало хвоста, который маска потока держит из-за незаконченного слова (N1): слово в
+/// конце текста; слово перед завершающими пробельными символами, если среди них перевод
+/// строки или это слово `Bearer`. Иначе — длина текста (держать нечего).
+fn word_hold(s: &str) -> usize {
+    let t = s.trim_end_matches(char::is_whitespace);
+    let start = t
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let trailing = &s[t.len()..];
+    if trailing.is_empty() || trailing.contains('\n') || t[start..].eq_ignore_ascii_case("bearer") {
+        start
+    } else {
+        s.len()
+    }
+}
+
+/// Начало частичного совпадения известного значения `n` в самом конце `b` (КМП по байтам
+/// без пропускаемых [`skip_mask`]); полные совпадения находит [`known_spans`].
+fn partial_tail(b: &[u8], skip: &[bool], n: &Needle) -> Option<usize> {
+    let m = n.pat.len();
+    if m == 0 {
+        return None;
+    }
+    let mut ring = vec![0usize; m];
+    let mut seen = 0usize;
+    let mut k = 0usize;
+    for (i, &c) in b.iter().enumerate() {
+        if skip[i] {
+            continue;
+        }
+        ring[seen % m] = i;
+        seen += 1;
+        while k > 0 && c != n.pat[k] {
+            k = n.fail[k - 1];
+        }
+        if c == n.pat[k] {
+            k += 1;
+        }
+        if k == m {
+            k = n.fail[m - 1];
+        }
+    }
+    (k > 0).then(|| ring[(seen - k) % m])
+}
 
 /// `s[..end]` с заменой слитых находок `spans` (все внутри `..end`) метками.
 fn render(s: &str, spans: &[Span<'_>], end: usize) -> String {

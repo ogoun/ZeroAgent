@@ -1735,7 +1735,7 @@ impl Live {
         // (2) Повторное разрешение путей: смена класса — ошибка (D98).
         let now = match resolve_all(&roots, &raw).await {
             Ok(p) => p,
-            Err(e) => return fail(e.to_string()),
+            Err(e) => return fail(path_error_text(&e)),
         };
         let changed = now.len() != planned.len()
             || now

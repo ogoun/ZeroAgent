@@ -1429,7 +1429,9 @@ async fn secret_split_across_deltas_is_masked() {
         "TOKEN".into(),
         secret.clone(),
     )])));
-    let head = format!("{}{a}", "x".repeat(za_agent::DELTA_FLUSH_BYTES));
+    // Слова через пробел: маска потока отдаёт всё до начала возможного секрета сразу.
+    let words = "word ".repeat(za_agent::DELTA_FLUSH_BYTES / 5 + 1);
+    let head = format!("{words}{a}");
     let tail = format!("{c} end");
     let full = format!("{head}{tail}");
     l.model.push(vec![
@@ -1453,14 +1455,85 @@ async fn secret_split_across_deltas_is_masked() {
         .collect();
     assert!(deltas.len() >= 2, "{}", deltas.len());
     let joined = deltas.concat();
-    assert_eq!(
-        joined,
-        format!(
-            "{}[secret masked: TOKEN] end",
-            "x".repeat(za_agent::DELTA_FLUSH_BYTES)
-        )
-    );
+    assert_eq!(joined, format!("{words}[secret masked: TOKEN] end"));
     for e in &evs {
         assert!(!e.payload.to_string().contains(&secret));
     }
+}
+
+// ---- Раунд исправлений 2 (повторное ревью задачи 12) ----
+
+/// N1: короткий ответ без возможного начала секрета уходит дельтой `model.delta` до конца
+/// стрима (маска потока ничего не держит).
+#[tokio::test]
+async fn short_answer_delta_not_held_until_end() {
+    let mut l = lx("delta_short");
+    let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
+    l.deps.journal = Journal::new(l.store.clone(), bus.clone());
+    l.deps.masker = Some(Arc::new(SecretMasker::new(vec![(
+        "TOKEN".into(),
+        ["verylong", "secret", "value"].concat(),
+    )])));
+    let mut rx = bus.subscribe();
+    // Стрим открыт: `Finished` не придёт, текст может уйти только по таймеру дельт.
+    l.model.push_open(vec![Ok(StreamEvent::TextDelta(
+        "Done, tests pass. ".into(),
+    ))]);
+    let (_ctl, ctl_rx) = control_channel(l.store.clone(), l.run);
+    let (deps, run, sp) = (l.deps.clone(), l.run, spec(&l, RunMode::Auto));
+    let h = tokio::spawn(async move { start_run(&deps, run, sp, ctl_rx).await });
+    let text = within("model.delta до конца стрима", async {
+        loop {
+            let e = rx.recv().await.expect("шина закрыта");
+            if e.event.kind == EventKind::ModelDelta
+                && let Some(t) = e.event.payload["text"].as_str()
+            {
+                return t.to_owned();
+            }
+        }
+    })
+    .await;
+    assert_eq!(text, "Done, tests pass. ");
+    h.abort();
+    let _ = h.await;
+}
+
+/// m-a: старый `tool.started` (до раунда 1) без `paths` у намерения без квитанции — пути
+/// не записаны, решение принимается заново по текущим путям: внешний путь — вопрос.
+#[tokio::test]
+async fn old_tool_started_without_paths_redecides() {
+    let b = bx("old_started").await;
+    let edit = EditStub::new();
+    let applied = Arc::clone(&edit.applied);
+    let reg = registry(vec![Arc::new(edit)]);
+    let target = b.d.outside.join("x.txt");
+    let args = json!({"path": s(&target), "old": "", "new": "n"});
+    let key = za_protocol::EffectKey::derive(b.run, 1, 0);
+    b.store
+        .record_intent(
+            b.run,
+            &key,
+            za_protocol::EffectClass::Idempotent,
+            "edit",
+            args.clone(),
+        )
+        .await
+        .unwrap();
+    b.j.append(za_protocol::NewEvent {
+        run_id: b.run,
+        parent_seq: None,
+        actor: za_protocol::Actor::Runtime,
+        kind: EventKind::ToolStarted,
+        payload: json!({"call_id": "c1", "name": "edit", "effect_key": key.0}),
+        tainted: false,
+    })
+    .await
+    .unwrap();
+    let out = b
+        .batch(&reg, &b.env(RunMode::Auto), 1, &[pc("c1", "edit", args)])
+        .await;
+    assert_eq!(reasons(&out), ["outside_project"]);
+    assert!(!out.suspend.unwrap().id.ends_with("-path"));
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert!(!target.exists());
 }

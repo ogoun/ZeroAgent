@@ -551,5 +551,30 @@ fn stream_mask_holds_window_across_chunks() {
         assert_eq!(out, m.mask(&text), "разрез на {cut}");
         assert!(!out.contains("verylong") && !out.contains("ghp_"), "{cut}");
     }
-    assert!(m.window() >= "verylongsecretvalue".len());
+}
+
+/// N1 (повторное ревью задачи 12): текст без возможного начала секрета отдаётся сразу;
+/// держится только незаконченное слово, слово перед переводом строки, `Bearer ` и
+/// частичное совпадение известного значения.
+#[test]
+fn stream_mask_holds_only_possible_secret_start() {
+    let m = SecretMasker::new(vec![("k".into(), "verylongsecretvalue".into())]);
+    let all = |s: &str| m.mask_stream(s, false);
+    assert_eq!(all("Done, tests pass. "), ("Done, tests pass. ".into(), 18));
+    assert_eq!(all("Done, tests pa").1, "Done, tests ".len());
+    assert_eq!(all("see line\n").1, "see ".len());
+    assert_eq!(all("Authorization: Bearer ").1, "Authorization: ".len());
+    // Частичное совпадение значения, разрезанного переводом строки, держится с начала.
+    assert_eq!(all("value: verylong\nsecr").1, "value: ".len());
+    // Значение не продолжилось — держать нечего.
+    assert_eq!(
+        all("value: verylong done. ").1,
+        "value: verylong done. ".len()
+    );
+    // Продолжение: склейка равна маске целого текста.
+    let text = format!("token {} and done. ", ghp());
+    let (a, b) = text.split_at(20);
+    let (p1, used) = m.mask_stream(a, false);
+    let (p2, _) = m.mask_stream(&format!("{}{b}", &a[used..]), true);
+    assert_eq!(format!("{p1}{p2}"), m.mask(&text));
 }
