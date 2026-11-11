@@ -282,7 +282,9 @@ fn is_assignment(w: &str) -> bool {
 /// Имя команды: последний компонент пути, нижний регистр, без `.exe`, `.cmd`, `.bat`,
 /// `.com` и `@` cmd. Слово-выражение (кавычки, скобки, `$`, пробел) путём не режется.
 pub(crate) fn norm(w: &str) -> String {
-    if w.contains(['(', ')', '[', ']', '{', '}', '$', '\'', '"', ' ']) {
+    if w.contains(['(', ')', '[', ']', '{', '}', '$', '\'', '"', ' '])
+        || w.contains(|c: char| matches!(c, '\u{2018}'..='\u{201E}'))
+    {
         return w.to_lowercase();
     }
     let t = w.trim_end_matches(['/', '\\']);
@@ -322,6 +324,7 @@ fn dynamic(raw: &str) -> bool {
 /// Слово PowerShell в начале сегмента — выражение, а не имя команды.
 pub(crate) fn pwsh_expression(raw: &str) -> bool {
     raw.starts_with(['$', '(', '[', '{', '\'', '"'])
+        || raw.starts_with(|c: char| matches!(c, '\u{2018}'..='\u{201E}'))
         || raw.starts_with("@(")
         || raw.starts_with("@{")
         || raw.starts_with(|c: char| c.is_ascii_digit())

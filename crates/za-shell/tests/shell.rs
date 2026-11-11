@@ -69,7 +69,8 @@ fn irreversible_hits() {
         ("xargs rm -rf", B, "delete"),
         ("find . -delete", B, "delete"),
         ("/bin/rm -f a", B, "delete"),
-        (r"\rm -rf a", B, "delete"),
+        // Экранирование в начале токена — вне подмножества (раунд 2 ревью задачи 8).
+        (r"\rm -rf a", B, "unparsed"),
         ("bash -c 'rm -rf x'", B, "delete"),
         ("ri -r x", P, "delete"),
         ("Remove-Item -Recurse:$true x", P, "delete"),
@@ -355,8 +356,11 @@ fn bypass_corpus_bash_gets_irreversible_label() {
         ("sudo -u root rm -rf x", "delete"),
         ("rm --recursive x", "delete"),
         ("rm -Rf x", "delete"),
-        ("find . -name '*.o' -exec rm -rf {} \\;", "delete"),
-        ("find . -exec sh -c 'rm -rf x' \\;", "delete"),
+        // `\;` — экранирование в начале токена, вне подмножества (раунд 2 ревью задачи 8).
+        ("find . -name '*.o' -exec rm -rf {} \\;", "unparsed"),
+        ("find . -exec sh -c 'rm -rf x' \\;", "unparsed"),
+        ("find . -name '*.o' -exec rm -rf {} ';'", "delete"),
+        ("find . -exec sh -c 'rm -rf x' ';'", "delete"),
         ("shred -u secret", "delete"),
         ("git -C . push --force-with-lease", "git_force_push"),
         ("git push origin :main", "git_force_push"),
@@ -986,63 +990,137 @@ fn c1_powershell_typographic_quotes_close_strings() {
             "{c:?}"
         );
     }
-    // Внутри строки типографская кавычка другого вида — обычный символ, как в PowerShell.
+    // Внутри строки типографская кавычка другого вида — обычный символ, как в PowerShell;
+    // текст не переписывается (N4 раунда 2).
     let s = seg0("Write-Output 'a\u{201C}b'", P);
-    assert_eq!(s.argv, ["Write-Output", "a\"b"]);
-    // Удвоенная кавычка любого вида — сама кавычка.
+    assert_eq!(s.argv, ["Write-Output", "a\u{201C}b"]);
+    // Удвоенная кавычка любого вида — одна кавычка.
     let s = seg0("Write-Output 'it\u{2019}\u{2019}s'", P);
-    assert_eq!(s.argv, ["Write-Output", "it's"]);
-    // В bash типографские кавычки — обычные символы.
+    assert_eq!(s.argv, ["Write-Output", "it\u{2019}s"]);
+    // В bash и cmd типографские кавычки — обычные символы.
     assert_eq!(
         segments("echo 'x\u{2019}; rm -rf ../v; echo \u{2019}y'", B).len(),
         1
     );
 }
 
-/// Одиночный `\r` — перевод строки PowerShell, то есть разделитель операторов.
+// ---- Раунд 2 ревью задачи 8: строгое подмножество синтаксиса (D81) ----
+
+/// Все сегменты команды неразобраны.
+fn all_unparsed(c: &str, d: Dialect) -> bool {
+    let segs = segments(c, d);
+    !segs.is_empty() && segs.iter().all(|s| s.unparsed)
+}
+
+/// CR не в паре CRLF — вне подмножества; CRLF — перевод строки.
 #[test]
-fn c1_powershell_lone_cr_separates_statements() {
-    for c in [
-        "Write-Output a\rRemove-Item -Recurse -Force ../victim",
-        "Write-Output a\r\nRemove-Item -Recurse -Force ../victim",
-    ] {
-        let segs = segments(c, P);
-        assert_eq!(segs.len(), 2, "{c:?}");
-        assert_eq!(argv0(&segs[1]).as_deref(), Some("remove-item"));
-        assert!(labels(c, P).contains(&"delete"), "{c:?}");
+fn strict_lone_cr_is_unparsed() {
+    for d in [B, P] {
+        for c in [
+            "echo a\rrm -rf ../victim",
+            "echo a\r\rrm -rf x",
+            "echo a\n\rrm -rf x",
+            "# note\rrm -rf x",
+        ] {
+            assert!(all_unparsed(c, d), "{d:?} {c:?}");
+        }
     }
-    // Комментарий кончается на `\r`.
-    assert_eq!(segments("# note\rRemove-Item -Recurse x", P).len(), 1);
-    assert!(labels("# note\rRemove-Item -Recurse x", P).contains(&"delete"));
-    // Перенос строки обратной кавычкой и `\r`.
-    assert_eq!(
-        segments("Write-Output a `\rb", P)[0].argv,
-        ["Write-Output", "a", "b"]
+    let segs = segments("Write-Output a\r\nRemove-Item -Recurse -Force ../victim", P);
+    assert_eq!(segs.len(), 2);
+    assert!(segs.iter().all(|s| !s.unparsed));
+    assert!(
+        labels("Write-Output a\r\nRemove-Item -Recurse -Force ../victim", P).contains(&"delete")
     );
 }
 
-/// Пробелы Unicode, `\v`, `\f` и U+0085 разделяют слова PowerShell (проверено на 5.1).
+/// N1: обратная кавычка вплотную к `\r\n` (PowerShell экранирует `\r`, `\n` разделяет)
+/// и любое продолжение строки — вне подмножества, в том числе в `$( )` и `& { }`.
 #[test]
-fn c1_powershell_unicode_spaces_split_words() {
+fn strict_n1_continuation_is_unparsed() {
+    for c in [
+        "Write-Output a`\r\nRemove-Item -Recurse ../x",
+        "Write-Output $(Write-Output a`\r\nRemove-Item -Recurse ../x)",
+        "& { Write-Output a`\r\nRemove-Item -Recurse ../x }",
+        "Write-Output a `\r\nRemove-Item -Recurse ../x",
+        "Write-Output a `\nb",
+        "Write-Output a`\nb",
+    ] {
+        assert!(all_unparsed(c, P), "{c:?}");
+        assert!(labels(c, P).contains(&"unparsed"), "{c:?}");
+    }
+}
+
+/// N2: экранирующий символ в начале токена — вне подмножества.
+#[test]
+fn strict_n2_escape_at_token_start_is_unparsed() {
+    for c in [
+        "` Remove-Item -Recurse -Force src",
+        "Write-Output a;`\tRemove-Item -Recurse ../x",
+        "Get-Content ` ..\\..\\secret",
+        "Get-ChildItem -LiteralPath ` ..\\..",
+    ] {
+        assert!(segments(c, P).iter().any(|s| s.unparsed), "{c:?}");
+        assert!(labels(c, P).contains(&"unparsed"), "{c:?}");
+    }
+    for c in [r"\rm -rf x", r"echo \$HOME", r"ls \ ../x"] {
+        assert!(labels(c, B).contains(&"unparsed"), "{c:?}");
+    }
+    // Экранирование внутри слова — в подмножестве.
+    assert_eq!(seg0("Write-Output a` b", P).argv, ["Write-Output", "a b"]);
+    assert!(!seg0("Write-Output a` b", P).unparsed);
+    assert!(!seg0(r"echo a\ b", B).unparsed);
+}
+
+/// N3: `\` + `\r\n` в bash (bash экранирует `\r`) и любое продолжение строки — вне
+/// подмножества.
+#[test]
+fn strict_n3_bash_continuation_is_unparsed() {
+    for c in [
+        "echo a \\\r\nrm -rf ../x",
+        "echo a\\\r\nrm -rf ../x",
+        "echo 'a' \\\r\n rm -rf ../x",
+        "cargo test \\\n  -p za-core",
+    ] {
+        assert!(all_unparsed(c, B), "{c:?}");
+    }
+    // CRLF без продолжения — два сегмента.
+    assert_eq!(segments("echo a\r\nrm -rf ../x", B).len(), 2);
+    assert!(labels("echo a\r\nrm -rf ../x", B).contains(&"delete"));
+    // cmd: `^` перед переводом строки.
+    assert!(labels("cmd /c \"echo a ^\r\nrd /s /q x\"", P).contains(&"unparsed"));
+}
+
+/// Управляющие символы и пробелы Unicode — вне подмножества во всех диалектах.
+#[test]
+fn strict_controls_and_unicode_spaces_are_unparsed() {
     for sp in [
         '\u{0b}', '\u{0c}', '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2007}', '\u{200a}',
-        '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}', '\0',
+        '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}', '\0', '\u{1b}',
     ] {
         let c = format!("Remove-Item{sp}-Recurse{sp}-Force{sp}../victim");
-        let s = seg0(&c, P);
-        assert_eq!(
-            s.argv,
-            ["Remove-Item", "-Recurse", "-Force", "../victim"],
-            "{sp:?}"
-        );
-        assert!(labels(&c, P).contains(&"delete"), "{sp:?}");
-        assert_eq!(path_words(&s, P), ["../victim"], "{sp:?}");
+        assert!(all_unparsed(&c, P), "{sp:?}");
+        let c = format!("rm{sp}-rf{sp}../victim");
+        assert!(all_unparsed(&c, B), "{sp:?}");
     }
-    // `iwr` так же не прячется от метки сети.
-    assert!(is_network(&seg0("iwr\u{2028}https://x", P), P));
-    // Невидимые символы нулевой ширины — часть слова, как в PowerShell.
+    // Табуляция и перевод строки — в подмножестве; нулевая ширина — символ слова.
+    assert!(!seg0("Write-Output\ta", P).unparsed);
     assert_eq!(
         seg0("Write-Output a\u{200b}b", P).argv,
         ["Write-Output", "a\u{200b}b"]
     );
+}
+
+/// N4: строка вложенной интерпретации передаётся как есть — типографские кавычки
+/// PowerShell не превращаются в ASCII-кавычки чужого диалекта.
+#[test]
+fn strict_n4_nested_code_is_not_rewritten() {
+    let c = "bash -c \"echo \u{2019}; rm -rf ../x; echo \u{2019}\"";
+    assert!(labels(c, P).contains(&"delete"), "{:?}", labels(c, P));
+    let segs = segments(c, P);
+    assert!(
+        segs.iter().any(|s| argv0(s).as_deref() == Some("rm")),
+        "{segs:?}"
+    );
+    let c = "powershell -c \"Write-Output '\u{2019}; Remove-Item -Recurse ../x; Write-Output \u{2019}'\"";
+    assert!(labels(c, P).contains(&"delete"), "{:?}", labels(c, P));
 }

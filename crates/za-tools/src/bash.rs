@@ -203,8 +203,23 @@ impl Shell {
     /// кавычки, пробелы Unicode, символы нулевой ширины и направления текста; у `sh`
     /// вместо `bash` — ещё `$'…'` (dash разбирает его иначе, m7).
     fn suspicious(&self, cmd: &str) -> bool {
+        // Bash: внутри обычных кавычек нестандартная кавычка — литерал (раунд 2 ревью:
+        // сообщения коммитов), вне кавычек — подозрительна. У PowerShell U+2018–U+201E —
+        // настоящие кавычки, поэтому подозрительны везде.
+        let bash = self.dialect == Dialect::Bash;
+        let (mut single, mut double, mut escaped) = (false, false, false);
         let mut it = cmd.chars().peekable();
         while let Some(c) = it.next() {
+            let quoted = single || double;
+            if bash {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' if !single => escaped = true,
+                    '\'' if !double => single = !single,
+                    '"' if !single => double = !double,
+                    _ => {}
+                }
+            }
             let bad = match c {
                 '\t' | '\n' | ' ' => false,
                 '\r' => it.peek() != Some(&'\n'),
@@ -218,8 +233,8 @@ impl Shell {
                 | '\u{300C}'..='\u{300F}'
                 | '\u{301D}'..='\u{301F}'
                 | '\u{FF02}'
-                | '\u{FF07}'
-                | '\u{200B}'..='\u{200F}'
+                | '\u{FF07}' => !(bash && quoted),
+                '\u{200B}'..='\u{200F}'
                 | '\u{202A}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{2069}'
@@ -885,7 +900,7 @@ mod tests {
         };
         for c in [
             "echo a\rrm -rf x",
-            "echo 'x\u{2019}; rm x'",
+            "echo x\u{2019}; rm x",
             "echo \u{201C}x\u{201D}",
             "echo \u{ab}x\u{bb}",
             "rm\u{a0}-rf x",
@@ -903,6 +918,20 @@ mod tests {
             assert!(ps.suspicious(c), "{c:?}");
             assert!(bash.suspicious(c), "{c:?}");
         }
+        // Раунд 2: в bash нестандартные кавычки внутри обычных — литералы.
+        for c in [
+            "git commit -m \"исправлено \u{ab}x\u{bb}\"",
+            "git commit -m 'it\u{2019}s done'",
+            "echo \"a \\\" \u{201C}b\u{201D}\"",
+        ] {
+            assert!(!bash.suspicious(c), "{c:?}");
+            assert!(ps.suspicious(c), "{c:?}");
+        }
+        assert!(bash.suspicious("echo \u{2019}x"));
+        assert!(
+            bash.suspicious("echo \"a\u{200b}\""),
+            "нулевая ширина — везде"
+        );
         for c in [
             "cargo test -p za-core",
             "echo 'привет, мир'",

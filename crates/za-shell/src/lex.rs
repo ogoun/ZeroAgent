@@ -5,11 +5,8 @@ use crate::{Lang, MAX_NEST, Segment};
 
 /// Сегменты кода; `interp` — уровень вложенной интерпретации, `nest` — подстановок.
 pub(crate) fn lex_code(code: &str, lang: Lang, interp: u8, nest: u8) -> Vec<Segment> {
-    let chars: Vec<char> = if lang == Lang::Pwsh {
-        pwsh_chars(code)
-    } else {
-        code.chars().collect()
-    };
+    let chars: Vec<char> = code.chars().collect();
+    let strict = outside_subset(&chars, lang);
     let raws = Lexer {
         s: &chars,
         i: 0,
@@ -63,33 +60,51 @@ pub(crate) fn lex_code(code: &str, lang: Lang, interp: u8, nest: u8) -> Vec<Segm
             out.extend(lex_code(&c, l, interp + 1, nest));
         }
     }
+    if strict {
+        // Текст вне подмножества: неразобраны все сегменты, и тела, и вложенный код. Нет
+        // ни одного (например, «комментарий» с CR, который PowerShell считает переводом
+        // строки) — всё равно один неразобранный сегмент, на подтверждение.
+        for s in &mut out {
+            s.unparsed = true;
+        }
+        if out.is_empty() {
+            out.push(Segment {
+                text: code.trim().to_string(),
+                argv: Vec::new(),
+                has_subst: false,
+                redirects: Vec::new(),
+                unparsed: true,
+            });
+        }
+    }
     out
 }
 
-/// Текст PowerShell в символах, равнозначных для его токенайзера (C1 ревью задачи 8):
-/// типографские кавычки U+2018–U+201B открывают и закрывают строку как `'`, U+201C–U+201E
-/// — как `"`; одиночный `\r` и `\r\n` — перевод строки (разделитель операторов); пробелы
-/// Unicode (Zs, Zl, Zp, NBSP, U+0085), `\v`, `\f` и NUL разделяют слова, как пробел.
-/// Тексты сегментов и слова берутся из этого вида.
-fn pwsh_chars(code: &str) -> Vec<char> {
-    let mut out = Vec::with_capacity(code.len());
-    let mut it = code.chars().peekable();
-    while let Some(c) = it.next() {
-        out.push(match c {
-            '\u{2018}'..='\u{201B}' => '\'',
-            '\u{201C}'..='\u{201E}' => '"',
-            '\r' => {
-                if it.peek() == Some(&'\n') {
-                    it.next();
-                }
-                '\n'
-            }
-            '\0' => ' ',
-            c if c.is_whitespace() && c != '\n' => ' ',
-            c => c,
-        });
+/// Текст вне строгого подмножества синтаксиса, которое лексер разбирает однозначно
+/// (D81, ревью задачи 8, раунд 2): лексер не повторяет тонкости оболочки, а отдаёт такой
+/// текст на подтверждение. Во всех диалектах вне подмножества: продолжение строки
+/// (экранирующий символ перед переводом строки), CR не в паре CRLF, управляющие символы,
+/// кроме табуляции и перевода строки, и пробельные символы, кроме пробела и табуляции.
+fn outside_subset(s: &[char], lang: Lang) -> bool {
+    let esc = escape_char(lang);
+    s.iter().enumerate().any(|(i, &c)| {
+        let next = s.get(i + 1).copied();
+        match c {
+            '\r' => next != Some('\n'),
+            '\n' | '\t' | ' ' => false,
+            c if c == esc => matches!(next, Some('\n' | '\r')),
+            c => c.is_control() || c.is_whitespace(),
+        }
+    })
+}
+
+/// Экранирующий символ диалекта.
+fn escape_char(lang: Lang) -> char {
+    match lang {
+        Lang::Bash => '\\',
+        Lang::Pwsh => '`',
+        Lang::Cmd => '^',
     }
-    out
 }
 
 /// Сегмент в процессе разбора.
@@ -132,6 +147,25 @@ struct Lexer<'a> {
 }
 
 impl Lexer<'_> {
+    /// Одинарная кавычка диалекта: у PowerShell — ещё U+2018–U+201B.
+    fn sq(&self, c: char) -> bool {
+        c == '\'' || (self.lang == Lang::Pwsh && matches!(c, '\u{2018}'..='\u{201B}'))
+    }
+
+    /// Двойная кавычка диалекта: у PowerShell — ещё U+201C–U+201E.
+    fn dq(&self, c: char) -> bool {
+        c == '"' || (self.lang == Lang::Pwsh && matches!(c, '\u{201C}'..='\u{201E}'))
+    }
+
+    /// `c` закрывает строку, открытую кавычкой вида `q` (`'`, `"`, `` ` ``).
+    fn closes(&self, q: char, c: char) -> bool {
+        match q {
+            '\'' => self.sq(c),
+            '"' => self.dq(c),
+            _ => c == q,
+        }
+    }
+
     fn at(&self, k: usize) -> Option<char> {
         self.s.get(self.i + k).copied()
     }
@@ -170,7 +204,10 @@ impl Lexer<'_> {
             if self.lang == Lang::Pwsh
                 && cur.argv.is_empty()
                 && (c == '&'
-                    || (c == '.' && matches!(self.at(1), Some(' ' | '(' | '{' | '\'' | '"' | '$'))))
+                    || (c == '.'
+                        && self.at(1).is_some_and(|n| {
+                            matches!(n, ' ' | '(' | '{' | '$') || self.sq(n) || self.dq(n)
+                        })))
             {
                 // Оператор вызова или dot-source: что вызывается, решает выражение.
                 cur.argv.push(c.to_string());
@@ -194,12 +231,21 @@ impl Lexer<'_> {
                 continue;
             }
             if self.redirect_start(c) {
+                if self.lang == Lang::Pwsh && cur.argv.is_empty() {
+                    // PowerShell 5.1 читает `>` в начале оператора как имя команды, а не
+                    // перенаправление (сверка с его парсером): вне подмножества.
+                    cur.unparsed = true;
+                }
                 self.redirect(&mut cur);
                 continue;
             }
+            if c == escape_char(self.lang) {
+                // Экранирование в начале токена (`\rm`, `` ` `` + пробел) — вне подмножества.
+                cur.unparsed = true;
+            }
             let before = self.i;
             let mut w = self.word(&mut cur);
-            if self.lang == Lang::Pwsh && cur.argv.is_empty() && matches!(c, '\'' | '"') {
+            if self.lang == Lang::Pwsh && cur.argv.is_empty() && (self.sq(c) || self.dq(c)) {
                 // Строковый литерал в начале сегмента — выражение: кавычки остаются.
                 w = self.s[before..self.i].iter().collect();
             }
@@ -667,8 +713,8 @@ impl Lexer<'_> {
                 '\\' if self.lang == Lang::Bash => self.i += 2,
                 '`' if self.lang == Lang::Pwsh => self.i += 2,
                 '`' if self.lang == Lang::Bash => self.skip_quoted('`')?,
-                '\'' => self.skip_quoted('\'')?,
-                '"' => self.skip_quoted('"')?,
+                c if self.sq(c) => self.skip_quoted('\'')?,
+                c if self.dq(c) => self.skip_quoted('"')?,
                 _ if c == open => {
                     depth += 1;
                     self.i += 1;
@@ -695,7 +741,7 @@ impl Lexer<'_> {
             match c {
                 '\\' if self.lang == Lang::Bash && q != '\'' => self.i += 2,
                 '`' if self.lang == Lang::Pwsh && q == '"' => self.i += 2,
-                _ if c == q => {
+                _ if self.closes(q, c) => {
                     self.i += 1;
                     return Some(());
                 }
@@ -707,7 +753,8 @@ impl Lexer<'_> {
 
     fn word_pwsh(&mut self, cur: &mut Raw) -> String {
         let mut w = String::new();
-        if self.rest_starts("--%") || self.rest_starts("@'") || self.rest_starts("@\"") {
+        let here = self.peek() == Some('@') && self.at(1).is_some_and(|n| self.sq(n) || self.dq(n));
+        if self.rest_starts("--%") || here {
             // Стоп-разбор и here-string: текст уходит как есть.
             self.fail(cur);
             return w;
@@ -733,7 +780,7 @@ impl Lexer<'_> {
                         }
                     }
                 }
-                '\'' => {
+                c if self.sq(c) => {
                     self.i += 1;
                     loop {
                         match self.peek() {
@@ -741,11 +788,12 @@ impl Lexer<'_> {
                                 cur.unparsed = true;
                                 break;
                             }
-                            Some('\'') if self.at(1) == Some('\'') => {
-                                w.push('\'');
+                            // Удвоенная кавычка любого вида — сама кавычка.
+                            Some(x) if self.sq(x) && self.at(1).is_some_and(|n| self.sq(n)) => {
+                                w.push(x);
                                 self.i += 2;
                             }
-                            Some('\'') => {
+                            Some(x) if self.sq(x) => {
                                 self.i += 1;
                                 break;
                             }
@@ -756,7 +804,7 @@ impl Lexer<'_> {
                         }
                     }
                 }
-                '"' => {
+                c if self.dq(c) => {
                     self.i += 1;
                     self.dquote_pwsh(&mut w, cur);
                 }
@@ -807,11 +855,11 @@ impl Lexer<'_> {
                     }
                     self.i += 2;
                 }
-                Some('"') if self.at(1) == Some('"') => {
-                    w.push('"');
+                Some(x) if self.dq(x) && self.at(1).is_some_and(|n| self.dq(n)) => {
+                    w.push(x);
                     self.i += 2;
                 }
-                Some('"') => {
+                Some(x) if self.dq(x) => {
                     self.i += 1;
                     return;
                 }

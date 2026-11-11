@@ -653,7 +653,8 @@ fn subjects_powershell_dialect() {
 }
 
 /// C1 ревью задачи 8: команды, которые лексер раньше видел не так, как PowerShell.
-/// Теперь видны метка удаления и внешний путь, а страховка ставит `unparsed`.
+/// Типографские кавычки разбираются как у PowerShell (видны метка удаления и внешний
+/// путь), а CR и пробелы Unicode — вне строгого подмножества (раунд 2): `unparsed`.
 #[test]
 fn c1_subjects_powershell_quotes_cr_spaces() {
     let tool = bash_tool(
@@ -664,9 +665,6 @@ fn c1_subjects_powershell_quotes_cr_spaces() {
     for c in [
         "Write-Output 'x\u{2019}; Remove-Item -Recurse -Force ../../victim; Write-Output \u{2019}y'",
         "Write-Output \"q\u{201D}; Remove-Item -Recurse -Force ../v; Write-Output \u{201C}z\"",
-        "Write-Output a\rRemove-Item -Recurse -Force ../victim",
-        "Remove-Item\u{2028}-Recurse\u{2028}-Force\u{2028}../victim",
-        "Remove-Item\u{0b}-Recurse\u{0c}-Force\u{85}../victim",
     ] {
         let s = tool.subjects(&json!({ "cmd": c }));
         assert!(
@@ -676,6 +674,17 @@ fn c1_subjects_powershell_quotes_cr_spaces() {
         );
         assert!(s.irreversible.contains(&"unparsed"), "{c:?}");
         assert!(s.paths.iter().any(|p| p.arg.starts_with("..")), "{c:?}");
+        assert!(s.segments.iter().all(|g| g.unparsed), "{c:?}");
+    }
+    for c in [
+        "Write-Output a\rRemove-Item -Recurse -Force ../victim",
+        "Remove-Item\u{2028}-Recurse\u{2028}-Force\u{2028}../victim",
+        "Remove-Item\u{0b}-Recurse\u{0c}-Force\u{85}../victim",
+        "Write-Output a`\r\nRemove-Item -Recurse ../x",
+        "` Remove-Item -Recurse -Force src",
+    ] {
+        let s = tool.subjects(&json!({ "cmd": c }));
+        assert!(s.irreversible.contains(&"unparsed"), "{c:?}");
         assert!(s.segments.iter().all(|g| g.unparsed), "{c:?}");
     }
 }
@@ -727,16 +736,6 @@ async fn c1_lexer_matches_powershell_execution() {
             "c1-dq",
             "Write-Output \"q\u{201D}; Write-Output INJ; Write-Output \u{201C}z\"",
             vec!["q", "INJ", "z"],
-        ),
-        (
-            "c1-cr",
-            "Write-Output a\rWrite-Output INJ",
-            vec!["a", "INJ"],
-        ),
-        (
-            "c1-ls",
-            "Write-Output a\u{2028}INJ\u{85}b\u{0b}c",
-            vec!["a", "INJ", "b", "c"],
         ),
     ] {
         let segs = za_core::shell::segments(cmd, Dialect::PowerShell);
