@@ -16,7 +16,12 @@
 //! `\n` в конце файла не меняется: замена трогает только найденное место. BOM снимает и
 //! возвращает вызывающий.
 
+use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use similar::TextDiff;
@@ -30,6 +35,11 @@ const CLOSEST_ALL_WINDOWS: usize = 2000;
 const CLOSEST_MAX_WINDOWS: usize = 5000;
 /// Предел времени поиска ближайшего участка: подсказка не должна держать вызов.
 const CLOSEST_BUDGET: Duration = Duration::from_secs(1);
+/// Сколько мест `old` показывать в неоднозначности; поиск останавливается на следующем
+/// (N1 повторного ревью): для решения хватает двух, а полный счёт перекрытий квадратичен.
+pub(crate) const AMBIGUOUS_SHOWN: usize = 10;
+/// Основание полиномиального хэша окна строк (уровни 3–4).
+const ROLL_BASE: u64 = 0x100_0000_01b3;
 /// Защита от перезаписи (таблица 3.4): файл от стольких строк…
 const SHRINK_MIN_LINES: usize = 20;
 
@@ -40,7 +50,8 @@ pub enum PatchError {
     NotFound {
         closest: Option<(usize, usize, String)>,
     },
-    /// `old` найден в нескольких местах: номера строк начала (с 1).
+    /// `old` найден в нескольких местах: номера строк начала (с 1) — по одному на место,
+    /// не больше `AMBIGUOUS_SHOWN + 1` (больше — «more than 10 places»).
     Ambiguous { lines: Vec<usize> },
     /// Правка убирает `removed` из `total` строк без `allow_shrink`.
     Shrink { removed: usize, total: usize },
@@ -62,6 +73,64 @@ pub enum MatchLevel {
 /// Заменяет единственное место `old` в `text` на `new` (см. модуль). Пустой `old` у
 /// пустого `text` даёт `new`; у непустого — [`PatchError::Exists`].
 pub fn apply(text: &str, old: &str, new: &str) -> Result<(String, MatchLevel), PatchError> {
+    apply_until(text, old, new, &Stop::after(CLOSEST_BUDGET))
+}
+
+/// Когда прекратить нечёткий поиск ближайшего участка: дедлайн и флаг отмены вызова.
+#[derive(Debug, Clone)]
+pub(crate) struct Stop {
+    deadline: Instant,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Stop {
+    /// Дедлайн через `d` от этого момента, без отмены.
+    pub(crate) fn after(d: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + d,
+            cancel: None,
+        }
+    }
+
+    /// С флагом отмены (бросок future вызова).
+    pub(crate) fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    fn stopped(&self) -> bool {
+        Instant::now() >= self.deadline
+            || self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+}
+
+thread_local! {
+    /// Шаги поиска в этом потоке: вызовы поиска подстроки, проверки окон строк и сравнения
+    /// окон ближайшего участка. Тесты проверяют по нему, что поиск не квадратичен (N1),
+    /// без порога настенного времени.
+    static MATCH_STEPS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn step() {
+    MATCH_STEPS.with(|c| c.set(c.get() + 1));
+}
+
+/// Сколько шагов поиска сделал этот поток (для тестов).
+#[doc(hidden)]
+pub fn match_steps() -> u64 {
+    MATCH_STEPS.with(Cell::get)
+}
+
+/// [`apply`] с остановкой нечёткого поиска по `stop`.
+pub(crate) fn apply_until(
+    text: &str,
+    old: &str,
+    new: &str,
+    stop: &Stop,
+) -> Result<(String, MatchLevel), PatchError> {
     if old.is_empty() {
         return if text.is_empty() {
             Ok((new.to_owned(), MatchLevel::Exact))
@@ -164,7 +233,7 @@ pub fn apply(text: &str, old: &str, new: &str) -> Result<(String, MatchLevel), P
         }
     }
     Err(PatchError::NotFound {
-        closest: closest(&norm.text, &lines, old_body),
+        closest: closest(&norm.text, &lines, old_body, stop),
     })
 }
 
@@ -215,19 +284,22 @@ fn splice(text: &str, a: usize, b: usize, with: &str) -> String {
     out
 }
 
-/// Начала всех вхождений `pat` в `text`, в том числе перекрывающихся (I1): поиск
-/// сдвигается на один символ, а не на длину совпадения. `"}\n}\n}\n"` содержит
-/// `"}\n}\n"` дважды — это неоднозначность, а не одно место.
+/// Начала вхождений `pat` в `text`, в том числе перекрывающихся (I1): поиск (`str::find`,
+/// линейный Two-Way) перезапускается со следующего символа, а не после совпадения.
+/// `"}\n}\n}\n"` содержит `"}\n}\n"` дважды — это неоднозначность. Поиск останавливается
+/// на `AMBIGUOUS_SHOWN + 1` местах (N1): на периодическом тексте полный счёт перекрытий —
+/// O(n·m), а для решения хватает двух.
 fn overlapping(text: &str, pat: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut pos = 0;
-    while let Some(i) = text[pos..].find(pat) {
+    while out.len() <= AMBIGUOUS_SHOWN {
+        step();
+        let Some(i) = text[pos..].find(pat) else {
+            break;
+        };
         let at = pos + i;
         out.push(at);
         pos = at + text[at..].chars().next().map_or(1, char::len_utf8);
-        if pos > text.len() {
-            break;
-        }
     }
     out
 }
@@ -301,10 +373,42 @@ fn find_windows(
     if k == 0 || lines.len() < k {
         return Vec::new();
     }
+    // Линейно (N1): полиномиальный хэш окна из `k` хэшей ключей скользит по строкам; окно
+    // с тем же хэшем сверяется точно. Поиск останавливается на `AMBIGUOUS_SHOWN + 1`.
+    let h = |s: &str| {
+        let mut st = DefaultHasher::new();
+        s.hash(&mut st);
+        st.finish()
+    };
     let keys: Vec<String> = lines.iter().map(|&(a, b)| key(&text[a..b])).collect();
-    (0..=lines.len() - k)
-        .filter(|&i| keys[i] == old_keys[0] && (1..k).all(|j| keys[i + j] == old_keys[j]))
-        .collect()
+    let hk: Vec<u64> = keys.iter().map(|s| h(s)).collect();
+    let roll = |xs: &[u64]| {
+        xs.iter()
+            .fold(0u64, |acc, &x| acc.wrapping_mul(ROLL_BASE).wrapping_add(x))
+    };
+    let target = roll(&old_keys.iter().map(|s| h(s)).collect::<Vec<_>>());
+    // ROLL_BASE^(k-1): вес уходящего из окна элемента.
+    let top = (1..k).fold(1u64, |acc, _| acc.wrapping_mul(ROLL_BASE));
+    let mut cur = roll(&hk[..k]);
+    let mut found = Vec::new();
+    for i in 0..=lines.len() - k {
+        if i > 0 {
+            cur = cur
+                .wrapping_sub(hk[i - 1].wrapping_mul(top))
+                .wrapping_mul(ROLL_BASE)
+                .wrapping_add(hk[i + k - 1]);
+        }
+        if cur == target {
+            step();
+            if (0..k).all(|j| keys[i + j] == old_keys[j]) {
+                found.push(i);
+                if found.len() > AMBIGUOUS_SHOWN {
+                    break;
+                }
+            }
+        }
+    }
+    found
 }
 
 /// `new` с отступами найденного места: отступ строки `new`, равный отступу строки `old`,
@@ -357,7 +461,12 @@ fn reindent(new: &str, old_lines: &[&str], found: &[&str]) -> String {
 }
 
 /// Ближайший к `old` участок из стольких же строк (сходство символов `similar` ≥ 0,6).
-fn closest(text: &str, lines: &[(usize, usize)], old: &str) -> Option<(usize, usize, String)> {
+fn closest(
+    text: &str,
+    lines: &[(usize, usize)],
+    old: &str,
+    stop: &Stop,
+) -> Option<(usize, usize, String)> {
     let k = old.split('\n').count();
     if lines.is_empty() {
         return None;
@@ -385,12 +494,14 @@ fn closest(text: &str, lines: &[(usize, usize)], old: &str) -> Option<(usize, us
         }
         s
     };
-    let deadline = Instant::now() + CLOSEST_BUDGET;
+    let deadline = stop.deadline.min(Instant::now() + CLOSEST_BUDGET);
     let mut best: Option<(f32, usize)> = None;
     for i in starts {
-        if Instant::now() >= deadline {
+        // Дедлайн и отмена — на каждом окне (N1), внутри сравнения — дедлайн `similar`.
+        if stop.stopped() || Instant::now() >= deadline {
             break;
         }
+        step();
         let window = &text[lines[i].0..lines[i + k - 1].1];
         let r = TextDiff::configure()
             .deadline(deadline)

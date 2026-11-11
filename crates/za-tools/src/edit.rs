@@ -9,7 +9,7 @@
 //!    в [`Tool::subjects`] с `Access::Write`. Файл только для чтения (Windows) или без
 //!    права записи владельца, или чужой (Unix) — отказ (I2): `rename` поверх него
 //!    обошёл бы `chmod a-w` и сменил бы владельца.
-//! 2. Маркер повтора `ZA_HOME/projects/<project_id>/edits/<file_stem>.json` ([`EditHome`],
+//! 2. Маркер повтора `ZA_HOME/projects/<project_id>/edits/<file_stem>.json` ([`AgentHome`],
 //!    m11): вне проекта, поэтому `bash` его не подделает. Каталог — через
 //!    [`home_dir`], на Unix он принадлежит текущему пользователю и закрыт на запись
 //!    группе и прочим. Файл уже равен `after` — результат маркера; равен `before` —
@@ -34,6 +34,7 @@ use std::fs::Permissions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -50,13 +51,13 @@ use za_core::{
 };
 use za_protocol::{EffectClass, RunId, RunRole, Tier, deny_reason};
 
-use crate::READ_MAX_BYTES;
 use crate::fs::{
     blocking, directory_text, error_text, invalid_args_text, is_missing, not_found, open_error,
     parse,
 };
-use crate::patch::{MatchLevel, PatchError, apply, shrink_guard};
+use crate::patch::{AMBIGUOUS_SHOWN, MatchLevel, PatchError, Stop, apply_until, shrink_guard};
 use crate::tracker::{ReadTracker, TrackError};
+use crate::{AgentHome, READ_MAX_BYTES};
 
 /// Отметка порядка байт UTF-8.
 const BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -67,21 +68,26 @@ const EDITS_DIR: &str = "edits";
 /// Временный файл правки старше этого — сирота прошлого сбоя (m3): правка длится не
 /// дольше тайм-аута вызова (30 с).
 const LEFTOVER_AGE: Duration = Duration::from_secs(120);
-/// Права временного файла до записи (m4) и нового файла (Unix).
+/// Права, с которыми временный файл создаётся (m4, N2): содержимое правки и маркера не
+/// доступно другим ни в один момент.
 #[cfg(unix)]
 const TMP_MODE: u32 = 0o600;
+/// Права нового файла до umask (N4), как у обычного создания файла.
 #[cfg(unix)]
-const NEW_FILE_MODE: u32 = 0o644;
+const NEW_FILE_MODE: u32 = 0o666;
+/// umask, если его не удалось прочитать (`/proc/self/status` есть только на Linux).
+#[cfg(unix)]
+const DEFAULT_UMASK: u32 = 0o022;
 /// Версия формата маркера.
 const MARKER_V: u32 = 1;
 /// Предел размера файла маркера при чтении.
 const MARKER_MAX: u64 = 1 << 20;
+/// Предел времени нечёткого поиска всех правок вызова (подсказка ближайшего участка).
+const MATCH_BUDGET: Duration = Duration::from_secs(5);
 /// Предел времени построения diff результата.
 const DIFF_TIMEOUT: Duration = Duration::from_secs(2);
 /// Контекст унифицированного diff (D88).
 const DIFF_CONTEXT: usize = 2;
-/// Сколько номеров строк показывать у неоднозначного `old`.
-const AMBIGUOUS_SHOWN: usize = 10;
 
 // Тексты для модели (D23, D94): английский, только ASCII-пунктуация.
 const NOT_READ: &str = "file not read in this run; read it first";
@@ -114,18 +120,20 @@ fn not_found_old_text(closest: Option<&(usize, usize, String)>) -> String {
     }
 }
 
+/// Неоднозначность: число мест (поиск останавливается на `AMBIGUOUS_SHOWN + 1`, тогда
+/// «more than 10») и номера строк без повторов (N5: перекрытия в одной строке).
 fn ambiguous_text(lines: &[usize]) -> String {
-    let mut shown: Vec<String> = lines
-        .iter()
-        .take(AMBIGUOUS_SHOWN)
-        .map(ToString::to_string)
-        .collect();
-    if lines.len() > AMBIGUOUS_SHOWN {
+    let mut uniq: Vec<usize> = lines.iter().take(AMBIGUOUS_SHOWN).copied().collect();
+    uniq.dedup();
+    let mut shown: Vec<String> = uniq.iter().map(ToString::to_string).collect();
+    let count = if lines.len() > AMBIGUOUS_SHOWN {
         shown.push("...".to_owned());
-    }
+        format!("more than {AMBIGUOUS_SHOWN}")
+    } else {
+        lines.len().to_string()
+    };
     format!(
-        "old matches {} places (lines {}); add surrounding lines",
-        lines.len(),
+        "old matches {count} places (lines {}); add surrounding lines",
         shown.join(", ")
     )
 }
@@ -278,38 +286,28 @@ struct Marker {
 
 // ---- инструмент ----
 
-/// Где правка хранит маркеры повтора (m11): `za_home/projects/<project_id>/edits`.
-/// `ZA_HOME` должен существовать; `project_id` — идентификатор проекта журнала
-/// (`zero-agent::home::project_id`), без `/`, `\` и `:`. Тот же `ZA_HOME` защищает
-/// от правки разрешение пути (D79).
-#[derive(Debug, Clone)]
-pub struct EditHome {
-    pub za_home: PathBuf,
-    pub project_id: String,
-}
-
 struct EditTool {
     spec: ToolSpec,
     tracker: Arc<ReadTracker>,
-    home: EditHome,
+    home: AgentHome,
     multi: bool,
     hook: Option<EditHook>,
 }
 
 /// Инструмент `edit(path, old, new, allow_shrink?)`.
-pub fn edit_tool(tracker: Arc<ReadTracker>, home: EditHome) -> Arc<dyn Tool> {
+pub fn edit_tool(tracker: Arc<ReadTracker>, home: AgentHome) -> Arc<dyn Tool> {
     build(tracker, home, false, None)
 }
 
 /// Инструмент `multi_edit(path, edits[{old, new}], allow_shrink?)`.
-pub fn multi_edit_tool(tracker: Arc<ReadTracker>, home: EditHome) -> Arc<dyn Tool> {
+pub fn multi_edit_tool(tracker: Arc<ReadTracker>, home: AgentHome) -> Arc<dyn Tool> {
     build(tracker, home, true, None)
 }
 
 /// [`edit_tool`] с крюком сбоя. Только для тестов (m12), как `CrashHook` и `FaultHook`.
 pub fn edit_tool_with_hook(
     tracker: Arc<ReadTracker>,
-    home: EditHome,
+    home: AgentHome,
     hook: EditHook,
 ) -> Arc<dyn Tool> {
     build(tracker, home, false, Some(hook))
@@ -318,7 +316,7 @@ pub fn edit_tool_with_hook(
 /// [`multi_edit_tool`] с крюком сбоя. Только для тестов (m12).
 pub fn multi_edit_tool_with_hook(
     tracker: Arc<ReadTracker>,
-    home: EditHome,
+    home: AgentHome,
     hook: EditHook,
 ) -> Arc<dyn Tool> {
     build(tracker, home, true, Some(hook))
@@ -326,7 +324,7 @@ pub fn multi_edit_tool_with_hook(
 
 fn build(
     tracker: Arc<ReadTracker>,
-    home: EditHome,
+    home: AgentHome,
     multi: bool,
     hook: Option<EditHook>,
 ) -> Arc<dyn Tool> {
@@ -441,8 +439,14 @@ impl Tool for EditTool {
                 tracker,
                 home,
                 hook,
+                cancel: Arc::default(),
             };
-            blocking(move || job.run(&lex)).await
+            // Бросок future (тайм-аут вызова) останавливает нечёткий поиск в
+            // `spawn_blocking` (N1): сам поток пула не прерывается.
+            let guard = CancelOnDrop(job.cancel.clone());
+            let out = blocking(move || job.run(&lex)).await;
+            drop(guard);
+            out
         })
     }
 
@@ -530,8 +534,19 @@ struct Job {
     args_hash: String,
     req: Request,
     tracker: Arc<ReadTracker>,
-    home: EditHome,
+    home: AgentHome,
     hook: Option<EditHook>,
+    /// Отмена вызова: ставится при броске future.
+    cancel: Arc<AtomicBool>,
+}
+
+/// Ставит флаг отмены при броске future вызова.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Файл до правки.
@@ -543,6 +558,8 @@ struct Before {
     /// Можно ли заменить файл (I2): не только для чтения, на Unix — право записи
     /// владельца и владелец — текущий пользователь.
     writable: bool,
+    /// Группа файла (Unix): замена её сохраняет (N3).
+    gid: Option<u32>,
 }
 
 fn hash_hex(bytes: &[u8]) -> String {
@@ -649,8 +666,9 @@ impl Job {
         // 3. Патчер; 4. защита от перезаписи.
         let mut after = text.to_owned();
         let mut level = MatchLevel::Exact;
+        let stop = Stop::after(MATCH_BUDGET).with_cancel(self.cancel.clone());
         for (i, (old, new)) in self.req.edits.iter().enumerate() {
-            match apply(&after, old, new) {
+            match apply_until(&after, old, new, &stop) {
                 Ok((next, l)) => {
                     after = next;
                     if l != MatchLevel::Exact && level == MatchLevel::Exact {
@@ -776,7 +794,7 @@ impl Job {
             return Err(ToolOutput::error(INTERNAL));
         };
         let perms = target_perms(before);
-        write_tmp(first, bytes, perms.clone()).map_err(|e| {
+        write_tmp(first, bytes, perms.clone(), before.gid).map_err(|e| {
             discard(first);
             werr(&e)
         })?;
@@ -819,7 +837,7 @@ impl Job {
                         return fail(werr(&e), tmp);
                     };
                     discard(tmp);
-                    if let Err(e) = write_tmp(next, bytes, perms.clone()) {
+                    if let Err(e) = write_tmp(next, bytes, perms.clone(), before.gid) {
                         return fail(werr(&e), next);
                     }
                     tmp = next;
@@ -837,7 +855,8 @@ struct Target<'a> {
     shown: &'a str,
 }
 
-/// Права файла после замены: права цели, а у нового файла на Unix — 0644.
+/// Права файла после замены: права цели, а у нового файла на Unix — 0666 с учётом umask
+/// процесса (N4).
 fn target_perms(before: &Before) -> Option<Permissions> {
     if let Some(p) = &before.perms {
         return Some(p.clone());
@@ -845,10 +864,28 @@ fn target_perms(before: &Before) -> Option<Permissions> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        Some(Permissions::from_mode(NEW_FILE_MODE))
+        Some(Permissions::from_mode(NEW_FILE_MODE & !umask()))
     }
     #[cfg(not(unix))]
     None
+}
+
+/// umask процесса (Unix), прочитанный один раз: `Umask:` из `/proc/self/status` (Linux).
+/// `umask(2)` не годится: он меняет маску всего процесса, пока её читают. Нет `/proc` —
+/// [`DEFAULT_UMASK`] (записанное ограничение прочих Unix).
+#[cfg(unix)]
+fn umask() -> u32 {
+    static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("Umask:"))
+                    .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+            })
+            .unwrap_or(DEFAULT_UMASK)
+    })
 }
 
 /// Удаляет маркер после отказа (I3), если файл не равен `after`: `rename` не состоялся,
@@ -914,6 +951,20 @@ fn writable(meta: &std::fs::Metadata) -> bool {
     }
 }
 
+/// Группа файла: Unix — `st_gid`, прочие ОС — нет.
+fn file_gid(meta: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(meta.gid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
 /// Файл до правки: байты (не больше [`READ_MAX_BYTES`]), хэш, права. Нет файла — пусто.
 fn read_before(root: &Path, r: &ResolvedPath) -> Result<Before, ToolOutput> {
     let none = Before {
@@ -921,6 +972,7 @@ fn read_before(root: &Path, r: &ResolvedPath) -> Result<Before, ToolOutput> {
         hash: None,
         perms: None,
         writable: true,
+        gid: None,
     };
     match stat_checked(r) {
         Ok(m) if m.is_dir() => {
@@ -948,27 +1000,58 @@ fn read_before(root: &Path, r: &ResolvedPath) -> Result<Before, ToolOutput> {
         hash: Some(hash_hex(&bytes)),
         bytes: Some(bytes),
         writable: writable(&meta),
+        gid: file_gid(&meta),
         perms: Some(meta.permissions()),
     })
 }
 
-/// Временный файл: через [`open_checked`] (обычный файл, не ссылка, одна жёсткая
-/// ссылка, путь сверен), на Unix сразу 0600 (m4), усечение остатка прошлой попытки,
-/// байты, `fsync` и права цели — до `rename`.
-fn write_tmp(tmp: &ResolvedPath, bytes: &[u8], perms: Option<Permissions>) -> io::Result<()> {
-    let mut f = open_checked(tmp, true)?;
+/// Временный файл. На Unix он сначала создаётся с правами 0600 (`create_new`,
+/// `O_NOFOLLOW`; уже есть — остаток прошлой попытки, N2), затем открывается через
+/// [`open_checked`] (обычный файл, не ссылка, одна жёсткая ссылка, путь сверен).
+/// Остаток усекается, пишутся байты, `fsync`, группа цели (N3, неудача — `warn`) и права
+/// цели — до `rename`.
+fn write_tmp(
+    tmp: &ResolvedPath,
+    bytes: &[u8],
+    perms: Option<Permissions>,
+    gid: Option<u32>,
+) -> io::Result<()> {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(Permissions::from_mode(TMP_MODE))?;
-    }
+    create_private(&tmp.path)?;
+    let mut f = open_checked(tmp, true)?;
     f.set_len(0)?;
     f.write_all(bytes)?;
     f.sync_all()?;
+    #[cfg(unix)]
+    if let Some(g) = gid
+        && let Err(e) = std::os::unix::fs::fchown(&f, None, Some(g))
+    {
+        tracing::warn!(path = %tmp.path.display(), gid = g, error = %e, "группа файла правки не сохранена");
+    }
+    #[cfg(not(unix))]
+    let _ = gid;
     if let Some(p) = perms {
         f.set_permissions(p)?;
     }
     Ok(())
+}
+
+/// Создаёт пустой файл 0600 без перехода по ссылке; уже есть — ничего (его проверит
+/// [`open_checked`]).
+#[cfg(unix)]
+fn create_private(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(TMP_MODE)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Удаляет временный файл; нет его — ничего, не удалось — `warn`.
@@ -992,7 +1075,7 @@ fn write_marker(marker: &ResolvedPath, stem: &str, json: &[u8]) -> io::Result<()
         inside: false,
         protected: false,
     };
-    let r = write_tmp(&tmp, json, None).and_then(|()| replace_checked(&tmp, marker));
+    let r = write_tmp(&tmp, json, None, None).and_then(|()| replace_checked(&tmp, marker));
     if r.is_err() {
         discard(&tmp);
     }

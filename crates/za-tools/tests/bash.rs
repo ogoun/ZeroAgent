@@ -15,7 +15,7 @@ use za_core::{Access, Approval, BoxFuture, RiskClass, Tool, ToolCx, ToolKind, To
 use za_jail::{CommandSpec, DirectRunner, Exit, Output, Runner, RunnerError};
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier, taint_origin};
 use za_tools::{
-    BASH_DEFAULT_TIMEOUT_S, BASH_MAX_TIMEOUT_S, EditHome, Shell, bash_tool, format_output,
+    AgentHome, BASH_DEFAULT_TIMEOUT_S, BASH_MAX_TIMEOUT_S, Shell, bash_tool, format_output,
     powershell_encoded,
 };
 
@@ -31,8 +31,8 @@ fn unique_dir(name: &str) -> PathBuf {
     d.join("p")
 }
 
-fn home(root: &Path) -> EditHome {
-    EditHome {
+fn home(root: &Path) -> AgentHome {
+    AgentHome {
         za_home: root.parent().unwrap().join("h"),
         project_id: "0123456789abcdef".into(),
     }

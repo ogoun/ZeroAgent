@@ -6,7 +6,7 @@
 //! `TMP`, `TEMP`, `TMPDIR` дочернего процесса — `<project>/.zero-agent/work/tmp/<run>`
 //! (`za_core::paths::work_dir`), системный каталог временных файлов не передаётся. На
 //! Linux запись реестра групп — `ZA_HOME/projects/<project_id>/procs/<file_stem>.json`
-//! ([`EditHome`], `home_dir`): по ней `reap_leftovers` убирает сирот после смерти агента.
+//! ([`AgentHome`], `home_dir`): по ней `reap_leftovers` убирает сирот после смерти агента.
 //!
 //! Результат ([`format_output`]): `exit code: N`, затем `--- stdout ---` и `--- stderr ---`;
 //! пустые секции опускаются. Ненулевой код выхода — данные (`is_error = false`), иначе
@@ -42,7 +42,7 @@ use za_core::{
 use za_jail::{CAPTURE_LIMIT, CommandSpec, Exit, Output, Runner, RunnerError};
 use za_protocol::{EffectClass, RunRole, Tier, taint_origin};
 
-use crate::EditHome;
+use crate::AgentHome;
 use crate::digest::{
     GAP, HUNKS_HEADER, STDERR_HEADER, TAIL_HEADER, diff_header, digest, more_entries, more_keys,
     more_lines, more_matches, tests_header,
@@ -347,12 +347,12 @@ struct BashTool {
     spec: ToolSpec,
     runner: Arc<dyn Runner>,
     shell: Shell,
-    home: EditHome,
+    home: AgentHome,
 }
 
 /// Инструмент `bash(cmd, cwd?, timeout?)`. `home` — `ZA_HOME` и проект для реестра групп
 /// процессов на Linux (D84; на других ОС не используется).
-pub fn bash_tool(runner: Arc<dyn Runner>, shell: Shell, home: EditHome) -> Arc<dyn Tool> {
+pub fn bash_tool(runner: Arc<dyn Runner>, shell: Shell, home: AgentHome) -> Arc<dyn Tool> {
     let schema = ToolSchema {
         name: "bash".into(),
         description: DESCRIPTION.into(),
@@ -459,7 +459,7 @@ fn prepare(
     cwd: Option<&str>,
     run: &str,
     stem: &str,
-    home: &EditHome,
+    home: &AgentHome,
 ) -> Result<Prepared, ToolOutput> {
     let cwd_path = match cwd {
         None => root.to_path_buf(),
@@ -491,7 +491,7 @@ fn prepare(
 /// `warn`: дерево всё равно убивается при броске future, теряется только уборка после
 /// смерти агента.
 #[cfg(target_os = "linux")]
-fn leftover(home: &EditHome, run: &str, stem: &str) -> Option<za_jail::Leftover> {
+fn leftover(home: &AgentHome, run: &str, stem: &str) -> Option<za_jail::Leftover> {
     use std::os::unix::fs::MetadataExt;
     let dir = za_core::paths::home_dir(
         &home.za_home,
@@ -525,7 +525,7 @@ fn leftover(home: &EditHome, run: &str, stem: &str) -> Option<za_jail::Leftover>
 
 /// Реестр групп нужен только на Linux (D84): на Windows дерево держит Job Object.
 #[cfg(not(target_os = "linux"))]
-fn leftover(_home: &EditHome, _run: &str, _stem: &str) -> Option<za_jail::Leftover> {
+fn leftover(_home: &AgentHome, _run: &str, _stem: &str) -> Option<za_jail::Leftover> {
     None
 }
 

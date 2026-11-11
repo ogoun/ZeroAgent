@@ -11,7 +11,7 @@ use za_core::paths::{ResolvedPath, Roots, classify, resolve};
 use za_core::{Access, Approval, RiskClass, Tool, ToolCx, ToolKind, ToolOutput};
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier};
 use za_tools::{
-    EditHome, GLOB_MAX, READ_DEFAULT_LIMIT, READ_MAX_BYTES, ReadTracker, SEARCH_MAX, Shell,
+    AgentHome, GLOB_MAX, READ_DEFAULT_LIMIT, READ_MAX_BYTES, ReadTracker, SEARCH_MAX, Shell,
     TrackError, WalkLimits, bash_tool, edit_tool, glob_split, glob_tool, multi_edit_tool, nearest,
     read_tool, search_in, search_tool,
 };
@@ -818,8 +818,8 @@ fn contract_matches_d74() {
 }
 
 /// `ZA_HOME` инструментов правки, которые не вызываются (только тексты).
-fn golden_home() -> EditHome {
-    EditHome {
+fn golden_home() -> AgentHome {
+    AgentHome {
         za_home: PathBuf::from("no-home"),
         project_id: "0".into(),
     }

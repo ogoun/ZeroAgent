@@ -32,6 +32,7 @@ mod bash;
 mod digest;
 mod edit;
 mod fs;
+mod home;
 mod nearest;
 mod patch;
 mod rules;
@@ -45,15 +46,16 @@ pub use bash::{
 };
 pub use digest::digest;
 pub use edit::{
-    EditHome, EditHook, EditPoint, clean_edit_leftovers, clean_leftovers_older, edit_tool,
+    EditHook, EditPoint, clean_edit_leftovers, clean_leftovers_older, edit_tool,
     edit_tool_with_hook, multi_edit_tool, multi_edit_tool_with_hook,
 };
 
 pub use fs::{
     WalkLimits, glob_in, glob_split, glob_tool, read_at, read_tool, search_in, search_tool,
 };
+pub use home::AgentHome;
 pub use nearest::nearest;
-pub use patch::{MatchLevel, PatchError, apply, shrink_guard};
+pub use patch::{MatchLevel, PatchError, apply, match_steps, shrink_guard};
 pub use tracker::{ReadTracker, TrackError};
 
 /// Сколько строк `read` показывает по умолчанию.

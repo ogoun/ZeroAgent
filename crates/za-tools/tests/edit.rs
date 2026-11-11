@@ -12,9 +12,9 @@ use za_core::paths::{Roots, classify, resolve};
 use za_core::{Access, Approval, Postcondition, RiskClass, Tool, ToolCx, ToolKind, ToolOutput};
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier};
 use za_tools::{
-    EditHome, EditHook, EditPoint, MatchLevel, PatchError, ReadTracker, TrackError, apply,
-    clean_edit_leftovers, clean_leftovers_older, edit_tool, edit_tool_with_hook, multi_edit_tool,
-    read_tool, shrink_guard,
+    AgentHome, EditHook, EditPoint, MatchLevel, PatchError, ReadTracker, TrackError, apply,
+    clean_edit_leftovers, clean_leftovers_older, edit_tool, edit_tool_with_hook, match_steps,
+    multi_edit_tool, read_tool, shrink_guard,
 };
 
 #[path = "../../../test-support/unique_dir.rs"]
@@ -33,16 +33,16 @@ fn unique_dir(name: &str) -> PathBuf {
 const PROJECT_ID: &str = "0123456789abcdef";
 
 /// `ZA_HOME` теста для проекта `root`.
-fn home(root: &Path) -> EditHome {
-    EditHome {
+fn home(root: &Path) -> AgentHome {
+    AgentHome {
         za_home: root.parent().unwrap().join("h"),
         project_id: PROJECT_ID.to_owned(),
     }
 }
 
 /// `ZA_HOME` инструмента, который не вызывается (контракт, предметы вызова).
-fn no_home() -> EditHome {
-    EditHome {
+fn no_home() -> AgentHome {
+    AgentHome {
         za_home: PathBuf::from("no-home"),
         project_id: PROJECT_ID.to_owned(),
     }
@@ -1120,12 +1120,28 @@ async fn unix_modes_of_new_and_owner_only_files() {
             .mode()
             & 0o777
     };
-    // Новый файл — 0644 (временный создавался 0600, m4).
+    // Новый файл — 0666 с учётом umask процесса (N4); на Linux umask — из /proc.
+    let umask = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Umask:"))
+                .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+        })
+        .unwrap_or(0o022);
     let o = k
         .edit(json!({"path": "new.txt", "old": "", "new": "x\n"}))
         .await;
     assert!(!o.is_error, "{}", o.content);
-    assert_eq!(mode("new.txt"), 0o644);
+    assert_eq!(mode("new.txt"), 0o666 & !umask);
+    // Маркер создан 0600 сразу (N2) и таким остался.
+    for n in names(&markers(&root)) {
+        let m = std::fs::metadata(markers(&root).join(&n))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(m & 0o777, 0o600, "{n}");
+    }
     // Секретный файл 0600 остаётся 0600.
     write(&root, "secret.txt", "s\n");
     std::fs::set_permissions(
@@ -1139,6 +1155,15 @@ async fn unix_modes_of_new_and_owner_only_files() {
         .await;
     assert!(!o.is_error, "{}", o.content);
     assert_eq!(mode("secret.txt"), 0o600);
+    // Группа сохранена (N3; без второй группы пользователя проверяется равенство).
+    {
+        use std::os::unix::fs::MetadataExt;
+        let gid = std::fs::metadata(root.join("new.txt")).unwrap().gid();
+        assert_eq!(
+            std::fs::metadata(root.join("secret.txt")).unwrap().gid(),
+            gid
+        );
+    }
     // Без права записи владельца (0555) — отказ.
     write(&root, "rx.sh", "a\n");
     std::fs::set_permissions(root.join("rx.sh"), std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -1184,4 +1209,71 @@ fn leftovers_are_cleaned_by_age() {
     assert_eq!(clean_leftovers_older(&root, Duration::ZERO).unwrap(), 1);
     assert!(!root.join(".zero-agent/work/edits/old-run-1-1.tmp").exists());
     assert!(root.join(".zero-agent/work/edits/keep.json").exists());
+}
+
+// ---- раунд исправлений 2 ----
+
+#[test]
+fn periodic_text_search_is_linear_and_stops() {
+    // N1: 4 МиБ `a` и old из 4 КиБ `a`: перекрытий 4 млн, но поиск останавливается на
+    // AMBIGUOUS_SHOWN + 1 местах. Проверка — счётчиком шагов, без порога времени.
+    let text = "a".repeat(4 << 20);
+    let old = "a".repeat(4 << 10);
+    let before = match_steps();
+    match apply(&text, &old, "b") {
+        Err(PatchError::Ambiguous { lines }) => assert_eq!(lines.len(), 11),
+        other => panic!("{other:?}"),
+    }
+    let steps = match_steps() - before;
+    assert!(steps <= 12, "{steps}");
+}
+
+#[test]
+fn periodic_lines_search_is_linear() {
+    // N1 на построчных уровнях: 200 тыс. строк `}` и old из 2000 строк `}` с иной
+    // последней строкой. Окна сверяются по скользящему хэшу, точных сверок — единицы;
+    // подсказка ближайшего участка ограничена числом окон и дедлайном.
+    let text = "  }\n".repeat(200_000);
+    let mut old = "}\n".repeat(1999);
+    old.push_str("x\n");
+    let before = match_steps();
+    assert!(matches!(
+        apply(&text, &old, "y"),
+        Err(PatchError::NotFound { .. })
+    ));
+    let steps = match_steps() - before;
+    assert!(steps <= 6000, "{steps}");
+    // Совпадающие окна: поиск останавливается на 11.
+    let old = "}\n".repeat(2000);
+    let before = match_steps();
+    match apply(&text, &old, "y") {
+        Err(PatchError::Ambiguous { lines }) => assert_eq!(lines.len(), 11),
+        other => panic!("{other:?}"),
+    }
+    assert!(match_steps() - before <= 40);
+}
+
+#[tokio::test]
+async fn ambiguity_text_has_unique_lines_and_cap() {
+    let root = unique_dir("ambiguity_text");
+    write(&root, "a.txt", "aaa\n");
+    write(&root, "b.txt", "x\n".repeat(30));
+    let mut k = Kit::new(&root);
+    k.read("a.txt").await;
+    let o = k
+        .edit(json!({"path": "a.txt", "old": "aa", "new": "b"}))
+        .await;
+    // N5: два места в одной строке — номер строки один раз.
+    assert_eq!(
+        o.content,
+        "old matches 2 places (lines 1); add surrounding lines"
+    );
+    k.read("b.txt").await;
+    let o = k
+        .edit(json!({"path": "b.txt", "old": "x", "new": "y"}))
+        .await;
+    assert_eq!(
+        o.content,
+        "old matches more than 10 places (lines 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ...); add surrounding lines"
+    );
 }
