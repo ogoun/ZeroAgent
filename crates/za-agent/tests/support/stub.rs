@@ -290,10 +290,12 @@ impl Tool for TextStub {
     }
 }
 
-/// Чекпоинт-заглушка: запоминает запросы, отвечает видом `files`.
+/// Чекпоинт-заглушка: запоминает запросы, отвечает видом `files` и пропущенными как
+/// секреты путями `secret_skipped` (D103).
 #[derive(Default)]
 pub struct CheckpointStub {
     pub requests: Mutex<Vec<CheckpointRequest>>,
+    pub secret_skipped: Vec<String>,
 }
 
 impl Checkpointer for CheckpointStub {
@@ -308,6 +310,7 @@ impl Checkpointer for CheckpointStub {
                 .unwrap_or_default()
         );
         self.requests.lock().unwrap().push(req);
+        let secret_skipped = self.secret_skipped.clone();
         Box::pin(async move {
             Checkpoint {
                 id,
@@ -315,6 +318,7 @@ impl Checkpointer for CheckpointStub {
                 git_ref: None,
                 commit: None,
                 reason: None,
+                secret_skipped,
             }
         })
     }

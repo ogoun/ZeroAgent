@@ -27,6 +27,12 @@
 //! Время — [`CHECKPOINT_TIMEOUT`] на чекпоинт git; превышение — `slow`, и до конца run git
 //! не вызывается.
 //!
+//! **Секреты** (R1-C2 D103): файл с именем секрета ([`secret_name`]) или до
+//! [`SECRET_SCAN_MAX`] байт, в котором фильтр бинарника ([`SecretFilter`]) нашёл секрет, в
+//! чекпоинт не входит ни в git, ни в копию файлов: трейлер `zero-agent-skipped-secret:` в
+//! сообщении коммита, состояние `secret` в манифесте. Восстановление такие файлы не трогает
+//! и не удаляет. Затронутые вызовом секретные файлы — в [`Checkpoint::secret_skipped`].
+//!
 //! **Восстановление** ([`restore`]) — только по чекпоинту, найденному для этого проекта, и
 //! только после успешного чекпоинта «до» ([`backup_before_restore`], I1): git — если
 //! получилось и он покрывает все файлы, которые восстановление изменит (включая
@@ -64,6 +70,71 @@ pub const CHECKPOINT_REF_PREFIX: &str = "refs/zero-agent/checkpoints";
 pub const CHECKPOINT_MAX_FILE: u64 = 64 << 20;
 /// Сколько новых байт (хэшируемых git или копируемых) самое большее на один чекпоинт (I3).
 pub const CHECKPOINT_MAX_TOTAL: u64 = 1 << 30;
+/// Файл до этого размера проверяется [`SecretFilter`] (D103); крупнее — только по имени.
+pub const SECRET_SCAN_MAX: u64 = 1 << 20;
+
+/// Признак секрета в содержимом файла (D103): `true` — файл в чекпоинт не входит. Даёт
+/// бинарник (известные значения хранилища и блок PEM); `za-tools` от `za-secrets` не
+/// зависит. Вызывается только для файлов до [`SECRET_SCAN_MAX`] байт.
+pub type SecretFilter = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
+/// Имя секретного файла (D103) — по последнему компоненту пути (`/` или `\`), без учёта
+/// регистра: `.env` и `.env.*` (кроме `.env.example`, `.env.sample`, `.env.template`,
+/// `.env.dist`), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.kdbx`,
+/// закрытые ключи SSH без `.pub`, `.netrc`, `_netrc`, `.npmrc`, `.pypirc`,
+/// `.git-credentials`.
+pub fn secret_name(rel: &str) -> bool {
+    let last = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+    let name = last.to_ascii_lowercase();
+    if name == ".env" {
+        return true;
+    }
+    if name.starts_with(".env.") {
+        return !matches!(
+            name.as_str(),
+            ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+        );
+    }
+    const EXT: [&str; 7] = [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".kdbx"];
+    const EXACT: [&str; 9] = [
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        ".netrc",
+        "_netrc",
+        ".npmrc",
+        ".pypirc",
+        ".git-credentials",
+    ];
+    EXT.iter().any(|e| name.ends_with(e)) || EXACT.contains(&name.as_str())
+}
+
+/// Секрет ли файл `abs` (имя `rel`) размера `size`: по имени, затем фильтром по
+/// содержимому (до [`SECRET_SCAN_MAX`] байт). Файл не прочитан — не секрет: его
+/// содержимое не попадёт и в чекпоинт.
+pub(crate) fn is_secret(rel: &str, abs: &Path, size: u64, filter: Option<&SecretFilter>) -> bool {
+    if secret_name(rel) {
+        return true;
+    }
+    let Some(f) = filter else {
+        return false;
+    };
+    if size > SECRET_SCAN_MAX {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let read = std::fs::File::open(abs).and_then(|file| {
+        io::Read::read_to_end(&mut io::Read::take(file, SECRET_SCAN_MAX), &mut buf)
+    });
+    match read {
+        Ok(_) => f(&buf),
+        Err(e) => {
+            tracing::debug!(path = %rel, error = %e, "файл не прочитан фильтром секретов");
+            false
+        }
+    }
+}
 
 /// Предел чекпоинта «до» и вызовов git при восстановлении (команда пользователя).
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -107,6 +178,8 @@ pub struct GitCheckpointer {
     slow: Arc<Mutex<HashSet<RunId>>>,
     /// Чекпоинты одного процесса идут по одному: общий кэш stat и каталоги run.
     lock: Arc<tokio::sync::Mutex<()>>,
+    /// Фильтр секретов по содержимому (D103); `None` — только по имени.
+    secret: Option<SecretFilter>,
 }
 
 impl std::fmt::Debug for GitCheckpointer {
@@ -137,7 +210,14 @@ impl GitCheckpointer {
             create_timeout: CHECKPOINT_TIMEOUT,
             slow: Arc::new(Mutex::new(HashSet::new())),
             lock: Arc::new(tokio::sync::Mutex::new(())),
+            secret: None,
         }
+    }
+
+    /// Фильтр секретов по содержимому (D103): и для чекпоинта git, и для копии файлов.
+    pub fn with_secret_filter(mut self, f: SecretFilter) -> Self {
+        self.secret = Some(f);
+        self
     }
 
     /// Для тестов: переменные, добавляемые к окружению каждого вызова git.
@@ -269,13 +349,17 @@ impl GitCheckpointer {
                 Ok(made) => {
                     // N10: каждый существующий правимый файл должен быть в снимке; иначе
                     // (сверх предела, отвергнут git) — копия правимых файлов.
+                    // Секретные файлы не входят ни в снимок, ни в копию (D103).
                     let (paths, root) = (req.paths.clone(), req.project_dir.clone());
                     let included = made.included;
+                    let secret: HashSet<String> = made.cp.secret_skipped.iter().cloned().collect();
                     let uncovered = blocking(move || {
                         Ok(paths.iter().any(|p| {
+                            let rel = za_core::paths::display(&root, p);
                             za_core::paths::within(&root, p)
                                 && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
-                                && !included.contains(&za_core::paths::display(&root, p))
+                                && !included.contains(&rel)
+                                && !secret.contains(&rel)
                         }))
                     })
                     .await
@@ -310,13 +394,11 @@ impl GitCheckpointer {
         let home = self.home.clone();
         let req = req.clone();
         let stem2 = stem.to_owned();
-        match blocking(move || files::copy(&home, &req, &stem2, strict)).await {
-            Ok(()) => Checkpoint {
-                id: id.to_owned(),
-                kind: checkpoint_kind::FILES.into(),
-                git_ref: None,
-                commit: None,
-                reason: None,
+        let filter = self.secret.clone();
+        match blocking(move || files::copy(&home, &req, &stem2, strict, filter.as_ref())).await {
+            Ok(secret_skipped) => Checkpoint {
+                secret_skipped,
+                ..files_cp(id)
             },
             Err(e) => {
                 tracing::warn!(id = %id, error = %e, "копия файлов чекпоинта не сделана");
@@ -338,6 +420,7 @@ impl GitCheckpointer {
             self.base_env.clone(),
             timeout,
             self.max_total,
+            self.secret.clone(),
         )
     }
 
@@ -620,6 +703,7 @@ fn skipped(id: &str, reason: &str) -> Checkpoint {
         git_ref: None,
         commit: None,
         reason: Some(reason.to_owned()),
+        secret_skipped: Vec::new(),
     }
 }
 
@@ -630,6 +714,7 @@ fn files_cp(id: &str) -> Checkpoint {
         git_ref: None,
         commit: None,
         reason: None,
+        secret_skipped: Vec::new(),
     }
 }
 

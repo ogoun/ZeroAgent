@@ -53,7 +53,9 @@ use za_protocol::{
 };
 use za_secrets::SecretMasker;
 use za_store::{AuditNew, INTERRUPT_OPEN, InterruptRow, ProjectStore, StoreError};
-use za_tools::{AgentHome, GitCheckpointer, NativeDeps, ReadTracker, Shell, native_capability};
+use za_tools::{
+    AgentHome, GitCheckpointer, NativeDeps, ReadTracker, SecretFilter, Shell, native_capability,
+};
 
 use crate::config::{AgentConfig, PROJECT_CONFIG, load_config, parse_project_config};
 use crate::home;
@@ -870,6 +872,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
     let started = start_gateway(home, &cfg, true).await?;
     // Маска печати ответа — по секретам, прочитанным при старте вместе с ключами (D90).
     let masker = started.secrets.masker();
+    let secret_filter = started.secrets.checkpoint_filter();
     let gateway = Arc::new(started.gateway);
     let select = |model: Option<String>| -> Result<EndpointId, SelectError> {
         gateway.select(&Selection {
@@ -951,6 +954,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 &gateway,
                 tools,
                 &masker,
+                secret_filter.clone(),
                 &prep,
                 args.checkpoint_timeout,
             );
@@ -997,6 +1001,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 &gateway,
                 tools,
                 &masker,
+                secret_filter.clone(),
                 &prep,
                 args.checkpoint_timeout,
             );
@@ -1065,6 +1070,7 @@ fn deps(
     gateway: &Arc<za_llm::Gateway>,
     tools: ToolRegistry,
     masker: &SecretMasker,
+    secret_filter: SecretFilter,
     prep: &Prepared,
     checkpoint_timeout: Option<Duration>,
 ) -> (LoopDeps, EventBus) {
@@ -1085,7 +1091,9 @@ fn deps(
         shell: shell(),
         home: agent_home.clone(),
     })];
-    let mut checkpointer = GitCheckpointer::new(runner, agent_home);
+    // D103: секретные файлы (имя, известные значения, PEM) в чекпоинты не входят.
+    let mut checkpointer =
+        GitCheckpointer::new(runner, agent_home).with_secret_filter(secret_filter);
     if let Some(t) = checkpoint_timeout {
         checkpointer = checkpointer.with_create_timeout_for_tests(t);
     }

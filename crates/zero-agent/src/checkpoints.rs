@@ -34,6 +34,7 @@ use za_tools::{AgentHome, GitCheckpointer, RestoreError, backup_before_restore, 
 
 use crate::home;
 use crate::run::{RunError, canonical_project, open_existing};
+use crate::secret::StoreSecrets;
 use crate::trust::trust_state;
 
 /// Кто восстанавливает: пользователь через CLI (как у `answer`, D91).
@@ -89,13 +90,15 @@ fn open(
         path: project.clone(),
         source,
     })?;
+    // Чекпоинт «до» восстановления тоже не сохраняет секреты (D103).
     let ck = GitCheckpointer::new(
         Arc::new(DirectRunner),
         AgentHome {
             za_home: za_home.to_path_buf(),
             project_id,
         },
-    );
+    )
+    .with_secret_filter(StoreSecrets::from_env().checkpoint_filter());
     Ok((project, store, ck))
 }
 

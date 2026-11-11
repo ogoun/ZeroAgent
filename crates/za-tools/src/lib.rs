@@ -55,7 +55,8 @@ pub use bash::{
 };
 pub use checkpoint::{
     CHECKPOINT_MAX_FILE, CHECKPOINT_MAX_TOTAL, CHECKPOINT_REF_PREFIX, CHECKPOINT_TIMEOUT,
-    GitCheckpointer, RestoreError, backup_before_restore, restore,
+    GitCheckpointer, RestoreError, SECRET_SCAN_MAX, SecretFilter, backup_before_restore, restore,
+    secret_name,
 };
 pub use digest::digest;
 pub use edit::{

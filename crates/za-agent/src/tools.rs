@@ -94,6 +94,10 @@ pub(crate) const OUTPUT_LOST: &str = "internal error: tool output lost";
 pub(crate) const AFTER_FINISH: &str = "not executed: run finished by finish";
 /// Путь вызова сменил класс между решением и слотом (D98).
 pub(crate) const PATH_CHANGED: &str = "path changed since planning; call again";
+/// Строка результата вызова, затронутый файл которого не вошёл в чекпоинт как секрет
+/// (R1-C2 D103).
+pub(crate) const SECRET_NO_CHECKPOINT: &str =
+    "[no checkpoint for this file: it looks like a secret]";
 /// Начало строки о нарушенном постусловии (TOOL-004).
 const POSTCONDITION_FAILED: &str = "[postcondition failed: ";
 /// Действующее лицо записей аудита пакета.
@@ -1225,6 +1229,10 @@ pub(crate) fn text_samples() -> Vec<(&'static str, String)> {
         ("runtime/tools.postcondition", postcondition_text("p")),
         ("runtime/tools.runtime_only", runtime_only_text("t")),
         (
+            "runtime/tools.secret_no_checkpoint",
+            SECRET_NO_CHECKPOINT.to_owned(),
+        ),
+        (
             "runtime/tools.timeout",
             timeout_text(Duration::from_millis(1500)),
         ),
@@ -1780,7 +1788,8 @@ impl Live {
             )
             .await;
         }
-        // (4) Чекпоинт перед `Edit` и `Exec` (D89).
+        // (4) Чекпоинт перед `Edit` и `Exec` (D89); секретные файлы в него не входят (D103).
+        let mut secret_skipped = false;
         if matches!(spec.kind, ToolKind::Edit | ToolKind::Exec)
             && let Some(cp) = &checkpointer
         {
@@ -1806,7 +1815,11 @@ impl Live {
                 if let Some(r) = &c.reason {
                     o.insert("reason".into(), json!(r));
                 }
+                if !c.secret_skipped.is_empty() {
+                    o.insert("secret_skipped".into(), json!(c.secret_skipped));
+                }
             }
+            secret_skipped = !c.secret_skipped.is_empty();
             self.append(
                 EventKind::CheckpointCreated,
                 Actor::Runtime,
@@ -1823,6 +1836,12 @@ impl Live {
             Err(_) => ToolOutput::error(timeout_text(timeout)),
         };
         self.crash_at(true, halt).await;
+        if secret_skipped {
+            if !out.content.is_empty() && !out.content.ends_with('\n') {
+                out.content.push('\n');
+            }
+            out.content.push_str(SECRET_NO_CHECKPOINT);
+        }
         // (8) Постусловия (TOOL-004).
         let failed = check_posts(&roots.project, &out.post).await;
         for what in &failed {

@@ -1,5 +1,6 @@
 //! Секреты бинарника (R1-C1 D90): кэш [`StoreSecrets`] для `Gateway` и маскировки,
-//! маска значений JSON, команда `zero-agent secret list`.
+//! маска значений JSON, фильтр секретов чекпоинтов (R1-C2 D103), команда
+//! `zero-agent secret list`.
 //!
 //! Источник — [`za_secrets::SecretStore`]; до клиента памяти ZeroAIMemory это
 //! [`EnvStore`] (`ZA_SECRET_<KEY_REF>`), для пользователя поведение прежнее. Значения
@@ -10,11 +11,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use serde_json::Value;
 use za_llm::config::secret_env_name;
 use za_llm::{Secret, SecretSource};
 use za_secrets::{EnvStore, MIN_SECRET_LEN, SecretMasker, SecretStore, known_values};
+use za_tools::SecretFilter;
 
 use crate::config::load_config;
 
@@ -52,6 +55,21 @@ impl StoreSecrets {
     /// Маскировщик по известным значениям кэша и шаблонам D90.
     pub fn masker(&self) -> SecretMasker {
         SecretMasker::new(known_values(self))
+    }
+
+    /// Фильтр секретов чекпоинтов (D103): `true`, если в байтах файла есть известное
+    /// значение хранилища (`known_values`) или блок PEM закрытого ключа. Широкие шаблоны
+    /// [`SecretMasker`] не применяются: ложное срабатывание молча лишило бы файл
+    /// чекпоинта и восстановления. Размер файла ограничивает `za-tools`
+    /// (`SECRET_SCAN_MAX`).
+    pub fn checkpoint_filter(&self) -> SecretFilter {
+        let values: Vec<Vec<u8>> = known_values(self)
+            .into_iter()
+            .map(|(_, v)| v.into_bytes())
+            .collect();
+        Arc::new(move |bytes: &[u8]| {
+            values.iter().any(|v| find(bytes, v).is_some()) || has_private_key_pem(bytes)
+        })
     }
 
     /// Имена секретов со значением короче [`MIN_SECRET_LEN`] символов: маска их не
@@ -106,6 +124,37 @@ impl fmt::Debug for StoreSecrets {
             .field("names", &self.cache.keys().collect::<Vec<_>>())
             .finish()
     }
+}
+
+/// Начало первого вхождения `needle` в `hay`.
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Блок PEM закрытого ключа: строка `-----BEGIN … PRIVATE KEY-----` (PKCS#8, RSA, EC,
+/// DSA, OpenSSH, зашифрованный), метка — в пределах одной строки.
+fn has_private_key_pem(bytes: &[u8]) -> bool {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    const END: &[u8] = b"PRIVATE KEY-----";
+    /// Длина метки самое большее (`ENCRYPTED PRIVATE KEY-----` и подобные).
+    const LABEL_MAX: usize = 64;
+    let mut rest = bytes;
+    while let Some(i) = find(rest, BEGIN) {
+        let after = &rest[i + BEGIN.len()..];
+        let line_end = after
+            .iter()
+            .position(|b| *b == b'\n' || *b == b'\r')
+            .unwrap_or(after.len());
+        let label = &after[..line_end.min(LABEL_MAX)];
+        if find(label, END).is_some() {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 /// Значение JSON, в котором замаскированы все строки и ключи объектов (D90, D100):
@@ -476,5 +525,41 @@ mod tests {
             }
             assert!(child.iter().any(|(k, _)| k == "PATH"));
         }
+    }
+
+    /// D103: фильтр чекпоинтов — только точные признаки. Текст «как секрет» без
+    /// известного значения и без PEM не секрет (нет ложного пропуска); известное значение
+    /// и блок закрытого ключа — секрет; открытый ключ и сертификат — нет.
+    #[test]
+    fn pattern_like_text_is_not_secret() {
+        let value = ["zeta", "-filter-", "value-5d1e"].concat();
+        let s = env(&[("ZA_SECRET_DB", value.as_str()), ("ZA_SECRET_SHORT", "abc")]);
+        let f = s.checkpoint_filter();
+        let ghp = ["ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"].concat();
+        for text in [
+            "api_key = example\n".to_owned(),
+            "password: hunter2\nsecret = changeme\n".to_owned(),
+            format!("token = {ghp}\n"),
+            "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----\n".to_owned(),
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".to_owned(),
+            "-----BEGIN \nPRIVATE KEY-----\n".to_owned(),
+            "abc abc abc\n".to_owned(),
+            String::new(),
+        ] {
+            assert!(!f(text.as_bytes()), "{text:?}");
+        }
+        let pem = |label: &str| format!("x\n-----BEGIN {label}-----\nMII\n-----END {label}-----\n");
+        for text in [
+            format!("DB_URL=postgres://u:{value}@h/db\n"),
+            pem(&["PRIVATE", " KEY"].concat()),
+            pem(&["RSA PRIVATE", " KEY"].concat()),
+            pem(&["OPENSSH PRIVATE", " KEY"].concat()),
+            pem(&["ENCRYPTED PRIVATE", " KEY"].concat()),
+        ] {
+            assert!(f(text.as_bytes()), "{text:?}");
+        }
+        // Без секретов в хранилище — только PEM.
+        let none = env(&[]).checkpoint_filter();
+        assert!(!none(format!("v={value}").as_bytes()));
     }
 }

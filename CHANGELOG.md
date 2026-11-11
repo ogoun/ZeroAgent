@@ -5,6 +5,12 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, задача 2 (секреты в чекпоинтах, D103):
+  - `za-tools`: секретные файлы не входят в чекпоинт git и в копию файлов — по имени (`secret_name`: `.env`, `.env.*` кроме примеров, ключи и хранилища ключей, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`) и по содержимому (`GitCheckpointer::with_secret_filter`, `SecretFilter`, файлы до `SECRET_SCAN_MAX` = 1 МиБ). Трейлер `zero-agent-skipped-secret: <путь>` в сообщении коммита, состояние `secret` в манифесте копии. Восстановление не пишет и не удаляет файлы с именем секрета, в том числе из чекпоинтов до R1-C2. Кэш stat — версия 4: кэш R1-C1 сбрасывается;
+  - `za-core`: `Checkpoint.secret_skipped` — затронутые вызовом файлы, пропущенные как секреты;
+  - `za-agent`: `checkpoint.created.secret_skipped`, строка результата `[no checkpoint for this file: it looks like a secret]`; `PROMPT_VERSION = "r1c2.1"`;
+  - `zero-agent`: фильтр по содержимому — известные значения `ZA_SECRET_*` и блок PEM закрытого ключа (`StoreSecrets::checkpoint_filter`), в `run` и в `checkpoints restore`;
+  - README: раздел «Секреты в чекпоинтах», старые блобы и ручная очистка.
 - R1-C2, задача 1:
   - `za-core`: модуль `text` — `clean_invisible(s, Clean::{Tags, Untrusted, Input})` возвращает текст без невидимых символов Unicode и их число (SEC-051, D102). Результаты инструментов чистятся как прежде;
   - `za-agent`: задача run, `AGENTS.md` (`CLAUDE.md`) и каждый ввод и поправка пользователя очищаются от символов тегов, нулевой ширины (кроме ZWJ и ZWNJ) и bidi до истории; событие `input.cleaned {source, removed}`. Ввод только из невидимых символов пропускается;

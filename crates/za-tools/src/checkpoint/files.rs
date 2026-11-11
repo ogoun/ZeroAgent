@@ -4,7 +4,9 @@
 //! Отсутствовавший файл — `absent` (удаляется при восстановлении только с `delete_new`).
 //! Файл больше [`CHECKPOINT_MAX_FILE`] — `skipped`: не копируется и при восстановлении не
 //! трогается (`strict` — ошибка); новых байт больше [`CHECKPOINT_MAX_TOTAL`] — ошибка
-//! `FileTooLarge`. Манифест пишется последним: его наличие — признак готовой копии.
+//! `FileTooLarge`. Секретный файл (D103: [`super::secret_name`] или фильтр по содержимому)
+//! — `secret`: не копируется и при восстановлении не трогается. Манифест пишется
+//! последним: его наличие — признак готовой копии.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read};
@@ -21,7 +23,10 @@ use super::home::{
     write_private,
 };
 use super::write::{Mode, Tmp, fill, finish, target};
-use super::{CHECKPOINT_MAX_FILE, CHECKPOINT_MAX_TOTAL, RestoreError, files_cp, valid_id};
+use super::{
+    CHECKPOINT_MAX_FILE, CHECKPOINT_MAX_TOTAL, RestoreError, SecretFilter, files_cp, is_secret,
+    valid_id,
+};
 use crate::AgentHome;
 
 /// Манифест копии файлов.
@@ -31,6 +36,13 @@ const FORMAT_V: u32 = 2;
 const STATE_FILE: &str = "file";
 const STATE_ABSENT: &str = "absent";
 const STATE_SKIPPED: &str = "skipped";
+/// Секретный файл (D103): копии нет, восстановление не трогает.
+const STATE_SECRET: &str = "secret";
+
+/// Состояние, которое восстановление не трогает и чекпоинт «до» не копирует.
+fn untouched(state: &str) -> bool {
+    state == STATE_SKIPPED || state == STATE_SECRET
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
@@ -43,7 +55,7 @@ struct Manifest {
 struct ManifestFile {
     /// Путь от корня проекта через `/`.
     path: String,
-    /// `file`, `absent` или `skipped` (сверх предела).
+    /// `file`, `absent`, `skipped` (сверх предела) или `secret` (D103).
     state: String,
     /// Имя копии в каталоге чекпоинта (у `file`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,17 +73,19 @@ fn too_large(what: String) -> io::Error {
 }
 
 /// Копия файлов запроса `req` под id `<run>/<stem>`. Повтор — готовая копия остаётся.
+/// Возвращает пропущенные как секреты пути (от корня проекта, D103).
 pub(super) fn copy(
     home: &AgentHome,
     req: &CheckpointRequest,
     stem: &str,
     strict: bool,
-) -> io::Result<()> {
+    filter: Option<&SecretFilter>,
+) -> io::Result<Vec<String>> {
     let id = format!("{}/{stem}", req.run);
     let dir = files_dir(home, &id)?;
     let manifest_path = dir.join(MANIFEST);
-    if load(&manifest_path).is_ok() {
-        return Ok(());
+    if let Ok(m) = load(&manifest_path) {
+        return Ok(secrets_of(&m));
     }
     let roots = Roots::canonical(&req.project_dir, &home.za_home)?;
     let mut files = Vec::new();
@@ -96,10 +110,33 @@ pub(super) fn copy(
             inside: true,
             protected: false,
         };
+        // По имени — и отсутствующий файл: восстановление не удалит созданный секрет.
+        if super::secret_name(&rel) {
+            tracing::info!(path = %rel, "имя секретного файла: в копию не входит");
+            files.push(ManifestFile {
+                path: rel,
+                state: STATE_SECRET.into(),
+                copy: None,
+                mode: None,
+                size: None,
+            });
+            continue;
+        }
         match open_checked(&r, false) {
             Ok(src) => {
                 let meta = src.metadata()?;
                 let size = meta.len();
+                if is_secret(&rel, &r.path, size, filter) {
+                    tracing::info!(path = %rel, "похоже на секрет: в копию не входит");
+                    files.push(ManifestFile {
+                        path: rel,
+                        state: STATE_SECRET.into(),
+                        copy: None,
+                        mode: None,
+                        size: None,
+                    });
+                    continue;
+                }
                 if size > CHECKPOINT_MAX_FILE {
                     if strict {
                         return Err(too_large(format!("{rel}: {size} байт")));
@@ -149,7 +186,20 @@ pub(super) fn copy(
         files,
     };
     let json = serde_json::to_vec(&m).map_err(io::Error::other)?;
-    write_private(&manifest_path, &json)
+    write_private(&manifest_path, &json)?;
+    Ok(secrets_of(&m))
+}
+
+/// Пути манифеста в состоянии `secret`, по возрастанию.
+fn secrets_of(m: &Manifest) -> Vec<String> {
+    let mut v: Vec<String> = m
+        .files
+        .iter()
+        .filter(|f| f.state == STATE_SECRET)
+        .map(|f| f.path.clone())
+        .collect();
+    v.sort();
+    v
 }
 
 fn load(path: &std::path::Path) -> io::Result<Manifest> {
@@ -171,7 +221,7 @@ pub(super) fn paths(home: &AgentHome, id: &str) -> io::Result<Vec<String>> {
     let m = load(&files_dir_existing(home, id)?.join(MANIFEST))?;
     Ok(m.files
         .into_iter()
-        .filter(|f| f.state != STATE_SKIPPED)
+        .filter(|f| !untouched(&f.state))
         .map(|f| f.path)
         .collect())
 }
@@ -213,7 +263,7 @@ pub(super) fn restore(
     })?;
     let mut plan = Vec::new();
     for f in &m.files {
-        if f.state == STATE_SKIPPED {
+        if untouched(&f.state) {
             continue;
         }
         if let Some(t) = target(roots, &f.path)? {

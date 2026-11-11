@@ -913,3 +913,57 @@ async fn approval_always_read_is_barrier_in_group() {
         .collect();
     assert_eq!(starts, ["r1"]);
 }
+
+// ---- R1-C2 D103: секретный файл без чекпоинта ----
+
+#[tokio::test]
+async fn secret_skipped_line_appended_by_slot() {
+    let (s, j, run) = setup("secret-skipped").await;
+    let log = SharedLog::default();
+    let reg = registry(vec![
+        tool("edit", ToolKind::Edit, 0, &log),
+        tool("edit2", ToolKind::Edit, 0, &log),
+    ]);
+    let mut e = env(run, RunMode::Auto, true);
+    e.checkpointer = Some(Arc::new(support::stub::CheckpointStub {
+        secret_skipped: vec![".env".into()],
+        ..Default::default()
+    }));
+    let calls = [planned("c1", "edit", json!({}))];
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let (_, text, is_error) = result_of(&out.results[0]);
+    assert_eq!(
+        text,
+        "edit done\n[no checkpoint for this file: it looks like a secret]"
+    );
+    assert!(!is_error);
+    let cps: Vec<Value> = s
+        .read_run(run, Seq(0), 10_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|ev| ev.kind == EventKind::CheckpointCreated)
+        .map(|ev| ev.payload)
+        .collect();
+    assert_eq!(cps.len(), 1, "{cps:?}");
+    assert_eq!(cps[0]["secret_skipped"], json!([".env"]), "{}", cps[0]);
+
+    // Без секретов строки и поля нет.
+    let (s2, j2, run2) = setup("secret-none").await;
+    let mut e2 = env(run2, RunMode::Auto, true);
+    e2.checkpointer = Some(Arc::new(support::stub::CheckpointStub::default()));
+    let calls = [planned("c2", "edit2", json!({}))];
+    let out = run_batch(&s2, &j2, &reg, &e2, &calls, &mut sig)
+        .await
+        .unwrap();
+    assert_eq!(result_of(&out.results[0]).1, "edit2 done");
+    let cp = s2
+        .read_run(run2, Seq(0), 10_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|ev| ev.kind == EventKind::CheckpointCreated)
+        .expect("checkpoint.created");
+    assert!(cp.payload.get("secret_skipped").is_none(), "{}", cp.payload);
+}
