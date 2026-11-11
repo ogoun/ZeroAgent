@@ -344,6 +344,7 @@ fn output(exit: Exit, stdout: &str, stderr: &str) -> Output {
     Output {
         exit,
         stdout: stdout.into(),
+        stdout_raw: None,
         stderr: stderr.into(),
         stdout_truncated: false,
         stderr_truncated: false,
@@ -580,11 +581,13 @@ async fn registry_dir_is_private_under_umask_002() {
     assert!(!o.is_error, "{}", o.content);
     let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "{mode:o}");
-    let specs = rec.specs.lock().unwrap();
-    let left = specs[0].leftover.as_ref().expect("запись реестра");
-    assert_eq!(left.file.parent(), Some(dir.as_path()));
+    {
+        // Блокировка — только в этом блоке: она не должна жить через `.await` ниже.
+        let specs = rec.specs.lock().unwrap();
+        let left = specs[0].leftover.as_ref().expect("запись реестра");
+        assert_eq!(left.file.parent(), Some(dir.as_path()));
+    }
     // Свой каталог, открытый на запись группе (старый агент), закрывается до 0700.
-    drop(specs);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
     call_with(
         &tool,
