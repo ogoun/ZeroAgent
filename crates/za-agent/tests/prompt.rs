@@ -380,6 +380,39 @@ fn git_branch_follows_gitdir_file() {
     assert_eq!(git_branch(&dir), "wt");
 }
 
+/// m9 ревью задачи 13: `gitdir:` недоверенного проекта не уводит за пределы проекта и не
+/// обращается к сетевому пути (`//host/share` на Windows — SMB-запрос и утечка NTLM).
+#[test]
+fn git_branch_gitdir_stays_inside_project() {
+    let root = git_dir("gitdir-outside");
+    let project = root.join("project");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("HEAD"), "ref: refs/heads/stolen\n").unwrap();
+    // Абсолютный путь и `..` наружу — не читаются.
+    std::fs::write(
+        project.join(".git"),
+        format!("gitdir: {}\n", outside.display()),
+    )
+    .unwrap();
+    assert_eq!(git_branch(&project), "-");
+    std::fs::write(project.join(".git"), "gitdir: ../outside\n").unwrap();
+    assert_eq!(git_branch(&project), "-");
+    // Сетевой путь отвергается лексически, до обращения к ФС: канонизаций не больше, чем
+    // у `gitdir:` на несуществующий каталог внутри проекта.
+    let calls = |gitdir: &str| {
+        std::fs::write(project.join(".git"), format!("gitdir: {gitdir}\n")).unwrap();
+        let before = za_core::paths::canonicalize_calls();
+        assert_eq!(git_branch(&project), "-", "{gitdir}");
+        za_core::paths::canonicalize_calls() - before
+    };
+    let baseline = calls("no-such-dir");
+    for unc in ["//192.0.2.1/share/repo", r"\\192.0.2.1\share\repo"] {
+        assert!(calls(unc) <= baseline, "{unc}: цель gitdir канонизирована");
+    }
+}
+
 #[tokio::test]
 async fn no_memory_is_l0() {
     let run = RunId::new();

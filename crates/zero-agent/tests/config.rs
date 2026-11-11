@@ -218,20 +218,41 @@ fn bypass_requires_global_flag() {
     assert!(!o.stderr.contains(&want), "{o:?}");
 }
 
-fn paris(_: &[serde_json::Value]) -> axum::response::Response {
-    support::fake_llama::text_reply(&["Париж"])
+/// Ход 1 — `read ../data/info.txt` (вне проекта, по гранту), ход 2 — `ask_user` (пауза),
+/// далее — «готово».
+fn read_outside(seen: &[serde_json::Value]) -> axum::response::Response {
+    match seen.len() {
+        1 => support::fake_llama::call_reply("call_1", "read", "{\"path\":\"../data/info.txt\"}"),
+        2 => support::fake_llama::call_reply("call_2", "ask_user", "{\"question\":\"дальше?\"}"),
+        _ => support::fake_llama::text_reply(&["готово"]),
+    }
+}
+
+/// События `grant.added` run: (источник, режим).
+fn grant_events(e: &support::process::Env, run: za_protocol::RunId) -> Vec<(String, String)> {
+    e.events(run)
+        .into_iter()
+        .filter(|(k, _)| *k == za_protocol::EventKind::GrantAdded)
+        .map(|(_, p)| {
+            (
+                p["source"].as_str().unwrap().to_owned(),
+                p["mode"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
 }
 
 /// D78: `--grant <путь>=rw` даёт грант run с каноническим путём и режимом rw
-/// (`RunSpec.grants` → снимок), источник `cli`, запись аудита `grant.added`; путь из
-/// глобальной конфигурации — тоже грант (`config`). Сетевой путь — ошибка, код 1.
+/// (`RunSpec.grants` → снимок), путь из глобальной конфигурации — тоже грант (`config`);
+/// проектный `[[policy.grants]]` не действует (ARC-041). Каждый грант — событие
+/// `grant.added` журнала run и запись аудита (I2 ревью задачи 13), в том числе новый
+/// грант при resume. Исполненный вызов вне проекта печатается (D96). Сетевой путь —
+/// ошибка, код 1.
 #[test]
 fn grant_flag_reaches_run() {
-    let srv = support::fake_llama::Fake::start(32768, true, paris);
+    let srv = support::fake_llama::Fake::start(32768, true, read_outside);
     let root = unique_dir("config-run", "grant-data");
-    let data = root.join("data");
     let shared = root.join("shared");
-    std::fs::create_dir_all(&data).unwrap();
     std::fs::create_dir_all(&shared).unwrap();
     let cfg = format!(
         "{}\n[[policy.grants]]\npath = {:?}\nreason = \"общий каталог\"\n",
@@ -239,12 +260,41 @@ fn grant_flag_reaches_run() {
         shared.to_str().unwrap()
     );
     let e = support::process::env_in("config-run", "grant", &cfg);
+    let data = e.project.parent().unwrap().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("info.txt"), "outside-data").unwrap();
+    std::fs::create_dir_all(e.project.join(".zero-agent")).unwrap();
+    std::fs::write(
+        e.project.join(".zero-agent/config.toml"),
+        format!(
+            "[[policy.grants]]\npath = {:?}\nmode = \"rw\"\n",
+            root.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    e.trust();
     let arg = format!("{}=rw", data.display());
-    let o = e.run_cmd(&["--grant", &arg, "Вопрос"]);
-    assert_eq!(o.code(), Some(0), "{o:?}");
-    let snap = e.snapshot(support::process::run_id(&o));
+    let o = e.run_cmd(&[
+        "--mode",
+        "auto",
+        "--tier",
+        "standard",
+        "--grant",
+        &arg,
+        "Вопрос",
+    ]);
+    assert_eq!(o.code(), Some(3), "{o:?}");
+    // D96: исполненный вызов вне проекта — строка в stderr; результат дошёл до модели.
+    assert!(
+        o.stderr.contains("zero-agent: вне проекта: read read ") && o.stderr.contains("info.txt"),
+        "{o:?}"
+    );
+    let second = serde_json::to_string(&srv.bodies()[1]["messages"]).unwrap();
+    assert!(second.contains("outside-data"), "{second}");
+    let run = support::process::run_id(&o);
+    let snap = e.snapshot(run);
     let grants = snap["grants"].as_array().unwrap();
-    assert_eq!(grants.len(), 2, "{snap}");
+    assert_eq!(grants.len(), 2, "проектный грант действует: {snap}");
     assert_eq!(grants[0]["mode"], "rw", "{snap}");
     assert_eq!(grants[0]["source"], "cli", "{snap}");
     let canon = std::fs::canonicalize(&data).unwrap();
@@ -257,8 +307,50 @@ fn grant_flag_reaches_run() {
     let first = serde_json::to_string(&srv.bodies()[0]["messages"]).unwrap();
     assert!(first.contains("<grants>"), "{first}");
     assert!(first.contains("(rw)"), "{first}");
-    let audit = e.last_audit("grant.").unwrap();
-    assert_eq!(audit.payload["mode"], "rw", "{audit:?}");
+    // I2: событие журнала и аудит у каждого источника.
+    let pair = |s: &str, m: &str| (s.to_owned(), m.to_owned());
+    assert_eq!(
+        grant_events(&e, run),
+        [pair("cli", "rw"), pair("config", "ro")]
+    );
+    let audits = |e: &support::process::Env| -> Vec<(String, String)> {
+        e.audit("grant.added")
+            .iter()
+            .map(|a| {
+                (
+                    a.actor.clone(),
+                    a.payload["source"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(audits(&e), [pair("user", "cli"), pair("runtime", "config")]);
+    // Resume с новым `--grant`: событие и аудит только нового гранта.
+    let extra = root.join("extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    let int = support::process::interrupt_id(&o);
+    let a = e.answer(&int, "да");
+    assert_eq!(a.code(), Some(0), "{a:?}");
+    let r = e.run_cmd(&[
+        "--resume",
+        &run.to_string(),
+        "--grant",
+        extra.to_str().unwrap(),
+    ]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert_eq!(
+        grant_events(&e, run),
+        [pair("cli", "rw"), pair("config", "ro"), pair("cli", "ro")]
+    );
+    assert_eq!(
+        audits(&e),
+        [
+            pair("user", "cli"),
+            pair("runtime", "config"),
+            pair("user", "cli")
+        ]
+    );
+    assert_eq!(e.snapshot(run)["grants"].as_array().unwrap().len(), 3);
     if cfg!(windows) {
         let o = e.run_cmd(&["--grant", r"\\192.0.2.1\share=ro", "Вопрос"]);
         assert_eq!(o.code(), Some(1), "{o:?}");

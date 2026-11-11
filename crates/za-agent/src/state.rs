@@ -241,12 +241,13 @@ pub struct LoopState {
 impl LoopState {
     /// Изменения политики, доверия и грантов (resume, D92). Доверие снимает метку
     /// `untrusted_project` (D82) и прежний отказ; отказ в доверии — `trust_refused`.
+    /// Возвращает действительно добавленные гранты (для `grant.added`, D78).
     pub fn apply_policy_change(
         &mut self,
         policy: Option<PolicySnapshot>,
         trusted: Option<bool>,
         grants_add: Vec<Grant>,
-    ) {
+    ) -> Vec<Grant> {
         if let Some(p) = policy {
             self.policy = p;
         }
@@ -258,11 +259,14 @@ impl LoopState {
             }
             None => {}
         }
+        let mut added = Vec::new();
         for g in grants_add {
             if !self.grants.contains(&g) {
-                self.grants.push(g);
+                self.grants.push(g.clone());
+                added.push(g);
             }
         }
+        added
     }
 
     /// Доверие дано (D83): метка недоверенного проекта снимается.

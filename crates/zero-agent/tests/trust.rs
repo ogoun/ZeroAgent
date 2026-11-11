@@ -406,6 +406,13 @@ fn resume_detects_removed_audit_tail() {
     e.trust();
     let o = e.run_cmd(&["--mode", "ask", "Запусти echo"]);
     assert_eq!(o.code(), Some(3), "{o:?}");
+    // D96 (m1 ревью задачи 13): пауза одобрения печатает вызов и причины.
+    assert!(
+        o.stderr
+            .contains("zero-agent: вызов: bash {\"cmd\":\"echo trusted-ok\"}"),
+        "{o:?}"
+    );
+    assert!(o.stderr.contains("zero-agent: причины: mode"), "{o:?}");
     let head = e.snapshot(run_id(&o))["audit_head"]["seq"]
         .as_u64()
         .unwrap();
@@ -440,4 +447,61 @@ fn trust_diff_names_changed_added_removed() {
         "изменены: AGENTS.md; новые: .claude/skills; удалены: CLAUDE.md"
     );
     assert!(TrustDiff::between(&set(&[]), &set(&[])).is_empty());
+}
+
+/// Ход 1 — `ask_user` (пауза), ход 2 — `read AGENTS.md`, далее — «готово».
+fn ask_then_read(seen: &[Value]) -> Response {
+    match seen.len() {
+        1 => call_reply("call_1", "ask_user", "{\"question\":\"дальше?\"}"),
+        2 => call_reply("call_2", "read", "{\"path\":\"AGENTS.md\"}"),
+        _ => text_reply(&["готово"]),
+    }
+}
+
+/// Проектная конфигурация с правилом `deny` для `read`.
+const DENY_READ: &str = "[[policy.rules]]\naction = \"deny\"\ntool = \"read\"\n";
+
+/// I1 ревью задачи 13: доверенный run на паузе; во время паузы `between` меняет проект
+/// (правка `AGENTS.md` или `trust --revoke`). Resume: проектный `deny` по-прежнему
+/// действует — `read` получает `denied: policy rule`, правило остаётся в снимке.
+fn project_deny_survives(name: &str, between: fn(&Env)) {
+    let (srv, e) = run_env(name, ask_then_read);
+    std::fs::write(e.project.join("AGENTS.md"), MARK).unwrap();
+    std::fs::create_dir_all(e.project.join(".zero-agent")).unwrap();
+    std::fs::write(e.project.join(".zero-agent/config.toml"), DENY_READ).unwrap();
+    e.trust();
+    let o = e.run_cmd(&["--mode", "auto", "--tier", "standard", "Прочитай"]);
+    assert_eq!(o.code(), Some(3), "{o:?}");
+    let run = run_id(&o);
+    assert_eq!(rules_of(&e.snapshot(run)), 1);
+    between(&e);
+    let a = e.answer(&interrupt_id(&o), "да");
+    assert_eq!(a.code(), Some(0), "{a:?}");
+    let r = e.run_cmd(&["--resume", &run.to_string()]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    let result = serde_json::to_string(&srv.bodies()[2]["messages"]).unwrap();
+    assert!(
+        result.contains("denied: policy rule"),
+        "проектный deny потерян: {result}"
+    );
+    let snap = e.snapshot(run);
+    assert_eq!(rules_of(&snap), 1, "{snap}");
+    assert_eq!(snap["policy"]["rules"][0][0], "project", "{snap}");
+}
+
+#[test]
+fn project_deny_survives_trusted_file_change() {
+    project_deny_survives("deny-after-change", |e| {
+        std::fs::write(e.project.join("AGENTS.md"), format!("{MARK} v2")).unwrap();
+    });
+}
+
+/// То же после `trust --revoke` посреди run (m2): доверие run снято (`trust_refused`),
+/// проектный `deny` остаётся.
+#[test]
+fn project_deny_survives_revoke() {
+    project_deny_survives("deny-after-revoke", |e| {
+        let r = e.run(&["trust", "--project", e.project_arg(), "--revoke"]);
+        assert_eq!(r.code(), Some(0), "{r:?}");
+    });
 }

@@ -403,8 +403,8 @@ fn quoted(p: &Path) -> String {
     format!("\"{}\"", display_path(p))
 }
 
-/// Что `run` знает о проекте до цикла (D78, D80, D83, D84, D91): доверие, политика,
-/// инструкции, гранты, корни и голова аудита.
+/// Что `run` знает о проекте до цикла (D78, D80, D83, D84): доверие, политика,
+/// инструкции, гранты и корни.
 struct Prepared {
     trusted: bool,
     /// Последнее решение о доверии — явный отзыв (`trust --revoke`).
@@ -414,15 +414,16 @@ struct Prepared {
     grants: Vec<Grant>,
     roots: Roots,
     project_id: String,
-    audit_head: Option<AuditHead>,
 }
 
 /// Подготовка run (новый и resume). Порядок: доверие (D83: набор сейчас против
 /// последней записи аудита доверия; не доверен — сообщение и отличия), уборка остатков
 /// прошлых сбоев (`reap_leftovers` реестра групп в `ZA_HOME`, временные файлы правок,
 /// D84), проектная конфигурация — только у доверенного проекта, снимок политики
-/// (глобальная и проектная, ARC-041) и `policy.loaded` при смене хэша, гранты (`--grant`
-/// и глобальные `[[policy.grants]]`, пути канонизируются), корни (D76) и голова аудита.
+/// (глобальная и проектная, ARC-041), гранты (`--grant` и глобальные
+/// `[[policy.grants]]`, пути канонизируются), корни (D76). Записи бинарника в аудит
+/// (`policy.loaded`, `grant.added`) и голова аудита — в [`record_start`], прямо перед
+/// циклом (m3, m4 ревью задачи 13).
 async fn prepare(
     za_home: &Path,
     project: &Path,
@@ -466,7 +467,6 @@ async fn prepare(
             "zero-agent: {PROJECT_CONFIG}: правило allow проекта не действует (только ask и deny, ARC-041)"
         );
     }
-    policy_loaded(store, project, &policy).await?;
     let mut grants = Vec::new();
     for (path, mode) in cli_grants {
         grants.push(grant(&roots, path, *mode, GrantSource::Cli, String::new()).await?);
@@ -483,10 +483,6 @@ async fn prepare(
             .await?,
         );
     }
-    let audit_head = store
-        .audit_head()
-        .await?
-        .map(|(seq, hash)| AuditHead { seq, hash });
     Ok(Prepared {
         trusted: check.trusted,
         revoked: check.revoked,
@@ -495,8 +491,28 @@ async fn prepare(
         grants,
         roots,
         project_id,
-        audit_head,
     })
+}
+
+/// Записи бинарника в аудит прямо перед циклом (D78, D91): `policy.loaded` при смене
+/// хэша политики run (`policy` — `None`, если политика run не меняется), `grant.added` на
+/// каждый новый грант run (источник `cli` — actor `user`, `config` — `runtime`); затем
+/// голова цепочки — якорь снимка (после всех записей, m3 ревью задачи 13).
+async fn record_start(
+    store: &ProjectStore,
+    project: &Path,
+    run: RunId,
+    policy: Option<&PolicySnapshot>,
+    grants: &[Grant],
+) -> Result<Option<AuditHead>, RunError> {
+    if let Some(p) = policy {
+        policy_loaded(store, project, p).await?;
+    }
+    grants_audit(store, run, grants).await?;
+    Ok(store
+        .audit_head()
+        .await?
+        .map(|(seq, hash)| AuditHead { seq, hash }))
 }
 
 /// Блокирующая работа с ФС вне потоков tokio; ошибка — `RunError::Io` с `what` и путём.
@@ -707,7 +723,12 @@ async fn check_audit_anchor(store: &ProjectStore, snap: &Value) -> Result<(), Ru
 /// Отличия resume от снимка run (D92): доверие, политика, гранты. Доверие снимается
 /// только явным отзывом (`trust --revoke`): правка доверенных файлов посреди run (тем же
 /// агентом) доверие этого run не отменяет, предупреждение — в stderr.
-fn resume_changes(p: &Prepared, snap: &Value) -> Result<ResumeChange, RunError> {
+///
+/// Проектные `deny` и `ask` не теряются (I1 ревью задачи 13): если снимок доверенный, а
+/// проект сейчас не доверен (доверенные файлы изменились или доверие отозвано), проектная
+/// часть политики берётся из снимка run — она только ограничивает; глобальная — из
+/// нынешней конфигурации.
+fn resume_changes(p: &Prepared, cfg: &AgentConfig, snap: &Value) -> Result<ResumeChange, RunError> {
     let snap_trusted = snap
         .get("trusted")
         .and_then(Value::as_bool)
@@ -730,7 +751,25 @@ fn resume_changes(p: &Prepared, snap: &Value) -> Result<ResumeChange, RunError> 
         .and_then(|v| v.get("hash"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let policy = (p.policy.hash != snap_hash).then(|| p.policy.clone());
+    let effective = if snap_trusted && !p.trusted {
+        let kept: PolicySnapshot = snap
+            .get("policy")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let project = za_agent::PolicyConfig {
+            rules: kept
+                .rules
+                .into_iter()
+                .filter(|(src, _)| *src == za_agent::RuleSource::Project)
+                .map(|(_, r)| r)
+                .collect(),
+            ..za_agent::PolicyConfig::default()
+        };
+        PolicySnapshot::build(&cfg.policy, Some(&project))?
+    } else {
+        p.policy.clone()
+    };
+    let policy = (effective.hash != snap_hash).then_some(effective);
     let had: Vec<Grant> = snap
         .get("grants")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -875,7 +914,6 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             } else {
                 None
             };
-            grants_audit(&store, run, &prep.grants).await?;
             let spec = RunSpec {
                 project_id: prep.project_id.clone(),
                 project_dir: project.clone(),
@@ -899,6 +937,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             };
             let (mut deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
             deps.crash = crash_hook(args.crash);
+            deps.audit_head =
+                record_start(&store, &project, run, Some(&prep.policy), &prep.grants).await?;
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
             let outcome = drive(&bus, fut, &ctl, args.crash, masker.clone()).await;
@@ -917,8 +957,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 .unwrap_or(Value::Null);
             check_audit_anchor(&store, &snap).await?;
             let prep = prepare(home, &project, &store, &cfg, &args.grants).await?;
-            let mut change = resume_changes(&prep, &snap)?;
-            grants_audit(&store, r.run, &change.grants_add).await?;
+            let mut change = resume_changes(&prep, &cfg, &snap)?;
             let endpoint = match r.model {
                 Some(m) => Some(select(Some(m)).map_err(CommandError::from)?),
                 None => None,
@@ -937,6 +976,14 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             };
             let (mut deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
             deps.crash = crash_hook(args.crash);
+            deps.audit_head = record_start(
+                &store,
+                &project,
+                r.run,
+                change.policy.as_ref(),
+                &change.grants_add,
+            )
+            .await?;
             // Новый канал управления на каждый resume: `start_run` и `resume_run` забирают
             // `ControlRx`, а Ctrl+C управляет этим `RunControl` (Carry M2 задачи 12).
             let (ctl, rx) = control_channel(store.clone(), r.run);
@@ -951,13 +998,20 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
     }
 }
 
-/// Аудит грантов `--grant` (D78): запись `grant.added` на каждый грант из командной
-/// строки (глобальные `[[policy.grants]]` входят в хэш `policy.loaded`).
+/// Аудит грантов run (D78, I2 ревью задачи 13): запись `grant.added` на каждый грант
+/// (флаг `--grant` — actor `user`, глобальный `[[policy.grants]]` — `runtime`). Событие
+/// `grant.added` журнала run пишет цикл (`za-agent`, шаг 0 и resume). Гранты проектной
+/// конфигурации не действуют (ARC-041) и сюда не попадают.
 async fn grants_audit(store: &ProjectStore, run: RunId, grants: &[Grant]) -> Result<(), RunError> {
-    for g in grants.iter().filter(|g| g.source == GrantSource::Cli) {
+    for g in grants {
+        let actor = if g.source == GrantSource::Cli {
+            AUDIT_ACTOR_USER
+        } else {
+            AUDIT_ACTOR_RUNTIME
+        };
         store
             .append_audit(AuditNew {
-                actor: AUDIT_ACTOR_USER.to_owned(),
+                actor: actor.to_owned(),
                 action: audit_action::GRANT_ADDED.to_owned(),
                 target: g.path.to_string_lossy().into_owned(),
                 payload: json!({
@@ -1011,7 +1065,6 @@ fn deps(
     // D100: ответ модели и результаты инструментов маскируются до квитанции.
     deps.masker = Some(Arc::new(masker.clone()));
     deps.trust_set = Some(trust_set_fn());
-    deps.audit_head = prep.audit_head.clone();
     (deps, bus)
 }
 

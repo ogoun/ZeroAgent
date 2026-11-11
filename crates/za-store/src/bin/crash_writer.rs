@@ -59,7 +59,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let store = match ProjectStore::open_with(&dir, opts) {
+    // Прежний писатель убит, а тест мог ещё не отпустить журнал (своё открытие для
+    // проверки): блокировка снимается не мгновенно — повтор на `Locked` до 5 с.
+    let mut tries = 0;
+    let opened = loop {
+        match ProjectStore::open_with(&dir, opts.clone()) {
+            Err(StoreError::Locked) if tries < 50 => {
+                tries += 1;
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+            r => break r,
+        }
+    };
+    let store = match opened {
         Ok(s) => s,
         Err(e) => {
             eprintln!("crash_writer: {e}");

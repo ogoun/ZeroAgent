@@ -246,7 +246,8 @@ pub async fn resume_run(
             if let Some(m) = change.run_mode {
                 st.setup.run_mode = m;
             }
-            st.apply_policy_change(change.policy, change.trusted, change.grants_add);
+            let added = st.apply_policy_change(change.policy, change.trusted, change.grants_add);
+            crate::driver::grants_added(j, run, &added).await?;
             st.at_boundary.resume_note = true;
             st.at_boundary.state_late = late;
             BOUNDARY

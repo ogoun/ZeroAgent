@@ -859,33 +859,71 @@ pub fn reasoning_for(tier: Tier) -> ReasoningMode {
 /// Длина сокращённого sha отсоединённого `HEAD`.
 const SHORT_SHA: usize = 12;
 
+/// Путь `arg` (от корня проекта) внутри проекта: канонический путь и локальные
+/// метаданные; сетевой, device-путь, вне проекта или нет файла — `None`.
+fn inside_file(
+    roots: &za_core::paths::Roots,
+    arg: &str,
+) -> Option<(za_core::paths::ResolvedPath, std::fs::Metadata)> {
+    let lex = za_core::paths::classify(&roots.project, arg).ok()?;
+    let r = za_core::paths::resolve(roots, &lex, za_core::Access::Read).ok()?;
+    if !r.inside {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(&r.path).ok()?;
+    Some((r, meta))
+}
+
+/// Текст файла `arg` внутри проекта (не больше 4 КиБ: `.git`-файл и `HEAD` короткие),
+/// без следования ссылке на последнем компоненте.
+fn read_inside(roots: &za_core::paths::Roots, arg: &str) -> Option<String> {
+    use std::io::Read;
+    let (r, meta) = inside_file(roots, arg)?;
+    if !meta.is_file() {
+        return None;
+    }
+    let f = za_core::paths::open_checked(&r, false).ok()?;
+    let mut buf = Vec::new();
+    f.take(4096).read_to_end(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
 /// Ветка из `<dir>/.git/HEAD` без запуска `git` (D24): `ref: refs/heads/x` → `x`,
 /// иначе первые 12 символов sha; нет файла или он пуст — `-`.
 ///
 /// `.git`-файл рабочего дерева (`gitdir: <путь>`, `git worktree`) ведёт к каталогу
 /// репозитория; относительный путь берётся от `project_dir`.
+///
+/// Проект может быть недоверенным (R1-C1, m9 ревью задачи 13): все пути проходят
+/// `za_core::paths` — `classify` отвергает сетевые и device-пути (`gitdir: //host/share`)
+/// до обращения к ФС, `resolve` не пускает за пределы проекта (в том числе по ссылкам),
+/// файлы открываются `open_checked` без следования ссылке. `gitdir:` вне проекта (рабочее
+/// дерево `git worktree` основного репозитория) — `-`.
 pub fn git_branch(project_dir: &Path) -> String {
-    let dot_git = project_dir.join(".git");
-    let git_dir = if dot_git.is_file() {
-        match std::fs::read_to_string(&dot_git) {
-            Ok(text) => match text.trim().strip_prefix("gitdir:") {
-                Some(p) => project_dir.join(p.trim()),
-                None => return "-".into(),
-            },
-            Err(e) => {
-                tracing::debug!(error = %e, "не прочитан файл .git");
-                return "-".into();
-            }
-        }
-    } else {
-        dot_git
+    let _drives = za_core::paths::DriveScope::enter();
+    let Ok(roots) = za_core::paths::Roots::canonical(project_dir, project_dir) else {
+        return "-".into();
     };
-    let head = match std::fs::read_to_string(git_dir.join("HEAD")) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::debug!(error = %e, "нет .git/HEAD");
+    let dot_git = match inside_file(&roots, ".git") {
+        Some((path, meta)) => (path, meta),
+        None => return "-".into(),
+    };
+    let head_rel = if dot_git.1.is_file() {
+        let Some(text) = read_inside(&roots, ".git") else {
             return "-".into();
+        };
+        match text.trim().strip_prefix("gitdir:") {
+            Some(p) => format!("{}/HEAD", p.trim().trim_end_matches(['/', '\\'])),
+            None => return "-".into(),
         }
+    } else if dot_git.1.is_dir() {
+        ".git/HEAD".to_owned()
+    } else {
+        return "-".into();
+    };
+    let Some(head) = read_inside(&roots, &head_rel) else {
+        tracing::debug!("нет HEAD репозитория внутри проекта");
+        return "-".into();
     };
     let head = head.trim();
     if let Some(r) = head.strip_prefix("ref:") {

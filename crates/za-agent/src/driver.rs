@@ -470,6 +470,10 @@ async fn step_zero(
     if known_ctx.is_none() {
         last_seq = Some(n_ctx_unknown(&deps.journal, run, &spec.endpoint, n_ctx).await?);
     }
+    // D78: гранты старта run (флаг, глобальная конфигурация) — `grant.added` в журнале.
+    if let Some(s) = grants_added(&deps.journal, run, &spec.grants).await? {
+        last_seq = Some(s);
+    }
 
     let registry = run_registry(deps)?;
     let (_, classes) = run_tools_of(&registry, spec.role, tier);
@@ -975,7 +979,8 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     // Политика, доверие и гранты resume (D92) — тоже с границы.
     let (policy, trusted) = (st.at_boundary.policy.take(), st.at_boundary.trusted.take());
     let grants_add = std::mem::take(&mut st.at_boundary.grants_add);
-    st.apply_policy_change(policy, trusted, grants_add);
+    let added = st.apply_policy_change(policy, trusted, grants_add);
+    grants_added(&deps.journal, st.run, &added).await?;
     // Шаг R1-B1 доработан: следующие ходы — с параметрами R1-B2 (D66).
     st.legacy_step = false;
     // (1) Сигналы до шага (D9): Input отброшен — ввод прочитает сама граница.
@@ -2928,6 +2933,25 @@ async fn turn_finished_with(
     )
     .await?;
     Ok(())
+}
+
+/// События `grant.added {path, mode, source}` (D78) — гранты старта run и resume; у
+/// `request_grant` событие пишет пакет (с `call_id`). Возвращает `seq` последнего.
+pub(crate) async fn grants_added(
+    j: &Journal,
+    run: RunId,
+    grants: &[Grant],
+) -> Result<Option<Seq>, StoreError> {
+    let mut last = None;
+    for g in grants {
+        let payload = json!({
+            "path": g.path.to_string_lossy(),
+            "mode": g.mode,
+            "source": g.source,
+        });
+        last = Some(append(j, run, Actor::Runtime, EventKind::GrantAdded, payload).await?);
+    }
+    Ok(last)
 }
 
 async fn append(

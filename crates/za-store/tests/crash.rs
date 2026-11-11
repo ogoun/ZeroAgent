@@ -215,6 +215,8 @@ fn audit_chain_survives_kill() {
             lost.is_empty(),
             "раунд {round}: потеряны подтверждённые записи аудита {lost:?}"
         );
+        // Журнал отпускается до следующего писателя (тот ещё и повторяет открытие).
+        drop(s);
     }
     assert!(
         !acked_all.is_empty(),

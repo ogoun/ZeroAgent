@@ -195,6 +195,19 @@ impl Env {
         rt.block_on(store.last_audit(prefix)).unwrap()
     }
 
+    /// Все записи аудита с действием `action` по порядку.
+    pub fn audit(&self, action: &str) -> Vec<za_store::AuditEntry> {
+        let store = self.store();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(store.audit_entries(0, usize::MAX))
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.action == action)
+            .collect()
+    }
+
     pub fn journal_dir(&self) -> PathBuf {
         self.home
             .join("projects")
