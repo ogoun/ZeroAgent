@@ -51,8 +51,9 @@ pub trait SecretSource: Send + Sync {
     fn get(&self, key_ref: &str) -> Option<Secret>;
 }
 
-/// Ключи из переменных окружения `ZA_SECRET_<KEY_REF>` (D4).
-/// Хранилище ОС и шифрованный файл (SEC-040) — R1-C, без смены конфигурации.
+/// Ключи из переменных окружения `ZA_SECRET_<KEY_REF>` (D4), читаемые при каждом `get`.
+/// Бинарник с R1-C1 берёт ключи через кэш `StoreSecrets` поверх `za_secrets::SecretStore`
+/// (D90: `EnvStore`, позже Vault памяти ZeroAIMemory) с тем же правилом имён.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EnvSecrets;
 

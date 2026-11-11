@@ -1,6 +1,6 @@
 //! Бинарник `zero-agent`: `doctor`, `demo-run`, `replay` (R0), `models`, `ask`,
 //! `resources` (R1-A), `run`, `answer` (R1-B1), `inspect`, `stats` (R1-B2), `audit`,
-//! `journal export`, `checkpoints` (R1-C1).
+//! `journal export`, `checkpoints`, `secret list` (R1-C1).
 //!
 //! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы, ошибка
 //! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя;
@@ -25,7 +25,7 @@ use za_agent::WorkMode;
 use za_core::{CrashPoint, DemoConfig, DemoOutcome, EffectError, replay_hash, run_demo};
 use za_protocol::{Priority, RunId, RunMode, Tier};
 use za_store::{ProjectStore, StoreError};
-use zero_agent::audit::{self as audit_cmd, AuditCmdError, KnownSecrets};
+use zero_agent::audit::{self as audit_cmd, AuditCmdError};
 use zero_agent::checkpoints::{self as checkpoints_cmd, CheckpointsCmdError};
 use zero_agent::doctor::{self, LLAMA_URL_ENV};
 use zero_agent::home::{self, NoHome};
@@ -37,6 +37,7 @@ use zero_agent::run::{
     self as agent_run, Answer, BudgetFlags, EXIT_NEEDS_DECISION, JOURNAL_FILE, NewRunArgs,
     ResumeArgs, RunAction, RunArgs, RunCrash, RunError, parse_run_crash, parse_usd,
 };
+use zero_agent::secret::{StoreSecrets, cmd_secret_list};
 /// Переменная окружения с фильтром логов; без неё читается `RUST_LOG`.
 const LOG_ENV: &str = "ZA_LOG";
 /// Фильтр логов по умолчанию.
@@ -173,6 +174,11 @@ enum Cmd {
     Journal {
         #[command(subcommand)]
         action: JournalCmd,
+    },
+    /// Секреты агента: имена и задан ли секрет, без значений.
+    Secret {
+        #[command(subcommand)]
+        action: SecretCmd,
     },
     /// Запрос хода к модели по журналу: блоки с байтами, токенами и хэшем, расход,
     /// предсказание следующего хода; `--raw` — тело запроса провайдеру.
@@ -358,7 +364,8 @@ fn run_args(r: RunCli) -> RunArgs {
 
 #[derive(Debug, Subcommand)]
 enum JournalCmd {
-    /// События run в JSONL по порядку `seq`, значения секретов `ZA_SECRET_*` замаскированы.
+    /// События run в JSONL по порядку `seq`, секреты замаскированы (значения
+    /// `ZA_SECRET_*` и шаблоны ключей).
     Export {
         /// Каталог проекта.
         #[arg(long)]
@@ -367,6 +374,13 @@ enum JournalCmd {
         #[arg(long, value_parser = parse_run)]
         run: RunId,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretCmd {
+    /// Имена секретов (`key_ref` из config.toml и переменные `ZA_SECRET_*`), отметка
+    /// «задан»; значения не печатаются.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -622,8 +636,8 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             json,
         } => {
             let home = home::za_home()?;
-            let secrets = KnownSecrets::from_vars(std::env::vars_os());
-            Ok(audit_cmd::cmd_audit(&home, &project, verify, json, &secrets).await?)
+            let masker = StoreSecrets::from_env().masker();
+            Ok(audit_cmd::cmd_audit(&home, &project, verify, json, &masker).await?)
         }
         Cmd::Checkpoints { action } => {
             let home = home::za_home()?;
@@ -643,8 +657,14 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             action: JournalCmd::Export { project, run },
         } => {
             let home = home::za_home()?;
-            let secrets = KnownSecrets::from_vars(std::env::vars_os());
-            Ok(audit_cmd::cmd_journal_export(&home, &project, run, &secrets).await?)
+            let masker = StoreSecrets::from_env().masker();
+            Ok(audit_cmd::cmd_journal_export(&home, &project, run, &masker).await?)
+        }
+        Cmd::Secret {
+            action: SecretCmd::List,
+        } => {
+            let home = home::za_home()?;
+            Ok(cmd_secret_list(&home))
         }
     }
 }

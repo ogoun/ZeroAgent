@@ -38,6 +38,7 @@ use za_protocol::{
     Actor, Budget, BudgetKind, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Seq, Tier,
     audit_action, pause_reason,
 };
+use za_secrets::SecretMasker;
 use za_store::{AuditNew, INTERRUPT_OPEN, InterruptRow, ProjectStore, StoreError};
 
 use crate::config::load_config;
@@ -401,6 +402,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
         return Err(CommandError::NoModels.into());
     }
     let started = start_gateway(home, &cfg, true).await?;
+    // Маска печати ответа — по секретам, прочитанным при старте вместе с ключами (D90).
+    let masker = started.secrets.masker();
     let gateway = Arc::new(started.gateway);
     let select = |model: Option<String>| -> Result<EndpointId, SelectError> {
         gateway.select(&Selection {
@@ -467,7 +470,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             let (deps, bus) = deps(&store, &gateway, tools);
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
-            let outcome = drive(&bus, fut, &ctl, args.crash).await;
+            let outcome = drive(&bus, fut, &ctl, args.crash, masker).await;
             report(&store, &project, run, outcome).await
         }
         RunAction::Resume(r) => {
@@ -501,7 +504,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 run_mode: None,
             };
             let fut = resume_run(&deps, r.run, change, rx);
-            let outcome = drive(&bus, fut, &ctl, args.crash).await;
+            let outcome = drive(&bus, fut, &ctl, args.crash, masker).await;
             report(&store, &project, r.run, outcome).await
         }
     }
@@ -532,9 +535,12 @@ fn deps(
     (deps, bus)
 }
 
-/// Печать ответа по `model.delta` шины (D35).
+/// Печать ответа по `model.delta` шины (D35). Текст проходит маску секретов (D90):
+/// каждая дельта отдельно (секрет на границе двух дельт может проскочить, D100), ответ
+/// после отставания — целиком.
 #[derive(Default)]
 struct Printer {
+    masker: SecretMasker,
     /// Текст текущей попытки хода: с ним сравнивается `answer` после отставания.
     current: String,
     /// Последний напечатанный байт — перевод строки (или ничего не напечатано).
@@ -547,8 +553,9 @@ struct Printer {
 }
 
 impl Printer {
-    fn new(crash: Option<RunCrash>) -> Self {
+    fn new(crash: Option<RunCrash>, masker: SecretMasker) -> Self {
         Self {
+            masker,
             at_line_start: true,
             crash,
             ..Self::default()
@@ -581,8 +588,9 @@ impl Printer {
                     return;
                 }
                 if let Some(t) = p.get("text").and_then(Value::as_str) {
-                    self.current.push_str(t);
-                    self.write(t);
+                    let t = self.masker.mask(t).into_owned();
+                    self.current.push_str(&t);
+                    self.write(&t);
                 } else if p.get("restart").is_some() {
                     if !self.at_line_start {
                         self.write("\n");
@@ -610,8 +618,13 @@ impl Printer {
         if self.lagged
             && let Some(a) = answer
         {
+            let a = self.masker.mask(a).into_owned();
+            let a = a.as_str();
             match a.strip_prefix(self.current.as_str()) {
-                Some(rest) => self.write(rest),
+                Some(rest) => {
+                    let rest = rest.to_owned();
+                    self.write(&rest);
+                }
                 None => {
                     if !self.at_line_start {
                         self.write("\n");
@@ -640,10 +653,11 @@ async fn drive(
     fut: impl std::future::Future<Output = Result<LoopOutcome, LoopError>>,
     ctl: &za_agent::RunControl,
     crash: Option<RunCrash>,
+    masker: SecretMasker,
 ) -> Result<LoopOutcome, LoopError> {
     // Подписка до первого опроса цикла: future ленив, ни одно событие не теряется.
     let mut rx = bus.subscribe();
-    let mut printer = Printer::new(crash);
+    let mut printer = Printer::new(crash, masker);
     let mut fut = std::pin::pin!(fut);
     let mut interrupt = Box::pin(ctrl_c());
     let mut presses = 0u32;

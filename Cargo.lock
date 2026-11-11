@@ -2224,6 +2224,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "za-secrets"
+version = "0.0.1"
+
+[[package]]
 name = "za-shell"
 version = "0.0.1"
 
@@ -2289,6 +2293,7 @@ dependencies = [
  "za-llm",
  "za-protocol",
  "za-res",
+ "za-secrets",
  "za-store",
  "za-tools",
 ]

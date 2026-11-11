@@ -151,6 +151,50 @@ fn journal_export_prints_masked_jsonl() {
     assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
 }
 
+/// Выгрузка маскирует шаблоны ключей D90 и без переменных `ZA_SECRET_*` в окружении
+/// (ревью задачи 4, m4): токен в тексте, аргументы вызова, ключ PEM, пароль в URL.
+#[test]
+fn journal_export_masks_patterns_without_env() {
+    const TOKEN: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+    const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaFAKEexample0000\n-----END OPENSSH PRIVATE KEY-----";
+    let e = env("export-patterns");
+    let (run, _) = with_run(&e, async |s, run| {
+        s.append(event(run, json!({"text": format!("token {TOKEN}")})))
+            .await
+            .unwrap();
+        s.append(event(
+            run,
+            json!({"arguments": {"cmd": format!("cat key\n{PEM}")},
+                   "raw_arguments": format!("{{\"url\":\"postgres://u:FakePass123@db/x\",\"t\":\"{TOKEN}\"}}")}),
+        ))
+        .await
+        .unwrap();
+    });
+    let o = e.run(&[
+        "journal",
+        "export",
+        "--project",
+        e.project_arg(),
+        "--run",
+        &run.to_string(),
+    ]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    for leak in [TOKEN, "b3BlbnNzaFAKEexample0000", "FakePass123"] {
+        assert!(!o.stdout.contains(leak), "{leak}: {}", o.stdout);
+    }
+    for label in [
+        "[secret masked: github_token]",
+        "[secret masked: private_key]",
+        "[secret masked: url_password]",
+    ] {
+        assert!(o.stdout.contains(label), "{label}: {}", o.stdout);
+    }
+    // Каждая строка — по-прежнему JSON.
+    for l in o.stdout.lines() {
+        serde_json::from_str::<Value>(l).unwrap_or_else(|err| panic!("{err}: {l}"));
+    }
+}
+
 #[test]
 fn journal_export_unknown_run_fails() {
     let e = env("export-unknown");

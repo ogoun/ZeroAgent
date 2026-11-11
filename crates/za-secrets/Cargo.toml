@@ -1,0 +1,15 @@
+[package]
+name = "za-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-secrets"
+
+[lints]
+workspace = true
+
+# Секреты (R1-C1 D73, D90): трейт `SecretStore`, `EnvStore` (`ZA_SECRET_*`), сканер и
+# маскировка. Без крейтов workspace и без внешних крейтов (проверяет `cargo xtask policy`):
+# сканер — проход по байтам с таблицей префиксов, без `regex`.
+[dependencies]

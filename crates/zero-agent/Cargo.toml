@@ -20,6 +20,9 @@ za-agent = { path = "../za-agent" }
 # Чекпоинты рабочей копии: `checkpoints list|restore` (R1-C1 D89), git — через `za-jail`.
 za-tools = { path = "../za-tools" }
 za-jail = { path = "../za-jail" }
+# Секреты (R1-C1 D90): `EnvStore` (`ZA_SECRET_*`) под кэшем `StoreSecrets`, маскировка
+# выгрузки журнала, аудита и печати `run`; команда `secret list`.
+za-secrets = { path = "../za-secrets" }
 clap.workspace = true
 # `macros` — `join!` проверок doctor и `select!` команды `run`, `time` — ожидание зондов и
 # `resources --watch`, `signal` — Ctrl+C команды `run` (пауза, второй — выход).

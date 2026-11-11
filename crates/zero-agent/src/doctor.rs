@@ -4,8 +4,10 @@
 //! GPU (`nvidia-smi`, D6) и состояние каждой модели из `config.toml` после первого
 //! зонда, показывает версию компилятора. Внешние системы необязательны: их
 //! недоступность — предупреждение, не отказ (нет GPU, модель `inactive` или
-//! `unreachable` — `Warn`). Отказ — старая SQLite и ошибка конфигурации. Проверка
-//! памяти ZeroAIMemory появится вместе с её клиентом.
+//! `unreachable` — `Warn`). Отказ — старая SQLite и ошибка конфигурации. Строка
+//! `secrets` называет источник секретов (R1-C1 D90): пока переменные `ZA_SECRET_*`, Vault
+//! памяти — с клиентом ZeroAIMemory. Проверка памяти ZeroAIMemory появится вместе с её
+//! клиентом.
 
 use std::path::Path;
 
@@ -15,6 +17,7 @@ use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query
 
 use crate::config::{AgentConfig, AppConfigError, LLAMA_URL_ENDPOINT, load_config};
 use crate::models::{PROBE_WAIT, start_gateway, state_text};
+use crate::secret::source_text;
 
 /// Переменная окружения с адресом `llama-server`.
 pub const LLAMA_URL_ENV: &str = "LLAMA_URL";
@@ -62,6 +65,8 @@ pub struct DoctorReport {
     pub llama: Check,
     /// GPU по `nvidia-smi`; недоступен — `Warn`.
     pub gpu: Check,
+    /// Источник секретов (D90); всегда `Ok`.
+    pub secrets: Check,
     /// Модели по id эндпоинта; `config` — ошибка или предупреждение конфигурации.
     pub models: Vec<(String, Check)>,
     /// Компилятор сборки и MSRV.
@@ -71,7 +76,7 @@ pub struct DoctorReport {
 impl DoctorReport {
     /// Есть ли отказ: `doctor` завершается с кодом 1.
     pub fn has_failure(&self) -> bool {
-        [&self.sqlite, &self.llama, &self.gpu]
+        [&self.sqlite, &self.llama, &self.gpu, &self.secrets]
             .into_iter()
             .chain(self.models.iter().map(|(_, c)| c))
             .any(|c| matches!(c, Check::Fail(_)))
@@ -84,6 +89,7 @@ impl DoctorReport {
             ("sqlite", &self.sqlite),
             ("llama", &self.llama),
             ("gpu", &self.gpu),
+            ("secrets", &self.secrets),
         ] {
             out.push_str(&format!("  {name:<7} {:<5} {}\n", c.label(), c.detail()));
         }
@@ -135,9 +141,16 @@ pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
         sqlite: check_sqlite(za_store::sqlite_library_version(), za_store::MIN_SQLITE),
         llama,
         gpu,
+        secrets: check_secrets(),
         models,
         rust: rust_version(),
     }
+}
+
+/// Источник секретов: «источник секретов: переменные ZA_SECRET_* (Vault памяти — с
+/// клиентом ZeroAIMemory)». Значения и имена секретов не читаются.
+pub fn check_secrets() -> Check {
+    Check::Ok(format!("источник секретов: {}", source_text("env")))
 }
 
 /// GPU и модели по конфигурации `home`.
@@ -366,6 +379,7 @@ mod tests {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
             gpu: Check::Warn("нет".to_owned()),
+            secrets: check_secrets(),
             models: vec![("local".to_owned(), Check::Warn("inactive".to_owned()))],
             rust: rust_version(),
         };
@@ -384,6 +398,7 @@ mod tests {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
             gpu: Check::Ok("RTX".to_owned()),
+            secrets: check_secrets(),
             models: vec![("local".to_owned(), Check::Ok("ready".to_owned()))],
             rust: "rustc 1.99.1".to_owned(),
         };
@@ -394,6 +409,7 @@ mod tests {
                 "sqlite": {"status": "ok", "detail": "3.54.1"},
                 "llama": {"status": "warn", "detail": "нет"},
                 "gpu": {"status": "ok", "detail": "RTX"},
+                "secrets": {"status": "ok", "detail": "источник секретов: переменные ZA_SECRET_* (Vault памяти — с клиентом ZeroAIMemory)"},
                 "models": [["local", {"status": "ok", "detail": "ready"}]],
                 "rust": "rustc 1.99.1",
             })

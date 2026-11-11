@@ -21,14 +21,15 @@ use serde_json::json;
 use za_llm::config::{ConfigError, ModelsConfig};
 use za_llm::profile::{EndpointState, ProbedEndpoint, ProfileStore};
 use za_llm::{
-    ChatRequest, DEFAULT_PROBE_DEADLINE, EndpointId, EndpointView, EnvSecrets, Gateway,
-    GatewayOptions, Message, ModelCall, ModelPort, Part, RequestMeta, Role, SelectError, Selection,
-    StreamEvent, WaitState,
+    ChatRequest, DEFAULT_PROBE_DEADLINE, EndpointId, EndpointView, Gateway, GatewayOptions,
+    Message, ModelCall, ModelPort, Part, RequestMeta, Role, SelectError, Selection, StreamEvent,
+    WaitState,
 };
 use za_protocol::{Priority, RunId};
 use za_res::{Admission, MonitorConfig, ResourceMonitor};
 
 use crate::config::{AgentConfig, AppConfigError, load_config};
+use crate::secret::StoreSecrets;
 
 /// Сколько команды ждут первых зондов: предел одного зонда и запас.
 pub const PROBE_WAIT: Duration = DEFAULT_PROBE_DEADLINE.saturating_add(Duration::from_secs(5));
@@ -66,11 +67,14 @@ pub enum CommandError {
 pub struct Started {
     pub gateway: Gateway,
     pub monitor: Option<ResourceMonitor>,
+    /// Секреты, прочитанные при старте: из них же ключи `Gateway` и маска (D90).
+    pub secrets: Arc<StoreSecrets>,
 }
 
 /// Запускает `Gateway` по конфигурации. `with_resources` — монитор ресурсов узла и
 /// допуск заявок (D10): для `ask` и `resources`. Нет `[models]` — пустой список
-/// эндпоинтов. Ключи — из `ZA_SECRET_<KEY_REF>` (D4).
+/// эндпоинтов. Ключи — из `ZA_SECRET_<KEY_REF>` (D4): [`StoreSecrets`] читает их один раз
+/// при старте (R1-C1 D90).
 pub async fn start_gateway(
     home: &Path,
     cfg: &AgentConfig,
@@ -91,15 +95,20 @@ pub async fn start_gateway(
     } else {
         (None, None)
     };
+    let secrets = Arc::new(StoreSecrets::from_env());
     let gateway = Gateway::start(
         cfg.models.clone().unwrap_or_default(),
-        Arc::new(EnvSecrets),
+        Arc::clone(&secrets) as Arc<dyn za_llm::SecretSource>,
         admission,
         store,
         GatewayOptions::default(),
     )
     .await?;
-    Ok(Started { gateway, monitor })
+    Ok(Started {
+        gateway,
+        monitor,
+        secrets,
+    })
 }
 
 /// Эндпоинт по id из списка `Gateway`.
