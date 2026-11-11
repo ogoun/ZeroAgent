@@ -47,7 +47,11 @@ impl Runner for DirectRunner {
 #[derive(Default)]
 struct Capture {
     buf: Vec<u8>,
+    /// Принято байт (в память или в файл).
+    len: usize,
     truncated: bool,
+    /// Ошибка записи stdout в файл (`CommandSpec::stdout_file`).
+    file_error: Option<std::io::Error>,
 }
 
 /// Итог запуска до декодирования вывода.
@@ -72,9 +76,13 @@ enum Event {
 async fn run(spec: CommandSpec) -> Result<Output, RunnerError> {
     let started = Instant::now();
     let limit = spec.capture_limit;
-    let keep_raw = spec.raw_stdout;
+    let to_file = spec.stdout_file.is_some();
+    let keep_raw = spec.raw_stdout && !to_file;
     let mut raw = run_raw(spec).await?;
-    let out_text = (!keep_raw).then_some(raw.out.buf.as_slice());
+    if let Some(e) = raw.out.file_error.take() {
+        return Err(RunnerError::Io(e));
+    }
+    let out_text = (!keep_raw && !to_file).then_some(raw.out.buf.as_slice());
     let oem = if out_text.is_some_and(crate::decode::needs_code_page)
         || crate::decode::needs_code_page(&raw.err.buf)
     {
@@ -82,7 +90,9 @@ async fn run(spec: CommandSpec) -> Result<Output, RunnerError> {
     } else {
         None
     };
-    let (stdout, stdout_raw) = if keep_raw {
+    let (stdout, stdout_raw) = if to_file {
+        (String::new(), None)
+    } else if keep_raw {
         (String::new(), Some(std::mem::take(&mut raw.out.buf)))
     } else {
         (crate::decode::decode(&raw.out.buf, limit, oem), None)
@@ -91,7 +101,7 @@ async fn run(spec: CommandSpec) -> Result<Output, RunnerError> {
         exit: raw.exit,
         stdout,
         stdout_raw,
-        stderr: crate::decode::decode(&raw.err.buf, limit, oem),
+        stderr: crate::decode::decode(&raw.err.buf, limit.min(crate::CAPTURE_LIMIT), oem),
         stdout_truncated: raw.out.truncated,
         stderr_truncated: raw.err.truncated,
         background_killed: raw.background_killed,
@@ -121,7 +131,7 @@ async fn console_code_page() -> Option<u32> {
     None
 }
 
-async fn run_raw(spec: CommandSpec) -> Result<Raw, RunnerError> {
+async fn run_raw(mut spec: CommandSpec) -> Result<Raw, RunnerError> {
     let started = Instant::now();
     let base = spec
         .base_env
@@ -194,7 +204,12 @@ async fn run_raw(spec: CommandSpec) -> Result<Raw, RunnerError> {
 
     let stdout = child.stdout().take();
     let stderr = child.stderr().take();
-    let stdin = child.stdin().take().zip(spec.stdin.clone());
+    // Вход забирается из спецификации, а не копируется (M9 ревью задачи 9).
+    let stdin = child.stdin().take().zip(spec.stdin.take());
+    let mut out_file = match &spec.stdout_file {
+        Some(f) => Some(tokio::fs::File::from_std(f.try_clone()?)),
+        None => None,
+    };
     let mut out = Capture::default();
     let mut err = Capture::default();
     let deadline = started
@@ -205,8 +220,19 @@ async fn run_raw(spec: CommandSpec) -> Result<Raw, RunnerError> {
     let mut background_killed = false;
     let mut killed = false;
     {
-        let mut out_fut = pin!(read_capped(stdout, spec.capture_limit, &mut out));
-        let mut err_fut = pin!(read_capped(stderr, spec.capture_limit, &mut err));
+        let mut out_fut = pin!(read_capped(
+            stdout,
+            spec.capture_limit,
+            &mut out,
+            out_file.as_mut()
+        ));
+        // Предел stderr не растёт вместе с пределом сырого stdout (M9).
+        let mut err_fut = pin!(read_capped(
+            stderr,
+            spec.capture_limit.min(crate::CAPTURE_LIMIT),
+            &mut err,
+            None
+        ));
         let mut in_fut = pin!(write_stdin(stdin));
         let mut in_done = false;
         let (mut out_done, mut err_done) = (false, false);
@@ -268,6 +294,12 @@ async fn run_raw(spec: CommandSpec) -> Result<Raw, RunnerError> {
         guard.kill(child.as_mut());
     }
     guard.finish().await;
+    if let Some(f) = out_file.as_mut()
+        && out.file_error.is_none()
+        && let Err(e) = f.flush().await
+    {
+        out.file_error = Some(e);
+    }
     let exit = match status {
         _ if timed_out => Exit::Timeout,
         Some(s) => exit_of(s),
@@ -291,9 +323,15 @@ fn start_kill(child: &mut dyn ChildWrapper) {
     }
 }
 
-/// Читает поток до EOF: первые `limit` байт — в `cap`, остаток отбрасывается с пометкой.
-/// Ошибка чтения — конец потока (канал закрыт убитым процессом).
-async fn read_capped<R: AsyncRead + Unpin>(r: Option<R>, limit: usize, cap: &mut Capture) {
+/// Читает поток до EOF: первые `limit` байт — в `cap` (или в файл `file`), остаток
+/// отбрасывается с пометкой. Ошибка чтения — конец потока (канал закрыт убитым
+/// процессом); ошибка записи в файл запоминается в `cap.file_error`.
+async fn read_capped<R: AsyncRead + Unpin>(
+    r: Option<R>,
+    limit: usize,
+    cap: &mut Capture,
+    mut file: Option<&mut tokio::fs::File>,
+) {
     let Some(mut r) = r else {
         return;
     };
@@ -307,8 +345,18 @@ async fn read_capped<R: AsyncRead + Unpin>(r: Option<R>, limit: usize, cap: &mut
                 return;
             }
         };
-        let take = n.min(limit.saturating_sub(cap.buf.len()));
-        cap.buf.extend_from_slice(&chunk[..take]);
+        let take = n.min(limit.saturating_sub(cap.len));
+        if let Some(f) = file.as_mut() {
+            if cap.file_error.is_none()
+                && take > 0
+                && let Err(e) = f.write_all(&chunk[..take]).await
+            {
+                cap.file_error = Some(e);
+            }
+        } else {
+            cap.buf.extend_from_slice(&chunk[..take]);
+        }
+        cap.len += take;
         if take < n {
             cap.truncated = true;
         }

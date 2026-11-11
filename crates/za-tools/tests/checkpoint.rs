@@ -21,8 +21,8 @@ use za_core::{BoxFuture, Checkpoint, CheckpointRequest, Checkpointer, ToolKind};
 use za_jail::{CommandSpec, DirectRunner, Output, Runner, RunnerError};
 use za_protocol::{EffectKey, RunId, checkpoint_kind, checkpoint_reason};
 use za_tools::{
-    AgentHome, CHECKPOINT_REF_PREFIX, CHECKPOINT_TIMEOUT, GitCheckpointer, RestoreError,
-    backup_before_restore, restore,
+    AgentHome, CHECKPOINT_MAX_FILE, CHECKPOINT_REF_PREFIX, CHECKPOINT_TIMEOUT, GitCheckpointer,
+    RestoreError, backup_before_restore, restore,
 };
 
 #[path = "../../../test-support/unique_dir.rs"]
@@ -380,7 +380,15 @@ async fn repo_hooks_fsmonitor_filters_not_executed() {
         std::fs::remove_file(e.unwrap().path()).unwrap();
     }
 
-    let ck = c.ck();
+    // Первый рубеж: такой конфиг не проходит статическую проверку, git не вызывается.
+    let s = create(&c.ck(), c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(
+        s.reason.as_deref(),
+        Some(checkpoint_reason::GIT_REPO_UNSAFE),
+        "{s:?}"
+    );
+    // Второй рубеж: без проверки опции и окружение git всё равно не дают исполнить код.
+    let ck = c.ck().without_repo_check_for_tests();
     c.write("a.txt", "beta\n");
     let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
     assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
@@ -389,7 +397,7 @@ async fn repo_hooks_fsmonitor_filters_not_executed() {
     let changed = within(
         Duration::from_secs(60),
         "восстановление",
-        restore(&ck, &c.root(), &cp, true),
+        restore(&ck, &c.root(), &cp, true, true),
     )
     .await
     .expect("восстановление");
@@ -411,6 +419,9 @@ async fn restore_round_trip_exact_bytes() {
     c.write("crlf.txt", crlf);
     c.write("lf.txt", lf);
     c.write("d/bin.dat", bin);
+    // Крупный объект восстанавливается потоком в файл.
+    let big: Vec<u8> = (0..(3 * 1024 * 1024u32)).map(|i| (i % 253) as u8).collect();
+    c.write("big.dat", &big);
     c.git(&["add", "-A"]);
     c.git(&["commit", "-q", "-m", "init"]);
     // Фильтры перевода строк репозитория не должны ни на что влиять.
@@ -424,6 +435,7 @@ async fn restore_round_trip_exact_bytes() {
     c.write("crlf.txt", "changed\n");
     c.write("lf.txt", "changed\r\n");
     std::fs::remove_file(c.project.join("d/bin.dat")).unwrap();
+    c.write("big.dat", "small now");
     c.write("untracked.txt", "x");
     c.write("brand-new.txt", "new");
     c.write("d/also-new.txt", "new");
@@ -432,22 +444,23 @@ async fn restore_round_trip_exact_bytes() {
     let changed = within(
         Duration::from_secs(60),
         "восстановление",
-        restore(&ck, &c.root(), &cp, false),
+        restore(&ck, &c.root(), &cp, false, true),
     )
     .await
     .expect("восстановление");
     assert_eq!(c.read("crlf.txt"), crlf);
     assert_eq!(c.read("lf.txt"), lf);
     assert_eq!(c.read("d/bin.dat"), bin);
+    assert_eq!(c.read("big.dat"), big);
     assert_eq!(c.read("untracked.txt"), b"u\r\n");
     assert!(c.project.join("brand-new.txt").exists());
-    assert_eq!(changed.len(), 4, "{changed:?}");
+    assert_eq!(changed.len(), 5, "{changed:?}");
 
     // С --delete-new — удаляются; неизменившиеся файлы не переписываются.
     let changed = within(
         Duration::from_secs(60),
         "восстановление",
-        restore(&ck, &c.root(), &cp, true),
+        restore(&ck, &c.root(), &cp, true, true),
     )
     .await
     .expect("восстановление");
@@ -494,7 +507,7 @@ async fn same_effect_key_reuses_checkpoint() {
     within(
         Duration::from_secs(60),
         "восстановление",
-        restore(&ck, &c.root(), &f2, false),
+        restore(&ck, &c.root(), &f2, false, false),
     )
     .await
     .unwrap();
@@ -592,14 +605,15 @@ async fn untrusted_or_non_git_uses_files() {
     let backup = within(
         Duration::from_secs(60),
         "чекпоинт перед восстановлением",
-        backup_before_restore(&ck, &c.root(), &cp),
+        backup_before_restore(&ck, &c.root(), &cp, true, false),
     )
-    .await;
+    .await
+    .expect("чекпоинт «до»");
     assert_eq!(backup.kind, checkpoint_kind::FILES, "{backup:?}");
     let changed = within(
         Duration::from_secs(60),
         "восстановление",
-        restore(&ck, &c.root(), &cp, true),
+        restore(&ck, &c.root(), &cp, true, false),
     )
     .await
     .expect("восстановление");
@@ -611,7 +625,7 @@ async fn untrusted_or_non_git_uses_files() {
     within(
         Duration::from_secs(60),
         "восстановление",
-        restore(&ck, &c.root(), &backup, true),
+        restore(&ck, &c.root(), &backup, true, false),
     )
     .await
     .unwrap();
@@ -719,7 +733,7 @@ async fn restore_refuses_link_swapped_after_checkpoint() {
         let r = within(
             Duration::from_secs(60),
             "восстановление",
-            restore(&ck, &c.root(), &cp, true),
+            restore(&ck, &c.root(), &cp, true, true),
         )
         .await;
         assert!(matches!(r, Err(RestoreError::Io(_))), "{r:?}");
@@ -739,20 +753,377 @@ async fn find_and_list_by_id() {
     let ck = c.ck();
     let run = RunId::new();
     let g = create(&ck, c.req(ToolKind::Exec, true, run, 1)).await;
-    let f = create(&ck, c.req_edit(&["a.txt"], false, run)).await;
+    let mut fr = c.req_edit(&["a.txt"], false, run);
+    fr.effect_key = EffectKey::derive(run, 2, 1);
+    let f = create(&ck, fr).await;
     assert_eq!(g.kind, checkpoint_kind::GIT);
     assert_eq!(f.kind, checkpoint_kind::FILES);
     let root = c.root();
-    let all = within(Duration::from_secs(60), "список", ck.list(&root))
+    let all = within(Duration::from_secs(60), "список", ck.list(&root, true))
         .await
         .unwrap();
     assert!(all.contains(&g) && all.contains(&f), "{all:?}");
-    let found = within(Duration::from_secs(60), "поиск", ck.find(&root, &g.id))
-        .await
-        .unwrap();
+    let found = within(
+        Duration::from_secs(60),
+        "поиск",
+        ck.find(&root, &g.id, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(found, g);
     for bad in ["nope", "../x/1-1", &format!("{run}/9-9"), "a:b/1-1"] {
-        let r = within(Duration::from_secs(60), "поиск", ck.find(&root, bad)).await;
+        let r = within(Duration::from_secs(60), "поиск", ck.find(&root, bad, true)).await;
         assert!(matches!(r, Err(RestoreError::NotFound(_))), "{bad}: {r:?}");
     }
+}
+
+// ---- статическая проверка репозитория (C1) ----
+
+/// Как подготовить случай небезопасного репозитория.
+enum Unsafe {
+    /// Дописать в `.git/config`.
+    Config(&'static str),
+    /// Записать `.git/objects/info/alternates`.
+    Alternates(String),
+    /// Заменить `.git` файлом `gitdir: <путь>`.
+    GitFile(String),
+    /// Файл `.git/commondir`.
+    CommonDir,
+    /// `.git` — ссылка на каталог вне проекта.
+    LinkedDotGit,
+}
+
+/// Подготовка случая небезопасного репозитория.
+type Prepare = Box<dyn Fn(&Case) -> Unsafe>;
+
+#[tokio::test]
+async fn unsafe_repo_is_never_given_to_git() {
+    let outside = |c: &Case| {
+        let d = c.base.join("outside");
+        std::fs::create_dir_all(d.join("objects")).unwrap();
+        d.display().to_string().replace('\\', "/")
+    };
+    let cases: Vec<(&str, Prepare)> = vec![
+        (
+            "include",
+            Box::new(|_| Unsafe::Config("[include]\n\tpath = ../x\n")),
+        ),
+        (
+            "include-if",
+            Box::new(|_| Unsafe::Config("[includeIf \"gitdir:/\"]\n\tpath = x\n")),
+        ),
+        (
+            "promisor",
+            Box::new(|_| {
+                Unsafe::Config(
+                    "[extensions]\n\tpartialClone = origin\n[remote \"origin\"]\n\turl = ssh://example.invalid/x\n\tpromisor = true\n",
+                )
+            }),
+        ),
+        (
+            "ssh-command",
+            Box::new(|_| Unsafe::Config("[core]\n\tsshCommand = sh -c x\n")),
+        ),
+        (
+            "fsmonitor",
+            Box::new(|_| Unsafe::Config("[core]\n\tfsmonitor = /x/fsmonitor.sh\n")),
+        ),
+        (
+            "filter",
+            Box::new(|_| Unsafe::Config("[filter \"x\"]\n\tclean = cat\n")),
+        ),
+        (
+            "credential",
+            Box::new(|_| Unsafe::Config("[credential]\n\thelper = store\n")),
+        ),
+        (
+            "worktree",
+            Box::new(|_| Unsafe::Config("[core]\n\tworktree = ..\n")),
+        ),
+        (
+            "excludes-unc",
+            Box::new(|_| Unsafe::Config("[core]\n\texcludesFile = //example.invalid/s/x\n")),
+        ),
+        (
+            "alias-command",
+            Box::new(|_| Unsafe::Config("[alias]\n\tst = !sh -c x\n")),
+        ),
+        (
+            "continuation",
+            Box::new(|_| Unsafe::Config("[core]\n\tpager = \\\nless\n")),
+        ),
+        (
+            "alternates-outside",
+            Box::new(move |c| Unsafe::Alternates(format!("{}/objects\n", outside(c)))),
+        ),
+        (
+            "alternates-unc",
+            Box::new(|_| Unsafe::Alternates("//example.invalid/share/objects\n".into())),
+        ),
+        (
+            "alternates-unc-backslash",
+            Box::new(|_| Unsafe::Alternates("\\\\example.invalid\\share\\objects\n".into())),
+        ),
+        (
+            "gitdir-outside",
+            Box::new(move |c| Unsafe::GitFile(outside(c))),
+        ),
+        (
+            "gitdir-unc",
+            Box::new(|_| Unsafe::GitFile("//example.invalid/share/repo".into())),
+        ),
+        ("commondir", Box::new(|_| Unsafe::CommonDir)),
+        ("dot-git-link", Box::new(|_| Unsafe::LinkedDotGit)),
+    ];
+    for (name, make) in cases {
+        let c = case(&format!("unsafe-{name}"));
+        c.init();
+        c.write("a.txt", "x");
+        match make(&c) {
+            Unsafe::Config(text) => {
+                let p = c.project.join(".git/config");
+                let mut cfg = std::fs::read_to_string(&p).unwrap();
+                cfg.push_str(text);
+                std::fs::write(p, cfg).unwrap();
+            }
+            Unsafe::Alternates(text) => {
+                let p = c.project.join(".git/objects/info");
+                std::fs::create_dir_all(&p).unwrap();
+                std::fs::write(p.join("alternates"), text).unwrap();
+            }
+            Unsafe::GitFile(target) => {
+                std::fs::remove_dir_all(c.project.join(".git")).unwrap();
+                std::fs::write(c.project.join(".git"), format!("gitdir: {target}\n")).unwrap();
+            }
+            Unsafe::CommonDir => {
+                std::fs::write(c.project.join(".git/commondir"), "..\n").unwrap();
+            }
+            Unsafe::LinkedDotGit => {
+                let real = c.base.join("real-git");
+                std::fs::rename(c.project.join(".git"), &real).unwrap();
+                if dir_link(&c.project.join(".git"), &real).is_none() {
+                    continue;
+                }
+            }
+        }
+        let stub = StubRunner::new(false);
+        let ck = GitCheckpointer::with_git(stub.clone(), c.home.clone(), Some("git".into()));
+        let s = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+        assert_eq!(
+            (s.kind.as_str(), s.reason.as_deref()),
+            (
+                checkpoint_kind::SKIPPED,
+                Some(checkpoint_reason::GIT_REPO_UNSAFE)
+            ),
+            "{name}: {s:?}"
+        );
+        let f = create(&ck, c.req_edit(&["a.txt"], true, RunId::new())).await;
+        assert_eq!(f.kind, checkpoint_kind::FILES, "{name}: {f:?}");
+        let root = c.root();
+        let all = within(Duration::from_secs(60), "список", ck.list(&root, true))
+            .await
+            .unwrap();
+        assert!(
+            all.iter().all(|x| x.kind == checkpoint_kind::FILES),
+            "{name}"
+        );
+        assert_eq!(stub.calls(), 0, "{name}: git вызван");
+    }
+}
+
+/// Частичный клон с промисором и битой скрытой ссылкой: чтение объекта не догружает его
+/// по сети (`core.sshCommand` пишет маркер), ни при статической проверке (git не
+/// вызывается), ни без неё (`GIT_NO_LAZY_FETCH`, `protocol.allow=never`).
+#[tokio::test]
+async fn lazy_fetch_never_runs() {
+    let c = case("lazy");
+    c.init();
+    c.write("a.txt", "x");
+    let marker = c.base.join("pwned");
+    let fwd = marker.display().to_string().replace('\\', "/");
+    let mut cfg = std::fs::read_to_string(c.project.join(".git/config")).unwrap();
+    cfg = cfg.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    cfg.push_str(&format!(
+        "[core]\n\tsshCommand = \"sh -c 'echo x > {fwd}; exit 1' --\"\n[extensions]\n\tpartialClone = origin\n[remote \"origin\"]\n\turl = ssh://example.invalid/x\n\tpromisor = true\n\tpartialclonefilter = blob:none\n"
+    ));
+    std::fs::write(c.project.join(".git/config"), cfg).unwrap();
+    let run = "0190b6a0-0000-7000-8000-000000000001";
+    let refs = c.project.join(".git/refs/zero-agent/checkpoints").join(run);
+    std::fs::create_dir_all(&refs).unwrap();
+    std::fs::write(refs.join("1-1"), format!("{}\n", "ab".repeat(20))).unwrap();
+    let id = format!("{run}/1-1");
+    let root = c.root();
+
+    for ck in [c.ck(), c.ck().without_repo_check_for_tests()] {
+        let all = within(Duration::from_secs(60), "список", ck.list(&root, true)).await;
+        assert!(
+            all.as_ref()
+                .is_ok_and(|v| v.iter().all(|x| x.kind != "git"))
+                || all.is_err(),
+            "{all:?}"
+        );
+        let found = within(Duration::from_secs(60), "поиск", ck.find(&root, &id, true)).await;
+        assert!(found.is_err(), "{found:?}");
+        let cp = Checkpoint {
+            id: id.clone(),
+            kind: checkpoint_kind::GIT.into(),
+            git_ref: Some(format!("{CHECKPOINT_REF_PREFIX}/{id}")),
+            commit: Some("ab".repeat(20)),
+            reason: None,
+        };
+        let r = within(
+            Duration::from_secs(60),
+            "восстановление",
+            restore(&ck, &root, &cp, true, true),
+        )
+        .await;
+        assert!(r.is_err(), "{r:?}");
+        assert!(
+            !marker.exists(),
+            "ленивая догрузка исполнила core.sshCommand"
+        );
+    }
+}
+
+/// Недоверенный проект (I2): `list`, `find`, `restore` не вызывают git, даже если
+/// чекпоинты git в репозитории есть.
+#[tokio::test]
+async fn untrusted_never_reads_git_checkpoints() {
+    let c = case("untrusted-read");
+    c.init();
+    c.write("a.txt", "x");
+    let g = create(&c.ck(), c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(g.kind, checkpoint_kind::GIT);
+    let stub = StubRunner::new(false);
+    let ck = GitCheckpointer::with_git(stub.clone(), c.home.clone(), Some("git".into()));
+    let root = c.root();
+    let all = within(Duration::from_secs(60), "список", ck.list(&root, false))
+        .await
+        .unwrap();
+    assert!(all.is_empty(), "{all:?}");
+    let r = within(
+        Duration::from_secs(60),
+        "поиск",
+        ck.find(&root, &g.id, false),
+    )
+    .await;
+    assert!(matches!(r, Err(RestoreError::NotFound(_))), "{r:?}");
+    let r = within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &root, &g, true, false),
+    )
+    .await;
+    assert!(matches!(r, Err(RestoreError::Untrusted)), "{r:?}");
+    let b = within(
+        Duration::from_secs(60),
+        "чекпоинт «до»",
+        backup_before_restore(&ck, &root, &g, true, false),
+    )
+    .await;
+    assert!(matches!(b, Err(RestoreError::Untrusted)), "{b:?}");
+    assert_eq!(stub.calls(), 0);
+}
+
+/// Чекпоинт «до» (I1): git не успел — копии всех файлов, которые тронет восстановление;
+/// по ней состояние возвращается целиком. Без возможности сделать «до» — отказ.
+#[tokio::test]
+async fn backup_falls_back_to_files_and_is_required() {
+    let c = case("backup");
+    c.init();
+    c.write("a.txt", "one\n");
+    c.write("b.txt", "bee\n");
+    let cp = create(&c.ck(), c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT);
+    c.write("a.txt", "two\n");
+    c.write("new.txt", "new\n");
+    let ck = c
+        .ck()
+        .with_backup_timeout_for_tests(Duration::from_nanos(1));
+    let root = c.root();
+    let before = within(
+        Duration::from_secs(60),
+        "чекпоинт «до»",
+        backup_before_restore(&ck, &root, &cp, true, true),
+    )
+    .await
+    .expect("чекпоинт «до»");
+    assert_eq!(before.kind, checkpoint_kind::FILES, "{before:?}");
+    within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &root, &cp, true, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.read("a.txt"), b"one\n");
+    assert!(!c.project.join("new.txt").exists());
+    within(
+        Duration::from_secs(60),
+        "откат",
+        restore(&ck, &root, &before, true, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.read("a.txt"), b"two\n");
+    assert_eq!(c.read("new.txt"), b"new\n");
+
+    // Файл сверх предела нельзя сохранить в «до»: восстановление не выполняется.
+    let f = create(&c.ck(), c.req_edit(&["b.txt"], false, RunId::new())).await;
+    assert_eq!(f.kind, checkpoint_kind::FILES);
+    let big = std::fs::File::create(c.project.join("b.txt")).unwrap();
+    big.set_len(CHECKPOINT_MAX_FILE + 1).unwrap();
+    drop(big);
+    let r = within(
+        Duration::from_secs(60),
+        "чекпоинт «до»",
+        backup_before_restore(&ck, &root, &f, true, false),
+    )
+    .await;
+    assert!(matches!(r, Err(RestoreError::NoBackup(_))), "{r:?}");
+}
+
+/// Пределы (I3): файл сверх предела не входит ни в чекпоинт git, ни в копию; такой файл
+/// восстановление не трогает и не удаляет.
+#[tokio::test]
+async fn files_over_limit_are_skipped_and_kept() {
+    let c = case("limits");
+    c.init();
+    c.write("a.txt", "x");
+    let big_path = c.project.join("huge.bin");
+    let big = std::fs::File::create(&big_path).unwrap();
+    big.set_len(CHECKPOINT_MAX_FILE + 1).unwrap();
+    drop(big);
+    let ck = c.ck();
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    let commit = cp.commit.clone().unwrap();
+    let names = c.git(&["ls-tree", "-r", "--name-only", &commit]);
+    assert!(!names.contains("huge.bin"), "{names}");
+    assert!(
+        c.git(&["cat-file", "commit", &commit])
+            .contains("zero-agent-skipped: huge.bin")
+    );
+    within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &c.root(), &cp, true, true),
+    )
+    .await
+    .unwrap();
+    assert!(big_path.exists(), "пропущенный файл удалён");
+
+    let f = create(&ck, c.req_edit(&["huge.bin", "a.txt"], false, RunId::new())).await;
+    assert_eq!(f.kind, checkpoint_kind::FILES, "{f:?}");
+    within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &c.root(), &f, true, false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::metadata(&big_path).unwrap().len(),
+        CHECKPOINT_MAX_FILE + 1
+    );
 }

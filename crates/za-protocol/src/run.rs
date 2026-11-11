@@ -171,6 +171,11 @@ pub mod checkpoint_reason {
     pub const GIT_ERROR: &str = "git_error";
     /// Сбой ввода-вывода при копии файлов (подробности — в логе).
     pub const IO_ERROR: &str = "io_error";
+    /// Репозиторий не прошёл статическую проверку (подключение файлов, частичный клон,
+    /// ключи-команды, данные вне проекта, сетевые пути): git не вызывается.
+    pub const GIT_REPO_UNSAFE: &str = "git_repo_unsafe";
+    /// Новых байт больше предела чекпоинта.
+    pub const TOO_LARGE: &str = "too_large";
 }
 
 /// Действия журнала аудита (R1-C1 D91): поле `action` записи `audit`.

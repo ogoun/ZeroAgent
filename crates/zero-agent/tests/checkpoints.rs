@@ -12,9 +12,10 @@ use serde_json::Value;
 use za_core::{CheckpointRequest, Checkpointer, ToolKind};
 use za_jail::DirectRunner;
 use za_protocol::{EffectKey, RunId, audit_action, checkpoint_kind};
-use za_store::ProjectStore;
+use za_store::{AuditNew, ProjectStore};
 use za_tools::{AgentHome, GitCheckpointer};
 use zero_agent::home::project_id;
+use zero_agent::trust::trust_set;
 
 mod support;
 use support::process::{Env, unique_dir, unique_dir_in};
@@ -102,6 +103,21 @@ fn list_and_restore_with_audit() {
     drop(ProjectStore::open(&e.journal_dir()).unwrap());
     let cp = checkpoint(&e);
 
+    // Недоверенный проект: чекпоинты git не читаются (I2), восстановить их нельзя.
+    let l = e.run(&["checkpoints", "list", "--project", e.project_arg()]);
+    assert_eq!(l.code(), Some(0), "{l:?}");
+    assert!(!l.stdout.contains(&cp.id), "{l:?}");
+    assert!(l.stderr.contains("проект не доверен"), "{l:?}");
+    let r = e.run(&[
+        "checkpoints",
+        "restore",
+        "--project",
+        e.project_arg(),
+        &cp.id,
+    ]);
+    assert_eq!(r.code(), Some(1), "{r:?}");
+    trust(&e);
+
     let l = e.run(&["checkpoints", "list", "--project", e.project_arg()]);
     assert_eq!(l.code(), Some(0), "{l:?}");
     assert!(
@@ -182,6 +198,19 @@ fn list_and_restore_with_audit() {
         n.stderr.contains(&format!("чекпоинт {bad} не найден")),
         "{n:?}"
     );
+}
+
+/// Доверие к проекту, как его пишет `answer --approve` на прерывание доверия.
+fn trust(e: &Env) {
+    let set = trust_set(&e.project).unwrap();
+    let s = e.store();
+    rt().block_on(s.append_audit(AuditNew {
+        actor: "user".into(),
+        action: audit_action::TRUST_GRANTED.into(),
+        target: e.project_arg().into(),
+        payload: serde_json::to_value(&set).unwrap(),
+    }))
+    .unwrap();
 }
 
 #[test]

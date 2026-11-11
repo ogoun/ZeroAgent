@@ -5,10 +5,16 @@
 //! [`Checkpoint`]).
 //!
 //! `zero-agent checkpoints restore --project P <id> [--delete-new] [--json]` — восстановление
-//! рабочей копии по чекпоинту (`za_tools::restore`). Перед ним делается новый чекпоинт
-//! (`za_tools::backup_before_restore`), после — запись аудита `checkpoint.restored`
-//! (actor `user`, target — id) с изменёнными путями и id чекпоинта «до». Файлы, которых
-//! нет в чекпоинте, удаляются только с `--delete-new`.
+//! рабочей копии по чекпоинту (`za_tools::restore`). Перед ним делается чекпоинт «до»
+//! (`za_tools::backup_before_restore`); не вышел — отказ, восстановления нет (I1 ревью
+//! задачи 9). После — запись аудита `checkpoint.restored` (actor `user`, target — id) с
+//! изменёнными путями и id чекпоинта «до», а при сбое посреди восстановления — ещё
+//! `error`. Файлы, которых нет в чекпоинте, удаляются только с `--delete-new`.
+//!
+//! Доверие (D83, I2): git вызывается только у доверенного проекта — последняя запись
+//! аудита доверия `trust.granted` с нынешним набором доверенных файлов. Иначе видны и
+//! восстанавливаются только копии файлов, в stderr — подсказка `zero-agent trust`. Единая
+//! проверка доверия перед git — задача 13.
 //!
 //! Обе команды работают с журналом проекта: его нет (`journal.db` проверяется до
 //! открытия) — ошибка «журнал проекта не найден»; журнал держит идущий run —
@@ -28,6 +34,7 @@ use za_tools::{AgentHome, GitCheckpointer, RestoreError, backup_before_restore, 
 
 use crate::home;
 use crate::run::{RunError, canonical_project, open_existing};
+use crate::trust::{TrustSet, trust_set};
 
 /// Кто восстанавливает: пользователь через CLI (как у `answer`, D91).
 const ACTOR_USER: &str = "user";
@@ -103,14 +110,45 @@ fn to_json(cp: &Checkpoint) -> Result<String, CheckpointsCmdError> {
     Ok(canonical_json(&v))
 }
 
+/// Доверен ли проект сейчас (D83): последняя запись аудита доверия — `trust.granted`, и
+/// её набор доверенных файлов совпадает с нынешним. До задачи 13 (единая проверка
+/// доверия перед git) — здесь; любой сбой — «не доверен».
+async fn trusted_now(store: &ProjectStore, project: &Path) -> bool {
+    let Ok(Some(last)) = store.last_audit("trust.").await else {
+        return false;
+    };
+    if last.action != audit_action::TRUST_GRANTED {
+        return false;
+    }
+    let Ok(granted) = serde_json::from_value::<TrustSet>(last.payload) else {
+        return false;
+    };
+    let dir = project.to_path_buf();
+    match tokio::task::spawn_blocking(move || trust_set(&dir)).await {
+        Ok(Ok(now)) => now == granted,
+        _ => false,
+    }
+}
+
+/// Подсказка недоверенному проекту: чекпоинты git не видны (I2 ревью задачи 9).
+fn untrusted_hint() {
+    eprintln!(
+        "zero-agent: проект не доверен — чекпоинты git не читаются, доступны только копии файлов; доверие: zero-agent trust"
+    );
+}
+
 /// `zero-agent checkpoints list`.
 pub async fn cmd_list(
     za_home: &Path,
     project: &Path,
     json: bool,
 ) -> Result<ExitCode, CheckpointsCmdError> {
-    let (project, _store, ck) = open(za_home, project)?;
-    let all = ck.list(&project).await?;
+    let (project, store, ck) = open(za_home, project)?;
+    let trusted = trusted_now(&store, &project).await;
+    if !trusted {
+        untrusted_hint();
+    }
+    let all = ck.list(&project, trusted).await?;
     let mut out = String::new();
     for cp in &all {
         out.push_str(&if json { to_json(cp)? } else { line(cp) });
@@ -123,7 +161,9 @@ pub async fn cmd_list(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `zero-agent checkpoints restore`.
+/// `zero-agent checkpoints restore`: найти чекпоинт, сделать чекпоинт «до» (без него —
+/// отказ, I1), восстановить и записать аудит — и при неудаче посреди восстановления
+/// (M7).
 pub async fn cmd_restore(
     za_home: &Path,
     project: &Path,
@@ -132,28 +172,46 @@ pub async fn cmd_restore(
     json: bool,
 ) -> Result<ExitCode, CheckpointsCmdError> {
     let (project, store, ck) = open(za_home, project)?;
-    let cp = ck.find(&project, id).await?;
-    let before = backup_before_restore(&ck, &project, &cp).await;
-    let changed = restore(&ck, &project, &cp, delete_new).await?;
-    let rels: Vec<String> = changed
-        .iter()
-        .map(|p| za_core::paths::display(&project, p))
-        .collect();
+    let trusted = trusted_now(&store, &project).await;
+    if !trusted {
+        untrusted_hint();
+    }
+    let cp = ck.find(&project, id, trusted).await?;
+    let before = backup_before_restore(&ck, &project, &cp, delete_new, trusted).await?;
+    eprintln!(
+        "zero-agent: состояние до восстановления — чекпоинт {} ({})",
+        before.id, before.kind
+    );
+    let result = restore(&ck, &project, &cp, delete_new, trusted).await;
+    let rels: Vec<String> = result
+        .as_ref()
+        .map(|changed| {
+            changed
+                .iter()
+                .map(|p| za_core::paths::display(&project, p))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut payload = json!({
+        "checkpoint": cp.id,
+        "kind": cp.kind,
+        "delete_new": delete_new,
+        "changed": rels,
+        "before": before.id,
+        "before_kind": before.kind,
+    });
+    if let Err(e) = &result {
+        payload["error"] = json!(e.to_string());
+    }
     store
         .append_audit(AuditNew {
             actor: ACTOR_USER.to_owned(),
             action: audit_action::CHECKPOINT_RESTORED.to_owned(),
             target: cp.id.clone(),
-            payload: json!({
-                "checkpoint": cp.id,
-                "kind": cp.kind,
-                "delete_new": delete_new,
-                "changed": rels,
-                "before": before.id,
-                "before_kind": before.kind,
-            }),
+            payload,
         })
         .await?;
+    result?;
     if json {
         let v = json!({
             "id": cp.id,
@@ -167,11 +225,9 @@ pub async fn cmd_restore(
             println!("{r}");
         }
         eprintln!(
-            "zero-agent: восстановлен чекпоинт {}: изменено файлов {}; состояние до восстановления — чекпоинт {} ({})",
+            "zero-agent: восстановлен чекпоинт {}: изменено файлов {}",
             cp.id,
-            rels.len(),
-            before.id,
-            before.kind
+            rels.len()
         );
     }
     Ok(ExitCode::SUCCESS)

@@ -411,6 +411,41 @@ async fn stdin_and_raw_stdout_are_exact_bytes() {
     assert_eq!((out.stdout.as_str(), out.stdout_raw), ("x\ny", None));
 }
 
+/// `stdout_file`: вывод идёт в файл, а не в память; предел `capture_limit` действует и
+/// там (I3 ревью задачи 9).
+#[tokio::test(flavor = "multi_thread")]
+async fn stdout_goes_to_file_with_limit() {
+    let project = dir("stdout-file");
+    let data: Vec<u8> = (0..(2 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
+    let path = project.join("out.bin");
+    let f = std::sync::Arc::new(std::fs::File::create(&path).unwrap());
+    let mut s = spec(&project, &["--cat"], scaled(Duration::from_secs(60)));
+    s.stdin = Some(data.clone());
+    s.stdout_file = Some(f);
+    let out = within(Duration::from_secs(60), "cat в файл", DirectRunner.run(s))
+        .await
+        .expect("запуск");
+    assert_eq!(out.exit, Exit::Code(0));
+    assert!(out.stdout.is_empty() && out.stdout_raw.is_none() && !out.stdout_truncated);
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    // Предел: в файле не больше `capture_limit` байт, пометка обрезки.
+    let path = project.join("cut.bin");
+    let f = std::sync::Arc::new(std::fs::File::create(&path).unwrap());
+    let mut s = spec(&project, &["--cat"], scaled(Duration::from_secs(60)));
+    s.stdin = Some(data.clone());
+    s.stdout_file = Some(f);
+    s.capture_limit = 1000;
+    let out = within(
+        Duration::from_secs(60),
+        "cat с пределом",
+        DirectRunner.run(s),
+    )
+    .await
+    .expect("запуск");
+    assert!(out.stdout_truncated);
+    assert_eq!(std::fs::read(&path).unwrap(), &data[..1000]);
+}
+
 // ---- Декодирование вывода (Windows) ----
 
 /// Вывод `cmd /u` — UTF-16LE без BOM.

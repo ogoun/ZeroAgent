@@ -51,8 +51,8 @@ pub use bash::{
     BASH_DEFAULT_TIMEOUT_S, BASH_MAX_TIMEOUT_S, Shell, bash_tool, format_output, powershell_encoded,
 };
 pub use checkpoint::{
-    CHECKPOINT_REF_PREFIX, CHECKPOINT_TIMEOUT, GitCheckpointer, RestoreError,
-    backup_before_restore, restore,
+    CHECKPOINT_MAX_FILE, CHECKPOINT_MAX_TOTAL, CHECKPOINT_REF_PREFIX, CHECKPOINT_TIMEOUT,
+    GitCheckpointer, RestoreError, backup_before_restore, restore,
 };
 pub use digest::digest;
 pub use edit::{

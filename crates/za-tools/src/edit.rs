@@ -872,7 +872,7 @@ fn target_perms(before: &Before) -> Option<Permissions> {
 /// `umask(2)` не годится: он меняет маску всего процесса, пока её читают. Нет `/proc` —
 /// [`DEFAULT_UMASK`] (записанное ограничение прочих Unix).
 #[cfg(unix)]
-fn umask() -> u32 {
+pub(crate) fn umask() -> u32 {
     static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MASK.get_or_init(|| {
         std::fs::read_to_string("/proc/self/status")

@@ -79,6 +79,11 @@ pub struct CommandSpec {
     /// нормализации `\r\n`; `Output::stdout` тогда пуст. Чекпоинты git: пути `-z` и
     /// содержимое объектов — байты как есть.
     pub raw_stdout: bool,
+    /// Писать stdout в этот файл (с текущей позиции), а не в память: содержимое большого
+    /// объекта git при восстановлении чекпоинта (R1-C1 I3). Предел `capture_limit`
+    /// действует и здесь; `Output::stdout` пуст, `stdout_raw` — `None`. Файл открывает и
+    /// проверяет вызывающий.
+    pub stdout_file: Option<std::sync::Arc<std::fs::File>>,
 }
 
 /// Значения окружения не печатаются: `env_set` — канал секретов инструменту (SEC-041,
@@ -104,6 +109,7 @@ impl std::fmt::Debug for CommandSpec {
             .field("base_env", &self.base_env.as_ref().map(|b| b.len()))
             .field("stdin", &self.stdin.as_ref().map(|b| b.len()))
             .field("raw_stdout", &self.raw_stdout)
+            .field("stdout_file", &self.stdout_file.is_some())
             .finish()
     }
 }
@@ -126,6 +132,7 @@ impl CommandSpec {
             base_env: None,
             stdin: None,
             raw_stdout: false,
+            stdout_file: None,
         }
     }
 }
