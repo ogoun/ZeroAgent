@@ -127,6 +127,8 @@ pub enum FaultPoint {
     /// внутри замыкания слота вызова шага (инструмент, `ask_user`, `finish`): вызов
     /// исполнен, `tool.finished` ещё нет
     BeforeToolFinished { step: u64 },
+    /// внутри замыкания слота `request_grant` шага: запись аудита гранта не удалась
+    GrantAudit { step: u64 },
     /// эффект `boundary` шага записан: следующая запись журнала не удалась (Ruling I1)
     AfterBoundary { step: u64 },
     /// эффект `context` первой оценки шага записан: следующая запись не удалась
@@ -136,7 +138,8 @@ pub enum FaultPoint {
 }
 
 /// true — в точке случается сбой журнала: замыкание `boundary` возвращает
-/// `EffectFailure::Transient`, слот вызова — ошибку записи `tool.finished`, точки
+/// `EffectFailure::Transient`, слот вызова — ошибку записи `tool.finished` (`GrantAudit` —
+/// записи аудита гранта), точки
 /// `After*` — ошибку записи журнала после эффекта (`StoreError::Io`), как настоящая (D72).
 pub type FaultHook = Arc<dyn Fn(FaultPoint) -> bool + Send + Sync>;
 

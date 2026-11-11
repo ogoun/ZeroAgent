@@ -209,6 +209,10 @@ impl fmt::Debug for ToolEnv {
 impl ToolEnv {
     /// Окружение с умолчаниями R1-B: проект доверен, политика пустая, без грантов, меток,
     /// чекпоинтов и маски. Корни — [`fallback_roots`] от `project_dir`.
+    ///
+    /// `trusted = true` по умолчанию — совместимость с R1-B (Ruling 1.20: тесты R1-B без
+    /// доверия). Это небезопасное умолчание: потребитель, которому доверие не известно
+    /// заранее, задаёт `trusted` явно, как бинарник (`zero-agent run`, D83).
     pub fn new(
         run: RunId,
         project_dir: PathBuf,
@@ -1634,7 +1638,7 @@ impl Live {
                 out: ToolOutput::ok(FINISH_OK),
                 ..Receipt::default()
             },
-            Action::Grant(g) => self.grant(g, fref).await,
+            Action::Grant(g) => self.grant(g, fref).await?,
         };
         let tainted = !receipt.origins.is_empty();
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1665,43 +1669,49 @@ impl Live {
         })
     }
 
-    /// Одобренный грант (D78): `grant.added` и запись аудита.
-    async fn grant(&self, g: Grant, fref: &mut Option<StoreError>) -> Receipt {
+    /// Одобренный грант (D78): запись аудита, затем `grant.added`. Без записи аудита
+    /// грант не выдаётся (SEC-090, финальное ревью R1-C1): квитанция — отказ, run встаёт
+    /// на паузу `store`, при реплее грант не действует.
+    async fn grant(&self, g: Grant, fref: &mut Option<StoreError>) -> Result<Receipt, String> {
         let payload = json!({
             "path": g.path.to_string_lossy(),
             "mode": g.mode,
             "source": g.source,
             "call_id": self.call_id,
         });
-        self.append(
-            EventKind::GrantAdded,
-            Actor::Runtime,
-            payload.clone(),
-            false,
-            fref,
-        )
-        .await;
-        let audit = self
-            .journal
-            .store()
-            .append_audit(AuditNew {
-                actor: AUDIT_ACTOR.into(),
-                action: audit_action::GRANT_ADDED.into(),
-                target: g.path.to_string_lossy().into_owned(),
-                payload,
-            })
-            .await;
+        let injected = self
+            .fault
+            .as_ref()
+            .is_some_and(|h| h(FaultPoint::GrantAudit { step: self.step }));
+        let audit = if injected {
+            // Тест: ошибка записи аудита, как настоящая.
+            Err(StoreError::Io(INJECTED_FAULT.into()))
+        } else {
+            self.journal
+                .store()
+                .append_audit(AuditNew {
+                    actor: AUDIT_ACTOR.into(),
+                    action: audit_action::GRANT_ADDED.into(),
+                    target: g.path.to_string_lossy().into_owned(),
+                    payload: payload.clone(),
+                })
+                .await
+                .map(|_| ())
+        };
         if let Err(e) = audit {
-            tracing::error!(key = %self.key, error = %e, "запись аудита гранта не удалась");
+            tracing::error!(key = %self.key, error = %e, "запись аудита гранта не удалась, грант не выдан");
             if fref.is_none() {
                 *fref = Some(e);
             }
+            return Err(JOURNAL_FAILED.to_owned());
         }
-        Receipt {
+        self.append(EventKind::GrantAdded, Actor::Runtime, payload, false, fref)
+            .await;
+        Ok(Receipt {
             out: ToolOutput::ok(granted_text(&g)),
             origins: Vec::new(),
             grant: Some(g),
-        }
+        })
     }
 
     /// Вызов инструмента в слоте, шаги 2–12 порядка задачи 12.

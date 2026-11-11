@@ -389,6 +389,7 @@ fn today_utc() -> String {
 }
 
 /// `<env>` нового run. `tier`, `n_ctx` и `budget` перезаписывает `start_run` (D37).
+/// Блокирующий ввод-вывод (`git_branch`): вызывать через [`blocking`].
 fn env_info(project: &Path) -> EnvInfo {
     EnvInfo {
         os: std::env::consts::OS.into(),
@@ -918,6 +919,12 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             } else {
                 None
             };
+            // Ветка git — чтение файлов `.git` проекта: вне потоков tokio (ревью R1-C1).
+            let p = project.clone();
+            let env = blocking("ветка git проекта", &project, move || {
+                Ok(env_info(&p))
+            })
+            .await?;
             let spec = RunSpec {
                 project_id: prep.project_id.clone(),
                 project_dir: project.clone(),
@@ -934,7 +941,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 max_wait: n.max_wait,
                 task: n.task,
                 agents_md,
-                env: env_info(&project),
+                env,
                 context: cfg.context.clone(),
                 trusted: prep.trusted,
                 grants: prep.grants.clone(),

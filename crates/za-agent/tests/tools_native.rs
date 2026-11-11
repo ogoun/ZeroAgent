@@ -17,10 +17,10 @@ use support::*;
 
 use serde_json::{Value, json};
 use za_agent::{
-    CallVerdict, CompactInput, ContextConfig, CrashPoint, EnvInfo, Grant, GrantMode, GrantSource,
-    LoopDeps, LoopError, LoopOutcome, PlannedCall, PolicyConfig, PolicySnapshot, ResumeChange,
-    Rule, RuleAction, RunSetup, RunSpec, Snapshot, TaskBlock, ToolEnv, ToolsOutcome, TrustSetFn,
-    builtin_tools, compact, control_channel, freeze, grants_text, prompt_texts_hash,
+    CallVerdict, CompactInput, ContextConfig, CrashPoint, EnvInfo, FaultPoint, Grant, GrantMode,
+    GrantSource, LoopDeps, LoopError, LoopOutcome, PlannedCall, PolicyConfig, PolicySnapshot,
+    ResumeChange, Rule, RuleAction, RunSetup, RunSpec, Snapshot, TaskBlock, ToolEnv, ToolsOutcome,
+    TrustSetFn, builtin_tools, compact, control_channel, freeze, grants_text, prompt_texts_hash,
     prompt_texts_hash_for, reasoning_for, render_task, request_grant_tool, resume_run, run_tools,
     signal_channel, start_run,
 };
@@ -1028,6 +1028,58 @@ async fn request_grant_flow_and_recitation() {
         "{first}"
     );
     assert!(l.store.last_audit("grant.").await.unwrap().is_some());
+}
+
+/// Финальное ревью R1-C1: запись аудита гранта не удалась — грант не выдан ни вживую,
+/// ни после resume (SEC-090: гранта без записи аудита нет), `grant.added` не пишется.
+#[tokio::test]
+async fn grant_without_audit_is_not_given() {
+    let mut l = lx("grant_no_audit");
+    let out_dir = l.d.outside.clone();
+    l.model.push(calls(&[(
+        "g1",
+        "request_grant",
+        json!({"path": s(&out_dir), "mode": "rw", "reason": "need"}),
+    )]));
+    let o = start(&l, spec(&l, RunMode::Auto)).await.unwrap();
+    let id = paused_id(&o);
+    assert!(
+        l.store
+            .resolve_interrupt(&id, json!({"approved": true}))
+            .await
+            .unwrap()
+    );
+    let mut faulty = l.deps.clone();
+    faulty.fault = Some(Arc::new(|p| matches!(p, FaultPoint::GrantAudit { .. })));
+    let o = resume(&l, &faulty, ResumeChange::default()).await.unwrap();
+    assert!(
+        matches!(
+            o,
+            LoopOutcome::Paused {
+                interrupt: None,
+                ..
+            }
+        ),
+        "{o:?}"
+    );
+    let evs = events_of(&l.store, l.run).await;
+    assert!(of_kind(&evs, EventKind::GrantAdded).is_empty());
+    assert!(l.store.last_audit("grant.").await.unwrap().is_none());
+    // Resume без сбоя: квитанция-отказ реплеится, гранта нет.
+    l.deps.fault = None;
+    l.model.push(answer("ok"));
+    assert_eq!(
+        resume(&l, &l.deps, ResumeChange::default()).await.unwrap(),
+        done("ok")
+    );
+    let r = last_results(&l.model);
+    assert_eq!(r[0].1, "internal error: journal write failed");
+    let evs = events_of(&l.store, l.run).await;
+    assert!(of_kind(&evs, EventKind::GrantAdded).is_empty());
+    let (_, v) = l.store.latest_snapshot(l.run).await.unwrap().unwrap();
+    let snap: Snapshot = serde_json::from_value(v).unwrap();
+    assert!(snap.grants.is_empty(), "{:?}", snap.grants);
+    assert!(l.store.last_audit("grant.").await.unwrap().is_none());
 }
 
 #[tokio::test]

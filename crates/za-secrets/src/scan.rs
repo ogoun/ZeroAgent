@@ -46,6 +46,21 @@ pub const MASK_PREFIX: &str = "[secret masked: ";
 /// ограничена).
 pub const CHECK_WINDOW: usize = 512;
 
+/// Запас предела хвоста маски потока сверх самого длинного известного значения, байт:
+/// окно проверок шаблонов и метка блока PEM с избытком.
+const HOLD_SLACK: usize = 2 * CHECK_WINDOW;
+
+/// Метка блока приватного ключа PEM.
+const PRIVATE_KEY: &str = "private_key";
+/// Начало метки начала блока PEM.
+const PEM_BEGIN: &str = "-----BEGIN ";
+/// Начало метки конца блока PEM.
+const PEM_END: &str = "-----END ";
+/// Конец метки блока PEM.
+const PEM_DASHES: &str = "-----";
+/// Сколько байт после `-----BEGIN ` или `-----END ` ищется конец метки.
+const PEM_LABEL_MAX: usize = 100;
+
 /// Сколько переносов строки подряд может пересечь хвост токена.
 const MAX_WRAPS: usize = 16;
 /// Наименьшая длина хвоста токена после переноса строки.
@@ -122,10 +137,16 @@ impl SecretMasker {
         (Cow::Owned(render(s, &spans, s.len())), steps)
     }
 
-    /// Маска потока текста по фрагментам (D100, I3): `s` — удержанный хвост и новый
-    /// фрагмент. Возвращает маскированный текст, который можно отдать, и сколько байт `s`
-    /// он покрывает; остаток вызывающий держит до следующего фрагмента. `last` — конец
-    /// потока: отдаётся всё. Секрет на стыке фрагментов так не проскакивает.
+    /// Предел удерживаемого хвоста маски потока, байт: [`HOLD_SLACK`] сверх самого
+    /// длинного известного значения.
+    fn hold_limit(&self) -> usize {
+        HOLD_SLACK + self.known.first().map_or(0, |n| n.pat.len())
+    }
+
+    /// Шаг маски потока: `s` — удержанный хвост и новый фрагмент. Возвращает
+    /// маскированный текст, который можно отдать, сколько байт `s` он покрывает (остаток
+    /// держится до следующего фрагмента) и продолжение находки, отданной меткой до конца
+    /// `s`. `last` — конец потока: отдаётся всё.
     ///
     /// Хвост держится только с самой ранней позиции, где может начинаться ещё не
     /// законченная находка (повторное ревью задачи 12, N1), остальное отдаётся сразу:
@@ -136,11 +157,20 @@ impl SecretMasker {
     ///   переводов строки, поэтому учитываются и разрезанные переносом значения);
     /// - находка, доходящая до конца текста (PEM без `END`, тело токена);
     /// - граница внутри находки — на её начало.
-    pub fn mask_stream(&self, s: &str, last: bool) -> (String, usize) {
+    ///
+    /// Хвост не длиннее [`Self::hold_limit`] (финальное ревью R1-C1), поэтому работа шага
+    /// линейна от длины фрагмента. Незаконченная находка длиннее предела отдаётся меткой
+    /// сразу, её продолжение пропускает [`MaskStream`]. Без такой находки хвост режется до
+    /// предела: шаблон, начатый раньше, уже решён — его тело длиннее [`CHECK_WINDOW`].
+    fn stream_step(&self, s: &str, last: bool, steps: &mut u64) -> (String, usize, Carry) {
         if last {
-            return (self.mask(s).into_owned(), s.len());
+            let (t, n) = self.mask_with_steps(s);
+            *steps += n + s.len() as u64;
+            return (t.into_owned(), s.len(), Carry::None);
         }
-        let mut cut = word_hold(s);
+        // Слово в конце, частичные совпадения и отрисовка — по проходу `s` на каждое.
+        *steps += s.len() as u64 * (2 + self.known.len() as u64);
+        let mut cut = word_hold(s).min(pem_hold(s));
         if !self.known.is_empty() && !s.is_empty() {
             let skip = skip_mask(s.as_bytes());
             for n in &self.known {
@@ -152,16 +182,45 @@ impl SecretMasker {
         while !s.is_char_boundary(cut) {
             cut -= 1;
         }
-        let spans = self.merged(s, &mut 0);
-        if let Some(sp) = spans.iter().find(|sp| sp.end >= s.len() && sp.start < cut) {
-            cut = sp.start;
+        let spans = self.merged(s, steps);
+        let limit = self.hold_limit();
+        // Находки слиты и отсортированы: доходящая до конца текста — последняя.
+        let open = spans.last().filter(|sp| sp.end >= s.len());
+        if let Some(sp) = open
+            && s.len() - sp.start > limit
+        {
+            // Длинная незаконченная находка: метка сейчас, продолжение пропускается.
+            let carry = if sp.label == PRIVATE_KEY {
+                Carry::Pem
+            } else {
+                Carry::Word
+            };
+            return (render(s, &spans, s.len()), s.len(), carry);
+        }
+        let open = open.map(|sp| sp.start);
+        if let Some(start) = open {
+            cut = cut.min(start);
+        }
+        if s.len() - cut > limit {
+            // Незаконченная находка (если есть) начинается не раньше `s.len() - limit`.
+            cut = s.len() - limit;
+            while !s.is_char_boundary(cut) {
+                cut += 1;
+            }
+            // Готовая находка на границе отдаётся целиком.
+            if let Some(sp) = spans.iter().find(|sp| sp.start < cut && cut < sp.end) {
+                cut = sp.end;
+            }
+            if let Some(start) = open {
+                cut = cut.min(start);
+            }
         }
         // Находки слиты и не пересекаются: граница внутри находки — на её начало.
         if let Some(sp) = spans.iter().find(|sp| sp.start < cut && cut < sp.end) {
             cut = sp.start;
         }
         let before: Vec<Span<'_>> = spans.into_iter().filter(|sp| sp.end <= cut).collect();
-        (render(s, &before, cut), cut)
+        (render(s, &before, cut), cut, Carry::None)
     }
 
     /// Находки в `s`, отсортированные и слитые (пересекающиеся — в одну, метка первой).
@@ -185,6 +244,143 @@ impl SecretMasker {
             }
         }
         out
+    }
+}
+
+/// Продолжение находки, отданной меткой до конца удержанного хвоста.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Carry {
+    #[default]
+    None,
+    /// Тело токена или пароль: пропускается до пробельного символа (с запасом: класс
+    /// символов тела уже).
+    Word,
+    /// Блок PEM: пропускается до `-----END …-----` включительно.
+    Pem,
+}
+
+/// Маска потока текста по фрагментам (D100, I3 ревью задачи 12): секрет на стыке
+/// фрагментов не проскакивает. Держит хвост, с которого может начинаться ещё не
+/// законченная находка, но не длиннее предела (финальное ревью R1-C1): работа линейна от
+/// длины потока и на длинном тексте без пробелов (base64, минифицированный код).
+///
+/// Находка длиннее предела отдаётся меткой сразу, а её продолжение в следующих фрагментах
+/// пропускается: тело токена — до пробельного символа, блок PEM — до `-----END …-----`.
+/// Ограничение (записанный риск): находки, которые узнаются только по концу, — пароль в
+/// URL (`://user:pass@`) и JWT с заголовком длиннее предела, — а также хвост токена после
+/// переноса строки за пределом отдаются без маски.
+#[derive(Default)]
+pub struct MaskStream {
+    held: String,
+    carry: Carry,
+    steps: u64,
+}
+
+impl fmt::Debug for MaskStream {
+    /// Без удержанного текста: в нём может быть начало секрета.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MaskStream")
+            .field("held_len", &self.held.len())
+            .field("carry", &self.carry)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MaskStream {
+    /// Нечего отдавать и нечего пропускать: конец потока ничего не изменит.
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty() && self.carry == Carry::None
+    }
+
+    /// Следующий фрагмент `chunk`; возвращает маскированный текст, который можно отдать.
+    /// `last` — конец потока: отдаётся всё, состояние сбрасывается.
+    pub fn push(&mut self, m: &SecretMasker, chunk: &str, last: bool) -> String {
+        let mut s = std::mem::take(&mut self.held);
+        s.push_str(chunk);
+        let Some(from) = self.swallow(&s, last) else {
+            return String::new();
+        };
+        let rest = &s[from..];
+        let (out, used, carry) = m.stream_step(rest, last, &mut self.steps);
+        self.held = rest[used..].to_owned();
+        self.carry = carry;
+        out
+    }
+
+    /// Число элементарных шагов с начала потока — для теста линейности, не для продукта.
+    #[doc(hidden)]
+    pub fn steps(&self) -> u64 {
+        self.steps
+    }
+
+    /// Пропуск продолжения находки в начале `s`: позиция, с которой текст обрабатывается
+    /// как обычно, или `None` — пропущен весь `s` (короткий хвост для поиска метки конца
+    /// PEM на стыке фрагментов остаётся в `held`).
+    fn swallow(&mut self, s: &str, last: bool) -> Option<usize> {
+        let carry = self.carry;
+        if last {
+            self.carry = Carry::None;
+        }
+        match carry {
+            Carry::None => Some(0),
+            Carry::Word => {
+                let p = s.find(char::is_whitespace);
+                self.steps += p.unwrap_or(s.len()) as u64 + 1;
+                if p.is_some() {
+                    self.carry = Carry::None;
+                }
+                p
+            }
+            Carry::Pem => {
+                self.steps += s.len() as u64 + 1;
+                let Some(e) = s.find(PEM_END) else {
+                    if !last {
+                        // Метка конца может быть разрезана фрагментами.
+                        let mut keep = s.len().saturating_sub(PEM_END.len() - 1);
+                        while !s.is_char_boundary(keep) {
+                            keep += 1;
+                        }
+                        self.held = s[keep..].to_owned();
+                    }
+                    return None;
+                };
+                let after = e + PEM_END.len();
+                let head = &s.as_bytes()[after..];
+                let window = &head[..head.len().min(PEM_LABEL_MAX)];
+                if let Some(f) = window
+                    .windows(PEM_DASHES.len())
+                    .position(|w| w == PEM_DASHES.as_bytes())
+                {
+                    self.carry = Carry::None;
+                    return Some(after + f + PEM_DASHES.len());
+                }
+                if !last && head.len() < PEM_LABEL_MAX {
+                    // Конец метки ещё не пришёл.
+                    self.held = s[e..].to_owned();
+                }
+                // Иначе метка без конца: как у [`pem_block`], блок — до конца текста.
+                None
+            }
+        }
+    }
+}
+
+/// Начало хвоста, который маска потока держит из-за незаконченной метки начала блока PEM
+/// (`-----BEGIN ` без конца метки на той же строке): метка содержит пробелы, и
+/// [`word_hold`] её не удержит. Иначе — длина текста.
+fn pem_hold(s: &str) -> usize {
+    let mut from = s.len().saturating_sub(PEM_BEGIN.len() + PEM_LABEL_MAX);
+    while !s.is_char_boundary(from) {
+        from += 1;
+    }
+    let Some(i) = s[from..].rfind(PEM_BEGIN).map(|i| from + i) else {
+        return s.len();
+    };
+    let label = &s[i + PEM_BEGIN.len()..];
+    if label.contains(PEM_DASHES) || label.contains('\n') {
+        s.len()
+    } else {
+        i
     }
 }
 
@@ -670,7 +866,7 @@ impl<'s, 'c> Scanner<'s, 'c> {
                 out.push(Span {
                     start: i,
                     end,
-                    label: "private_key",
+                    label: PRIVATE_KEY,
                 });
                 i = end;
                 continue;
@@ -825,10 +1021,10 @@ impl<'s, 'c> Scanner<'s, 'c> {
 /// Блок приватного ключа PEM с `-----BEGIN … PRIVATE KEY-----` в `i`: конец блока —
 /// после `-----END …-----`, без `END` — конец текста. Метка ищется не дальше 100 байт.
 fn pem_block(s: &str, i: usize) -> Option<usize> {
-    const BEGIN: &str = "-----BEGIN ";
-    const END: &str = "-----END ";
-    const DASHES: &str = "-----";
-    const LABEL_MAX: usize = 100;
+    const BEGIN: &str = PEM_BEGIN;
+    const END: &str = PEM_END;
+    const DASHES: &str = PEM_DASHES;
+    const LABEL_MAX: usize = PEM_LABEL_MAX;
     let rest = s[i..].strip_prefix(BEGIN)?;
     let head = &rest.as_bytes()[..rest.len().min(LABEL_MAX)];
     let h = head

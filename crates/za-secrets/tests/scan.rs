@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 
-use za_secrets::{MASK_PREFIX, SecretMasker};
+use za_secrets::{MASK_PREFIX, MaskStream, SecretMasker};
 
 /// Склейка частей фиктивного значения.
 fn j(parts: &[&str]) -> String {
@@ -540,13 +540,10 @@ fn stream_mask_holds_window_across_chunks() {
     let text = format!("{} verylongsecretvalue mid {} tail", "a".repeat(700), ghp());
     for cut in [705, 710, 720, 730, 735, 745, 760] {
         let (a, b) = text.split_at(cut);
-        let mut held = String::new();
+        let mut ms = MaskStream::default();
         let mut out = String::new();
         for (chunk, last) in [(a, false), (b, false), ("", true)] {
-            held.push_str(chunk);
-            let (part, used) = m.mask_stream(&held, last);
-            out.push_str(&part);
-            held = held[used..].to_owned();
+            out.push_str(&ms.push(&m, chunk, last));
         }
         assert_eq!(out, m.mask(&text), "разрез на {cut}");
         assert!(!out.contains("verylong") && !out.contains("ghp_"), "{cut}");
@@ -559,22 +556,83 @@ fn stream_mask_holds_window_across_chunks() {
 #[test]
 fn stream_mask_holds_only_possible_secret_start() {
     let m = SecretMasker::new(vec![("k".into(), "verylongsecretvalue".into())]);
-    let all = |s: &str| m.mask_stream(s, false);
-    assert_eq!(all("Done, tests pass. "), ("Done, tests pass. ".into(), 18));
-    assert_eq!(all("Done, tests pa").1, "Done, tests ".len());
-    assert_eq!(all("see line\n").1, "see ".len());
-    assert_eq!(all("Authorization: Bearer ").1, "Authorization: ".len());
+    let all = |s: &str| MaskStream::default().push(&m, s, false);
+    assert_eq!(all("Done, tests pass. "), "Done, tests pass. ");
+    assert_eq!(all("Done, tests pa"), "Done, tests ");
+    assert_eq!(all("see line\n"), "see ");
+    assert_eq!(all("Authorization: Bearer "), "Authorization: ");
     // Частичное совпадение значения, разрезанного переводом строки, держится с начала.
-    assert_eq!(all("value: verylong\nsecr").1, "value: ".len());
+    assert_eq!(all("value: verylong\nsecr"), "value: ");
     // Значение не продолжилось — держать нечего.
-    assert_eq!(
-        all("value: verylong done. ").1,
-        "value: verylong done. ".len()
-    );
+    assert_eq!(all("value: verylong done. "), "value: verylong done. ");
     // Продолжение: склейка равна маске целого текста.
     let text = format!("token {} and done. ", ghp());
     let (a, b) = text.split_at(20);
-    let (p1, used) = m.mask_stream(a, false);
-    let (p2, _) = m.mask_stream(&format!("{}{b}", &a[used..]), true);
+    let mut ms = MaskStream::default();
+    let p1 = ms.push(&m, a, false);
+    let p2 = ms.push(&m, b, true);
     assert_eq!(format!("{p1}{p2}"), m.mask(&text));
+    assert!(ms.is_empty());
+}
+
+/// Поток фрагментами по `chunk` байт: склейка отданного и число шагов маски.
+fn stream(m: &SecretMasker, text: &str, chunk: usize) -> (String, u64) {
+    let mut ms = MaskStream::default();
+    let mut out = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut n = chunk.min(rest.len());
+        while !rest.is_char_boundary(n) {
+            n += 1;
+        }
+        let (a, b) = rest.split_at(n);
+        out.push_str(&ms.push(m, a, false));
+        rest = b;
+    }
+    out.push_str(&ms.push(m, "", true));
+    assert!(ms.is_empty());
+    (out, ms.steps())
+}
+
+/// Финальное ревью R1-C1 (Minor 3): длинное слово без пробелов (base64, минифицированный
+/// код) мелкими фрагментами — хвост ограничен, работа линейна: вчетверо длиннее текст —
+/// шагов больше не в 16 раз, а примерно вчетверо; текст отдаётся по ходу потока.
+#[test]
+fn stream_mask_is_linear_on_long_word() {
+    let known = SecretMasker::new(vec![("k".into(), "verylongsecretvalue".into())]);
+    let word = |n: usize| "Ab0+/".repeat(n / 5);
+    for m in [&none(), &known] {
+        let (out1, s1) = stream(m, &word(32 * 1024), 16);
+        let (out4, s4) = stream(m, &word(128 * 1024), 16);
+        assert_eq!(out1, word(32 * 1024));
+        assert_eq!(out4, word(128 * 1024));
+        assert!(s4 <= s1 * 5, "{s1} → {s4}: не линейно");
+        // Хвост не растёт: почти всё отдано ещё до конца потока.
+        let mut ms = MaskStream::default();
+        let mut given = 0;
+        for _ in 0..4096 {
+            given += ms.push(m, "Ab0+/Ab0+/Ab0+/A", false).len();
+        }
+        assert!(given + 2048 >= 4096 * 16, "отдано {given}");
+    }
+}
+
+/// Длинный незаконченный токен и блок PEM мелкими фрагментами: метка отдаётся сразу,
+/// продолжение пропускается, склейка равна маске целого текста.
+#[test]
+fn stream_mask_swallows_long_finding() {
+    let m = SecretMasker::new(vec![("k".into(), "verylongsecretvalue".into())]);
+    let token = format!("before {}{} after", ghp(), "q".repeat(64 * 1024));
+    let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n".repeat(400);
+    let pem = format!(
+        "key:\n-----BEGIN RSA PRIVATE KEY-----\n{body}-----END RSA PRIVATE KEY-----\nafter"
+    );
+    for text in [&token, &pem] {
+        for chunk in [7, 16, 2048] {
+            let (out, _) = stream(&m, text, chunk);
+            assert_eq!(out, m.mask(text), "фрагмент {chunk}");
+            assert!(!out.contains("MIIE") && !out.contains("qqqq"), "{chunk}");
+            assert!(out.ends_with("after"), "{chunk}");
+        }
+    }
 }

@@ -13,5 +13,5 @@
 mod scan;
 mod store;
 
-pub use scan::{MASK_PREFIX, SecretMasker};
+pub use scan::{MASK_PREFIX, MaskStream, SecretMasker};
 pub use store::{ENV_PREFIX, EnvStore, MIN_SECRET_LEN, SecretStore, env_var_name, known_values};

@@ -34,7 +34,7 @@ use za_llm::{
     StreamEvent, ToolCall, ToolSchema, Usage, WaitState,
 };
 use za_protocol::{Actor, BlobHash, EffectClass, EventKind, NewEvent, RunId};
-use za_secrets::SecretMasker;
+use za_secrets::{MaskStream, SecretMasker};
 use za_store::{StoreError, UsageRow};
 
 use crate::detect::{Degenerate, StreamWatch};
@@ -716,10 +716,10 @@ struct StreamState<'w> {
     watch: Option<&'w mut StreamWatch>,
     /// Срабатывание детектора на последнем шаге цикла стрима: стрим обрывается.
     degenerate: Option<Degenerate>,
-    /// Удержанные хвосты текста и рассуждения маски потока (D100, I3 ревью задачи 12):
-    /// секрет на стыке дельт маскируется целиком.
-    held_text: String,
-    held_reasoning: String,
+    /// Маски потока текста и рассуждения (D100, I3 ревью задачи 12): секрет на стыке
+    /// дельт маскируется целиком.
+    held_text: MaskStream,
+    held_reasoning: MaskStream,
 }
 
 impl LiveTurn<'_> {
@@ -804,8 +804,8 @@ impl LiveTurn<'_> {
             ttft_ms: None,
             watch,
             degenerate: None,
-            held_text: String::new(),
-            held_reasoning: String::new(),
+            held_text: MaskStream::default(),
+            held_reasoning: MaskStream::default(),
         };
         let mut stream = match model.stream(call).await {
             Ok(s) => s,
@@ -976,9 +976,10 @@ impl LiveTurn<'_> {
         Ok(None)
     }
 
-    /// Дельта `field` (`text` | `reasoning`) в журнал. С маской (D100) — окно перекрытия:
-    /// хвост [`SecretMasker::window`] держится до следующей дельты, `last` (конец стрима
-    /// или попытки) отдаёт всё; пустая часть не пишется.
+    /// Дельта `field` (`text` | `reasoning`) в журнал. С маской (D100) — маска потока
+    /// [`MaskStream`]: хвост, с которого может начинаться секрет (не длиннее предела),
+    /// держится до следующей дельты, `last` (конец стрима или попытки) отдаёт всё; пустая
+    /// часть не пишется.
     async fn write_delta(
         &self,
         st: &mut StreamState<'_>,
@@ -993,11 +994,7 @@ impl LiveTurn<'_> {
                 } else {
                     &mut st.held_reasoning
                 };
-                let mut all = std::mem::take(held);
-                all.push_str(&chunk);
-                let (out, used) = m.mask_stream(&all, last);
-                *held = all[used..].to_owned();
-                out
+                held.push(m, &chunk, last)
             }
             None => chunk,
         };
