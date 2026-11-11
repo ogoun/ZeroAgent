@@ -8,8 +8,9 @@
 //! Коды выхода (D28): 0 — `done` или `partial`; 1 — ошибка или `failed`; 3 — нужно
 //! решение (`needs_input`, `needs_approval`, `needs_decision`), в stderr строка
 //! `zero-agent: ответьте: zero-agent answer --interrupt <id> …`; 4 — прочая пауза или
-//! `blocked_on_budget`; 5 — `blocked`; 6 — `cancelled`. На Windows аварийное завершение
-//! (`abort`) тоже даёт код 3: признак настоящего «нужно решение» — строка `ответьте:`.
+//! `blocked_on_budget`; 5 — `blocked`; 6 — `cancelled`. Аварийное завершение (`abort`)
+//! даёт на Windows `0xC0000409` (`__fastfail`), на Unix — SIGABRT; признак настоящего
+//! «нужно решение» — строка `ответьте:`.
 //!
 //! `answer` открывает журнал, записывает решение прерывания и выходит; цикл продолжает
 //! `run --resume`. Ответ на одобрение (`appr-…`) и на доверие (`trust-…`) закрывает
@@ -206,6 +207,9 @@ pub struct RunArgs {
     /// `--grant <путь>[=ro|=rw]` (D78): у нового run и у resume (добавляются с границы).
     pub grants: Vec<(PathBuf, GrantMode)>,
     pub crash: Option<RunCrash>,
+    /// Предел чекпоинта git при вызове инструмента вместо `CHECKPOINT_TIMEOUT` (скрытый
+    /// `--checkpoint-timeout`, только для тестов под нагрузкой: × `ZA_TEST_TIME_SCALE`).
+    pub checkpoint_timeout: Option<Duration>,
 }
 
 /// Флаги бюджета `run`: каждый задаёт своё поле поверх базового бюджета.
@@ -935,7 +939,14 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 trusted: prep.trusted,
                 grants: prep.grants.clone(),
             };
-            let (mut deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
+            let (mut deps, bus) = deps(
+                &store,
+                &gateway,
+                tools,
+                &masker,
+                &prep,
+                args.checkpoint_timeout,
+            );
             deps.crash = crash_hook(args.crash);
             deps.audit_head =
                 record_start(&store, &project, run, Some(&prep.policy), &prep.grants).await?;
@@ -974,7 +985,14 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             } else {
                 None
             };
-            let (mut deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
+            let (mut deps, bus) = deps(
+                &store,
+                &gateway,
+                tools,
+                &masker,
+                &prep,
+                args.checkpoint_timeout,
+            );
             deps.crash = crash_hook(args.crash);
             deps.audit_head = record_start(
                 &store,
@@ -1041,6 +1059,7 @@ fn deps(
     tools: ToolRegistry,
     masker: &SecretMasker,
     prep: &Prepared,
+    checkpoint_timeout: Option<Duration>,
 ) -> (LoopDeps, EventBus) {
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
     let mut deps = LoopDeps::new(
@@ -1059,7 +1078,11 @@ fn deps(
         shell: shell(),
         home: agent_home.clone(),
     })];
-    deps.checkpointer = Some(Arc::new(GitCheckpointer::new(runner, agent_home)));
+    let mut checkpointer = GitCheckpointer::new(runner, agent_home);
+    if let Some(t) = checkpoint_timeout {
+        checkpointer = checkpointer.with_create_timeout_for_tests(t);
+    }
+    deps.checkpointer = Some(Arc::new(checkpointer));
     deps.policy = prep.policy.clone();
     deps.roots = prep.roots.clone();
     // D100: ответ модели и результаты инструментов маскируются до квитанции.

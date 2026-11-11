@@ -285,6 +285,10 @@ struct RunCli {
     /// Аварийно завершить процесс: `after-delta:N` или `in-tool:N` (тесты, D33, D92).
     #[arg(long, hide = true, value_parser = parse_run_crash)]
     crash_at: Option<RunCrash>,
+    /// Предел чекпоинта git при вызове инструмента, с (тесты под нагрузкой; по умолчанию
+    /// 20 с).
+    #[arg(long, hide = true, value_name = "СЕК")]
+    checkpoint_timeout: Option<u64>,
     /// Текст задачи.
     #[arg(required_unless_present = "resume", conflicts_with = "resume")]
     task: Option<String>,
@@ -382,6 +386,7 @@ fn run_args(r: RunCli) -> RunArgs {
         },
         grants: r.grants,
         crash: r.crash_at,
+        checkpoint_timeout: r.checkpoint_timeout.map(Duration::from_secs),
     }
 }
 

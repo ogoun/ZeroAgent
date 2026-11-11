@@ -39,7 +39,9 @@ use serde_json::{Value, json};
 use za_protocol::EventKind;
 
 use support::fake_llama::{Fake, call_reply, calls_reply, llama_config, text_reply};
-use support::process::{Env, Out, count, interrupt_id, run_id, unique_dir, unique_dir_in};
+use support::process::{
+    Env, Out, count, interrupt_id, run_id, time_scale, unique_dir, unique_dir_in,
+};
 
 /// Окно `/props` сценариев.
 const N_CTX: u32 = 32768;
@@ -141,8 +143,17 @@ impl Case {
         self.e.run_with(args, &vars)
     }
 
+    /// `run` с пределом чекпоинта git 20 с × `ZA_TEST_TIME_SCALE`: под нагрузкой станции
+    /// чекпоинт не превращается в `slow`.
     fn run(&self, extra: &[&str]) -> Out {
-        let mut args = vec!["run", "--project", self.e.project_arg()];
+        let ck = (20 * time_scale()).to_string();
+        let mut args = vec![
+            "run",
+            "--project",
+            self.e.project_arg(),
+            "--checkpoint-timeout",
+            &ck,
+        ];
         args.extend_from_slice(extra);
         self.za(&args)
     }
@@ -343,15 +354,23 @@ fn s4_edit_and_test_loop() {
         assert!(l.stdout.contains(id.as_str()), "{id}: {l:?}");
     }
 
-    // Первый чекпоинт (перед первой проверкой) — файл как до правки.
-    let r = c.za(&[
-        "checkpoints",
-        "restore",
-        "--project",
-        c.e.project_arg(),
-        &ids[0],
-    ]);
-    assert_eq!(r.code(), Some(0), "{r:?}");
+    // Чекпоинт самой правки (c4) снят до записи: восстановление возвращает файл до
+    // правки (инвариант 10). Затем чекпоинт после правки (c5) — файл после неё, и первый
+    // (c3, перед первой проверкой) — снова до правки.
+    let restore = |id: &str| {
+        let r = c.za(&["checkpoints", "restore", "--project", c.e.project_arg(), id]);
+        assert_eq!(r.code(), Some(0), "restore {id}: {r:?}");
+    };
+    restore(&ids[1]);
+    assert_eq!(c.read("calc.txt"), CALC_BEFORE);
+    restore(&ids[2]);
+    assert_eq!(
+        c.read("calc.txt"),
+        "# сумма 2 + 2
+result = 4
+"
+    );
+    restore(&ids[0]);
     assert_eq!(c.read("calc.txt"), CALC_BEFORE);
 
     let v = c.za(&["audit", "--project", c.e.project_arg(), "--verify"]);
@@ -443,6 +462,15 @@ fn untrusted_repo_asks_trust_once() {
     let events = c.e.events(run_id(&o));
     assert_eq!(count(&events, EventKind::InterruptOpened), 1, "{events:?}");
     assert_eq!(c.e.last_audit("trust.").unwrap().action, "trust.granted");
+    // Доверие разово: следующий run того же проекта не спрашивает (решение заказчика (б)):
+    // набор, записанный ответом, совпадает с пересчитанным при старте run.
+    let n = c.run(&["--mode", "auto", "Запусти две команды ещё раз"]);
+    assert_eq!(n.code(), Some(0), "{n:?}");
+    assert!(!n.stderr.contains("проект не доверен"), "{n:?}");
+    let events = c.e.events(run_id(&n));
+    assert_eq!(count(&events, EventKind::InterruptOpened), 0, "{events:?}");
+    assert_eq!(count(&events, EventKind::ToolStarted), 2, "{events:?}");
+    assert_eq!(c.e.snapshot(run_id(&n))["trusted"], true);
 
     // Отказ в доверии: обе команды не исполнены, вопрос один.
     let d = Case::new("untrusted-deny", two_commands);
@@ -466,6 +494,56 @@ fn untrusted_repo_asks_trust_once() {
     assert_eq!(count(&events, EventKind::ToolStarted), 0, "{events:?}");
 }
 
+// ---- Чтение из сети и следующие команды ----
+
+/// Модель: сетевая команда (`git fetch` без удалённых репозиториев — сети нет, но
+/// команда сетевая, D77), затем команда внутри проекта, затем ответ.
+fn network_then_command(seen: &[Value]) -> Response {
+    match tool_results(seen.last()) {
+        0 => call_reply("n1", "bash", r#"{"cmd":"git fetch"}"#),
+        1 => call_reply("n2", "bash", r#"{"cmd":"echo after-network"}"#),
+        _ => text_reply(&["готово"]),
+    }
+}
+
+/// Решение заказчика 2026-11-11 (D82): метка `network` — происхождение данных; следующая
+/// команда внутри проекта в `auto` идёт без вопроса.
+#[test]
+fn network_read_does_not_ask_next_command() {
+    let c = Case::new("network", network_then_command);
+    c.trust();
+    let o = c.run(&["--mode", "auto", "Обнови и продолжи"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert_eq!(
+        o.stdout,
+        "готово
+",
+        "{o:?}"
+    );
+    let events = c.e.events(run_id(&o));
+    assert_eq!(count(&events, EventKind::InterruptOpened), 0, "{events:?}");
+    let f1 = of_call(&events, EventKind::ToolFinished, "n1");
+    assert_eq!(f1.len(), 1, "{events:?}");
+    assert_eq!(f1[0]["tainted"], true, "{}", f1[0]);
+    let f2 = of_call(&events, EventKind::ToolFinished, "n2");
+    assert_eq!(f2.len(), 1, "{events:?}");
+    let bodies = c.bodies();
+    assert!(
+        result_of(&bodies, "n1").contains("[untrusted content: network]"),
+        "{}",
+        result_of(&bodies, "n1")
+    );
+    assert!(result_of(&bodies, "n2").contains("after-network"));
+    let snap = c.e.snapshot(run_id(&o));
+    assert!(
+        snap["taint"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("network")),
+        "{snap}"
+    );
+}
+
 // ---- Сбой посреди команды ----
 
 /// Модель: команда, пишущая `marker.txt`, затем ответ.
@@ -481,7 +559,13 @@ fn crash_mid_bash_then_resume_asks_decision() {
     let c = Case::new("crash", marker_model);
     c.trust();
     let o = c.run(&["--mode", "auto", "--crash-at", "in-tool:1", "Запиши marker"]);
-    assert_ne!(o.code(), Some(0), "{o:?}");
+    // `abort()`: Windows — `__fastfail`, код STATUS_STACK_BUFFER_OVERRUN (0xC0000409);
+    // Unix — сигнал SIGABRT, кода нет.
+    if cfg!(windows) {
+        assert_eq!(o.code(), Some(0xC000_0409_u32 as i32), "{o:?}");
+    } else {
+        assert_eq!(o.code(), None, "{o:?}");
+    }
     assert!(!o.stderr.contains("ответьте:"), "{o:?}");
     // Команда исполнена, квитанции нет: tool.started и чекпоинт есть, tool.finished нет.
     assert!(c.e.project.join("marker.txt").exists(), "{o:?}");
@@ -647,9 +731,16 @@ fn ac_sec_2_outside_access_always_journaled() {
     let mut stderr = String::new();
     let mut o = first;
     let mut rounds = 0;
+    // Общий предел набора B (81 процесс); у каждого процесса свой предел — 60 с × масштаб.
+    let started = std::time::Instant::now();
+    let total = std::time::Duration::from_secs(600) * time_scale();
     while o.code() == Some(3) {
         rounds += 1;
         assert!(rounds <= 2 * PER_KIND, "лишние вопросы: {o:?}");
+        assert!(
+            started.elapsed() < total,
+            "набор B не уложился в {total:?}: {rounds} раундов"
+        );
         stderr.push_str(&o.stderr);
         let id = interrupt_id(&o);
         assert!(id.starts_with("appr-"), "{id}: {o:?}");
