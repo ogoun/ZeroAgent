@@ -8,8 +8,11 @@
 //! рабочей копии по чекпоинту (`za_tools::restore`). Перед ним делается чекпоинт «до»
 //! (`za_tools::backup_before_restore`); не вышел — отказ, восстановления нет (I1 ревью
 //! задачи 9). После — запись аудита `checkpoint.restored` (actor `user`, target — id) с
-//! изменёнными путями и id чекпоинта «до», а при сбое посреди восстановления — ещё
-//! `error`. Файлы, которых нет в чекпоинте, удаляются только с `--delete-new`.
+//! изменёнными путями, путями, не тронутыми как секрет (`secret_untouched`, D103), и id
+//! чекпоинта «до», а при сбое посреди восстановления — ещё `error`. Файлы, которых нет в
+//! чекпоинте, удаляются только с `--delete-new`. Секретный файл (по имени или сейчас по
+//! содержимому) восстановление не трогает ни в какой ветке (ревью задачи 2 R1-C2: I1, I2):
+//! он в `secret_untouched` вывода `--json` и в строке stderr.
 //!
 //! Доверие (D83, I2): git вызывается только у доверенного проекта — последняя запись
 //! аудита доверия `trust.granted` с нынешним набором доверенных файлов. Иначе видны и
@@ -174,18 +177,23 @@ pub async fn cmd_restore(
     let result = restore(&ck, &project, &cp, delete_new, trusted).await;
     let rels: Vec<String> = result
         .as_ref()
-        .map(|changed| {
-            changed
+        .map(|r| {
+            r.changed
                 .iter()
                 .map(|p| za_core::paths::display(&project, p))
                 .collect()
         })
+        .unwrap_or_default();
+    let secret: Vec<String> = result
+        .as_ref()
+        .map(|r| r.secret_untouched.clone())
         .unwrap_or_default();
     let mut payload = json!({
         "checkpoint": cp.id,
         "kind": cp.kind,
         "delete_new": delete_new,
         "changed": rels,
+        "secret_untouched": secret,
         "before": before.id,
         "before_kind": before.kind,
     });
@@ -206,6 +214,7 @@ pub async fn cmd_restore(
             "id": cp.id,
             "kind": cp.kind,
             "changed": rels,
+            "secret_untouched": secret,
             "before": serde_json::to_value(&before).map_err(CheckpointsCmdError::Json)?,
         });
         println!("{}", canonical_json(&v));
@@ -218,6 +227,9 @@ pub async fn cmd_restore(
             cp.id,
             rels.len()
         );
+        if !secret.is_empty() {
+            eprintln!("zero-agent: не тронуты как секреты: {}", secret.join(", "));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

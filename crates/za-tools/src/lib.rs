@@ -55,12 +55,12 @@ pub use bash::{
 };
 pub use checkpoint::{
     CHECKPOINT_MAX_FILE, CHECKPOINT_MAX_TOTAL, CHECKPOINT_REF_PREFIX, CHECKPOINT_TIMEOUT,
-    GitCheckpointer, RestoreError, SECRET_SCAN_MAX, SecretFilter, backup_before_restore, restore,
-    secret_name,
+    GitCheckpointer, RestoreError, Restored, SECRET_SCAN_MAX, SecretFilter, backup_before_restore,
+    restore, secret_name,
 };
 pub use digest::digest;
 pub use edit::{
-    EditHook, EditPoint, clean_edit_leftovers, clean_leftovers_older, edit_tool,
+    EditHook, EditPoint, TextMask, clean_edit_leftovers, clean_leftovers_older, edit_tool,
     edit_tool_with_hook, multi_edit_tool, multi_edit_tool_with_hook,
 };
 

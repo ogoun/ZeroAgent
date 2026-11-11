@@ -439,16 +439,17 @@ async fn step_zero(
     let mut ctx = RunCtx::new(store.clone(), run);
     let mut last_seq = None;
     // D102, SEC-051: задача — без невидимых символов до первого сообщения, снимка и
-    // разбора `/имя`; число удалённых — `input.cleaned`.
+    // разбора `/имя`; число удалённых — `input.cleaned` (после эффекта памяти, D4).
+    let mut cleaned = Vec::new();
     if let Some((task, removed)) = clean_input(&spec.task) {
         spec.task = task;
-        last_seq = Some(input_cleaned(&deps.journal, run, input_source::TASK, removed).await?);
+        cleaned.push((input_source::TASK, removed));
     }
     // Текст `AGENTS.md` (или `CLAUDE.md`) — до `fit_agents_md` и замороженного префикса.
     // Чистит драйвер, а не бинарник: событие пишется в журнал уже созданного run.
     if let Some((md, removed)) = spec.agents_md.as_deref().and_then(clean_input) {
         spec.agents_md = Some(md);
-        last_seq = Some(input_cleaned(&deps.journal, run, input_source::AGENTS_MD, removed).await?);
+        cleaned.push((input_source::AGENTS_MD, removed));
     }
 
     // Снимок памяти — эффект: внешнее значение входит в цикл только так (D9, D24).
@@ -469,6 +470,11 @@ async fn step_zero(
         .await
         .map_err(effect_err)?;
     let memory_text = v.get("text").and_then(Value::as_str).map(str::to_owned);
+    // Ревью задачи 1, m1: события шага 0 — после квитанции памяти, снимок шага 0 стоит
+    // на последнем событии run (D4).
+    for (source, removed) in cleaned {
+        last_seq = Some(input_cleaned(&deps.journal, run, source, removed, None).await?);
+    }
     if deps.memory.level() == MemoryLevel::L0 {
         last_seq = Some(
             append(
@@ -1088,7 +1094,7 @@ async fn push_inbox(
                     continue;
                 }
                 // D102: невидимые символы — до истории и до разбора `/имя`.
-                let text = clean_inbox(deps, st, text).await?;
+                let text = clean_inbox(deps, st, *seq, text).await?;
                 if text.is_empty() {
                     tracing::warn!(
                         seq,
@@ -1104,9 +1110,9 @@ async fn push_inbox(
                 // Ввод пользователя сбрасывает окно повтора (Ruling I-3 ревью задачи 6).
                 st.detectors.on_user_input();
             }
-            Inbox::Correct { note, command, .. } => {
+            Inbox::Correct { seq, note, command } => {
                 // D102: поправка — тоже ввод пользователя.
-                let note = clean_inbox(deps, st, note).await?;
+                let note = clean_inbox(deps, st, *seq, note).await?;
                 st.conv.push_user(render_control(
                     ControlFrom::User,
                     ControlAction::Correct,
@@ -1131,12 +1137,25 @@ async fn push_inbox(
 }
 
 /// Очистка ввода `inbox` (D102, `Clean::Input`): удалённые символы — `input.cleaned
-/// {source: "input"}`. Реплей границы повторяет событие, как `control.applied`.
-async fn clean_inbox(deps: &LoopDeps, st: &mut LoopState, text: &str) -> Result<String, LoopError> {
+/// {source: "input", seq}`, `seq` — событие исходного ввода (`turn.input` или
+/// `control.requested`). Реплей границы повторяет событие, как `control.applied`;
+/// по `seq` повтор отличается от нового ввода (ревью задачи 1, m2).
+async fn clean_inbox(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    seq: u64,
+    text: &str,
+) -> Result<String, LoopError> {
     match clean_input(text) {
         Some((clean, removed)) => {
-            st.last_seq =
-                input_cleaned(&deps.journal, st.run, input_source::INPUT, removed).await?;
+            st.last_seq = input_cleaned(
+                &deps.journal,
+                st.run,
+                input_source::INPUT,
+                removed,
+                Some(seq),
+            )
+            .await?;
             Ok(clean)
         }
         None => Ok(text.to_owned()),
@@ -1151,21 +1170,20 @@ fn clean_input(text: &str) -> Option<(String, usize)> {
     }
 }
 
-/// Событие `input.cleaned {source, removed}` (D102).
+/// Событие `input.cleaned {source, removed, seq?}` (D102); `seq` — событие исходного
+/// ввода `inbox`, у задачи и `AGENTS.md` его нет.
 async fn input_cleaned(
     j: &Journal,
     run: RunId,
     source: &str,
     removed: usize,
+    seq: Option<u64>,
 ) -> Result<Seq, StoreError> {
-    append(
-        j,
-        run,
-        Actor::Runtime,
-        EventKind::InputCleaned,
-        json!({ "source": source, "removed": removed }),
-    )
-    .await
+    let mut payload = json!({ "source": source, "removed": removed });
+    if let Some(seq) = seq {
+        payload["seq"] = json!(seq);
+    }
+    append(j, run, Actor::Runtime, EventKind::InputCleaned, payload).await
 }
 
 /// Повторное чтение ввода после компакции на границе (Ruling I-2): эффект `inbox`

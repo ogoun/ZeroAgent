@@ -2285,6 +2285,7 @@ dependencies = [
  "clap",
  "http-body",
  "jiff",
+ "memchr",
  "rusqlite",
  "serde",
  "serde_json",

@@ -30,6 +30,7 @@ fn deps() -> NativeDeps {
             za_home: PathBuf::from("no-home"),
             project_id: "0".into(),
         },
+        mask: None,
     }
 }
 

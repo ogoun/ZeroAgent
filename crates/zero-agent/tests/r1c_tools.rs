@@ -982,14 +982,24 @@ fn edit_of_env_reports_no_checkpoint() {
         assert_eq!(cps[0]["kind"], "git", "{id}: {}", cps[0]);
         assert_eq!(cps[0]["secret_skipped"], json!([path]), "{id}: {}", cps[0]);
     }
-    // Значения секрета нет в каталоге чекпоинтов (свой репозиторий, кэш stat, индексы).
+    // Значения секрета нет в каталоге чекпоинтов (свой репозиторий, кэш stat, индексы) и
+    // в маркерах повтора правок `edits/*.json` (ревью задачи 2, сомнение 1: diff маскируется).
     let cps: Vec<PathBuf> = files_under(&c.e.home)
         .into_iter()
-        .filter(|f| f.components().any(|p| p.as_os_str() == "checkpoints"))
+        .filter(|f| {
+            f.components()
+                .any(|p| p.as_os_str() == "checkpoints" || p.as_os_str() == "edits")
+        })
         .collect();
     assert!(
         cps.iter().any(|f| f.ends_with("stat.json")),
         "нет каталога чекпоинтов: {cps:?}"
+    );
+    assert!(
+        cps.iter()
+            .any(|f| f.parent().is_some_and(|d| d.ends_with("edits"))
+                && f.extension().is_some_and(|e| e == "json")),
+        "нет маркеров правок: {cps:?}"
     );
     for f in &cps {
         let data = std::fs::read(f).unwrap();
@@ -999,6 +1009,39 @@ fn edit_of_env_reports_no_checkpoint() {
             f.display()
         );
     }
+    // Восстановление чекпоинта перед правкой `config.txt`: секреты не тронуты и названы
+    // (ревью задачи 2, I2): `--json`, stderr и аудит.
+    let id = of_call(&events, EventKind::CheckpointCreated, "e2")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = c.za(&[
+        "checkpoints",
+        "restore",
+        "--project",
+        c.e.project_arg(),
+        &id,
+        "--delete-new",
+        "--json",
+    ]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    let v: Value = serde_json::from_str(r.stdout.trim()).unwrap();
+    assert_eq!(v["secret_untouched"], json!([".env", "config.txt"]), "{v}");
+    assert_eq!(c.read(".env"), "MODE=prod\n");
+    assert!(c.read("config.txt").contains("level = 2"), "{r:?}");
+    let r = c.za(&[
+        "checkpoints",
+        "restore",
+        "--project",
+        c.e.project_arg(),
+        &id,
+    ]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert!(
+        r.stderr
+            .contains("не тронуты как секреты: .env, config.txt"),
+        "{r:?}"
+    );
 }
 
 // ---- Сетевой путь ----

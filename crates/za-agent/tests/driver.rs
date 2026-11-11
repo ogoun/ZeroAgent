@@ -1308,6 +1308,69 @@ async fn task_with_tag_chars_is_cleaned_and_logged() {
     assert_eq!(cleaned[0].actor, Actor::Runtime);
 }
 
+/// Память L1 без текста: шаг 0 не пишет `memory.unavailable`.
+struct EmptyMemory;
+
+impl za_agent::MemoryPort for EmptyMemory {
+    fn level(&self) -> za_agent::MemoryLevel {
+        za_agent::MemoryLevel::L1
+    }
+
+    fn snapshot(&self, _run: RunId, _budget_tokens: u32) -> BoxFuture<'_, za_agent::Recall> {
+        Box::pin(async { za_agent::Recall::Empty })
+    }
+
+    fn before_compaction<'a>(&'a self, _run: RunId, _next_step: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn after_compaction(
+        &self,
+        _run: RunId,
+        _budget_tokens: u32,
+    ) -> BoxFuture<'_, za_agent::Recall> {
+        Box::pin(async { za_agent::Recall::Empty })
+    }
+}
+
+/// Ревью задачи 1, m1 (D4): `input.cleaned` шага 0 пишется после эффекта памяти,
+/// снимок шага 0 стоит на последнем событии до первого хода.
+#[tokio::test]
+async fn step0_snapshot_on_last_event_after_cleaned_task() {
+    let mut f = fx("task_tag_snapshot", scripted().with_context(32768));
+    f.deps.memory = Arc::new(EmptyMemory);
+    f.model.push(answer("ок"));
+    let mut s = spec(RunRole::Top);
+    s.task = "fix\u{E0069} bug".into();
+    s.agents_md = Some("rules\u{202E}".into());
+    start(&mut f, s).await.unwrap();
+    let (seq0, s0) = &snapshots(&f.store, f.run).await[0];
+    assert_eq!(s0.step, 0);
+    let evs = events(&f.store, f.run).await;
+    // Шаг 1 начинается с эффекта `boundary`: снимок шага 0 — на событии перед ним.
+    let boundary = evs
+        .iter()
+        .find(|e| e.kind == EventKind::EffectIntent && e.payload["name"] == "boundary")
+        .expect("нет эффекта boundary")
+        .seq;
+    let last_before = evs
+        .iter()
+        .filter(|e| e.seq < boundary)
+        .map(|e| e.seq)
+        .max()
+        .unwrap();
+    assert_eq!(*seq0, last_before, "{evs:#?}");
+    // Квитанция памяти раньше `input.cleaned`.
+    let mem = evs
+        .iter()
+        .find(|e| e.kind == EventKind::EffectIntent && e.payload["name"] == "memory.snapshot")
+        .expect("нет эффекта памяти")
+        .seq;
+    let cleaned = of_kind(&evs, EventKind::InputCleaned);
+    assert_eq!(cleaned.len(), 2, "{cleaned:?}");
+    assert!(cleaned.iter().all(|e| e.seq > mem), "{cleaned:?}");
+}
+
 #[tokio::test]
 async fn clean_task_logs_nothing() {
     let mut f = fx("task_clean", scripted());
@@ -1353,5 +1416,19 @@ async fn inbox_input_is_cleaned() {
     let evs = events(&f.store, f.run).await;
     let cleaned = of_kind(&evs, EventKind::InputCleaned);
     assert_eq!(cleaned.len(), 1, "{cleaned:?}");
-    assert_eq!(cleaned[0].payload, json!({"source": "input", "removed": 1}));
+    // Ревью задачи 1, m2: `seq` исходного `turn.input` — повтор после resume
+    // отличается от нового ввода.
+    let input = of_kind(&evs, EventKind::TurnInput);
+    let src = input
+        .iter()
+        .find(|e| {
+            e.payload["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("abc"))
+        })
+        .expect("нет turn.input");
+    assert_eq!(
+        cleaned[0].payload,
+        json!({"source": "input", "removed": 1, "seq": src.seq.0})
+    );
 }

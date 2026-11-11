@@ -11,9 +11,9 @@ use std::sync::Arc;
 use za_core::Capability;
 use za_jail::Runner;
 
+use crate::edit::edit_tool_masked;
 use crate::{
-    AgentHome, ReadTracker, Shell, bash_tool, edit_tool, glob_tool, multi_edit_tool, read_tool,
-    search_tool,
+    AgentHome, ReadTracker, Shell, TextMask, bash_tool, glob_tool, read_tool, search_tool,
 };
 
 /// Имя capability нативных инструментов.
@@ -21,13 +21,15 @@ pub const NATIVE_CAPABILITY: &str = "native";
 
 /// Зависимости нативных инструментов одного процесса: запуск команд (`bash`, только
 /// через [`Runner`], SEC-006), общий трекер чтений (`read` → `edit`, D87), оболочка
-/// (D85) и каталог агента в `ZA_HOME` (маркеры правок, реестр групп процессов).
+/// (D85), каталог агента в `ZA_HOME` (маркеры правок, реестр групп процессов) и маска
+/// секретов маркеров правок (`None` — без маски).
 #[derive(Clone)]
 pub struct NativeDeps {
     pub runner: Arc<dyn Runner>,
     pub tracker: Arc<ReadTracker>,
     pub shell: Shell,
     pub home: AgentHome,
+    pub mask: Option<TextMask>,
 }
 
 impl std::fmt::Debug for NativeDeps {
@@ -46,8 +48,13 @@ pub fn native_capability(d: &NativeDeps) -> Capability {
         read_tool(Arc::clone(&d.tracker)),
         search_tool(),
         glob_tool(),
-        edit_tool(Arc::clone(&d.tracker), d.home.clone()),
-        multi_edit_tool(Arc::clone(&d.tracker), d.home.clone()),
+        edit_tool_masked(
+            Arc::clone(&d.tracker),
+            d.home.clone(),
+            false,
+            d.mask.clone(),
+        ),
+        edit_tool_masked(Arc::clone(&d.tracker), d.home.clone(), true, d.mask.clone()),
         bash_tool(Arc::clone(&d.runner), d.shell.clone(), d.home.clone()),
     ];
     tools.sort_by(|a, b| a.spec().schema.name.cmp(&b.spec().schema.name));

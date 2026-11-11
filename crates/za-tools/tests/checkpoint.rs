@@ -431,7 +431,7 @@ async fn repo_hooks_fsmonitor_filters_not_executed() {
     )
     .await
     .expect("восстановление");
-    assert!(!changed.is_empty());
+    assert!(!changed.changed.is_empty());
     assert_eq!(c.read("a.txt"), b"beta\n");
     let left: Vec<_> = std::fs::read_dir(&markers).unwrap().collect();
     assert!(left.is_empty(), "сработал код репозитория: {left:?}");
@@ -484,7 +484,7 @@ async fn restore_round_trip_exact_bytes() {
     assert_eq!(c.read("big.dat"), big);
     assert_eq!(c.read("untracked.txt"), b"u\r\n");
     assert!(c.project.join("brand-new.txt").exists());
-    assert_eq!(changed.len(), 5, "{changed:?}");
+    assert_eq!(changed.changed.len(), 5, "{changed:?}");
 
     // С --delete-new — удаляются; неизменившиеся файлы не переписываются.
     let changed = within(
@@ -496,7 +496,7 @@ async fn restore_round_trip_exact_bytes() {
     .expect("восстановление");
     assert!(!c.project.join("brand-new.txt").exists());
     assert!(!c.project.join("d/also-new.txt").exists());
-    assert_eq!(changed.len(), 2, "{changed:?}");
+    assert_eq!(changed.changed.len(), 2, "{changed:?}");
     assert_eq!(c.read("crlf.txt"), crlf);
 }
 
@@ -641,7 +641,7 @@ async fn untrusted_or_non_git_uses_files() {
     .expect("восстановление");
     assert_eq!(c.read("a.txt"), b"before\r\n");
     assert!(!c.project.join("new.txt").exists());
-    assert_eq!(changed.len(), 2, "{changed:?}");
+    assert_eq!(changed.changed.len(), 2, "{changed:?}");
     assert_eq!(stub.calls(), 0);
     // Чекпоинт перед восстановлением держит состояние «после».
     within(
@@ -1427,7 +1427,8 @@ fn has(hay: &[u8], needle: &[u8]) -> bool {
 
 /// Фильтр «как у бинарника»: известное значение в байтах файла.
 fn value_filter(value: String) -> SecretFilter {
-    Arc::new(move |b: &[u8]| has(b, value.as_bytes()))
+    let fp = *blake3::hash(value.as_bytes()).as_bytes();
+    SecretFilter::new(fp, move |b: &[u8]| has(b, value.as_bytes()))
 }
 
 /// Все обычные файлы под `dir`.
@@ -1629,7 +1630,7 @@ async fn content_secret_skipped_by_filter() {
     c.write("big.log", &big);
     let calls = Arc::new(AtomicUsize::new(0));
     let (n, v) = (calls.clone(), value.clone());
-    let filter: SecretFilter = Arc::new(move |b: &[u8]| {
+    let filter = SecretFilter::new([7; 32], move |b: &[u8]| {
         n.fetch_add(1, Ordering::SeqCst);
         assert!(
             b.len() as u64 <= SECRET_SCAN_MAX,
@@ -1702,7 +1703,7 @@ async fn restore_leaves_secret_file_alone() {
     assert_eq!(c.read(".env"), b"TOKEN=new\n");
     assert_eq!(c.read("app/.env.local"), b"LOCAL=1\n");
     assert!(!c.project.join("brand-new.txt").exists());
-    assert_eq!(changed.len(), 2, "{changed:?}");
+    assert_eq!(changed.changed.len(), 2, "{changed:?}");
 }
 
 /// Каталог без git (`files::copy`): у секрета состояние `secret` в манифесте, копии нет;
@@ -1763,8 +1764,274 @@ async fn files_snapshot_skips_secret() {
     assert_eq!(c.read(".env"), b"TOKEN=changed\n");
     assert_eq!(c.read("conf.txt"), b"x = changed\n");
     assert_eq!(c.read("app/.env.local"), b"LOCAL=1\n");
-    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert_eq!(changed.changed.len(), 1, "{changed:?}");
     // Повтор по ключу эффекта: готовая копия, тот же признак.
     let again = create(&ck, c.req_edit(&rels, true, run)).await;
     assert_eq!(again.secret_skipped, cp.secret_skipped);
+}
+
+// ---- ревью задачи 2 R1-C2: I1, I2, кэш проверки по содержимому ----
+
+impl Case {
+    /// git над своим репозиторием агента со входом `stdin`.
+    fn ours_in(&self, args: &[&str], stdin: &[u8]) -> String {
+        use std::io::Write;
+        let mut child = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(self.own_repo())
+            .args(args)
+            .current_dir(&self.base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("git не запустился: нужен git в PATH");
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Каталог копии файлов чекпоинта `id`.
+    fn files_dir(&self, id: &str) -> PathBuf {
+        self.home
+            .za_home
+            .join("projects")
+            .join(&self.home.project_id)
+            .join("checkpoints")
+            .join(id)
+    }
+
+    /// Манифест копии файлов «как в R1-C1»: пути `from` переименованы в `to`.
+    fn rename_in_manifest(&self, id: &str, renames: &[(&str, &str)]) {
+        let path = self.files_dir(id).join("manifest.json");
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for f in m["files"].as_array_mut().unwrap() {
+            for (from, to) in renames {
+                if f["path"] == *from {
+                    f["path"] = serde_json::json!(to);
+                }
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+    }
+
+    /// Чекпоинт git «как в R1-C1»: в дереве `cp` путь `from` переименован в `to`, ссылка
+    /// указывает на новый коммит с тем же сообщением.
+    fn rename_in_git_cp(&self, cp: &Checkpoint, from: &str, to: &str) -> Checkpoint {
+        let commit = cp.commit.clone().unwrap();
+        let tree = self.ours(&["ls-tree", "--full-tree", &commit]);
+        let tree = tree.replace(&format!("\t{from}\n"), &format!("\t{to}\n"));
+        let new_tree = self.ours_in(&["mktree"], tree.as_bytes());
+        let raw = self.ours(&["cat-file", "commit", &commit]);
+        let msg = raw.split_once("\n\n").unwrap().1;
+        let new_commit = self.ours_in(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit-tree",
+                new_tree.trim(),
+                "-F",
+                "-",
+            ],
+            msg.as_bytes(),
+        );
+        let new_commit = new_commit.trim().to_owned();
+        let git_ref = cp.git_ref.clone().unwrap();
+        self.ours(&["update-ref", &git_ref, &new_commit]);
+        Checkpoint {
+            commit: Some(new_commit),
+            ..cp.clone()
+        }
+    }
+}
+
+/// I1: копия файлов «как в R1-C1» с `.env` (`file` и `absent`) — восстановление с
+/// `--delete-new` не перезаписывает и не удаляет текущие секретные файлы.
+#[tokio::test]
+async fn files_restore_of_r1c1_manifest_leaves_env() {
+    let c = case("secret-r1c1-files");
+    c.write("env.txt", "TOKEN=old\n");
+    c.write("a.txt", "one\n");
+    let ck = c.ck();
+    let cp = create(
+        &ck,
+        c.req_edit(&["env.txt", "a.txt", "local.txt"], false, RunId::new()),
+    )
+    .await;
+    assert_eq!(cp.kind, checkpoint_kind::FILES, "{cp:?}");
+    c.rename_in_manifest(
+        &cp.id,
+        &[("env.txt", ".env"), ("local.txt", "app/.env.local")],
+    );
+    c.write(".env", "TOKEN=now\n");
+    c.write("app/.env.local", "LOCAL=now\n");
+    c.write("a.txt", "two\n");
+    within(
+        Duration::from_secs(60),
+        "чекпоинт перед восстановлением",
+        backup_before_restore(&ck, &c.root(), &cp, true, false),
+    )
+    .await
+    .expect("чекпоинт «до»");
+    let r = within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &c.root(), &cp, true, false),
+    )
+    .await
+    .expect("восстановление");
+    assert_eq!(c.read("a.txt"), b"one\n");
+    assert_eq!(c.read(".env"), b"TOKEN=now\n");
+    assert_eq!(c.read("app/.env.local"), b"LOCAL=now\n");
+    assert_eq!(r.changed, vec![c.root().join("a.txt")], "{r:?}");
+    assert_eq!(r.secret_untouched, [".env", "app/.env.local"], "{r:?}");
+}
+
+/// Чекпоинт git «как в R1-C1» с блобом `.env` в дереве: восстановление не пишет его
+/// поверх текущего `.env`.
+#[tokio::test]
+async fn git_restore_of_r1c1_tree_leaves_env() {
+    let c = case("secret-r1c1-git");
+    c.init();
+    c.write("env.txt", "TOKEN=old\n");
+    c.write("a.txt", "one\n");
+    let ck = c.ck();
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    let cp = c.rename_in_git_cp(&cp, "env.txt", ".env");
+    std::fs::remove_file(c.project.join("env.txt")).unwrap();
+    c.write(".env", "TOKEN=now\n");
+    c.write("a.txt", "two\n");
+    within(
+        Duration::from_secs(60),
+        "чекпоинт перед восстановлением",
+        backup_before_restore(&ck, &c.root(), &cp, true, true),
+    )
+    .await
+    .expect("чекпоинт «до»");
+    let r = within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &c.root(), &cp, true, true),
+    )
+    .await
+    .expect("восстановление");
+    assert_eq!(c.read("a.txt"), b"one\n");
+    assert_eq!(c.read(".env"), b"TOKEN=now\n");
+    assert_eq!(r.changed, vec![c.root().join("a.txt")], "{r:?}");
+    assert_eq!(r.secret_untouched, [".env"], "{r:?}");
+}
+
+/// I2: файл, который сейчас секрет по содержимому, восстановление не перезаписывает и
+/// (новый) не удаляет — в обеих ветках.
+#[tokio::test]
+async fn content_secret_not_overwritten_by_restore() {
+    for git in [true, false] {
+        let c = case(if git {
+            "secret-now-git"
+        } else {
+            "secret-now-files"
+        });
+        if git {
+            c.init();
+        }
+        let value = secret_value();
+        c.write("config.txt", "level = 1\n");
+        c.write("a.txt", "one\n");
+        let ck = c.ck().with_secret_filter(value_filter(value.clone()));
+        let cp = create(
+            &ck,
+            c.req_edit(&["config.txt", "a.txt", "fresh.txt"], git, RunId::new()),
+        )
+        .await;
+        let want = if git {
+            checkpoint_kind::GIT
+        } else {
+            checkpoint_kind::FILES
+        };
+        assert_eq!(cp.kind, want, "{cp:?}");
+        let now = format!("level = 2\ntoken = {value}\n");
+        c.write("config.txt", &now);
+        c.write("fresh.txt", format!("token = {value}\n"));
+        c.write("a.txt", "two\n");
+        within(
+            Duration::from_secs(60),
+            "чекпоинт перед восстановлением",
+            backup_before_restore(&ck, &c.root(), &cp, true, git),
+        )
+        .await
+        .expect("чекпоинт «до»");
+        let r = within(
+            Duration::from_secs(60),
+            "восстановление",
+            restore(&ck, &c.root(), &cp, true, git),
+        )
+        .await
+        .expect("восстановление");
+        assert_eq!(c.read("a.txt"), b"one\n", "git={git}");
+        assert_eq!(c.read("config.txt"), now.as_bytes(), "git={git}");
+        assert!(c.project.join("fresh.txt").exists(), "git={git}");
+        assert_eq!(r.changed, vec![c.root().join("a.txt")], "git={git}: {r:?}");
+        assert_eq!(
+            r.secret_untouched,
+            ["config.txt", "fresh.txt"],
+            "git={git}: {r:?}"
+        );
+    }
+}
+
+/// Сомнение 2: итог проверки по содержимому кэшируется по stat и отпечатку набора
+/// значений; имя проверяется до кэша; смена отпечатка или файла — новая проверка.
+#[tokio::test]
+async fn content_scan_cached_by_stat_and_fingerprint() {
+    let c = case("secret-scan-cache");
+    c.init();
+    c.write("a.txt", "plain\n");
+    c.write("b.txt", "other\n");
+    c.write(".env", "MODE=dev\n");
+    // Файлы «старые»: кэш не доверяет файлам моложе 2 с (racy).
+    let old = std::time::SystemTime::now() - Duration::from_secs(600);
+    for rel in ["a.txt", "b.txt", ".env"] {
+        let f = std::fs::File::options()
+            .write(true)
+            .open(c.project.join(rel))
+            .unwrap();
+        f.set_modified(old).unwrap();
+    }
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let filter = |fp: u8| {
+        let seen = seen.clone();
+        SecretFilter::new([fp; 32], move |b: &[u8]| {
+            seen.lock().unwrap().push(b.to_vec());
+            false
+        })
+    };
+    let count = |what: &[u8]| seen.lock().unwrap().iter().filter(|b| *b == what).count();
+    let ck = c.ck().with_secret_filter(filter(1));
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    assert_eq!(count(b"plain\n"), 1);
+    // `.env` отсекается по имени: фильтр его не видит.
+    assert_eq!(count(b"MODE=dev\n"), 0);
+    // Тот же stat и отпечаток — итог из кэша.
+    create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(count(b"plain\n"), 1);
+    // Файл изменился — проверка заново.
+    c.write("b.txt", "changed\n");
+    create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(count(b"changed\n"), 1);
+    assert_eq!(count(b"plain\n"), 1);
+    // Другой набор значений (отпечаток) — проверка заново.
+    let ck = ck.with_secret_filter(filter(2));
+    create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(count(b"plain\n"), 2);
 }

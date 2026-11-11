@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use serde_json::Value;
 use za_llm::config::secret_env_name;
@@ -20,6 +19,10 @@ use za_secrets::{EnvStore, MIN_SECRET_LEN, SecretMasker, SecretStore, known_valu
 use za_tools::SecretFilter;
 
 use crate::config::load_config;
+
+/// Версия правил фильтра секретов чекпоинтов (входит в отпечаток: смена правил — новая
+/// проверка файлов).
+const FILTER_RULES_V: &str = "zero-agent checkpoint filter v1 (values, pem)";
 
 /// Секреты, прочитанные из хранилища при старте (D90, 1.15).
 #[derive(Clone, Default)]
@@ -62,13 +65,30 @@ impl StoreSecrets {
     /// [`SecretMasker`] не применяются: ложное срабатывание молча лишило бы файл
     /// чекпоинта и восстановления. Размер файла ограничивает `za-tools`
     /// (`SECRET_SCAN_MAX`).
+    ///
+    /// Отпечаток фильтра — BLAKE3 отсортированного набора значений (с длинами, с меткой
+    /// версии правил PEM): `za-tools` кэширует итог проверки файла, пока отпечаток и stat
+    /// файла те же (ревью задачи 2, сомнение 2). Отпечаток живёт только в памяти.
     pub fn checkpoint_filter(&self) -> SecretFilter {
-        let values: Vec<Vec<u8>> = known_values(self)
+        let mut values: Vec<Vec<u8>> = known_values(self)
             .into_iter()
             .map(|(_, v)| v.into_bytes())
             .collect();
-        Arc::new(move |bytes: &[u8]| {
-            values.iter().any(|v| find(bytes, v).is_some()) || has_private_key_pem(bytes)
+        values.sort();
+        values.dedup();
+        let mut h = blake3::Hasher::new();
+        h.update(FILTER_RULES_V.as_bytes());
+        for v in &values {
+            h.update(&(v.len() as u64).to_le_bytes());
+            h.update(v);
+        }
+        let fingerprint = *h.finalize().as_bytes();
+        let finders: Vec<memchr::memmem::Finder<'static>> = values
+            .iter()
+            .map(|v| memchr::memmem::Finder::new(v).into_owned())
+            .collect();
+        SecretFilter::new(fingerprint, move |bytes: &[u8]| {
+            finders.iter().any(|f| f.find(bytes).is_some()) || has_private_key_pem(bytes)
         })
     }
 
@@ -546,7 +566,7 @@ mod tests {
             "abc abc abc\n".to_owned(),
             String::new(),
         ] {
-            assert!(!f(text.as_bytes()), "{text:?}");
+            assert!(!f.matches(text.as_bytes()), "{text:?}");
         }
         let pem = |label: &str| format!("x\n-----BEGIN {label}-----\nMII\n-----END {label}-----\n");
         for text in [
@@ -556,10 +576,26 @@ mod tests {
             pem(&["OPENSSH PRIVATE", " KEY"].concat()),
             pem(&["ENCRYPTED PRIVATE", " KEY"].concat()),
         ] {
-            assert!(f(text.as_bytes()), "{text:?}");
+            assert!(f.matches(text.as_bytes()), "{text:?}");
         }
         // Без секретов в хранилище — только PEM.
         let none = env(&[]).checkpoint_filter();
-        assert!(!none(format!("v={value}").as_bytes()));
+        assert!(!none.matches(format!("v={value}").as_bytes()));
+    }
+
+    /// Сомнение 2 ревью задачи 2: отпечаток фильтра зависит только от набора значений —
+    /// тот же набор в другом порядке и под другими именами даёт тот же отпечаток, другое
+    /// значение — другой.
+    #[test]
+    fn filter_fingerprint_follows_value_set() {
+        let a = ["zeta", "-fp-", "value-0001"].concat();
+        let b = ["zeta", "-fp-", "value-0002"].concat();
+        let one = env(&[("ZA_SECRET_A", a.as_str()), ("ZA_SECRET_B", b.as_str())]);
+        let same = env(&[("ZA_SECRET_X", b.as_str()), ("ZA_SECRET_Y", a.as_str())]);
+        let other = env(&[("ZA_SECRET_A", a.as_str())]);
+        let fp = one.checkpoint_filter().fingerprint();
+        assert_eq!(fp, same.checkpoint_filter().fingerprint());
+        assert_ne!(fp, other.checkpoint_filter().fingerprint());
+        assert_ne!(fp, env(&[]).checkpoint_filter().fingerprint());
     }
 }

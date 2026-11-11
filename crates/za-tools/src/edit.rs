@@ -16,7 +16,8 @@
 //!    группе и прочим. Файл уже равен `after` — результат маркера; равен `before` —
 //!    правка продолжается (проверку трекера прерванная попытка уже прошла на этом
 //!    содержимом, Ruling 1); иначе — ошибка. Отказ после записи маркера удаляет его,
-//!    если файл не равен `after` (I3).
+//!    если файл не равен `after` (I3). Результат в маркере (diff) до записи на диск
+//!    проходит маску секретов бинарника ([`TextMask`], ревью задачи 2 R1-C2, сомнение 1).
 //! 3. [`ReadTracker`] по каноническому пути: правка только прочитанного и не изменившегося
 //!    файла. Создание нового файла (`old` пуст, файла нет) её пропускает.
 //! 4. Патчер [`crate::patch::apply`], для `multi_edit` — по очереди на копии.
@@ -268,6 +269,11 @@ impl Request {
     }
 }
 
+/// Маска секретов текста (D90): даёт бинарник (`SecretMasker`), `za-tools` от
+/// `za-secrets` не зависит. Применяется к результату правки в маркере повтора до записи
+/// в `ZA_HOME`.
+pub type TextMask = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 /// Маркер повтора (D88): что было до правки, что стало и результат для модели.
 #[derive(Serialize, Deserialize)]
 struct Marker {
@@ -289,16 +295,27 @@ struct EditTool {
     home: AgentHome,
     multi: bool,
     hook: Option<EditHook>,
+    mask: Option<TextMask>,
 }
 
 /// Инструмент `edit(path, old, new, allow_shrink?)`.
 pub fn edit_tool(tracker: Arc<ReadTracker>, home: AgentHome) -> Arc<dyn Tool> {
-    build(tracker, home, false, None)
+    build(tracker, home, false, None, None)
 }
 
 /// Инструмент `multi_edit(path, edits[{old, new}], allow_shrink?)`.
 pub fn multi_edit_tool(tracker: Arc<ReadTracker>, home: AgentHome) -> Arc<dyn Tool> {
-    build(tracker, home, true, None)
+    build(tracker, home, true, None, None)
+}
+
+/// `edit` (`multi = false`) или `multi_edit` с маской секретов маркера повтора.
+pub(crate) fn edit_tool_masked(
+    tracker: Arc<ReadTracker>,
+    home: AgentHome,
+    multi: bool,
+    mask: Option<TextMask>,
+) -> Arc<dyn Tool> {
+    build(tracker, home, multi, None, mask)
 }
 
 /// [`edit_tool`] с крюком сбоя. Только для тестов (m12), как `CrashHook` и `FaultHook`.
@@ -307,7 +324,7 @@ pub fn edit_tool_with_hook(
     home: AgentHome,
     hook: EditHook,
 ) -> Arc<dyn Tool> {
-    build(tracker, home, false, Some(hook))
+    build(tracker, home, false, Some(hook), None)
 }
 
 /// [`multi_edit_tool`] с крюком сбоя. Только для тестов (m12).
@@ -316,7 +333,7 @@ pub fn multi_edit_tool_with_hook(
     home: AgentHome,
     hook: EditHook,
 ) -> Arc<dyn Tool> {
-    build(tracker, home, true, Some(hook))
+    build(tracker, home, true, Some(hook), None)
 }
 
 fn build(
@@ -324,6 +341,7 @@ fn build(
     home: AgentHome,
     multi: bool,
     hook: Option<EditHook>,
+    mask: Option<TextMask>,
 ) -> Arc<dyn Tool> {
     let path =
         json!({ "type": "string", "description": "File path, relative to the project root" });
@@ -402,6 +420,7 @@ fn build(
         home,
         multi,
         hook,
+        mask,
     })
 }
 
@@ -414,6 +433,7 @@ impl Tool for EditTool {
         let tracker = self.tracker.clone();
         let home = self.home.clone();
         let hook = self.hook.clone();
+        let mask = self.mask.clone();
         let multi = self.multi;
         Box::pin(async move {
             let args_hash = blake3::hash(args.to_string().as_bytes())
@@ -436,6 +456,7 @@ impl Tool for EditTool {
                 tracker,
                 home,
                 hook,
+                mask,
                 cancel: Arc::default(),
             };
             // Бросок future (тайм-аут вызова) останавливает нечёткий поиск в
@@ -533,6 +554,8 @@ struct Job {
     tracker: Arc<ReadTracker>,
     home: AgentHome,
     hook: Option<EditHook>,
+    /// Маска секретов результата в маркере.
+    mask: Option<TextMask>,
     /// Отмена вызова: ставится при броске future.
     cancel: Arc<AtomicBool>,
 }
@@ -701,13 +724,19 @@ impl Job {
         if self.crash(EditPoint::BeforeWrite, &r.path) {
             return ToolOutput::error(INTERRUPTED);
         }
+        // Diff в маркере — только маскированный: маркер лежит в `ZA_HOME` (сомнение 1).
+        let mut stored = output.clone();
+        if let Some(m) = &self.mask {
+            stored.content = m(&stored.content);
+            stored.digest = stored.digest.map(|d| m(&d));
+        }
         let marker = Marker {
             v: MARKER_V,
             path: r.path.clone(),
             args: self.args_hash.clone(),
             before: before.hash.clone(),
             after: after_hash.clone(),
-            output: output.clone(),
+            output: stored,
         };
         let target = Target {
             root: &root,

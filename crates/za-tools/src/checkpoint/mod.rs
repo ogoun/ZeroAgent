@@ -30,8 +30,11 @@
 //! **Секреты** (R1-C2 D103): файл с именем секрета ([`secret_name`]) или до
 //! [`SECRET_SCAN_MAX`] байт, в котором фильтр бинарника ([`SecretFilter`]) нашёл секрет, в
 //! чекпоинт не входит ни в git, ни в копию файлов: трейлер `zero-agent-skipped-secret:` в
-//! сообщении коммита, состояние `secret` в манифесте. Восстановление такие файлы не трогает
-//! и не удаляет. Затронутые вызовом секретные файлы — в [`Checkpoint::secret_skipped`].
+//! сообщении коммита, состояние `secret` в манифесте. Затронутые вызовом секретные файлы —
+//! в [`Checkpoint::secret_skipped`]. Восстановление не трогает и не удаляет ни их, ни
+//! файл, который секрет сейчас (по имени или по содержимому, ревью задачи 2: I1, I2), в
+//! том числе по чекпоинту R1-C1 с таким файлом; такие пути — в [`Restored::secret_untouched`].
+//! Итог проверки по содержимому кэшируется в памяти (модуль `secret`).
 //!
 //! **Восстановление** ([`restore`]) — только по чекпоинту, найденному для этого проекта, и
 //! только после успешного чекпоинта «до» ([`backup_before_restore`], I1): git — если
@@ -46,6 +49,7 @@
 mod files;
 mod git;
 mod home;
+mod secret;
 mod write;
 
 use std::collections::HashSet;
@@ -70,70 +74,17 @@ pub const CHECKPOINT_REF_PREFIX: &str = "refs/zero-agent/checkpoints";
 pub const CHECKPOINT_MAX_FILE: u64 = 64 << 20;
 /// Сколько новых байт (хэшируемых git или копируемых) самое большее на один чекпоинт (I3).
 pub const CHECKPOINT_MAX_TOTAL: u64 = 1 << 30;
-/// Файл до этого размера проверяется [`SecretFilter`] (D103); крупнее — только по имени.
-pub const SECRET_SCAN_MAX: u64 = 1 << 20;
+use secret::SecretScan;
+pub use secret::{SECRET_SCAN_MAX, SecretFilter, secret_name};
 
-/// Признак секрета в содержимом файла (D103): `true` — файл в чекпоинт не входит. Даёт
-/// бинарник (известные значения хранилища и блок PEM); `za-tools` от `za-secrets` не
-/// зависит. Вызывается только для файлов до [`SECRET_SCAN_MAX`] байт.
-pub type SecretFilter = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
-
-/// Имя секретного файла (D103) — по последнему компоненту пути (`/` или `\`), без учёта
-/// регистра: `.env` и `.env.*` (кроме `.env.example`, `.env.sample`, `.env.template`,
-/// `.env.dist`), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.kdbx`,
-/// закрытые ключи SSH без `.pub`, `.netrc`, `_netrc`, `.npmrc`, `.pypirc`,
-/// `.git-credentials`.
-pub fn secret_name(rel: &str) -> bool {
-    let last = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
-    let name = last.to_ascii_lowercase();
-    if name == ".env" {
-        return true;
-    }
-    if name.starts_with(".env.") {
-        return !matches!(
-            name.as_str(),
-            ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
-        );
-    }
-    const EXT: [&str; 7] = [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".kdbx"];
-    const EXACT: [&str; 9] = [
-        "id_rsa",
-        "id_dsa",
-        "id_ecdsa",
-        "id_ed25519",
-        ".netrc",
-        "_netrc",
-        ".npmrc",
-        ".pypirc",
-        ".git-credentials",
-    ];
-    EXT.iter().any(|e| name.ends_with(e)) || EXACT.contains(&name.as_str())
-}
-
-/// Секрет ли файл `abs` (имя `rel`) размера `size`: по имени, затем фильтром по
-/// содержимому (до [`SECRET_SCAN_MAX`] байт). Файл не прочитан — не секрет: его
-/// содержимое не попадёт и в чекпоинт.
-pub(crate) fn is_secret(rel: &str, abs: &Path, size: u64, filter: Option<&SecretFilter>) -> bool {
-    if secret_name(rel) {
-        return true;
-    }
-    let Some(f) = filter else {
-        return false;
-    };
-    if size > SECRET_SCAN_MAX {
-        return false;
-    }
-    let mut buf = Vec::new();
-    let read = std::fs::File::open(abs).and_then(|file| {
-        io::Read::read_to_end(&mut io::Read::take(file, SECRET_SCAN_MAX), &mut buf)
-    });
-    match read {
-        Ok(_) => f(&buf),
-        Err(e) => {
-            tracing::debug!(path = %rel, error = %e, "файл не прочитан фильтром секретов");
-            false
-        }
-    }
+/// Итог восстановления: изменённые (записанные и удалённые) пути и пути, которые
+/// восстановление не тронуло как секрет (D103; ревью задачи 2: I1, I2) — по записи
+/// чекпоинта, по имени или по содержимому сейчас. Пути — от корня проекта через `/`, по
+/// возрастанию, без повторов.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restored {
+    pub changed: Vec<PathBuf>,
+    pub secret_untouched: Vec<String>,
 }
 
 /// Предел чекпоинта «до» и вызовов git при восстановлении (команда пользователя).
@@ -178,8 +129,8 @@ pub struct GitCheckpointer {
     slow: Arc<Mutex<HashSet<RunId>>>,
     /// Чекпоинты одного процесса идут по одному: общий кэш stat и каталоги run.
     lock: Arc<tokio::sync::Mutex<()>>,
-    /// Фильтр секретов по содержимому (D103); `None` — только по имени.
-    secret: Option<SecretFilter>,
+    /// Проверка секретов (D103): имя и фильтр по содержимому с кэшем итогов.
+    scan: SecretScan,
 }
 
 impl std::fmt::Debug for GitCheckpointer {
@@ -210,13 +161,13 @@ impl GitCheckpointer {
             create_timeout: CHECKPOINT_TIMEOUT,
             slow: Arc::new(Mutex::new(HashSet::new())),
             lock: Arc::new(tokio::sync::Mutex::new(())),
-            secret: None,
+            scan: SecretScan::default(),
         }
     }
 
     /// Фильтр секретов по содержимому (D103): и для чекпоинта git, и для копии файлов.
     pub fn with_secret_filter(mut self, f: SecretFilter) -> Self {
-        self.secret = Some(f);
+        self.scan = SecretScan::new(Some(f));
         self
     }
 
@@ -394,8 +345,8 @@ impl GitCheckpointer {
         let home = self.home.clone();
         let req = req.clone();
         let stem2 = stem.to_owned();
-        let filter = self.secret.clone();
-        match blocking(move || files::copy(&home, &req, &stem2, strict, filter.as_ref())).await {
+        let scan = self.scan.clone();
+        match blocking(move || files::copy(&home, &req, &stem2, strict, &scan)).await {
             Ok(secret_skipped) => Checkpoint {
                 secret_skipped,
                 ..files_cp(id)
@@ -420,7 +371,7 @@ impl GitCheckpointer {
             self.base_env.clone(),
             timeout,
             self.max_total,
-            self.secret.clone(),
+            self.scan.clone(),
         )
     }
 
@@ -562,7 +513,8 @@ pub async fn backup_before_restore(
         }
         checkpoint_kind::FILES => {
             let (home, cid) = (ck.home.clone(), cp.id.clone());
-            let rels = blocking(move || files::paths(&home, &cid)).await?;
+            let (top, scan) = (project.to_path_buf(), ck.scan.clone());
+            let rels = blocking(move || files::paths(&home, &cid, &top, &scan)).await?;
             rels.iter().map(|rel| join_rel(project, rel)).collect()
         }
         _ => return Err(RestoreError::NotFound(cp.id.clone())),
@@ -582,15 +534,16 @@ pub async fn backup_before_restore(
 }
 
 /// Восстанавливает рабочую копию проекта `project` (канонический корень) по чекпоинту
-/// `cp`. Возвращает изменённые (записанные и удалённые) пути. Чекпоинт git — только
-/// `trusted` (I2). Чекпоинт «до» делает вызывающий ([`backup_before_restore`]).
+/// `cp`. Возвращает изменённые (записанные и удалённые) пути и пути, не тронутые как
+/// секрет ([`Restored`]). Чекпоинт git — только `trusted` (I2). Чекпоинт «до» делает
+/// вызывающий ([`backup_before_restore`]).
 pub async fn restore(
     ck: &GitCheckpointer,
     project: &Path,
     cp: &Checkpoint,
     delete_new: bool,
     trusted: bool,
-) -> Result<Vec<PathBuf>, RestoreError> {
+) -> Result<Restored, RestoreError> {
     let _one = ck.lock.lock().await;
     let roots = {
         let (p, h) = (project.to_path_buf(), ck.home.za_home.clone());
@@ -602,9 +555,8 @@ pub async fn restore(
             s.restore(&repo, roots, &commit, delete_new).await
         }
         checkpoint_kind::FILES => {
-            let home = ck.home.clone();
-            let id = cp.id.clone();
-            blocking(move || Ok(files::restore(&home, &roots, &id, delete_new))).await?
+            let (home, id, scan) = (ck.home.clone(), cp.id.clone(), ck.scan.clone());
+            blocking(move || Ok(files::restore(&home, &roots, &id, delete_new, &scan))).await?
         }
         _ => Err(RestoreError::NotFound(cp.id.clone())),
     }

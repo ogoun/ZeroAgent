@@ -1090,6 +1090,11 @@ fn deps(
         tracker: ReadTracker::new(),
         shell: shell(),
         home: agent_home.clone(),
+        // Маркер повтора правки в `ZA_HOME` — с маскированным diff (ревью задачи 2 R1-C2).
+        mask: Some({
+            let m = masker.clone();
+            Arc::new(move |s: &str| m.mask(s).into_owned())
+        }),
     })];
     // D103: секретные файлы (имя, известные значения, PEM) в чекпоинты не входят.
     let mut checkpointer =

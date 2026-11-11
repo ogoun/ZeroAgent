@@ -32,6 +32,8 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 blake3.workspace = true
+# Поиск известных значений фильтром секретов чекпоинтов (D103).
+memchr.workspace = true
 # Дата `<env>` первого сообщения run (`YYYY-MM-DD` по UTC, D24).
 jiff.workspace = true
 thiserror.workspace = true
