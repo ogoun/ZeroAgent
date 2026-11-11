@@ -14,7 +14,7 @@ use za_llm::{Effort, ReasoningMode};
 use za_protocol::{RunId, RunRole, Tier};
 
 /// Версия набора промптов; входит в `FrozenPrefix` и `model.request` (PRM-010).
-pub const PROMPT_VERSION: &str = "r1b.2";
+pub const PROMPT_VERSION: &str = "r1c1.1";
 
 /// Лимит блока `<env>`, токены (PRM-002: «top small ≤ 800 + `<env>` ≤ 200»).
 pub const ENV_LIMIT: u32 = 200;
@@ -154,6 +154,7 @@ pub fn runtime_texts() -> Vec<(&'static str, String)> {
         .iter()
         .map(|(n, t)| (*n, (*t).to_owned()))
         .chain(crate::context::compact_text_samples())
+        .chain(crate::policy::text_samples())
         .chain(crate::tools::text_samples())
         .chain(crate::turn::text_samples())
         .collect();

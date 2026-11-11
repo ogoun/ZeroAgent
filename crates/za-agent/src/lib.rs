@@ -21,7 +21,8 @@
 //! повтора, цикла и застоя [`DetectorState`] (D54–D56), повтора текста и бесконечного
 //! рассуждения в стриме [`StreamWatch`] (D58, D59), обещания без действия
 //! [`promise_without_action`], ошибок инструмента, порчи JSON и падения кэша (D57,
-//! D60–D62). Модель
+//! D60–D62), движок политики [`decide`] (правила, гранты [`Grant`], защищённые пути,
+//! доверие и метка `tainted`, R1-C1 D77–D83). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod budget;
@@ -33,6 +34,7 @@ mod driver;
 mod exit;
 mod inspect;
 mod memory;
+mod policy;
 mod prompt;
 mod request;
 mod resume;
@@ -66,6 +68,11 @@ pub use driver::{
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 pub use inspect::{BlockCost, InspectError, Inspection, RunMetrics, inspect, run_metrics};
 pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};
+pub use policy::{
+    Decision, Grant, GrantConfig, GrantMode, GrantSource, PolicyConfig, PolicyCx, PolicyError,
+    PolicySnapshot, Rule, RuleAction, RuleSource, covers, decide, grants_text, parse_grant_flag,
+    subject_paths,
+};
 pub use prompt::{
     AGENTS_MD_LIMIT, BRANCH_MAX_CHARS, BudgetCase, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo,
     LEFT_ANGLES, MODE_LIMIT, PROMPT_VERSION, RIGHT_ANGLES, TaskBlock, WorkMode, agents_md_budget,

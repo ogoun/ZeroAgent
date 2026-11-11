@@ -377,7 +377,7 @@ fn unknown_tool_text(name: &str) -> String {
 }
 
 /// Результат вызова, запрещённого режимом run (D14).
-fn denied_text(reason: &str) -> String {
+pub(crate) fn denied_text(reason: &str) -> String {
     format!("denied: {reason}")
 }
 

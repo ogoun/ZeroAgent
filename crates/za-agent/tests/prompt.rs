@@ -56,7 +56,7 @@ fn texts_match_appendix() {
             assert!(!text.contains("\n\n"), "{name}");
         }
     }
-    assert_eq!(PROMPT_VERSION, "r1b.2");
+    assert_eq!(PROMPT_VERSION, "r1c1.1");
 }
 
 /// Окно байтов «4 ASCII-цифры, '-', 2 ASCII-цифры» (дата вида 2026-11).

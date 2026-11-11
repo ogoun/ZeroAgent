@@ -604,16 +604,27 @@ pub fn resolve(roots: &Roots, lex: &LexPath, access: Access) -> Result<ResolvedP
     let _drives = DriveScope::enter();
     let path = canonical_prefix(lex.as_path())?;
     let inside = within(&roots.project, &path);
-    let za = roots.project.join(ZA_DIR);
-    let fold = cfg!(windows);
-    let protected_place = within_with(&roots.za_home, &path, fold)
-        || (within_with(&za, &path, fold) && !within(&za.join(WORK), &path))
-        || within_with(&roots.project.join(GIT_DIR), &path, fold);
+    let protected = access == Access::Write && protected_place(roots, &path);
     Ok(ResolvedPath {
         path,
         inside,
-        protected: access == Access::Write && protected_place,
+        protected,
     })
+}
+
+/// Канонический путь `p` лежит в защищённом месте D79: `ZA_HOME`, `<project>/.zero-agent/`
+/// кроме `.zero-agent/work/`, `<project>/.git/`. Чистая функция; на Windows без учёта
+/// регистра (ошибка — в безопасную сторону). Её же повторно применяет политика (D80).
+pub fn protected_place(roots: &Roots, p: &Path) -> bool {
+    let za = roots.project.join(ZA_DIR);
+    in_za_home(roots, p)
+        || (within_with(&za, p, cfg!(windows)) && !within(&za.join(WORK), p))
+        || within_with(&roots.project.join(GIT_DIR), p, cfg!(windows))
+}
+
+/// Канонический путь `p` лежит в `ZA_HOME` агента; на Windows без учёта регистра.
+pub fn in_za_home(roots: &Roots, p: &Path) -> bool {
+    within_with(&roots.za_home, p, cfg!(windows))
 }
 
 /// Компоненты равны: буква диска (`\\?\C:` ≡ `C:`) — без учёта ASCII-регистра, прочее —
