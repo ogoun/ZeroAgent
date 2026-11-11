@@ -282,7 +282,7 @@ struct RunCli {
     /// Ввод пользователя для продолжаемого run.
     #[arg(long, requires = "resume")]
     input: Option<String>,
-    /// Аварийно завершить процесс: `after-delta:N` (тесты, D33).
+    /// Аварийно завершить процесс: `after-delta:N` или `in-tool:N` (тесты, D33, D92).
     #[arg(long, hide = true, value_parser = parse_run_crash)]
     crash_at: Option<RunCrash>,
     /// Текст задачи.

@@ -130,22 +130,45 @@ pub enum RunError {
     AuditAnchor { seq: u64 },
 }
 
-/// Точка аварийного завершения `--crash-at` (D33).
+/// Точка аварийного завершения `--crash-at` (D33; только для тестов).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunCrash {
     /// `std::process::abort()` на первом `model.delta` хода N (ходы с 1).
     AfterDelta(u32),
+    /// `std::process::abort()` внутри слота вызова инструмента шага N (шаги с 1) после
+    /// самого вызова: `tool.started` и чекпоинт записаны, инструмент отработал,
+    /// квитанции и `tool.finished` нет (R1-C1 D92, `CrashPoint::InTool`). Resume видит
+    /// намерение без квитанции: класс `NonIdempotent` даёт прерывание `unk-…`.
+    InTool(u64),
 }
 
-/// Разбор `--crash-at after-delta:N`.
+/// Разбор `--crash-at after-delta:N` и `--crash-at in-tool:N`.
 pub fn parse_run_crash(s: &str) -> Result<RunCrash, String> {
-    let bad = || format!("ожидается after-delta:N, получено {s:?}");
+    let bad = || format!("ожидается after-delta:N или in-tool:N, получено {s:?}");
     let (kind, n) = s.split_once(':').ok_or_else(bad)?;
     let n: u32 = n.trim().parse().map_err(|_| bad())?;
     match kind.trim() {
         "after-delta" if n >= 1 => Ok(RunCrash::AfterDelta(n)),
+        "in-tool" if n >= 1 => Ok(RunCrash::InTool(u64::from(n))),
         _ => Err(bad()),
     }
+}
+
+/// Крюк сбоя цикла для `--crash-at in-tool:N`: настоящее аварийное завершение процесса
+/// (эквивалент `kill -9`) в точке `CrashPoint::InTool { step: N, after_call: true }`.
+fn crash_hook(crash: Option<RunCrash>) -> Option<za_agent::CrashHook> {
+    let Some(RunCrash::InTool(step)) = crash else {
+        return None;
+    };
+    Some(Arc::new(move |p| {
+        if p == (za_agent::CrashPoint::InTool {
+            step,
+            after_call: true,
+        }) {
+            std::process::abort();
+        }
+        false
+    }))
 }
 
 /// Аргументы нового run.
@@ -874,7 +897,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 trusted: prep.trusted,
                 grants: prep.grants.clone(),
             };
-            let (deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
+            let (mut deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
+            deps.crash = crash_hook(args.crash);
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
             let outcome = drive(&bus, fut, &ctl, args.crash, masker.clone()).await;
@@ -911,7 +935,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             } else {
                 None
             };
-            let (deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
+            let (mut deps, bus) = deps(&store, &gateway, tools, &masker, &prep);
+            deps.crash = crash_hook(args.crash);
             // Новый канал управления на каждый resume: `start_run` и `resume_run` забирают
             // `ControlRx`, а Ctrl+C управляет этим `RunControl` (Carry M2 задачи 12).
             let (ctl, rx) = control_channel(store.clone(), r.run);
@@ -1634,6 +1659,8 @@ mod tests {
         assert!(parse_run_crash("after-delta:0").is_err());
         assert!(parse_run_crash("after-delta").is_err());
         assert!(parse_run_crash("intent:1").is_err());
+        assert_eq!(parse_run_crash("in-tool:3"), Ok(RunCrash::InTool(3)));
+        assert!(parse_run_crash("in-tool:0").is_err());
     }
 
     #[test]

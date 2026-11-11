@@ -252,6 +252,19 @@ pub fn call_reply_with(id: &str, name: &str, args: &str, u: Spend) -> Response {
     sse_reply(body)
 }
 
+/// Ответ пакетом вызовов `(id, name, args)` (аргументы — JSON-текст) в одном ходе.
+pub fn calls_reply(calls: &[(String, String, String)]) -> Response {
+    let mut body = chunk(json!({"role": "assistant", "content": null}));
+    for (i, (id, name, args)) in calls.iter().enumerate() {
+        body.push_str(&chunk(
+            json!({"tool_calls": [{"index": i, "id": id, "type": "function",
+            "function": {"name": name, "arguments": args}}]}),
+        ));
+    }
+    body.push_str(&tail("tool_calls"));
+    sse_reply(body)
+}
+
 /// Тело SSE: части с паузами перед ними.
 pub struct PacedBody {
     pub parts: Vec<(Duration, Bytes)>,
