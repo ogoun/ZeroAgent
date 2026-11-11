@@ -10,6 +10,7 @@
 //! - `--newpgrp` — Unix: потомок уходит в свою группу (`setpgid`, как GNU `timeout`);
 //! - `--exit C` — код выхода (после ожидания потомка);
 //! - `--spam BYTES` — напечатать BYTES байт `x` в stdout и выйти;
+//! - `--cat` — скопировать stdin в stdout байт в байт и выйти;
 //! - `--runner FILE` — стать родителем: через `DirectRunner` запустить себя с остальными
 //!   флагами и записью реестра групп `FILE`, ждать без конца.
 
@@ -31,6 +32,7 @@ struct Args {
     newpgrp: bool,
     exit: u8,
     spam: Option<usize>,
+    cat: bool,
     pid_file: Option<PathBuf>,
     runner: Option<PathBuf>,
 }
@@ -43,6 +45,7 @@ fn parse() -> Result<Args, String> {
         match flag.as_str() {
             "--depth" => a.depth = value()?.parse().map_err(|e| format!("--depth: {e}"))?,
             "--hold" => a.hold = true,
+            "--cat" => a.cat = true,
             "--background" => a.background = true,
             "--newpgrp" => a.newpgrp = true,
             "--exit" => a.exit = value()?.parse().map_err(|e| format!("--exit: {e}"))?,
@@ -158,6 +161,12 @@ fn real_main() -> Result<ExitCode, String> {
     let a = parse()?;
     if let Some(leftover) = a.runner.clone() {
         return run_as_runner(&a, leftover);
+    }
+    if a.cat {
+        let mut out = std::io::stdout().lock();
+        std::io::copy(&mut std::io::stdin().lock(), &mut out).map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+        return Ok(ExitCode::SUCCESS);
     }
     if let Some(n) = a.spam {
         let mut out = std::io::stdout().lock();

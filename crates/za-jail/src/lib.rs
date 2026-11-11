@@ -71,6 +71,14 @@ pub struct CommandSpec {
     pub leftover: Option<Leftover>,
     /// Для тестов: окружение-основа вместо std::env::vars_os().
     pub base_env: Option<Vec<(OsString, OsString)>>,
+    /// Байты на stdin процесса; после них stdin закрывается. `None` — stdin пуст
+    /// (`Stdio::null`). Чекпоинты git (R1-C1 D89): `--stdin-paths`, `--index-info`,
+    /// `cat-file --batch`.
+    pub stdin: Option<Vec<u8>>,
+    /// Вернуть stdout сырыми байтами ([`Output::stdout_raw`]) без декодирования и
+    /// нормализации `\r\n`; `Output::stdout` тогда пуст. Чекпоинты git: пути `-z` и
+    /// содержимое объектов — байты как есть.
+    pub raw_stdout: bool,
 }
 
 /// Значения окружения не печатаются: `env_set` — канал секретов инструменту (SEC-041,
@@ -94,13 +102,15 @@ impl std::fmt::Debug for CommandSpec {
             .field("capture_limit", &self.capture_limit)
             .field("leftover", &self.leftover)
             .field("base_env", &self.base_env.as_ref().map(|b| b.len()))
+            .field("stdin", &self.stdin.as_ref().map(|b| b.len()))
+            .field("raw_stdout", &self.raw_stdout)
             .finish()
     }
 }
 
 impl CommandSpec {
     /// Спецификация с умолчаниями: `EnvMode::Inherit`, без доп. переменных, тайм-аут
-    /// `timeout`, предел [`CAPTURE_LIMIT`].
+    /// `timeout`, предел [`CAPTURE_LIMIT`], пустой stdin, вывод декодируется.
     pub fn new(program: impl Into<PathBuf>, cwd: impl Into<PathBuf>, timeout: Duration) -> Self {
         Self {
             program: program.into(),
@@ -114,6 +124,8 @@ impl CommandSpec {
             capture_limit: CAPTURE_LIMIT,
             leftover: None,
             base_env: None,
+            stdin: None,
+            raw_stdout: false,
         }
     }
 }
@@ -133,8 +145,12 @@ pub enum Exit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub exit: Exit,
-    /// Вывод: `from_utf8_lossy`, `\r\n` → `\n`, не длиннее `capture_limit` байт.
+    /// Вывод: `from_utf8_lossy`, `\r\n` → `\n`, не длиннее `capture_limit` байт. При
+    /// `CommandSpec::raw_stdout` — пусто, байты — в [`Output::stdout_raw`].
     pub stdout: String,
+    /// stdout как есть (не длиннее `capture_limit` байт) — только при
+    /// `CommandSpec::raw_stdout`.
+    pub stdout_raw: Option<Vec<u8>>,
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,

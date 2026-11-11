@@ -27,8 +27,11 @@ serde.workspace = true
 serde_json.workspace = true
 # Унифицированный diff результата и сходство участков у `edit` (D88).
 similar.workspace = true
-# `rt` — `spawn_blocking`: вся работа с ФС идёт вне потоков tokio.
-tokio = { workspace = true, features = ["rt"] }
+# Ошибки восстановления чекпоинта (`RestoreError`).
+thiserror.workspace = true
+# `rt` — `spawn_blocking`: вся работа с ФС идёт вне потоков tokio; `time` — предел
+# чекпоинта, `sync` — чекпоинты одного процесса по одному (D89).
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
 tracing.workspace = true
 
 # Только Unix: `geteuid` — владелец файла правки и каталога маркеров (I2, m11 задачи 7).
@@ -36,4 +39,5 @@ tracing.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# `test-util` — тест предела чекпоинта на остановленных часах (`start_paused`).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }

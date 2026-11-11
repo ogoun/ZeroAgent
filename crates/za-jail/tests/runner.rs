@@ -385,6 +385,32 @@ async fn capture_is_capped() {
     assert!(out.stdout_truncated && !out.stderr_truncated);
 }
 
+/// stdin доходит до процесса целиком (больше буфера канала, без взаимной блокировки с
+/// чтением вывода), а `raw_stdout` возвращает байты как есть: `\r\n` и не-UTF-8 не
+/// трогаются (чекпоинты git, R1-C1 D89).
+#[tokio::test(flavor = "multi_thread")]
+async fn stdin_and_raw_stdout_are_exact_bytes() {
+    let project = dir("stdin-raw");
+    let mut data = b"a\r\nb\n\xff\xfe\x00z".to_vec();
+    data.extend(std::iter::repeat_n(b'q', 3 * 1024 * 1024));
+    let mut s = spec(&project, &["--cat"], scaled(Duration::from_secs(60)));
+    s.stdin = Some(data.clone());
+    s.raw_stdout = true;
+    let out = within(Duration::from_secs(60), "cat 3 МиБ", DirectRunner.run(s))
+        .await
+        .expect("запуск");
+    assert_eq!(out.exit, Exit::Code(0));
+    assert!(out.stdout.is_empty(), "текст не декодируется");
+    assert_eq!(out.stdout_raw.as_deref(), Some(data.as_slice()));
+    // Без `raw_stdout` — прежнее декодирование, сырых байт нет.
+    let mut s = spec(&project, &["--cat"], scaled(Duration::from_secs(60)));
+    s.stdin = Some(b"x\r\ny".to_vec());
+    let out = within(Duration::from_secs(60), "cat", DirectRunner.run(s))
+        .await
+        .expect("запуск");
+    assert_eq!((out.stdout.as_str(), out.stdout_raw), ("x\ny", None));
+}
+
 // ---- Декодирование вывода (Windows) ----
 
 /// Вывод `cmd /u` — UTF-16LE без BOM.

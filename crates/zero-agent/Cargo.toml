@@ -17,6 +17,9 @@ za-llm = { path = "../za-llm" }
 za-res = { path = "../za-res" }
 # Цикл агента: команды `run` и `answer` (R1-B1).
 za-agent = { path = "../za-agent" }
+# Чекпоинты рабочей копии: `checkpoints list|restore` (R1-C1 D89), git — через `za-jail`.
+za-tools = { path = "../za-tools" }
+za-jail = { path = "../za-jail" }
 clap.workspace = true
 # `macros` — `join!` проверок doctor и `select!` команды `run`, `time` — ожидание зондов и
 # `resources --watch`, `signal` — Ctrl+C команды `run` (пауза, второй — выход).

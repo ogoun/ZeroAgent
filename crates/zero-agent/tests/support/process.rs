@@ -42,6 +42,9 @@ mod unique;
 /// Чистый каталог теста `<CARGO_TARGET_TMPDIR>/<group>/<name>-<pid>-<n>` — общий помощник
 /// workspace (`test-support/unique_dir.rs`).
 pub use unique::unique_dir;
+/// Чистый каталог `<root>/<name>-<pid>-<n>` (git-репозитории тестов в `.tmp/r1c1-git`).
+#[allow(unused_imports)]
+pub use unique::unique_dir_in;
 
 /// Чистые `ZA_HOME` и каталог проекта в [`unique_dir`]; `config` — текст `config.toml`
 /// (пустой — без файла).

@@ -27,8 +27,14 @@
 //! код выхода — данные, ошибка — только сбой запуска и тайм-аут. Предметы вызова — разбор
 //! [`za_core::shell`]; решение принимает политика. Сжатие вывода по типу — [`digest()`]
 //! (D86).
+//!
+//! Чекпоинты рабочей копии ([`GitCheckpointer`], [`restore`], D89): git plumbing без
+//! хуков, fsmonitor и фильтров со своим индексом и скрытой ссылкой
+//! [`CHECKPOINT_REF_PREFIX`], без git и в недоверенном проекте — копия затронутых файлов
+//! в `ZA_HOME`; восстановление — только внутри проекта, без следования ссылкам.
 
 mod bash;
+mod checkpoint;
 mod digest;
 mod edit;
 mod fs;
@@ -43,6 +49,10 @@ mod unique_dir;
 
 pub use bash::{
     BASH_DEFAULT_TIMEOUT_S, BASH_MAX_TIMEOUT_S, Shell, bash_tool, format_output, powershell_encoded,
+};
+pub use checkpoint::{
+    CHECKPOINT_REF_PREFIX, CHECKPOINT_TIMEOUT, GitCheckpointer, RestoreError,
+    backup_before_restore, restore,
 };
 pub use digest::digest;
 pub use edit::{

@@ -7,7 +7,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Instant, sleep_until};
 
 use crate::{BoxFuture, CommandSpec, Exit, KILL_GRACE, Output, Runner, RunnerError, child_env};
@@ -63,6 +63,8 @@ enum Event {
     Exited(std::io::Result<ExitStatus>),
     OutDone,
     ErrDone,
+    /// stdin записан и закрыт (или процесс закрыл его раньше).
+    InDone,
     Deadline,
     Drain,
 }
@@ -70,17 +72,25 @@ enum Event {
 async fn run(spec: CommandSpec) -> Result<Output, RunnerError> {
     let started = Instant::now();
     let limit = spec.capture_limit;
-    let raw = run_raw(spec).await?;
-    let oem = if crate::decode::needs_code_page(&raw.out.buf)
+    let keep_raw = spec.raw_stdout;
+    let mut raw = run_raw(spec).await?;
+    let out_text = (!keep_raw).then_some(raw.out.buf.as_slice());
+    let oem = if out_text.is_some_and(crate::decode::needs_code_page)
         || crate::decode::needs_code_page(&raw.err.buf)
     {
         console_code_page().await
     } else {
         None
     };
+    let (stdout, stdout_raw) = if keep_raw {
+        (String::new(), Some(std::mem::take(&mut raw.out.buf)))
+    } else {
+        (crate::decode::decode(&raw.out.buf, limit, oem), None)
+    };
     Ok(Output {
         exit: raw.exit,
-        stdout: crate::decode::decode(&raw.out.buf, limit, oem),
+        stdout,
+        stdout_raw,
         stderr: crate::decode::decode(&raw.err.buf, limit, oem),
         stdout_truncated: raw.out.truncated,
         stderr_truncated: raw.err.truncated,
@@ -131,7 +141,11 @@ async fn run_raw(spec: CommandSpec) -> Result<Raw, RunnerError> {
             .current_dir(&spec.cwd)
             .env_clear()
             .envs(env)
-            .stdin(Stdio::null())
+            .stdin(if spec.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
     });
@@ -180,6 +194,7 @@ async fn run_raw(spec: CommandSpec) -> Result<Raw, RunnerError> {
 
     let stdout = child.stdout().take();
     let stderr = child.stderr().take();
+    let stdin = child.stdin().take().zip(spec.stdin.clone());
     let mut out = Capture::default();
     let mut err = Capture::default();
     let deadline = started
@@ -192,6 +207,8 @@ async fn run_raw(spec: CommandSpec) -> Result<Raw, RunnerError> {
     {
         let mut out_fut = pin!(read_capped(stdout, spec.capture_limit, &mut out));
         let mut err_fut = pin!(read_capped(stderr, spec.capture_limit, &mut err));
+        let mut in_fut = pin!(write_stdin(stdin));
+        let mut in_done = false;
         let (mut out_done, mut err_done) = (false, false);
         // Предел ожидания EOF после выхода главного процесса или после убийства дерева.
         let mut drain: Option<Instant> = None;
@@ -208,6 +225,7 @@ async fn run_raw(spec: CommandSpec) -> Result<Raw, RunnerError> {
                 r = child.inner_mut().wait(), if status.is_none() => Event::Exited(r),
                 () = &mut out_fut, if !out_done => Event::OutDone,
                 () = &mut err_fut, if !err_done => Event::ErrDone,
+                () = &mut in_fut, if !in_done => Event::InDone,
                 () = sleep_until(deadline), if status.is_none() && !killed => Event::Deadline,
                 () = sleep_until(drain_at), if drain.is_some() => Event::Drain,
             };
@@ -224,6 +242,7 @@ async fn run_raw(spec: CommandSpec) -> Result<Raw, RunnerError> {
                 Event::Exited(Err(e)) => return Err(RunnerError::Io(e)),
                 Event::OutDone => out_done = true,
                 Event::ErrDone => err_done = true,
+                Event::InDone => in_done = true,
                 Event::Deadline => {
                     tracing::debug!(program = %spec.program.display(), "тайм-аут, дерево убивается");
                     guard.kill(child.as_mut());
@@ -294,6 +313,18 @@ async fn read_capped<R: AsyncRead + Unpin>(r: Option<R>, limit: usize, cap: &mut
             cap.truncated = true;
         }
     }
+}
+
+/// Пишет `data` в stdin процесса и закрывает его (EOF). Ошибка записи — процесс закрыл
+/// stdin раньше (вышел или не читает): остаток не нужен.
+async fn write_stdin(w: Option<(tokio::process::ChildStdin, Vec<u8>)>) {
+    let Some((mut w, data)) = w else {
+        return;
+    };
+    if let Err(e) = w.write_all(&data).await {
+        tracing::debug!(error = %e, "запись stdin прервана");
+    }
+    drop(w);
 }
 
 fn exit_of(s: ExitStatus) -> Exit {

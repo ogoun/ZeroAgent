@@ -154,6 +154,25 @@ pub mod checkpoint_kind {
     pub const SKIPPED: &str = "skipped";
 }
 
+/// Причина чекпоинта вида `skipped` (R1-C1 D89): поле `reason` события
+/// `checkpoint.created`.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod checkpoint_reason {
+    /// git не уложился в `CHECKPOINT_TIMEOUT`; до конца run чекпоинты git не делаются.
+    pub const SLOW: &str = "slow";
+    /// Проект не в репозитории git, игнорируется git или недоверен (`Exec`).
+    pub const NO_GIT: &str = "no_git";
+    /// git нет в `PATH`.
+    pub const GIT_NOT_FOUND: &str = "git_not_found";
+    /// git отказал по владельцу репозитория (`safe.directory` не трогается).
+    pub const GIT_UNSAFE_DIRECTORY: &str = "git_unsafe_directory";
+    /// Прочий отказ git (подробности — в логе).
+    pub const GIT_ERROR: &str = "git_error";
+    /// Сбой ввода-вывода при копии файлов (подробности — в логе).
+    pub const IO_ERROR: &str = "io_error";
+}
+
 /// Действия журнала аудита (R1-C1 D91): поле `action` записи `audit`.
 ///
 /// Значения — часть протокола, менять строки нельзя.

@@ -2257,6 +2257,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "thiserror",
  "tokio",
  "tracing",
  "za-core",
@@ -2284,10 +2285,12 @@ dependencies = [
  "uuid",
  "za-agent",
  "za-core",
+ "za-jail",
  "za-llm",
  "za-protocol",
  "za-res",
  "za-store",
+ "za-tools",
 ]
 
 [[package]]

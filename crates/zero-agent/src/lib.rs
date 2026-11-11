@@ -2,9 +2,10 @@
 //! (`config.toml`), команды моделей (`models`, `ask`), ресурсов (`resources`), `doctor` и
 //! цикла агента (`run`, `answer`, R1-B1), инспектора запроса и метрик run (`inspect`, `stats`,
 //! R1-B2), журнала аудита и выгрузки журнала (`audit`, `journal export`), набора доверенных
-//! файлов проекта (R1-C1).
+//! файлов проекта, чекпоинтов рабочей копии (`checkpoints`, R1-C1).
 
 pub mod audit;
+pub mod checkpoints;
 pub mod config;
 pub mod doctor;
 pub mod home;

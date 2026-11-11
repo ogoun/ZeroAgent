@@ -1,6 +1,6 @@
 //! Бинарник `zero-agent`: `doctor`, `demo-run`, `replay` (R0), `models`, `ask`,
 //! `resources` (R1-A), `run`, `answer` (R1-B1), `inspect`, `stats` (R1-B2), `audit`,
-//! `journal export` (R1-C1).
+//! `journal export`, `checkpoints` (R1-C1).
 //!
 //! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы, ошибка
 //! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя;
@@ -26,6 +26,7 @@ use za_core::{CrashPoint, DemoConfig, DemoOutcome, EffectError, replay_hash, run
 use za_protocol::{Priority, RunId, RunMode, Tier};
 use za_store::{ProjectStore, StoreError};
 use zero_agent::audit::{self as audit_cmd, AuditCmdError, KnownSecrets};
+use zero_agent::checkpoints::{self as checkpoints_cmd, CheckpointsCmdError};
 use zero_agent::doctor::{self, LLAMA_URL_ENV};
 use zero_agent::home::{self, NoHome};
 use zero_agent::inspect::{self as inspector, InspectArgs, InspectCmdError};
@@ -162,6 +163,11 @@ enum Cmd {
         /// Вывод в JSON (строка на запись).
         #[arg(long)]
         json: bool,
+    },
+    /// Чекпоинты рабочей копии проекта: список и восстановление.
+    Checkpoints {
+        #[command(subcommand)]
+        action: CheckpointsCmd,
     },
     /// Журнал проекта.
     Journal {
@@ -364,6 +370,34 @@ enum JournalCmd {
 }
 
 #[derive(Debug, Subcommand)]
+enum CheckpointsCmd {
+    /// Чекпоинты проекта: id, вид, коммит.
+    List {
+        /// Каталог проекта.
+        #[arg(long)]
+        project: PathBuf,
+        /// Вывод в JSON (строка на чекпоинт).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Восстановить рабочую копию по чекпоинту; перед этим делается новый чекпоинт,
+    /// восстановление пишется в журнал аудита.
+    Restore {
+        /// Каталог проекта.
+        #[arg(long)]
+        project: PathBuf,
+        /// id чекпоинта `<run>/<шаг>-<номер>`.
+        id: String,
+        /// Удалить файлы, которых нет в чекпоинте (кроме игнорируемых).
+        #[arg(long)]
+        delete_new: bool,
+        /// Итог в JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ModelsCmd {
     /// Повторный зонд эндпоинта и сохранение профиля; код 0 — эндпоинт готов.
     Probe {
@@ -421,6 +455,8 @@ enum AppError {
     Inspect(#[from] InspectCmdError),
     #[error(transparent)]
     Audit(#[from] AuditCmdError),
+    #[error(transparent)]
+    Checkpoints(#[from] CheckpointsCmdError),
 }
 
 fn parse_run(s: &str) -> Result<RunId, String> {
@@ -588,6 +624,20 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             let home = home::za_home()?;
             let secrets = KnownSecrets::from_vars(std::env::vars_os());
             Ok(audit_cmd::cmd_audit(&home, &project, verify, json, &secrets).await?)
+        }
+        Cmd::Checkpoints { action } => {
+            let home = home::za_home()?;
+            Ok(match action {
+                CheckpointsCmd::List { project, json } => {
+                    checkpoints_cmd::cmd_list(&home, &project, json).await?
+                }
+                CheckpointsCmd::Restore {
+                    project,
+                    id,
+                    delete_new,
+                    json,
+                } => checkpoints_cmd::cmd_restore(&home, &project, &id, delete_new, json).await?,
+            })
         }
         Cmd::Journal {
             action: JournalCmd::Export { project, run },
