@@ -716,6 +716,10 @@ struct StreamState<'w> {
     watch: Option<&'w mut StreamWatch>,
     /// Срабатывание детектора на последнем шаге цикла стрима: стрим обрывается.
     degenerate: Option<Degenerate>,
+    /// Удержанные хвосты текста и рассуждения маски потока (D100, I3 ревью задачи 12):
+    /// секрет на стыке дельт маскируется целиком.
+    held_text: String,
+    held_reasoning: String,
 }
 
 impl LiveTurn<'_> {
@@ -800,6 +804,8 @@ impl LiveTurn<'_> {
             ttft_ms: None,
             watch,
             degenerate: None,
+            held_text: String::new(),
+            held_reasoning: String::new(),
         };
         let mut stream = match model.stream(call).await {
             Ok(s) => s,
@@ -908,7 +914,7 @@ impl LiveTurn<'_> {
                 mark_ttft(st, started, now);
                 st.degenerate = st.watch.as_deref_mut().and_then(|w| w.on_text(&t));
                 if let Some(chunk) = st.text.push(&t, now) {
-                    self.write_delta(st.attempt, "text", chunk).await?;
+                    self.write_delta(st, "text", chunk, false).await?;
                 }
             }
             StreamEvent::ReasoningDelta(t) => {
@@ -918,7 +924,7 @@ impl LiveTurn<'_> {
                     .as_deref_mut()
                     .and_then(|w| w.on_reasoning(&t, now));
                 if let Some(chunk) = st.reasoning.push(&t, now) {
-                    self.write_delta(st.attempt, "reasoning", chunk).await?;
+                    self.write_delta(st, "reasoning", chunk, false).await?;
                 }
             }
             StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallArgs { .. } => {
@@ -970,24 +976,52 @@ impl LiveTurn<'_> {
         Ok(None)
     }
 
-    async fn write_delta(&self, attempt: u32, field: &str, chunk: String) -> Result<(), Live> {
-        let mut payload = json!({"turn": self.turn, "effect_key": self.key, "attempt": attempt});
+    /// Дельта `field` (`text` | `reasoning`) в журнал. С маской (D100) — окно перекрытия:
+    /// хвост [`SecretMasker::window`] держится до следующей дельты, `last` (конец стрима
+    /// или попытки) отдаёт всё; пустая часть не пишется.
+    async fn write_delta(
+        &self,
+        st: &mut StreamState<'_>,
+        field: &'static str,
+        chunk: String,
+        last: bool,
+    ) -> Result<(), Live> {
         let chunk = match self.masker {
-            Some(m) => m.mask(&chunk).into_owned(),
+            Some(m) => {
+                let held = if field == "text" {
+                    &mut st.held_text
+                } else {
+                    &mut st.held_reasoning
+                };
+                let mut all = std::mem::take(held);
+                all.push_str(&chunk);
+                let (out, used) = m.mask_stream(&all, last);
+                *held = all[used..].to_owned();
+                out
+            }
             None => chunk,
         };
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let mut payload = json!({"turn": self.turn, "effect_key": self.key, "attempt": st.attempt});
         payload[field] = Value::String(chunk);
         self.append(Actor::Model, EventKind::ModelDelta, payload)
             .await
     }
 
-    /// Сброс обоих буферов: рассуждение, затем текст.
+    /// Сброс обоих буферов (конец стрима или попытки): рассуждение, затем текст; маска
+    /// потока отдаёт и удержанный хвост.
     async fn flush(&self, st: &mut StreamState<'_>) -> Result<(), Live> {
-        if let Some(chunk) = st.reasoning.take() {
-            self.write_delta(st.attempt, "reasoning", chunk).await?;
+        let r = st.reasoning.take();
+        if r.is_some() || !st.held_reasoning.is_empty() {
+            self.write_delta(st, "reasoning", r.unwrap_or_default(), true)
+                .await?;
         }
-        if let Some(chunk) = st.text.take() {
-            self.write_delta(st.attempt, "text", chunk).await?;
+        let t = st.text.take();
+        if t.is_some() || !st.held_text.is_empty() {
+            self.write_delta(st, "text", t.unwrap_or_default(), true)
+                .await?;
         }
         Ok(())
     }
@@ -997,12 +1031,12 @@ impl LiveTurn<'_> {
         if st.reasoning.deadline().is_some_and(|d| d <= now)
             && let Some(chunk) = st.reasoning.take()
         {
-            self.write_delta(st.attempt, "reasoning", chunk).await?;
+            self.write_delta(st, "reasoning", chunk, false).await?;
         }
         if st.text.deadline().is_some_and(|d| d <= now)
             && let Some(chunk) = st.text.take()
         {
-            self.write_delta(st.attempt, "text", chunk).await?;
+            self.write_delta(st, "text", chunk, false).await?;
         }
         Ok(())
     }

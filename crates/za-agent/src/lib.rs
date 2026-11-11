@@ -83,7 +83,8 @@ pub use prompt::{
 };
 pub use request::{
     BlockHashes, BlockSizes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions,
-    build_request, first_message, first_message_with, freeze, grants_block, request_hash,
+    build_request, first_message, first_message_with, freeze, freeze_for, grants_block,
+    request_hash,
 };
 pub use resume::{ResumeChange, resume_run, state_block};
 pub use state::{AtBoundary, Counters, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};

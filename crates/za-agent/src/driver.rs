@@ -72,13 +72,12 @@ use crate::detect::{
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
 use crate::policy::{Grant, PolicySnapshot, grants_text};
-use crate::prompt::prompt_texts_hash_for;
 use crate::prompt::{
     ControlAction, ControlFrom, EnvInfo, WorkMode, escape_untrusted, reasoning_for, render_control,
     render_control_trusted, render_env,
 };
 use crate::request::{
-    FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message_with, freeze,
+    FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message_with, freeze_for,
 };
 use crate::resume::state_block;
 use crate::state::{AtBoundary, Counters, LoopState, Next, PendingExit};
@@ -469,15 +468,14 @@ async fn step_zero(
     }
 
     let registry = run_registry(deps)?;
-    let (tools, classes) = run_tools_of(&registry, spec.role, tier);
-    let mut frozen = freeze(
+    let (_, classes) = run_tools_of(&registry, spec.role, tier);
+    // D94: тексты инструментов run (`Tool::texts`) входят в хэш промптов.
+    let frozen = freeze_for(
         &setup,
-        &tools,
+        &registry.for_run(spec.role, tier),
         &deps.capabilities,
         spec.agents_md.as_deref(),
     )?;
-    // D94: тексты инструментов run (`Tool::texts`) входят в хэш промптов.
-    frozen.texts_hash = prompt_texts_hash_for(&registry.for_run(spec.role, tier));
     let frozen_ref = put_json(&store, &frozen).await?;
 
     let mut env = spec.env.clone();

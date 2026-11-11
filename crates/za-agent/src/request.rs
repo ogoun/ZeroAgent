@@ -268,6 +268,20 @@ pub fn freeze(
     })
 }
 
+/// [`freeze`] по инструментам run (R1-C1 D94): описания — из `Tool::spec`, хэш текстов —
+/// [`crate::prompt_texts_hash_for`] с текстами инструментов (`Tool::texts`).
+pub fn freeze_for(
+    setup: &RunSetup,
+    tools: &[std::sync::Arc<dyn za_core::Tool>],
+    caps: &[Capability],
+    agents_md: Option<&str>,
+) -> Result<FrozenPrefix, PrefixError> {
+    let schemas: Vec<ToolSchema> = tools.iter().map(|t| t.spec().schema.clone()).collect();
+    let mut f = freeze(setup, &schemas, caps, agents_md)?;
+    f.texts_hash = crate::prompt::prompt_texts_hash_for(tools);
+    Ok(f)
+}
+
 /// Блок 6 (D24): `<env>`, затем `<memory>…</memory>` при непустом снимке (не из одних
 /// пробельных символов), затем задача.
 ///

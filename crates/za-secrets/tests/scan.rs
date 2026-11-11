@@ -530,3 +530,26 @@ fn masked_text_is_stable() {
         assert_eq!(m.mask(&once), once.as_str(), "{text}");
     }
 }
+
+/// Маска потока (D100, I3 ревью задачи 12): известное значение и токен, разрезанные между
+/// фрагментами в любом месте, маскируются целиком; склейка отданных частей равна маске
+/// всего текста.
+#[test]
+fn stream_mask_holds_window_across_chunks() {
+    let m = SecretMasker::new(vec![("k".into(), "verylongsecretvalue".into())]);
+    let text = format!("{} verylongsecretvalue mid {} tail", "a".repeat(700), ghp());
+    for cut in [705, 710, 720, 730, 735, 745, 760] {
+        let (a, b) = text.split_at(cut);
+        let mut held = String::new();
+        let mut out = String::new();
+        for (chunk, last) in [(a, false), (b, false), ("", true)] {
+            held.push_str(chunk);
+            let (part, used) = m.mask_stream(&held, last);
+            out.push_str(&part);
+            held = held[used..].to_owned();
+        }
+        assert_eq!(out, m.mask(&text), "разрез на {cut}");
+        assert!(!out.contains("verylong") && !out.contains("ghp_"), "{cut}");
+    }
+    assert!(m.window() >= "verylongsecretvalue".len());
+}

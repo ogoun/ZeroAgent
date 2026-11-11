@@ -381,7 +381,7 @@ async fn tool_events_written_live_only() {
     assert_eq!(
         ev[0].2,
         json!({"call_id": "c1", "name": "echo", "effect_key": format!("{run}:0:0"),
-            "arguments": {"x": 1}, "decision": {"action": "allow"}})
+            "arguments": {"x": 1}, "decision": {"action": "allow"}, "paths": []})
     );
     assert_eq!((&ev[1].0, ev[1].1), (&EventKind::ToolFinished, Actor::Tool));
     assert_eq!(ev[1].2["call_id"], "c1");

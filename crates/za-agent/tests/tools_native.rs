@@ -1310,3 +1310,155 @@ async fn policy_change_applies_at_boundary() {
     let snap: Snapshot = serde_json::from_value(v).unwrap();
     assert_eq!(snap.policy, deny);
 }
+
+// ---- Раунд исправлений 1 (ревью задачи 12) ----
+
+/// I1: правка начата (`tool.started` с путями записан), сбой до вызова; до resume каталог
+/// подменён ссылкой наружу. Реплей сверяет пути с записанными: нужно новое одобрение,
+/// записи вне проекта без него нет.
+#[tokio::test]
+async fn replay_without_receipt_rechecks_recorded_paths() {
+    let b = bx("replay_recheck").await;
+    let l = b.d.roots.project.join("l");
+    std::fs::create_dir_all(&l).unwrap();
+    let edit = EditStub::new();
+    let applied = Arc::clone(&edit.applied);
+    let reg = registry(vec![Arc::new(edit)]);
+    let mut env = b.env(RunMode::Auto);
+    env.crash = Some(Arc::new(|p| {
+        p == CrashPoint::InTool {
+            step: 1,
+            after_call: false,
+        }
+    }));
+    let calls = [pc(
+        "c1",
+        "edit",
+        json!({"path": "l/x", "old": "", "new": "n"}),
+    )];
+    assert!(b.batch(&reg, &env, 1, &calls).await.halted);
+    let started = of_kind(&b.events().await, EventKind::ToolStarted)
+        .last()
+        .map(|e| e.payload.clone())
+        .unwrap();
+    assert_eq!(started["paths"][0]["inside"], true);
+    std::fs::remove_dir(&l).unwrap();
+    if !link_or_skip(&l, &b.d.outside) {
+        return;
+    }
+    env.crash = None;
+    let out = b.batch(&reg, &env, 1, &calls).await;
+    let int = out.suspend.expect("нет нового одобрения");
+    assert!(int.id.ends_with("-path"), "{}", int.id);
+    assert_eq!(reasons_of(&int.payload), ["outside_project"]);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert!(!b.d.outside.join("x").exists());
+    // Отказ: вызов не исполняется.
+    b.approve(&int.id, json!({"approved": false})).await;
+    let out = b.batch(&reg, &env, 1, &calls).await;
+    assert_eq!(content(&out, 0), ("denied by user".into(), true));
+    assert!(!b.d.outside.join("x").exists());
+}
+
+fn reasons_of(payload: &Value) -> Vec<String> {
+    serde_json::from_value(payload["reasons"].clone()).unwrap()
+}
+
+/// I2: `request_grant` одобрен для пути из payload; до resume путь стал ссылкой на другой
+/// каталог. Грант выдаётся на путь, который видел пользователь.
+#[tokio::test]
+async fn grant_uses_approved_payload_path() {
+    let b = bx("grant_payload").await;
+    let g = b.d.outside.join("g");
+    let other = b.d.outside.join("other");
+    std::fs::create_dir_all(&g).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let reg = registry(vec![]);
+    let env = b.env(RunMode::Auto);
+    let calls = [pc(
+        "g1",
+        "request_grant",
+        json!({"path": s(&g), "mode": "rw", "reason": "r"}),
+    )];
+    let out = b.batch(&reg, &env, 1, &calls).await;
+    let int = out.suspend.unwrap();
+    let shown = int.payload["grant"]["path"].as_str().unwrap().to_owned();
+    std::fs::remove_dir(&g).unwrap();
+    if !link_or_skip(&g, &other) {
+        return;
+    }
+    b.approve(&int.id, json!({"approved": true})).await;
+    let out = b.batch(&reg, &env, 1, &calls).await;
+    assert_eq!(out.grants.len(), 1);
+    assert_eq!(out.grants[0].path, PathBuf::from(&shown));
+    let (text, _) = content(&out, 0);
+    assert!(text.ends_with(&shown), "{text}");
+    assert!(!text.contains("other"), "{text}");
+}
+
+/// I4: слово команды, которое разбор пути отвергает (на Windows `/etc/hosts` — путь без
+/// буквы диска), — вопрос `outside_project`, а не ошибка вызова.
+#[tokio::test]
+async fn rejected_command_word_asks_outside() {
+    let b = bx("rejected_word").await;
+    let bash = BashStub::new();
+    let seen = Arc::clone(&bash.seen);
+    let reg = registry(vec![Arc::new(bash)]);
+    let out = b
+        .batch(
+            &reg,
+            &b.env(RunMode::Auto),
+            1,
+            &[pc("c1", "bash", json!({"cmd": "cat /etc/hosts"}))],
+        )
+        .await;
+    assert!(out.results.is_empty(), "{:?}", out.results);
+    assert_eq!(reasons(&out), ["outside_project"]);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// I3: секрет, разрезанный между двумя дельтами `model.delta`, маскируется целиком.
+#[tokio::test]
+async fn secret_split_across_deltas_is_masked() {
+    let secret = ["split", "secret", "value", "42"].concat();
+    let (a, c) = secret.split_at(9);
+    let mut l = lx("delta_split");
+    l.deps.masker = Some(Arc::new(SecretMasker::new(vec![(
+        "TOKEN".into(),
+        secret.clone(),
+    )])));
+    let head = format!("{}{a}", "x".repeat(za_agent::DELTA_FLUSH_BYTES));
+    let tail = format!("{c} end");
+    let full = format!("{head}{tail}");
+    l.model.push(vec![
+        Ok(StreamEvent::TextDelta(head)),
+        Ok(StreamEvent::TextDelta(tail)),
+        Ok(StreamEvent::Finished {
+            message: Message {
+                role: Role::Assistant,
+                parts: vec![Part::Text(full)],
+            },
+            finish: FinishReason::Stop,
+            usage: Usage::default(),
+        }),
+    ]);
+    let o = start(&l, spec(&l, RunMode::Auto)).await.unwrap();
+    assert!(matches!(o, LoopOutcome::Finished { .. }), "{o:?}");
+    let evs = events_of(&l.store, l.run).await;
+    let deltas: Vec<String> = of_kind(&evs, EventKind::ModelDelta)
+        .iter()
+        .filter_map(|e| e.payload["text"].as_str().map(str::to_owned))
+        .collect();
+    assert!(deltas.len() >= 2, "{}", deltas.len());
+    let joined = deltas.concat();
+    assert_eq!(
+        joined,
+        format!(
+            "{}[secret masked: TOKEN] end",
+            "x".repeat(za_agent::DELTA_FLUSH_BYTES)
+        )
+    );
+    for e in &evs {
+        assert!(!e.payload.to_string().contains(&secret));
+    }
+}

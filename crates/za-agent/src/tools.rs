@@ -353,6 +353,9 @@ enum Prep {
     Run(Box<Job>),
     /// Нужно решение пользователя.
     Suspend(Interrupt),
+    /// Нужно новое решение пользователя: прерывание открывается, когда пакет до него
+    /// дошёл (`apply`), — не раньше исполнения предыдущих вызовов группы (m2 ревью).
+    Open(Interrupt),
 }
 
 /// D14–D17, D77–D100. Прерывание: результаты до прерывания в outcome, suspend = Some.
@@ -481,6 +484,11 @@ async fn apply(
         Prep::Done(part) => {
             out.results.push(part);
             Ok(true)
+        }
+        Prep::Open(int) => {
+            interrupt_open(ctx, &int).await?;
+            out.suspend = Some(int);
+            Ok(false)
         }
         Prep::Suspend(int) => {
             out.suspend = Some(int);
@@ -618,23 +626,51 @@ async fn prepare(
     let row = ctx.store().effect(ctx.run_id(), &key).await;
     let row = observe_store(ctx, row)?;
     let subjects = tool.subjects_in(&env.roots.project, &call.arguments);
-    let raw = subject_paths(&subjects);
-    if let Some(row) = row {
-        let planned = if row.result.is_some() {
-            Vec::new()
-        } else {
-            resolve_all(&env.roots, &raw).await.unwrap_or_default()
-        };
+    // Квитанция есть: реплей результата, инструмент не вызывается — пути не нужны.
+    if row.as_ref().is_some_and(|r| r.result.is_some()) {
+        let raw = subject_paths(&subjects);
         let decision = json!({"action": "recorded"});
-        let action = tool_action(&tool, call, env, st, &key, raw, planned, subjects, decision);
+        let action = tool_action(
+            &tool,
+            call,
+            env,
+            st,
+            &key,
+            raw,
+            Vec::new(),
+            subjects,
+            decision,
+        );
         return run(slots, action, None);
     }
-    let planned = match resolve_all(&env.roots, &raw).await {
+    let (subjects, rejected, planned) = match plan_paths(env, tool.spec(), subjects).await {
         Ok(p) => p,
-        Err(e) => return Ok(Prep::Done(result(call, e.to_string(), true))),
+        Err(e) => return Ok(Prep::Done(result(call, path_error_text(&e), true))),
     };
+    let raw = subject_paths(&subjects);
+    let classes = path_classes(&raw, &planned);
+    let mut appr = Interrupt::for_effect(InterruptKind::Approval, &key, Value::Null).id;
+    // Намерение без квитанции (D98, I1 ревью задачи 12): пути сверяются с записанными в
+    // `tool.started` этого вызова; любое расхождение — новое одобрение, без него вызов не
+    // исполняется. Записи нет — вызов не начинался, решение принимается заново.
+    let mut changed = false;
+    if let Some(row) = row {
+        match started_paths(ctx, row.intent_seq, &key).await? {
+            Some(seen) if seen == classes => {
+                let decision = json!({"action": "recorded"});
+                let action =
+                    tool_action(&tool, call, env, st, &key, raw, planned, subjects, decision);
+                return run(slots, action, None);
+            }
+            Some(_) => {
+                tracing::warn!(key = %key.0, "пути вызова изменились после начала: новое одобрение");
+                appr = format!("{appr}{REASK_SUFFIX}");
+                changed = true;
+            }
+            None => {}
+        }
+    }
     // Записанное одобрение (D92): решение пользователя, политика не пересчитывается.
-    let appr = Interrupt::for_effect(InterruptKind::Approval, &key, Value::Null).id;
     let row = ctx.store().interrupt(&appr).await;
     let decided = match observe_store(ctx, row)? {
         Some(row) => match row.response {
@@ -642,7 +678,7 @@ async fn prepare(
                 // Одобрен вызов с путями тех классов, что видел пользователь (D77, D98):
                 // путь, сменивший класс до ответа (ссылка наружу), — повторить вызов.
                 let seen = row.payload.as_ref().and_then(|p| p.get("paths"));
-                if seen.is_some_and(|s| class_of(s) != class_of(&path_classes(&raw, &planned))) {
+                if seen.is_some_and(|s| class_of(s) != class_of(&classes)) {
                     tracing::warn!(id = %appr, "путь одобренного вызова сменил класс");
                     return Ok(Prep::Done(result(call, PATH_CHANGED.to_owned(), true)));
                 }
@@ -667,21 +703,36 @@ async fn prepare(
                 taint: &st.taint,
                 grants: &st.grants,
             };
-            match decide(&cx, tool.spec(), &subjects, &planned) {
+            let mut d = decide(&cx, tool.spec(), &subjects, &planned);
+            // Слово команды, отвергнутое разбором пути (I4): граница неизвестна —
+            // `Ask(outside_project)`, как у `decide` при несовпавшей длине (задача 11).
+            if rejected {
+                d = with_reason(d, approval_reason::OUTSIDE_PROJECT);
+            }
+            // Пути начатого вызова изменились: только с новым одобрением (I1).
+            if changed {
+                let outside = planned.iter().any(|p| !p.inside);
+                d = with_reason(
+                    d,
+                    if outside {
+                        approval_reason::OUTSIDE_PROJECT
+                    } else {
+                        approval_reason::MODE
+                    },
+                );
+            }
+            match d {
                 Decision::Allow => json!({"action": "allow"}),
                 Decision::Deny(reason) => {
                     return Ok(Prep::Done(result(call, denied_text(reason), true)));
                 }
                 Decision::Trust => {
-                    let int = trust_interrupt(env, &key).await?;
-                    interrupt_open(ctx, &int).await?;
-                    return Ok(Prep::Suspend(int));
+                    return Ok(Prep::Open(trust_interrupt(env, &key).await?));
                 }
                 Decision::Ask { reasons } => {
-                    let classes = path_classes(&raw, &planned);
-                    let int = approval_interrupt(env, call, &key, &subjects, reasons, classes);
-                    interrupt_open(ctx, &int).await?;
-                    return Ok(Prep::Suspend(int));
+                    let mut int = approval_interrupt(env, call, &key, &subjects, reasons, classes);
+                    int.id = appr;
+                    return Ok(Prep::Open(int));
                 }
             }
         }
@@ -689,6 +740,107 @@ async fn prepare(
     let action = tool_action(&tool, call, env, st, &key, raw, planned, subjects, decided);
     run(slots, action, None)
 }
+
+/// Суффикс id повторного одобрения вызова, чьи пути изменились после начала (I1).
+const REASK_SUFFIX: &str = "-path";
+
+/// Порядок причин одобрения (D80, 1.5).
+const REASON_ORDER: [&str; 6] = [
+    approval_reason::MODE,
+    approval_reason::RULE,
+    approval_reason::OUTSIDE_PROJECT,
+    approval_reason::TAINTED,
+    approval_reason::IRREVERSIBLE,
+    approval_reason::GRANT,
+];
+
+/// Решение с дополнительной причиной `Ask`: `Allow` становится `Ask`, `Deny` и `Trust`
+/// не меняются (ранний выход D80).
+fn with_reason(d: Decision, reason: &'static str) -> Decision {
+    match d {
+        Decision::Allow => Decision::Ask {
+            reasons: vec![reason],
+        },
+        Decision::Ask { mut reasons } => {
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+                reasons.sort_by_key(|r| REASON_ORDER.iter().position(|o| o == r));
+            }
+            Decision::Ask { reasons }
+        }
+        d => d,
+    }
+}
+
+/// Разрешение путей предметов перед решением (D98). У команды (`Exec`) слово, которое
+/// отверг разбор пути (`classify`: UNC, устройство, `/etc/x` на Windows и т. п.),
+/// выбрасывается из предметов, а итог помечается `rejected` (I4): решение — `Ask`. У
+/// нативного инструмента путь — сам аргумент: отказ разбора — ошибка вызова.
+async fn plan_paths(
+    env: &ToolEnv,
+    spec: &ToolSpec,
+    mut s: Subjects,
+) -> Result<(Subjects, bool, Vec<ResolvedPath>), PathError> {
+    if spec.kind != ToolKind::Exec {
+        let planned = resolve_all(&env.roots, &subject_paths(&s)).await?;
+        return Ok((s, false, planned));
+    }
+    let mut rejected = false;
+    let mut keep = Vec::new();
+    let mut planned = Vec::new();
+    for p in std::mem::take(&mut s.paths) {
+        match resolve_all(&env.roots, std::slice::from_ref(&p)).await {
+            Ok(mut r) => {
+                planned.append(&mut r);
+                keep.push(p);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "слово команды не разобрано как путь");
+                rejected = true;
+            }
+        }
+    }
+    s.paths = keep;
+    if let Some(cwd) = s.cwd.take() {
+        let raw = RawPath {
+            arg: cwd.clone(),
+            access: Access::Exec,
+        };
+        match resolve_all(&env.roots, std::slice::from_ref(&raw)).await {
+            Ok(mut r) => {
+                planned.append(&mut r);
+                s.cwd = Some(cwd);
+            }
+            Err(_) => rejected = true,
+        }
+    }
+    Ok((s, rejected, planned))
+}
+
+/// Пути из `tool.started` вызова `key` (запись D98): события после намерения.
+async fn started_paths(
+    ctx: &mut RunCtx,
+    after: za_protocol::Seq,
+    key: &EffectKey,
+) -> Result<Option<Value>, EffectError> {
+    let evs = ctx
+        .store()
+        .read_run(
+            ctx.run_id(),
+            za_protocol::Seq(after.0.saturating_sub(1)),
+            STARTED_SCAN,
+        )
+        .await;
+    let evs = observe_store(ctx, evs)?;
+    Ok(evs
+        .into_iter()
+        .find(|e| e.kind == EventKind::ToolStarted && e.payload["effect_key"] == key.0.as_str())
+        .and_then(|e| e.payload.get("paths").cloned()))
+}
+
+/// Сколько событий после намерения просматривается в поисках `tool.started`: слот пишет
+/// его сразу после намерения, между ними — только события соседних слотов группы чтений.
+const STARTED_SCAN: usize = 1024;
 
 /// Записанный ответ на прерывание доверия вызова (D83, D92): `Some` — исход вызова
 /// (пауза или отказ), `None` — решать дальше (доверие дано или прерывания нет). Ответ
@@ -760,13 +912,49 @@ async fn prepare_grant(
     let Some(arg) = arg else {
         return Ok(Prep::Done(result(call, GRANT_NO_PATH.to_owned(), true)));
     };
+    // Записанное решение (D92, I2 ревью задачи 12): грант — ровно на путь, который
+    // видел пользователь в одобренном payload, а не на заново разрешённый.
+    let id = Interrupt::for_effect(InterruptKind::Approval, key, Value::Null).id;
+    let row = ctx.store().interrupt(&id).await;
+    if let Some(row) = observe_store(ctx, row)? {
+        let shown = row
+            .payload
+            .as_ref()
+            .and_then(|p| p["grant"]["path"].as_str())
+            .map(PathBuf::from);
+        return Ok(match (row.response, shown) {
+            (None, _) => Prep::Suspend(Interrupt {
+                id: row.id,
+                kind: InterruptKind::Approval,
+                payload: row.payload.unwrap_or(Value::Null),
+            }),
+            (Some(v), Some(path)) if approved(&v) => {
+                let grant = Grant {
+                    path,
+                    mode,
+                    source: GrantSource::Request,
+                    reason,
+                };
+                let slot = take(slots, i)?;
+                Prep::Run(Box::new(job(
+                    slot,
+                    call,
+                    Action::Grant(grant),
+                    j,
+                    env,
+                    None,
+                )))
+            }
+            (Some(v), _) => Prep::Done(result(call, denied_by_user(&v), true)),
+        });
+    }
     let raw = vec![RawPath {
         arg: arg.to_owned(),
         access: Access::Read,
     }];
     let path = match resolve_all(&env.roots, &raw).await {
         Ok(mut p) => p.remove(0).path,
-        Err(e) => return Ok(Prep::Done(result(call, e.to_string(), true))),
+        Err(e) => return Ok(Prep::Done(result(call, path_error_text(&e), true))),
     };
     let grant = Grant {
         path,
@@ -788,21 +976,7 @@ async fn prepare_grant(
             "reasons": [approval_reason::GRANT],
         }),
     );
-    match decision(ctx, &int).await? {
-        None => Ok(Prep::Suspend(int)),
-        Some(v) if approved(&v) => {
-            let slot = take(slots, i)?;
-            Ok(Prep::Run(Box::new(job(
-                slot,
-                call,
-                Action::Grant(grant),
-                j,
-                env,
-                None,
-            ))))
-        }
-        Some(v) => Ok(Prep::Done(result(call, denied_by_user(&v), true))),
-    }
+    Ok(Prep::Open(int))
 }
 
 /// Прерывание одобрения (D90, 3.4): `{call_id, name, arguments (маска), reasons, paths,
@@ -982,9 +1156,17 @@ fn granted_text(g: &Grant) -> String {
 /// `request_grant` без пути.
 const GRANT_NO_PATH: &str = "invalid arguments for \"request_grant\": path is required";
 
-/// `request_grant` с неизвестным режимом; значение экранирует `finish_part`.
+/// `request_grant` с неизвестным режимом; значение модели экранируется (D23).
 fn grant_mode_text(m: &str) -> String {
-    format!("invalid arguments for \"{REQUEST_GRANT_TOOL}\": mode must be ro or rw, got \"{m}\"")
+    format!(
+        "invalid arguments for \"{REQUEST_GRANT_TOOL}\": mode must be ro or rw, got \"{}\"",
+        escape_untrusted(m)
+    )
+}
+
+/// Ошибка разбора пути вызова: в тексте — аргумент модели, он экранируется (D23).
+fn path_error_text(e: &PathError) -> String {
+    escape_untrusted(&e.to_string())
 }
 
 /// Пометка недоверенного результата (D82).
@@ -1417,9 +1599,13 @@ impl Live {
     ) -> Result<Value, String> {
         let started = Instant::now();
         let mut halt = Some(halt);
-        let (args, decision) = match &action {
-            Action::Tool(t) => (mask_value(t.masker.as_deref(), &t.args), t.decision.clone()),
-            _ => (Value::Null, Value::Null),
+        let (args, decision, paths) = match &action {
+            Action::Tool(t) => (
+                mask_value(t.masker.as_deref(), &t.args),
+                t.decision.clone(),
+                path_classes(&t.raw, &t.planned),
+            ),
+            _ => (Value::Null, Value::Null, Value::Null),
         };
         let mut payload =
             json!({ "call_id": self.call_id, "name": self.name, "effect_key": self.key });
@@ -1428,6 +1614,8 @@ impl Live {
         {
             o.insert("arguments".into(), args);
             o.insert("decision".into(), decision);
+            // Разрешённые пути вызова (D98, I1): при реплее без квитанции сверка с ними.
+            o.insert("paths".into(), paths);
         }
         if !self
             .append(EventKind::ToolStarted, Actor::Runtime, payload, false, fref)
@@ -1554,7 +1742,7 @@ impl Live {
                 .iter()
                 .zip(&planned)
                 .any(|(a, b)| a.inside != b.inside || a.protected != b.protected);
-        if changed && !planned.is_empty() {
+        if changed {
             tracing::warn!(key = %self.key, "путь вызова сменил класс после решения");
             return fail(PATH_CHANGED.to_owned());
         }

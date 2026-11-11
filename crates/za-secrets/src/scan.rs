@@ -115,41 +115,87 @@ impl SecretMasker {
     #[doc(hidden)]
     pub fn mask_with_steps<'a>(&self, s: &'a str) -> (Cow<'a, str>, u64) {
         let mut steps = 0u64;
-        let mut spans = Vec::new();
-        if !self.known.is_empty() && !s.is_empty() {
-            let skip = skip_mask(s.as_bytes());
-            steps += s.len() as u64;
-            for n in &self.known {
-                known_spans(s.as_bytes(), &skip, n, &mut spans, &mut steps);
-            }
-        }
-        Scanner::new(s, &mut steps).run(&mut spans);
+        let spans = self.merged(s, &mut steps);
         if spans.is_empty() {
             return (Cow::Borrowed(s), steps);
         }
+        (Cow::Owned(render(s, &spans, s.len())), steps)
+    }
+
+    /// Длина хвоста, который маска потока держит до следующего фрагмента (D100, ревью
+    /// задачи 12, I3): не меньше самого длинного известного значения и окна шаблонов.
+    pub fn window(&self) -> usize {
+        self.known
+            .iter()
+            .map(|n| n.pat.len())
+            .max()
+            .unwrap_or(0)
+            .max(STREAM_WINDOW)
+    }
+
+    /// Маска потока текста по фрагментам (D100, I3): `s` — удержанный хвост и новый
+    /// фрагмент. Возвращает маскированный текст, который можно отдать, и сколько байт `s`
+    /// он покрывает; остаток (последние [`SecretMasker::window`] байт, а если на границе
+    /// стоит находка — с её начала) вызывающий держит до следующего фрагмента. `last` —
+    /// конец потока: отдаётся всё. Секрет на стыке фрагментов так не проскакивает.
+    pub fn mask_stream(&self, s: &str, last: bool) -> (String, usize) {
+        if last {
+            return (self.mask(s).into_owned(), s.len());
+        }
+        let mut cut = s.len().saturating_sub(self.window());
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let spans = self.merged(s, &mut 0);
+        // Находки слиты и не пересекаются: граница внутри находки — на её начало.
+        if let Some(sp) = spans.iter().find(|sp| sp.start < cut && cut < sp.end) {
+            cut = sp.start;
+        }
+        let before: Vec<Span<'_>> = spans.into_iter().filter(|sp| sp.end <= cut).collect();
+        (render(s, &before, cut), cut)
+    }
+
+    /// Находки в `s`, отсортированные и слитые (пересекающиеся — в одну, метка первой).
+    fn merged<'m>(&'m self, s: &str, steps: &mut u64) -> Vec<Span<'m>> {
+        let mut spans = Vec::new();
+        if !self.known.is_empty() && !s.is_empty() {
+            let skip = skip_mask(s.as_bytes());
+            *steps += s.len() as u64;
+            for n in &self.known {
+                known_spans(s.as_bytes(), &skip, n, &mut spans, steps);
+            }
+        }
+        Scanner::new(s, steps).run(&mut spans);
         // Устойчивая сортировка: при равных участках метка известного значения раньше.
         spans.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
-        let mut out = String::with_capacity(s.len());
-        let mut pos = 0;
-        let mut it = spans.into_iter().peekable();
-        while let Some(first) = it.next() {
-            let mut end = first.end;
-            while let Some(next) = it.peek() {
-                if next.start >= end {
-                    break;
-                }
-                end = end.max(next.end);
-                it.next();
+        let mut out: Vec<Span<'m>> = Vec::with_capacity(spans.len());
+        for sp in spans {
+            match out.last_mut() {
+                Some(last) if sp.start < last.end => last.end = last.end.max(sp.end),
+                _ => out.push(sp),
             }
-            out.push_str(&s[pos..first.start]);
-            out.push_str(MASK_PREFIX);
-            out.push_str(first.label);
-            out.push(']');
-            pos = end;
         }
-        out.push_str(&s[pos..]);
-        (Cow::Owned(out), steps)
+        out
     }
+}
+
+/// Окно шаблонов для маски потока: тело шаблона проверяется не дальше [`CHECK_WINDOW`],
+/// плюс запас на префикс и границу слова.
+const STREAM_WINDOW: usize = CHECK_WINDOW + 64;
+
+/// `s[..end]` с заменой слитых находок `spans` (все внутри `..end`) метками.
+fn render(s: &str, spans: &[Span<'_>], end: usize) -> String {
+    let mut out = String::with_capacity(end);
+    let mut pos = 0;
+    for sp in spans {
+        out.push_str(&s[pos..sp.start]);
+        out.push_str(MASK_PREFIX);
+        out.push_str(sp.label);
+        out.push(']');
+        pos = sp.end;
+    }
+    out.push_str(&s[pos..end]);
+    out
 }
 
 impl fmt::Debug for SecretMasker {
