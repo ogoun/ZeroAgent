@@ -1,8 +1,8 @@
 //! Нормализация хоста (R1-C2 D124) и сквозная таблица: сырой хост `za_shell` →
-//! `normalize_host`.
+//! `shell_hosts` (сбор с `normalize_host`).
 
-use za_core::net::normalize_host;
-use za_core::shell::{Dialect, network_hosts, segments};
+use za_core::net::{normalize_host, shell_hosts};
+use za_core::shell::{Dialect, segments};
 
 #[test]
 fn normalize_host_table() {
@@ -24,6 +24,11 @@ fn normalize_host_table() {
         ("a b", None),
         ("a%2fb", None),
         ("[::1", None),
+        // Пустая метка после снятия одной точки (M5 ревью задачи 3).
+        ("evil.test..", None),
+        ("a..b", None),
+        (".a", None),
+        ("..", None),
     ] {
         assert_eq!(normalize_host(raw).as_deref(), want, "{raw}");
     }
@@ -31,20 +36,38 @@ fn normalize_host_table() {
 
 #[test]
 fn shell_hosts_normalized() {
-    for (cmd, want) in [
-        ("curl https://пример.рф/", vec!["xn--e1afmkfd.xn--p1ai"]),
-        ("curl https://Evil.TEST./x", vec!["evil.test"]),
+    for (cmd, want, unknown) in [
+        (
+            "curl https://пример.рф/",
+            vec!["xn--e1afmkfd.xn--p1ai"],
+            false,
+        ),
+        ("curl https://Evil.TEST./x", vec!["evil.test"], false),
         (
             "wget http://[::FFFF:127.0.0.1]:8080/",
             vec!["::ffff:7f00:1"],
+            false,
         ),
+        // Повтор после нормализации — один хост.
+        (
+            "curl https://A.test/ ; curl https://a.test./",
+            vec!["a.test"],
+            false,
+        ),
+        // `None` от `normalize_host` — хост неизвестен, а не пропуск (I1 ревью задачи 3).
+        ("curl https://1.2.3.4.5/", vec![], true),
+        ("curl https://xn--a.test/", vec![], true),
+        (
+            "curl https://a.test/ https://1.2.3.4.5/",
+            vec!["a.test"],
+            true,
+        ),
+        ("curl https://evil.test../", vec![], true),
+        ("git status", vec![], false),
     ] {
         let d = Dialect::Bash;
-        let got: Vec<String> = segments(cmd, d)
-            .iter()
-            .flat_map(|s| network_hosts(s, d).hosts)
-            .filter_map(|h| normalize_host(&h))
-            .collect();
-        assert_eq!(got, want, "{cmd}");
+        let got = shell_hosts(&segments(cmd, d), d);
+        let want: Vec<String> = want.into_iter().map(String::from).collect();
+        assert_eq!(got, (want, unknown), "{cmd}");
     }
 }

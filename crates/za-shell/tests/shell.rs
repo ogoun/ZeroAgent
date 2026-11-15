@@ -1241,7 +1241,8 @@ fn hosts_table_extended() {
         // Схема не с начала слова; многобайтовый символ перед схемой (без паники).
         ("curl ёhttps://a.test/", B, &[], true),
         ("curl 'x https://a.test/'", B, &[], true),
-        ("nc ёhttps://a.test/", B, &["a.test"], false),
+        // Адрес `nc` — не URL: хост из URL добавляется, но хост соединения неизвестен (M3).
+        ("nc ёhttps://a.test/", B, &["a.test"], true),
         // Хост не записан буквально.
         ("curl https://$H/x", B, &[], true),
         ("curl 'https://%65vil.test/'", B, &[], true),
@@ -1318,6 +1319,88 @@ fn hosts_table_extended() {
         let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
         assert_eq!((h.hosts, h.unknown), (want, *unknown), "{cmd}");
     }
+}
+
+/// Ревью задачи 3: слово, которое нельзя однозначно отнести к хосту, даёт `unknown`,
+/// а не хост.
+#[test]
+fn hosts_table_review() {
+    let t: &[(&str, &[&str], bool)] = &[
+        // C1: у git адрес — только слово-репозиторий; refspec не разбирается.
+        ("git push origin HEAD:main", &[], true),
+        ("git push origin main:release", &[], true),
+        ("git fetch origin a:b", &[], true),
+        ("git fetch origin main:main", &[], true),
+        ("git -C a push origin HEAD:main", &[], true),
+        ("git pull origin a:b", &[], true),
+        ("git push git@a.test:r HEAD:main", &["a.test"], false),
+        ("git clone https://a.test/r b.test:dir", &["a.test"], false),
+        ("git clone --depth 1 https://a.test/r", &["a.test"], false),
+        (
+            "git clone --depth=1 -q https://a.test/r",
+            &["a.test"],
+            false,
+        ),
+        ("git clone -- https://a.test/r", &["a.test"], false),
+        ("git remote add -f up https://a.test/r", &["a.test"], false),
+        ("git ls-remote --heads git@a.test:r", &["a.test"], false),
+        // Опция, значение которой могло стать словом-репозиторием, или подмена адреса.
+        ("git clone -u x:y https://a.test/r", &[], true),
+        ("git clone --upload-pack x:y https://a.test/r", &[], true),
+        ("git remote add -t main up https://a.test/r", &[], true),
+        (
+            "git clone -c url.https://e.test/.insteadOf=https://a.test/ https://a.test/r",
+            &[],
+            true,
+        ),
+        ("git clone --config=a.b=c https://a.test/r", &[], true),
+        (
+            "git clone --bundle-uri=https://e.test/b https://a.test/r",
+            &[],
+            true,
+        ),
+        ("git clone --recurse-submodules https://a.test/r", &[], true),
+        ("git fetch --all", &[], true),
+        // Путь со схемой не с начала слова — локальный (git и scp так его и понимают).
+        ("git clone a/https://b.test/r", &[], true),
+        ("scp a/https://b.test/x h.test:y", &["h.test"], false),
+        // C2: свои опции у sftp.
+        ("sftp -P 2222 me@s.test", &["s.test"], false),
+        ("sftp -s sftp-server me@s.test", &["s.test"], false),
+        ("sftp -S prog me@s.test", &["s.test"], true),
+        // M1: `-o` в связке коротких опций; ключи, меняющие имя хоста.
+        ("scp -vo HostName=x.test a h.test:b", &["h.test"], true),
+        ("ssh -qoHostName=x.test h.test", &["h.test"], true),
+        ("ssh -o CanonicalDomains=e.test h.test", &["h.test"], true),
+        // M2: `ssh -P tag` (OpenSSH 9.2+).
+        ("ssh -P work me@host.example", &["host.example"], false),
+        // M3: адрес у socat — не URL.
+        (
+            "socat TCP:host.test:80 SYSTEM:'echo https://a.test/'",
+            &["a.test"],
+            true,
+        ),
+        ("telnet host.test", &[], true),
+        // M4: после `]` — не порт.
+        ("curl http://[::1]x.test/", &[], true),
+        ("curl http://[::1]:8080/", &["[::1]"], false),
+        // M6: отказ от прокси — не подмена адреса.
+        ("wget --no-proxy https://a.test/", &["a.test"], false),
+        ("curl --noproxy '*' https://a.test/", &["a.test"], false),
+        ("curl --noproxy=* https://a.test/", &["a.test"], false),
+    ];
+    let mut bad = Vec::new();
+    for (cmd, want, unknown) in t {
+        let h = hosts_of(cmd, B);
+        let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+        if (&h.hosts, h.unknown) != (&want, *unknown) {
+            bad.push(format!(
+                "{cmd}: {:?} {} != {want:?} {unknown}",
+                h.hosts, h.unknown
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
 #[test]
