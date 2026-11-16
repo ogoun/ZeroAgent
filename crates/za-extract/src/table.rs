@@ -37,7 +37,10 @@
 //! Текст и порядок ячеек не меняются. Таблица, где после замены нет ни `th`, ни `thead`,
 //! у `htmd` идёт обычным обходом детей (режим `Pure`) — текст ячеек сохраняется и там.
 //! Вложенные таблицы — отдельные элементы `table`, их обрабатывает свой вызов. Цена — один
-//! проход по секциям, строкам и ячейкам таблицы.
+//! проход по секциям, строкам и ячейкам таблицы и, если до заголовка встретился пустой
+//! `thead`, ещё один обратный проход: решение «за ним есть заголовок» для всех позиций
+//! считается сразу (I1 ревью fix-13: поиск вперёд от каждого из подряд идущих пустых
+//! `thead` был квадратичным — 224 КБ разбирались 9 с).
 //!
 //! ## Выравнивание
 //!
@@ -114,6 +117,10 @@ pub(crate) fn normalize_table(table: &Handle) {
     let mut first = true;
     let old = std::mem::take(&mut *table.children.borrow_mut());
     let mut kept: Vec<Handle> = Vec::with_capacity(old.len());
+    // Решения секций за каждой позицией ([`decisions_after`]) — один обратный проход, при
+    // первом пустом `thead` до заголовка (I1 ревью fix-13: поиск вперёд от каждого из подряд
+    // идущих пустых `thead` был квадратичным).
+    let mut after: Option<Vec<Option<bool>>> = None;
     for (i, section) in old.iter().cloned().enumerate() {
         // Пустой `thead` до заголовка — тело, если за ним `htmd` взял бы заголовок (m-2
         // повторного ревью fix-10): иначе тот занял бы место заголовка, и таблица вышла бы без
@@ -123,8 +130,10 @@ pub(crate) fn normalize_table(table: &Handle) {
         let section = if is_html(&section, "thead")
             && !header
             && is_empty_head(&section)
-            && header_follows(&section, &old[i + 1..])
-        {
+            && header_follows(
+                &section,
+                after.get_or_insert_with(|| decisions_after(&old))[i + 1],
+            ) {
             renamed(&section, "tbody", table)
         } else {
             section
@@ -188,39 +197,52 @@ fn is_empty_head(thead: &Handle) -> bool {
 }
 
 /// Возьмёт ли `htmd` строку заголовка, если пустой `thead` станет телом: первая непустая
-/// строка — его собственная (после пустой первой) или секций `rest` за ним — из одних `th`,
-/// или дальше идёт непустой `thead` (его первую строку [`normalize_table`] делает
-/// заголовком). Пустые строки и пустые `thead` выбор не сдвигают.
-fn header_follows(thead: &Handle, rest: &[Handle]) -> bool {
-    // Решение по первой непустой строке; `None` — непустых строк нет.
-    let decide = |rows: Vec<Handle>| {
-        rows.iter().find_map(|row| {
-            let (th, td) = cell_counts(row);
-            (th + td > 0).then_some(td == 0)
-        })
+/// строка — его собственная (после пустой первой) или секций за ним — из одних `th`, или
+/// дальше идёт непустой `thead` (его первую строку [`normalize_table`] делает заголовком).
+/// Пустые строки и пустые `thead` выбор не сдвигают. `after` — решение секций за `thead`
+/// ([`decisions_after`]); `None` — решающей секции нет.
+fn header_follows(thead: &Handle, after: Option<bool>) -> bool {
+    decide(rows_of(thead)).or(after).unwrap_or(false)
+}
+
+/// Решение по первой непустой строке: из одних `th` — `true`, иначе `false`; `None` —
+/// непустых строк нет.
+fn decide(rows: Vec<Handle>) -> Option<bool> {
+    rows.iter().find_map(|row| {
+        let (th, td) = cell_counts(row);
+        (th + td > 0).then_some(td == 0)
+    })
+}
+
+/// Решение секции `section` для пустого `thead` перед ней: непустой `thead` — `true`, иначе
+/// первая непустая строка секции ([`decide`]); `None` — секция ничего не решает.
+fn decision_of(section: &Handle) -> Option<bool> {
+    if is_html(section, "thead") && !is_empty_head(section) {
+        return Some(true);
+    }
+    let rows = if is_html(section, "tr") {
+        vec![Rc::clone(section)]
+    } else if ["tbody", "tfoot", "thead"]
+        .iter()
+        .any(|s| is_html(section, s))
+    {
+        rows_of(section)
+    } else {
+        Vec::new()
     };
-    if let Some(d) = decide(rows_of(thead)) {
-        return d;
+    decide(rows)
+}
+
+/// `out[i]` — решение первой решающей секции из `sections[i..]` ([`decision_of`]), `None` —
+/// такой нет; `out[sections.len()]` — `None`. Один обратный проход: O(секций, строк и ячеек)
+/// (I1 ревью fix-13). Секции после текущей [`normalize_table`] к этому моменту не менял,
+/// поэтому решения те же, что при поиске вперёд.
+fn decisions_after(sections: &[Handle]) -> Vec<Option<bool>> {
+    let mut out = vec![None; sections.len() + 1];
+    for i in (0..sections.len()).rev() {
+        out[i] = decision_of(&sections[i]).or(out[i + 1]);
     }
-    for section in rest {
-        if is_html(section, "thead") && !is_empty_head(section) {
-            return true;
-        }
-        let rows = if is_html(section, "tr") {
-            vec![Rc::clone(section)]
-        } else if ["tbody", "tfoot", "thead"]
-            .iter()
-            .any(|s| is_html(section, s))
-        {
-            rows_of(section)
-        } else {
-            Vec::new()
-        };
-        if let Some(d) = decide(rows) {
-            return d;
-        }
-    }
-    false
+    out
 }
 
 /// Строки `tr` среди детей секции.

@@ -958,6 +958,56 @@ fn empty_thead_before_data_rows_keeps_table_rows() {
     );
 }
 
+/// I1 ревью fix-13: решение «за пустым `thead` есть заголовок» считается один раз на
+/// таблицу, а не заново для каждого пустого `thead`. 2 МиБ идущих подряд `<thead>` (около
+/// 300 тыс. секций — меньше предела стража, глубина мала) перед строкой `td` и перед строкой
+/// `th`: в release около 0,35 с, почти всё — разбор `html5ever` (при квадратичном выборе —
+/// минуты). Предел теста — 1 с: под параллельной нагрузкой других тестов набора 0,5 с не
+/// держится, а регрессию ловит и он. Вывод — строки таблицы или заголовок с разделителем,
+/// как у малой таблицы.
+#[test]
+fn many_empty_theads_are_linear() {
+    for (row, header) in [
+        (
+            "<tr><td>1</td><td>2</td></tr><tr><td>3</td><td>4</td></tr>",
+            false,
+        ),
+        (
+            "<tr><th>Alpha</th><th>Beta</th></tr><tr><td>one</td><td>two</td></tr>",
+            true,
+        ),
+    ] {
+        let mut html = String::from("<table>");
+        let tail = format!("{row}</table><p>after</p>");
+        while html.len() + tail.len() + 7 < HTML_MAX_BYTES - 64 {
+            html.push_str("<thead>");
+        }
+        html.push_str(&tail);
+        assert!(html.len() > 2 * MIB - 128, "{}", html.len());
+        let m = bounded_within("many empty thead", html, release_second());
+        assert!(!m.simplified);
+        let lines = table_lines(&m.text);
+        if header {
+            assert_eq!(lines.len(), 3, "{:?}", &m.text[..m.text.len().min(400)]);
+            assert!(lines[0].contains("Alpha") && lines[0].contains("Beta"));
+            assert!(lines[1].contains("---"), "нет разделителя: {}", m.text);
+            assert!(lines[2].contains("one") && lines[2].contains("two"));
+        } else {
+            assert!(
+                lines.iter().any(|l| l.contains('1') && l.contains('2'))
+                    && lines.iter().any(|l| l.contains('3') && l.contains('4')),
+                "{:?}",
+                &m.text[..m.text.len().min(400)]
+            );
+        }
+        assert!(
+            m.text.ends_with("after"),
+            "{:?}",
+            &m.text[m.text.len().saturating_sub(200)..]
+        );
+    }
+}
+
 /// m6 ревью задачи 10. Многострочный `thead`: `htmd` читает только первую строку, остальные
 /// пропадали. Первая строка — заголовок, следующие — строки данных перед телом.
 #[test]
