@@ -1,16 +1,14 @@
-//! Поддельный HTTP-сервер на `127.0.0.1` (R1-C2, D121): сайт или свой экземпляр SearXNG.
-//! Ответ строит обработчик теста по пути с запросом (`/search?q=…&format=json`); каждый
-//! принятый запрос пишется в журнал сервера ([`FakeHttp::requests`]) — тест «подключения не
-//! было» смотрит на пустой журнал, а не на таймер. Настоящий интернет тесты не используют.
+//! Поддельный HTTP-сервер на `127.0.0.1` (R1-C2, D121): сайт, свой экземпляр SearXNG или
+//! HTTP-прокси ([`proxy`]). Ответ строит обработчик теста по пути с запросом
+//! (`/search?q=…&format=json`); каждый принятый запрос пишется в журнал сервера
+//! ([`FakeHttp::requests`]) — тест «подключения не было» смотрит на пустой журнал, а не на
+//! таймер. Настоящий интернет тесты не используют.
 
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-
-/// Ответ по пути с запросом (`/page`, `/search?q=x&format=json`).
-pub type HttpHandler = fn(&str) -> Response;
 
 /// Сервер: runtime живёт, пока жив сервер.
 pub struct FakeHttp {
@@ -22,7 +20,9 @@ pub struct FakeHttp {
 }
 
 impl FakeHttp {
-    pub fn start(handler: HttpHandler) -> Self {
+    /// Сервер с ответом `handler` по пути с запросом (`/page`, `/search?q=x&format=json`);
+    /// замыкание — когда выдаче SearXNG нужны адреса поддельных сайтов теста.
+    pub fn start(handler: impl Fn(&str) -> Response + Send + Sync + 'static) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -30,8 +30,10 @@ impl FakeHttp {
             .unwrap();
         let requests = Arc::new(Mutex::new(Vec::<String>::new()));
         let log = requests.clone();
+        let handler = Arc::new(handler);
         let app = Router::new().fallback(move |uri: Uri| {
             let log = log.clone();
+            let handler = handler.clone();
             async move {
                 let target = uri
                     .path_and_query()
@@ -83,6 +85,13 @@ pub fn searx_results(hits: &[(&str, &str, &str)]) -> Response {
         "application/json",
         serde_json::json!({"query": "q", "results": results}).to_string(),
     )
+}
+
+/// Поддельный HTTP-прокси (D107, D121): на любой запрос — 502. Запрос через прокси к
+/// `http://` приходит строкой `GET http://host:port/path`, и журнал сервера его видит; тест
+/// ждёт пустой журнал после завершения процесса.
+pub fn proxy() -> FakeHttp {
+    FakeHttp::start(|_| reply(StatusCode::BAD_GATEWAY, "text/plain", "proxied"))
 }
 
 /// Порт, на котором никто не слушает: сервер на нём только что закрыт.

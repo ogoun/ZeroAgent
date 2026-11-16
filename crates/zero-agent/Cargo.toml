@@ -70,6 +70,13 @@ required-features = ["test-hooks"]
 name = "skills"
 required-features = ["test-hooks"]
 
+# Приёмка R1-C2 (задача 15): S1 с поиском и ссылками, отказ локальных адресов, Rule of Two,
+# скиллы, resume веба, маска секрета в URL, прокси — сайты и SearXNG на 127.0.0.1 под
+# именами `--web-resolve`.
+[[test]]
+name = "r1c2_web_skills"
+required-features = ["test-hooks"]
+
 [dev-dependencies]
 # Жив ли подпроцесс извлекателя после тайм-аута и броска future (тест `extract`).
 sysinfo.workspace = true
