@@ -28,6 +28,10 @@ serde.workspace = true
 # Ошибка разбора PDF (`ExtractError`).
 thiserror.workspace = true
 
+[dev-dependencies]
+# Хэши закреплённого корпуса `tests/corpus.rs` (m4 финального ревью извлечения).
+blake3.workspace = true
+
 [features]
 # Намеренный сбой подпроцесса для теста `deep_nesting_kills_only_child` (D128): в продукте
 # крюка нет. Сквозной тест падения подпроцесса через `za_jail::Runner` — у бинарника

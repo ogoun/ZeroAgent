@@ -2736,6 +2736,7 @@ dependencies = [
 name = "za-extract"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "htmd",
  "html5ever",
  "markup5ever_rcdom",
