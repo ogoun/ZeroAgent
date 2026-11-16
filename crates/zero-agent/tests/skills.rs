@@ -638,10 +638,10 @@ impl za_core::extract::Extractor for NoExtractor {
 }
 
 /// Настоящий набор top standard (нативные инструменты, встроенные, веб из `zero_agent::web`
-/// с поиском и каталог core pack): описания при n_ctx 16k и 32k укладываются в предел D169
-/// — слот Tools тира, но не ниже окна 32k, плюс колонка каталога (1800 и 2100 токенов);
-/// каталог — в своей колонке `ContextBudget::catalog` окна. Тест здесь: `za-agent` от
-/// `za-tools` и `za-web` не зависит.
+/// с поиском и каталог core pack) по частям D169 (Ruling m1 ревью задачи 14): описания без
+/// каталога на 16k и 32k — не больше 1700 токенов (`STANDARD_TOOLS_LIMIT`), каталог — не
+/// больше своей колонки окна `ContextBudget::catalog` (300, 600, 1500 на 16k, 32k, 64k).
+/// Тест здесь: `za-agent` от `za-tools` и `za-web` не зависит.
 #[test]
 fn standard_tools_fit_slot_with_web_and_catalog() {
     let native = za_tools::native_capability(&za_tools::NativeDeps {
@@ -671,27 +671,34 @@ fn standard_tools_fit_slot_with_web_and_catalog() {
     let caps = [za_agent::skills_capability(Arc::new(catalog))];
     let cases = za_agent::standard_tools_cases(&tools, &caps).unwrap();
     let want = [
-        ("top/standard/tools@16k", 16_384, 1800),
-        ("top/standard/tools@32k", 32_768, 2100),
+        ("top/standard/tools@16k", 1700),
+        ("top/standard/catalog@16k", 300),
+        ("top/standard/tools@32k", 1700),
+        ("top/standard/catalog@32k", 600),
+        ("top/standard/catalog@64k", 1500),
     ];
-    assert_eq!(cases.len(), want.len());
-    for (case, (name, n_ctx, limit)) in cases.iter().zip(want) {
-        assert_eq!(case.name, name);
+    let names: Vec<&str> = cases.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, want.map(|(n, _)| n));
+    assert_eq!(za_agent::STANDARD_TOOLS_LIMIT, 1700);
+    for (case, (name, limit)) in cases.iter().zip(want) {
         assert_eq!(case.limit, limit, "{name}: предел D169");
-        for tool in ["web_fetch", "web_search", "activate_skill", "read", "glob"] {
-            assert!(case.text.contains(tool), "{name}: нет {tool}");
-        }
         let tokens = za_agent::approx_tokens(&case.text);
         assert!(tokens <= limit, "{name}: {tokens} > {limit}");
-        let at = case.text.find("<skill_catalog>").expect("нет каталога");
-        let end = case
-            .text
-            .find("</skill_catalog>")
-            .expect("нет конца каталога")
-            + "</skill_catalog>".len();
-        let column = za_agent::ContextBudget::for_context(n_ctx).catalog;
-        let cat = za_agent::approx_tokens(&case.text[at..end]);
-        assert!(cat <= column, "{name}: каталог {cat} > {column}");
-        println!("{name}: {tokens}/{limit}, каталог {cat}/{column}");
+        if name.contains("/tools@") {
+            for tool in ["web_fetch", "web_search", "activate_skill", "read", "glob"] {
+                assert!(case.text.contains(tool), "{name}: нет {tool}");
+            }
+            assert!(!case.text.contains("<skill_catalog>"), "{name}");
+        } else {
+            assert!(
+                case.text.starts_with("<skill_catalog>") && case.text.ends_with("</skill_catalog>"),
+                "{name}: {}",
+                case.text
+            );
+            for skill in za_skills::PACK {
+                assert!(case.text.contains(skill), "{name}: нет {skill}");
+            }
+        }
+        println!("{name}: {tokens}/{limit}");
     }
 }

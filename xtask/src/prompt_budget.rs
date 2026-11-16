@@ -13,9 +13,11 @@
 //! `za_tools::native_capability()` ([`all_cases`]). Случаи `skills/<name>` — тексты
 //! core pack целиком, не больше 700 токенов каждый (R1-C2 D120): их даёт
 //! `za_agent::budget_cases()` с теми же текстами, что входят в хэш промптов. Случаи
-//! `top/standard/tools@{16k,32k}` (R1-C2 D117) — описания инструментов run с тиром standard:
-//! встроенные, нативные, `web_fetch`, `web_search` и `activate_skill` с каталогом 14 скиллов
-//! поставки ([`standard_cases`]); инструменты веба только строятся, к сети команда не идёт.
+//! `top/standard/tools@{16k,32k}` и `top/standard/catalog@{16k,32k,64k}` (R1-C2 D117, D169) —
+//! описания инструментов run с тиром standard по частям: встроенные, нативные, `web_fetch`,
+//! `web_search` и `activate_skill` без каталога (предел 1700) и сам каталог 14 скиллов
+//! поставки (предел — колонка окна) ([`standard_cases`]); инструменты веба только строятся,
+//! к сети команда не идёт.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -507,10 +509,11 @@ mod tests {
         }
     }
 
-    /// R1-C2 D117 (preflight 3.7, 5.10): случаи `top/standard/tools@{16k,32k}` — настоящий
-    /// набор run с тиром standard: нативные, встроенные, веб и `activate_skill` с каталогом
-    /// 14 скиллов поставки в ограждении; лимит — слот Tools тира (не меньше окна 32k) и
-    /// колонка каталога окна (300 и 600): 1800 и 2100 (D169).
+    /// R1-C2 D117, D169 (preflight 3.7, 5.10; Ruling m1 ревью задачи 14 — части отдельно):
+    /// `top/standard/tools@{16k,32k}` — настоящий набор run с тиром standard без каталога
+    /// (нативные, встроенные, веб и `activate_skill`), предел 1700; `top/standard/catalog@
+    /// {16k,32k,64k}` — каталог 14 скиллов поставки в ограждении, предел — колонка каталога
+    /// окна (300, 600, 1500).
     #[test]
     fn prompt_budget_has_standard_cases() {
         use za_protocol::Tier;
@@ -523,14 +526,37 @@ mod tests {
             Tier::Small
         );
         let cases = all_cases().unwrap();
-        for (window, n_ctx, limit) in [("16k", 16_384, 1500 + 300), ("32k", 32_768, 1500 + 600)] {
-            let c = cases
+        let find = |name: String| {
+            cases
                 .iter()
-                .find(|c| c.name == format!("top/standard/tools@{window}"))
-                .unwrap_or_else(|| panic!("нет случая {window}"));
-            assert_eq!(c.limit, limit, "{window}");
-            let b = za_agent::ContextBudget::for_context(n_ctx);
-            assert_eq!(c.limit, 1500 + b.catalog, "{window}");
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("нет случая {name}"))
+        };
+        for (window, n_ctx, column) in [
+            ("16k", 16_384, 300),
+            ("32k", 32_768, 600),
+            ("64k", 65_536, 1500),
+        ] {
+            let c = find(format!("top/standard/catalog@{window}"));
+            assert_eq!(c.limit, column, "{window}");
+            assert_eq!(
+                c.limit,
+                za_agent::ContextBudget::for_context(n_ctx).catalog,
+                "{window}"
+            );
+            assert!(c.text.starts_with("<skill_catalog>"), "{window}");
+            assert!(c.text.ends_with("</skill_catalog>"), "{window}");
+            for skill in za_skills::PACK {
+                assert!(c.text.contains(skill), "{window}: {skill}");
+            }
+            let n = count(&c.text);
+            assert!(!over_limit(&n, c.limit), "{window}: {n:?} при {}", c.limit);
+        }
+        assert!(!cases.iter().any(|c| c.name == "top/standard/tools@64k"));
+        for window in ["16k", "32k"] {
+            let c = find(format!("top/standard/tools@{window}"));
+            assert_eq!(c.limit, 1700, "{window}");
+            assert_eq!(c.limit, za_agent::STANDARD_TOOLS_LIMIT, "{window}");
             for name in [
                 "read",
                 "search",
@@ -550,10 +576,7 @@ mod tests {
                 );
             }
             assert!(!c.text.contains("\"name\":\"finish\""), "{window}");
-            assert!(c.text.contains("<skill_catalog>"), "{window}");
-            for skill in za_skills::PACK {
-                assert!(c.text.contains(skill), "{window}: {skill}");
-            }
+            assert!(!c.text.contains("<skill_catalog>"), "{window}");
             let n = count(&c.text);
             assert!(!over_limit(&n, c.limit), "{window}: {n:?} при {}", c.limit);
         }

@@ -705,29 +705,60 @@ pub fn small_prefix_cases(tools: &[std::sync::Arc<dyn za_core::Tool>]) -> Vec<Bu
     out
 }
 
-/// Окна случаев CI-лимита описаний инструментов top standard (R1-C2 D117): `(n_ctx, имя)`.
-const STANDARD_WINDOWS: [(u32, &str); 2] = [(16_384, "16k"), (32_768, "32k")];
+/// Окна случаев CI-лимита top standard (R1-C2 D117, D169): `(n_ctx, имя, есть ли случай
+/// описаний)`. Описания без каталога проверяются на 16k и 32k (у окна 64k+ слота Tools нет),
+/// каталог — на всех трёх: его колонка растёт с окном (300, 600, 1500).
+const STANDARD_WINDOWS: [(u32, &str, bool); 3] = [
+    (16_384, "16k", true),
+    (32_768, "32k", true),
+    (65_536, "64k", false),
+];
 /// Наименьшее окно тира standard по умолчанию (`Tier::for_context`): на окне меньше standard
 /// бывает только по `--tier`.
 pub const STANDARD_MIN_WINDOW: u32 = 32_768;
+/// Предел описаний инструментов top standard без каталога скиллов на окнах 16k и 32k,
+/// токены (R1-C2 D169, Ruling m1 ревью задачи 14). Набор на обоих окнах один: встроенные,
+/// нативные, веб и `activate_skill` без каталога — замер 1539 по [`approx_tokens`] (байты /
+/// 4) и около 1414 cl100k. Слот Tools окна 32k (1500) по осторожной оценке им уже превышен
+/// (рантайм слот standard не читает, D169), поэтому предел — замер и запас около 160 токенов:
+/// новое описание или правка на абзац сверх запаса роняет CI, и решать это нужно осознанно, а
+/// не поднимать предел молча.
+pub const STANDARD_TOOLS_LIMIT: u32 = 1700;
+/// Ограждение каталога скиллов в описании `activate_skill` (D117, `skills::fence`).
+const CATALOG_OPEN: &str = "<skill_catalog>";
+const CATALOG_CLOSE: &str = "</skill_catalog>";
 
-/// Случаи CI-лимита описаний инструментов top standard (R1-C2 D117, preflight 3.7, 5.10):
-/// `top/standard/tools@16k` и `top/standard/tools@32k` — `render_tools` префикса run с тиром
-/// standard на окне 16k и 32k: встроенные инструменты ([`crate::builtin_tools`],
-/// [`crate::request_grant_tool`]), `tools` (нативные и веб — их собирает `xtask`) и
-/// инструменты capability `caps` (скиллы с каталогом поставки) так, как их видит run: через
-/// [`crate::freeze`], с каталогом в описании `activate_skill` в его колонке
-/// (`ContextBudget::catalog`).
-///
-/// Лимит — слот Tools тира и колонка каталога окна: каталог — своя колонка, а не остаток
-/// слота (D117). Слот Tools берётся по окну, но не меньше окна [`STANDARD_MIN_WINDOW`]
-/// (R1-C2 D169): набор standard на окне 16k бывает только по `--tier`, а слот 16k (800)
-/// рассчитан на набор small и превышен нативными, встроенными и вебом уже без каталога
-/// (preflight 3.7). Итог — 1800 на 16k и 2100 на 32k. Колонка каталога — по самому окну,
-/// как её берёт `freeze`.
+/// Каталог скиллов `text` в ограждении (с ним самим) и остаток без каталога; ограждения нет —
+/// пустой каталог и весь текст.
+fn split_catalog(text: &str) -> (String, String) {
+    let Some(at) = text.find(CATALOG_OPEN) else {
+        return (String::new(), text.to_owned());
+    };
+    let end = text[at..]
+        .find(CATALOG_CLOSE)
+        .map_or(text.len(), |e| at + e + CATALOG_CLOSE.len());
+    (
+        text[at..end].to_owned(),
+        format!("{}{}", &text[..at], &text[end..]),
+    )
+}
+
+/// Случаи CI-лимита описаний инструментов top standard (R1-C2 D117, D169, preflight 3.7,
+/// 5.10) — `render_tools` префикса run с тиром standard: встроенные инструменты
+/// ([`crate::builtin_tools`], [`crate::request_grant_tool`]), `tools` (нативные и веб — их
+/// собирает `xtask`) и инструменты capability `caps` (скиллы с каталогом поставки) так, как
+/// их видит run: через [`crate::freeze`], с каталогом в описании `activate_skill` в его
+/// колонке (`ContextBudget::catalog`). Части проверяются отдельно (Ruling m1 ревью задачи
+/// 14: сумма скрывала, что описания без каталога больше слота, и запас занимала у колонки
+/// каталога):
+/// - `top/standard/tools@16k`, `@32k` — описания без каталога, предел
+///   [`STANDARD_TOOLS_LIMIT`];
+/// - `top/standard/catalog@16k`, `@32k`, `@64k` — каталог в ограждении, предел — колонка
+///   каталога окна (300, 600, 1500).
 ///
 /// Префикс не собран — ошибка, а не случай с пустым текстом: 0 токенов прошёл бы любой
-/// лимит (m1 ревью задачи 13).
+/// лимит (m1 ревью задачи 13). Каталога нет (`caps` без скиллов) — у случая каталога пустой
+/// текст, и `xtask prompt-budget` считает его несобранным.
 pub fn standard_tools_cases(
     tools: &[std::sync::Arc<dyn za_core::Tool>],
     caps: &[za_core::Capability],
@@ -749,7 +780,7 @@ pub fn standard_tools_cases(
         .map(|t| t.spec().schema.clone())
         .collect();
     let mut out = Vec::new();
-    for (n_ctx, window) in STANDARD_WINDOWS {
+    for (n_ctx, window, with_tools) in STANDARD_WINDOWS {
         let setup = crate::request::RunSetup {
             role: RunRole::Top,
             tier: Tier::Standard,
@@ -764,20 +795,25 @@ pub fn standard_tools_cases(
             project_dir: std::path::PathBuf::from("."),
             context: crate::context::ContextConfig::default(),
         };
-        let budget = crate::context::ContextBudget::for_context(n_ctx);
-        let slot = crate::context::ContextBudget::for_context(n_ctx.max(STANDARD_MIN_WINDOW))
-            .tools
-            .unwrap_or(u32::MAX);
+        let column = crate::context::ContextBudget::for_context(n_ctx).catalog;
         // Повтор имени отсеян реестром выше, но ошибку префикса не прячем.
         let frozen = crate::request::freeze(&setup, &schemas, caps, None)?;
         let text = za_llm::render_tools(&za_llm::PromptBlocks {
             tools: frozen.tools,
             ..Default::default()
         });
+        let (catalog, rest) = split_catalog(&text);
+        if with_tools {
+            out.push(BudgetCase {
+                name: format!("top/standard/tools@{window}"),
+                text: rest,
+                limit: STANDARD_TOOLS_LIMIT,
+            });
+        }
         out.push(BudgetCase {
-            name: format!("top/standard/tools@{window}"),
-            text,
-            limit: slot.saturating_add(budget.catalog),
+            name: format!("top/standard/catalog@{window}"),
+            text: catalog,
+            limit: column,
         });
     }
     Ok(out)

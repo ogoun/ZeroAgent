@@ -78,9 +78,11 @@ impl ContextBudget {
     ///
     /// Примечание к строкам 8k и 16k (R1-C2 D169): слот Tools 550 и 800 рассчитан на набор
     /// tier small, и рантайм читает его только у small (`small_instructions`). Набор
-    /// standard на окне 16k бывает только по `--tier`: его предел CI — слот окна 32k (1500)
-    /// и колонка каталога окна, 1800 на 16k и 2100 на 32k (`standard_tools_cases`); резерв
-    /// вывода хода standard на 16k — 5120 (D40), рабочая часть окна ≈ 9,7k.
+    /// standard на окне 16k бывает только по `--tier`: его пределы CI — по частям
+    /// (`standard_tools_cases`): описания без каталога не больше 1700 на 16k и 32k
+    /// (`STANDARD_TOOLS_LIMIT`; слот окна 32k, 1500, по осторожной оценке уже превышен),
+    /// каталог — не больше колонки окна; резерв вывода хода standard на 16k — 5120 (D40),
+    /// рабочая часть окна ≈ 9,7k.
     pub fn for_context(n_ctx: u32) -> ContextBudget {
         let (prompt, tools, output_reserve, compaction_reserve, catalog) = if n_ctx < 16_384 {
             (800, Some(550), 1000, 1000, 300)
