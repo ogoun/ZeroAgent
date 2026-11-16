@@ -247,13 +247,20 @@ pub async fn cmd_skills_list(
 
 /// Текст `skills list`: строки `name  source  путь` (по старшинству источника, затем
 /// имени) с предупреждениями, затем заметки о проекте, пропущенные, корни, не прочитанные
-/// пределом записей, и каталоги скиллов по ссылке ([`linked_lines`]).
+/// пределом записей, и каталоги скиллов по ссылке ([`linked_lines`]). Пути, причины и
+/// предупреждения берутся из файлов источников, поэтому печатаются через [`printable`].
 pub fn render_list(cat: &Catalog, s: &SkillsSettings, notes: &[String]) -> String {
     let mut out = String::new();
     for k in &cat.skills {
-        out.push_str(&format!("{}  {}  {}", k.name, k.source, k.display));
+        out.push_str(&format!(
+            "{}  {}  {}",
+            k.name,
+            k.source,
+            printable(&k.display)
+        ));
         if !k.warnings.is_empty() {
-            out.push_str(&format!("  предупреждения: {}", k.warnings.join("; ")));
+            let w = k.warnings.join("; ");
+            out.push_str(&format!("  предупреждения: {}", printable(&w)));
         }
         out.push('\n');
     }
@@ -266,11 +273,64 @@ pub fn render_list(cat: &Catalog, s: &SkillsSettings, notes: &[String]) -> Strin
     if !cat.skipped.is_empty() {
         out.push_str("пропущены:\n");
         for k in &cat.skipped {
-            out.push_str(&format!("  {}: {}\n", k.path, k.reason));
+            out.push_str(&format!(
+                "  {}: {}\n",
+                printable(&k.path),
+                printable(&k.reason)
+            ));
         }
     }
     for l in limit_lines(cat, s).into_iter().chain(linked_lines(cat)) {
-        out.push_str(&format!("предупреждение: {l}\n"));
+        out.push_str(&format!("предупреждение: {}\n", printable(&l)));
     }
     out
+}
+
+/// Строка для терминала (Minor 8 финального ревью скиллов): управляющие символы и
+/// невидимые символы уровня `Untrusted` (D102: bidi, нулевая ширина, теги) — в виде
+/// `\u{…}`, остальное как есть (обратная косая путей Windows не удваивается). Иначе имя
+/// каталога с U+202E переставляло бы текст строки `skills list`.
+fn printable(s: &str) -> std::borrow::Cow<'_, str> {
+    let hidden = |c: char| {
+        let mut buf = [0u8; 4];
+        // Отдельный символ: U+FEFF в начале строки `clean_invisible` считает BOM.
+        c.is_control()
+            || c == '\u{feff}'
+            || za_core::text::clean_invisible(
+                c.encode_utf8(&mut buf),
+                za_core::text::Clean::Untrusted,
+            )
+            .1 > 0
+    };
+    if !s.chars().any(hidden) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| {
+                if hidden(c) {
+                    c.escape_unicode().to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::printable;
+
+    /// Minor 8 финального ревью скиллов: управляющие и невидимые символы экранируются,
+    /// путь Windows, кириллица и эмодзи без ZWJ — как есть.
+    #[test]
+    fn printable_escapes_hidden_chars() {
+        assert_eq!(printable("C:\\skills\\мой"), "C:\\skills\\мой");
+        assert_eq!(
+            printable("a\u{202E}b\u{200B}c\u{7}d\u{E0041}\u{feff}"),
+            "a\\u{202e}b\\u{200b}c\\u{7}d\\u{e0041}\\u{feff}"
+        );
+        assert!(matches!(printable("plain"), std::borrow::Cow::Borrowed(_)));
+    }
 }

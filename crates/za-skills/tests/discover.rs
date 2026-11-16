@@ -663,6 +663,33 @@ fn skill_meta_fields() {
     );
 }
 
+/// Minor 8 финального ревью скиллов (m7 ревью задачи 11): скиллы — недоверенные данные
+/// (D102), и имя ресурса с невидимыми символами (bidi, нулевая ширина) в список ресурсов
+/// не входит: модель увидела бы одно имя, а файл назывался бы другим. Предупреждение
+/// называет имя с экранированием.
+#[test]
+fn resource_names_with_invisible_chars_not_listed() {
+    let user = dir("invisible-names");
+    skill(&user, "x", "x", "skill with odd resource names");
+    write(&user.join("x/ok.md"), "fine");
+    write(&user.join("x/evil\u{202E}dm.md"), "bidi");
+    write(&user.join("x/zero\u{200B}width.md"), "zero width");
+    let cat = discover(&DiscoverInput {
+        user_dir: Some(user),
+        ..DiscoverInput::default()
+    });
+    let x = cat.get("x").unwrap();
+    assert_eq!(
+        x.files.keys().cloned().collect::<Vec<_>>(),
+        ["ok.md".to_owned()]
+    );
+    for shown in ["evil\\u{202e}dm.md", "zero\\u{200b}width.md"] {
+        let want =
+            format!("file {shown} is not listed: invisible or control characters in the name");
+        assert!(x.warnings.contains(&want), "{:?}", x.warnings);
+    }
+}
+
 #[test]
 fn load_detects_change() {
     let user = dir("load");
