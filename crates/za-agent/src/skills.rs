@@ -58,6 +58,11 @@ pub(crate) const SKILL_LOAD_EFFECT: &str = "skill.load";
 /// Предел результата `activate_skill`, байт (D123: 64 КиБ); на окне меньше 64k — меньше,
 /// см. [`skill_output_limit`].
 pub const SKILL_OUTPUT_LIMIT: usize = 64 * 1024;
+/// Скиллы выключены конфигурацией (`[skills] enabled = false`) после старта run, а описание
+/// `activate_skill` осталось в замороженном префиксе (Minor 4 финального ревью скиллов, по
+/// образцу веба — Ruling «Задача 15»): вызов не исполняется, модель получает
+/// [`skills_withdrawn_text`]. Префикс не меняется: иначе сломается кэш.
+pub const SKILLS_DISABLED: &str = "skills are disabled by configuration since this run started";
 /// Предел карточки роутера, токены `upper_tokens` (D119).
 pub const CARD_LIMIT: u32 = 150;
 /// Потолок recall активных скиллов после компакции, токены (D118).
@@ -164,9 +169,23 @@ fn timeout_text(name: &str) -> String {
     )
 }
 
-/// Строка о скилле, снятом компакцией (D118).
-fn unloaded_text(name: &str) -> String {
-    format!("[skill \"{name}\" unloaded by compaction; activate it again if needed]")
+/// Результат вызова `activate_skill`, снятого с исполнения после старта run
+/// (`ToolRegistry::withdraw`, [`SKILLS_DISABLED`]): `<имя>: <причина>`, как у веба.
+pub fn skills_withdrawn_text() -> String {
+    format!("{ACTIVATE_SKILL_TOOL}: {SKILLS_DISABLED}")
+}
+
+/// Строка о скилле, снятом компакцией (D118). `activate` — в наборе run есть
+/// `activate_skill` (standard и full): модель загрузит скилл сама. На small инструмента нет,
+/// и строка называет путь пользователя `/имя` (m1 ревью fix-13).
+fn unloaded_text(name: &str, activate: bool) -> String {
+    if activate {
+        format!("[skill \"{name}\" unloaded by compaction; activate it again if needed]")
+    } else {
+        format!(
+            "[skill \"{name}\" unloaded by compaction; the user can load it again with /{name}]"
+        )
+    }
 }
 
 /// Последняя строка обрезанного каталога (D117).
@@ -213,7 +232,9 @@ pub(crate) fn text_samples() -> Vec<(&'static str, String)> {
         ("runtime/skills.timeout", timeout_text("x")),
         ("runtime/skills.unknown", unknown_text("x")),
         ("runtime/skills.unknown_file", unknown_file_text("f", "x")),
-        ("runtime/skills.unloaded", unloaded_text("x")),
+        ("runtime/skills.unloaded", unloaded_text("x", true)),
+        ("runtime/skills.unloaded_slash", unloaded_text("x", false)),
+        ("runtime/skills.withdrawn", skills_withdrawn_text()),
     ]
 }
 
@@ -873,12 +894,14 @@ pub(crate) async fn user_skill(
 /// эпохи (результат вызова с тем же `call_id` или сообщение с тем же блоком), остаётся
 /// активным без повтора блока. Чистая функция состояния: блобы адресованы содержимым,
 /// реплей даёт тот же итог. Итог — текст (пусто — нечего дописывать) и активные скиллы в
-/// прежнем порядке.
+/// прежнем порядке. `activate` — в замороженном наборе run есть `activate_skill`
+/// ([`unloaded_text`]).
 pub(crate) async fn recall(
     store: &ProjectStore,
     skills: &[ActiveSkill],
     tail: &[Message],
     limit: u32,
+    activate: bool,
 ) -> Result<(String, Vec<ActiveSkill>), StoreError> {
     let mut used = 0u32;
     let mut keep = vec![false; skills.len()];
@@ -900,7 +923,7 @@ pub(crate) async fn recall(
             keep[i] = true;
             blocks.push(text);
         } else {
-            unloaded.push(unloaded_text(&s.name));
+            unloaded.push(unloaded_text(&s.name, activate));
         }
     }
     blocks.extend(unloaded);

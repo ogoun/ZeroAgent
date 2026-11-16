@@ -627,6 +627,37 @@ async fn activation_result_not_spilled() {
     assert!(!f.project.join(".zero-agent/work/spill").exists());
 }
 
+/// m2 ревью fix-13: предел результата `activate_skill` — по окну run (D169,
+/// `skill_output_limit`), а не постоянный `SKILL_OUTPUT_LIMIT`. На standard 32k блок не
+/// длиннее 32 768 байт и с пометкой обрезки.
+#[tokio::test]
+async fn activation_result_cut_to_window() {
+    let body: String = (0..2500)
+        .map(|i| format!("Step {i:04}: do the next small thing carefully.\n"))
+        .collect();
+    let n_ctx = 32_768u32;
+    let limit = za_agent::skill_output_limit(n_ctx);
+    assert_eq!(limit, 32_768);
+    assert!(limit < SKILL_OUTPUT_LIMIT);
+    let f = fx(
+        "cut_to_window",
+        stubs(&[("big", "Use when big.", &body)]),
+        n_ctx,
+    );
+    f.model.push(activate("c1", "big"));
+    f.model.push(answer("ok"));
+    assert_eq!(start(&f, spec(&f, "t", Tier::Standard)).await, done("ok"));
+    let (content, is_error) = result_in(&last_request(&f), "c1");
+    assert!(!is_error);
+    assert!(content.len() <= limit, "{}", content.len());
+    assert!(content.len() > limit - 1024, "{}", content.len());
+    assert!(content.starts_with("<skill_content name=\"big\""));
+    assert_eq!(
+        content.lines().last(),
+        Some("[skill truncated; load parts with file]")
+    );
+}
+
 // ---- Каталог (D117) ----
 
 #[tokio::test]

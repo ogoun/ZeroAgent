@@ -435,9 +435,15 @@ pub async fn compact(
         let limit =
             crate::skills::recall_budget(n_ctx, input.setup.context.compact_at, reserve, estimate);
         let tail_msgs = &input.conv.messages()[split.min(input.conv.messages().len())..];
-        let (recalled, kept) = crate::skills::recall(&store, input.skills, tail_msgs, limit)
-            .await
-            .map_err(|e| store_err(ctx, e))?;
+        let activate = input
+            .frozen
+            .tools
+            .iter()
+            .any(|t| t.name == crate::skills::ACTIVATE_SKILL_TOOL);
+        let (recalled, kept) =
+            crate::skills::recall(&store, input.skills, tail_msgs, limit, activate)
+                .await
+                .map_err(|e| store_err(ctx, e))?;
         skills = kept;
         if !recalled.is_empty() {
             first.push_str("\n\n");

@@ -735,18 +735,35 @@ async fn prepare(
         CallVerdict::Reuse(text) => return Ok(Prep::Done(result(call, text.clone(), false))),
         CallVerdict::Run => {}
     }
+    let key = slot_ref(slots, i)?.key().clone();
+    let run = |slots: &mut [Option<EffectSlot>], action, finish| -> Result<Prep, EffectError> {
+        let slot = take(slots, i)?;
+        Ok(Prep::Run(Box::new(job(slot, call, action, j, env, finish))))
+    };
     let Some(tool) = reg.get(&call.name) else {
+        // Квитанция `skill.load` под ключом вызова реплеится и тогда, когда скиллы
+        // выключены после старта run (D92, Minor 4 финального ревью скиллов): итог вызова уже
+        // записан, и реплей не зависит от реестра.
+        if call.name == ACTIVATE_SKILL_TOOL
+            && let Some(recorded) = recorded_skill_load(ctx, &key, true).await?
+        {
+            return match plan_activation(
+                env.skills.as_deref(),
+                &st.skills,
+                &call.arguments,
+                Some(&recorded),
+                activation_limit(env),
+            ) {
+                Activation::Done { text, is_error } => Ok(Prep::Done(result(call, text, is_error))),
+                Activation::Load(job) => run(slots, Action::Skill(job), None),
+            };
+        }
         // Снятый с исполнения инструмент замороженного префикса (выключен конфигурацией
         // после старта run) — текст причины от того, кто его снял; иначе `unknown tool`.
         let text = reg
             .withdrawn(&call.name)
             .map_or_else(|| unknown_tool_text(&call.name), str::to_owned);
         return Ok(Prep::Done(result(call, text, true)));
-    };
-    let key = slot_ref(slots, i)?.key().clone();
-    let run = |slots: &mut [Option<EffectSlot>], action, finish| -> Result<Prep, EffectError> {
-        let slot = take(slots, i)?;
-        Ok(Prep::Run(Box::new(job(slot, call, action, j, env, finish))))
     };
     match call.name.as_str() {
         FINISH_TOOL | ASK_USER_TOOL => {
@@ -780,21 +797,13 @@ async fn prepare(
             }
             // Записанный `skill.load` под ключом вызова реплеится (D92), что бы ни стало с
             // каталогом с тех пор.
-            let row = ctx.store().effect(ctx.run_id(), &key).await;
-            let recorded = observe_store(ctx, row)?
-                .filter(|r| r.name == crate::skills::SKILL_LOAD_EFFECT)
-                .map(|r| r.args);
-            // Предел блока — по окну run (D169), как предел слота у прочих инструментов;
-            // без окна — `output_limit` инструмента.
-            let limit = env.spill.map_or(crate::skills::SKILL_OUTPUT_LIMIT, |c| {
-                crate::skills::skill_output_limit(c.n_ctx)
-            });
+            let recorded = recorded_skill_load(ctx, &key, false).await?;
             return match plan_activation(
                 env.skills.as_deref(),
                 &st.skills,
                 &call.arguments,
                 recorded.as_ref(),
-                limit,
+                activation_limit(env),
             ) {
                 Activation::Done { text, is_error } => Ok(Prep::Done(result(call, text, is_error))),
                 Activation::Load(job) => run(slots, Action::Skill(job), None),
@@ -1026,6 +1035,27 @@ async fn started_paths(
 /// Сколько событий после намерения просматривается в поисках `tool.started`: слот пишет
 /// его сразу после намерения, между ними — только события соседних слотов группы чтений.
 const STARTED_SCAN: usize = 1024;
+
+/// Аргументы эффекта `skill.load`, записанного под ключом вызова `activate_skill` (D92);
+/// `receipt` — только с квитанцией (итог вызова записан).
+async fn recorded_skill_load(
+    ctx: &mut RunCtx,
+    key: &EffectKey,
+    receipt: bool,
+) -> Result<Option<Value>, EffectError> {
+    let row = ctx.store().effect(ctx.run_id(), key).await;
+    Ok(observe_store(ctx, row)?
+        .filter(|r| r.name == crate::skills::SKILL_LOAD_EFFECT && (!receipt || r.result.is_some()))
+        .map(|r| r.args))
+}
+
+/// Предел блока `activate_skill` — по окну run (D169), как предел слота у прочих
+/// инструментов; без окна — `output_limit` инструмента.
+fn activation_limit(env: &ToolEnv) -> usize {
+    env.spill.map_or(crate::skills::SKILL_OUTPUT_LIMIT, |c| {
+        crate::skills::skill_output_limit(c.n_ctx)
+    })
+}
 
 /// Записанный ответ на прерывание доверия вызова (D83, D92): `Some` — исход вызова
 /// (пауза или отказ), `None` — решать дальше (доверие дано или прерывания нет). Ответ

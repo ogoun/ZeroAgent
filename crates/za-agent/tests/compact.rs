@@ -1840,6 +1840,70 @@ async fn compaction_recalls_active_skills() {
     assert_eq!(snap.skills[0].name, "tdd");
 }
 
+/// m1 ревью fix-13 (Minor 1 финального ревью скиллов): на small `activate_skill` в наборе
+/// нет, и строка скилла, снятого компакцией, советует путь пользователя `/имя`, а не
+/// отсутствующий инструмент. Скилл загружен `/review` в задаче; на окне 8k recall не больше
+/// 1024 токенов, и блок около 2000 токенов снимается.
+#[tokio::test]
+async fn small_unloaded_skill_points_to_slash() {
+    let catalog = sized_catalog([1980, 400]);
+    let n_ctx = 8192;
+    let small = || RunSpec {
+        tier: Some(Tier::Small),
+        task: "/review go".into(),
+        ..spec()
+    };
+    // Оценка первого запроса с блоком `/review` (байты / 4): пробный run.
+    let mut p = fx("small_unload_probe", scripted(n_ctx));
+    with_skills(&mut p, &catalog);
+    p.model.push(answer("ok"));
+    let (_ctl, rx) = control_channel(p.store.clone(), p.run);
+    let out = within("start_run", start_run(&p.deps, p.run, small(), rx))
+        .await
+        .unwrap();
+    assert_eq!(out, done("ok"));
+    let first_req = &p.model.calls()[0].request;
+    assert!(
+        !first_req.tools.iter().any(|t| t.name == "activate_skill"),
+        "на small activate_skill нет"
+    );
+    assert!(text_of(&first_req.messages[0]).contains("<skill_content name=\"review\""));
+    let start_est = ContextMeter::default()
+        .estimate(first_req, p.model.as_ref(), &EndpointId("a".into()))
+        .await
+        .tokens;
+    let reserve = za_agent::output_plan(
+        &za_agent::ContextBudget::for_context(n_ctx),
+        &reasoning_for(Tier::Small),
+    )
+    .max_output_tokens;
+    let threshold = 6144 - reserve;
+    // Запись `note` поднимает оценку на 150 выше порога (ход — около tokens + 13).
+    let big = threshold + 150 - start_est - 13;
+
+    let mut f = fx("small_unload", scripted(n_ctx));
+    with_skills(&mut f, &catalog);
+    f.model.push(note("n1", big));
+    f.model.push(summary("finish"));
+    f.model.push(answer("готово"));
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let out = within("start_run", start_run(&f.deps, f.run, small(), rx))
+        .await
+        .unwrap();
+    assert_eq!(out, done("готово"));
+    assert_eq!(compactions(&f.model), 1);
+    let last = turn_requests(&f.model).pop().unwrap();
+    let first = text_of(&last.messages[0]);
+    assert!(!first.contains("<skill_content name=\"review\""), "{first}");
+    assert!(
+        first.ends_with(
+            "\n\n[skill \"review\" unloaded by compaction; the user can load it again with /review]"
+        ),
+        "{}",
+        &first[first.len().saturating_sub(200)..]
+    );
+}
+
 /// D169 (I2 ревью задачи 13): recall не больше запаса новой эпохи до порога компакции. На
 /// окне 16k у standard резерв хода 5120, порог оценки 7168; хвост — последний ход с
 /// крупной записью. Оба скилла (около 1950 токенов) помещаются в `skill_recall_limit`

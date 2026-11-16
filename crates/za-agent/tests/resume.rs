@@ -1601,6 +1601,89 @@ async fn resume_replays_skill_load_from_receipt() {
     assert_eq!(snap.skills[0].call_id.as_deref(), Some("c1"));
 }
 
+/// Minor 4 финального ревью скиллов: скиллы выключены во время паузы (`[skills] enabled =
+/// false` — бинарник не подключает capability и снимает `activate_skill` с исполнения,
+/// `ToolRegistry::withdraw`), а описание `activate_skill` осталось в замороженном префиксе.
+/// Записанный `skill.load` реплеится по квитанции до проверки реестра (D92): тот же текст,
+/// без второго эффекта. Новый вызов получает понятный текст, а не `unknown tool`.
+#[tokio::test]
+async fn resume_with_skills_disabled_replays_and_withdraws() {
+    let (_root, cat) = user_skill_catalog("skill_withdrawn", "Original method.");
+    let mut f = fx("skill_withdrawn");
+    with_skills(&mut f.deps, cat);
+    f.deps.crash = crash_at(CrashPoint::AfterBoundary { step: 2 });
+    let spec = RunSpec {
+        tier: Some(Tier::Standard),
+        ..ask()
+    };
+    // Сбой — на границе шага 2, до вызова модели: второго ответа в сценарии нет.
+    f.model.push(activate_call("c1"));
+    assert!(matches!(start(&f, spec).await, Err(LoopError::Halted)));
+    let evs = events(&f.store, f.run).await;
+    let key = evs
+        .iter()
+        .find(|e| e.kind == EventKind::EffectIntent && e.payload["name"] == "skill.load")
+        .map(|e| e.payload["key"].clone())
+        .expect("нет намерения skill.load");
+    let receipt = evs
+        .iter()
+        .find(|e| e.kind == EventKind::EffectReceipt && e.payload["key"] == key)
+        .expect("нет квитанции skill.load");
+    let first = receipt.payload["result"]["value"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(first.contains("Original method."), "{first}");
+    // Скиллы выключены: capability нет, каталога исполнения нет, имя снято с исполнения.
+    let mut deps = f.deps.clone();
+    deps.crash = None;
+    deps.capabilities = Vec::new();
+    deps.skills = None;
+    let mut reg = (*deps.tools).clone();
+    reg.withdraw(
+        za_agent::ACTIVATE_SKILL_TOOL,
+        za_agent::skills_withdrawn_text(),
+    );
+    deps.tools = Arc::new(reg);
+    // Другие аргументы: повтор того же вызова был бы повтором (D54), а не вызовом.
+    let mut other = activate_call("c2");
+    if let Ok(StreamEvent::Finished { message, .. }) = &mut other[0]
+        && let Part::ToolCall(c) = &mut message.parts[0]
+    {
+        c.arguments = json!({"name": "review"});
+    }
+    f.model.push(other);
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume_with(&f, &deps, ResumeChange::default())
+            .await
+            .unwrap(),
+        done("ок")
+    );
+    let msgs = f.model.calls().last().unwrap().request.messages.clone();
+    assert_eq!(
+        result_of(&msgs, "c1"),
+        Some((first, false)),
+        "реплей квитанции"
+    );
+    assert_eq!(
+        result_of(&msgs, "c2"),
+        Some((
+            "activate_skill: skills are disabled by configuration since this run started"
+                .to_owned(),
+            true
+        ))
+    );
+    let evs = events(&f.store, f.run).await;
+    assert_eq!(
+        evs.iter()
+            .filter(|e| e.kind == EventKind::EffectIntent && e.payload["name"] == "skill.load")
+            .count(),
+        1,
+        "эффект skill.load повторён"
+    );
+}
+
 /// Каталог golden снимка v4 (D130): снимок живого run R1-C2 с активным скиллом и
 /// экспозицией (`snapshot.json`).
 fn golden_v4_path() -> PathBuf {
