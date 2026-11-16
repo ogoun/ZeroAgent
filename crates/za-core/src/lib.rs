@@ -54,9 +54,9 @@ pub use recovery::{
 };
 pub use runtime::{EffectError, EffectFailure, EffectSlot, EffectSource, EffectSpec, RunCtx};
 pub use tool::{
-    Access, Approval, DEADLINE_GRACE, DuplicateTool, Gate, NetRequest, Postcondition, RawPath,
-    RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, call_deadline,
-    gate,
+    Access, Approval, DEADLINE_GRACE, DIGEST_RESERVE, DuplicateTool, Gate, NetRequest,
+    Postcondition, RawPath, RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
+    ToolSpec, call_deadline, gate,
 };
 /// Схема инструмента для модели (поле [`ToolSpec::schema`]): крейты инструментов
 /// (`za-tools`) строят её без зависимости от `za-llm`.

@@ -12,14 +12,14 @@ use serde_json::{Value, json};
 use tokio::sync::{Barrier, watch};
 use tokio::time::{Instant, timeout};
 use za_agent::{
-    CallVerdict, Grant, GrantMode, GrantSource, PlannedCall, Signals, ToolEnv, ToolsOutcome,
-    builtin_tools, run_tools, signal_channel,
+    CallVerdict, Grant, GrantMode, GrantSource, PlannedCall, SPILL_DIR, Signals, SpillCfg, ToolEnv,
+    ToolsOutcome, builtin_tools, run_tools, signal_channel, spill_limit_bytes,
 };
 use za_core::paths::Roots;
 use za_core::{
-    Access, Approval, DEADLINE_GRACE, EffectError, EventBus, InterruptKind, InterruptState,
-    Journal, NetRequest, RawPath, RiskClass, RunCtx, Subjects, Tool, ToolCx, ToolKind, ToolOutput,
-    ToolRegistry, ToolSpec, interrupt,
+    Access, Approval, DEADLINE_GRACE, DIGEST_RESERVE, EffectError, EventBus, InterruptKind,
+    InterruptState, Journal, NetRequest, RawPath, RiskClass, RunCtx, Subjects, Tool, ToolCx,
+    ToolKind, ToolOutput, ToolRegistry, ToolSpec, interrupt,
 };
 use za_llm::normalize::CallSource;
 use za_llm::{BoxFuture, Part, ToolCall, ToolSchema};
@@ -81,6 +81,8 @@ struct TestTool {
     subjects: Subjects,
     /// Дедлайны полученных вызовов (`ToolCx::deadline`).
     deadlines: Arc<Mutex<Vec<Option<std::time::Instant>>>>,
+    /// Пределы результата полученных вызовов (`ToolCx::output_budget`).
+    budgets: Arc<Mutex<Vec<Option<usize>>>>,
 }
 
 impl Tool for TestTool {
@@ -94,6 +96,7 @@ impl Tool for TestTool {
 
     fn call(&self, _args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         self.deadlines.lock().unwrap().push(cx.deadline);
+        self.budgets.lock().unwrap().push(cx.output_budget);
         let delay = self.delay;
         let out = self.out.clone();
         let log = Arc::clone(&self.log);
@@ -183,6 +186,7 @@ fn test_tool(
         hold: None,
         subjects: Subjects::default(),
         deadlines: Arc::default(),
+        budgets: Arc::default(),
     }
 }
 
@@ -985,6 +989,40 @@ async fn secret_skipped_line_appended_by_slot() {
     assert!(cp.payload.get("secret_skipped").is_none(), "{}", cp.payload);
 }
 
+/// Строка слота `[no checkpoint …]` идёт и в `digest`: длинный вывод команды показывается
+/// им, и строка не должна теряться (тот же класс, что I1 ревью задачи 8).
+#[tokio::test]
+async fn secret_skipped_line_kept_in_digest() {
+    let (s, j, run) = setup("secret-skipped-digest").await;
+    let log = SharedLog::default();
+    let mut exec = test_tool(
+        "bash",
+        ToolKind::Exec,
+        0,
+        Duration::from_secs(60),
+        ToolOutput {
+            digest: Some("[test output digest]".into()),
+            ..ToolOutput::ok("o".repeat(10_000))
+        },
+        &log,
+    );
+    exec.spec.output_limit = Some(2000);
+    let reg = registry(vec![Arc::new(exec)]);
+    let mut e = env(run, RunMode::Auto, true);
+    e.checkpointer = Some(Arc::new(support::stub::CheckpointStub {
+        secret_skipped: vec![".env".into()],
+        ..Default::default()
+    }));
+    let calls = [planned("c1", "bash", json!({}))];
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]).1,
+        "[test output digest]\n[no checkpoint for this file: it looks like a secret]\n\
+         [output digest; full output: full output not saved]"
+    );
+}
+
 // ---- R1-C2 D110, D112: результат веба и журнал сетевых обращений ----
 
 /// Сетевое чтение с контрактом `web_fetch` (D123): `Read`, `Network`, `tainted`; вывод `out`.
@@ -1200,4 +1238,276 @@ async fn own_origin_keeps_outside_project() {
         text, "[untrusted content: outside_project, web]\npage",
         "outside_project — по путям, tool и network — нет"
     );
+}
+
+// ---- Ревью задачи 8 R1-C2: метка у `digest` (I1) и предел результата (I2) ----
+
+/// I1 (тест рецензента `review8_digest_keeps_untrusted_line`): длинный результат с `digest`
+/// сохраняет первую строку `[untrusted content: web]` — пакет показывает `digest`, а не
+/// `content`, и метка должна быть и там.
+#[tokio::test]
+async fn digest_keeps_untrusted_line() {
+    let (s, j, run) = setup("digest-untrusted").await;
+    let log = SharedLog::default();
+    let digest = "url: https://site.test/\nstatus: 200\ntype: text/plain\n\nmatched passage";
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        digest: Some(digest.into()),
+        ..ToolOutput::ok(format!("url: https://site.test/\n\n{}", "x".repeat(10_000)))
+    };
+    let mut tool = web_tool(out, &log);
+    tool.spec.output_limit = Some(2000);
+    // Помеченный инструмент без своего происхождения (`spec.tainted`): метка `tool`.
+    let mut marked = test_tool(
+        "marked",
+        ToolKind::Read,
+        0,
+        Duration::from_secs(60),
+        ToolOutput {
+            digest: Some("short digest".into()),
+            ..ToolOutput::ok("y".repeat(10_000))
+        },
+        &log,
+    );
+    marked.spec.tainted = true;
+    marked.spec.output_limit = Some(2000);
+    let reg = registry(vec![Arc::new(tool), Arc::new(marked)]);
+    let calls = [
+        planned("c1", "web_fetch", json!({"url": "https://site.test/"})),
+        planned("c2", "marked", json!({})),
+    ];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    let (_, text, _) = result_of(&o.results[0]);
+    assert_eq!(
+        text,
+        format!(
+            "[untrusted content: web]\n{digest}\n[output digest; full output: full output not saved]"
+        )
+    );
+    let (_, text, _) = result_of(&o.results[1]);
+    assert_eq!(
+        text,
+        "[untrusted content: tool]\nshort digest\n[output digest; full output: full output not saved]"
+    );
+}
+
+/// I1 с настоящей выгрузкой (`ToolEnv::spill`): в контексте — метка, `digest` и указатель
+/// `search …`, в файле — полный вывод (с той же меткой первой строкой).
+#[tokio::test]
+async fn digest_with_spill_file_keeps_untrusted_line() {
+    let project = dir("digest-spill-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let (s, j, run) = setup("digest-spill").await;
+    let log = SharedLog::default();
+    let body = format!("url: https://site.test/\n\n{}", "x".repeat(100_000));
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        digest: Some("matched passage".into()),
+        ..ToolOutput::ok(body.clone())
+    };
+    let reg = registry(vec![Arc::new(web_tool(out, &log))]);
+    let e = ToolEnv::new(
+        run,
+        project.clone(),
+        RunMode::Auto,
+        true,
+        Some(SpillCfg {
+            n_ctx: 16_384,
+            share: 0.15,
+        }),
+    );
+    let calls = [planned(
+        "c1",
+        "web_fetch",
+        json!({"url": "https://site.test/"}),
+    )];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let (_, text, _) = result_of(&o.results[0]);
+    let stem = EffectKey::derive(run, 0, 0).file_stem();
+    let rel = format!("{SPILL_DIR}/{stem}.txt");
+    assert_eq!(
+        text,
+        format!(
+            "[untrusted content: web]\nmatched passage\n[output digest; full output: search {rel}]"
+        )
+    );
+    let saved = std::fs::read_to_string(project.join(&rel)).expect("файл выгрузки");
+    assert_eq!(saved, format!("[untrusted content: web]\n{body}"));
+}
+
+/// I2: слот передаёт инструменту фактический предел результата на этом окне
+/// (`ToolCx::output_budget`): с выгрузкой — `spill_limit_bytes(n_ctx, share, output_limit)`,
+/// без неё — `output_limit`, без предела — `None`.
+#[tokio::test]
+async fn slot_passes_output_budget() {
+    let cfg = |n_ctx| SpillCfg { n_ctx, share: 0.15 };
+    let cases = [
+        // Окна 16k и 64k при `output_limit` `web_fetch` (128 КиБ): предел — доля окна.
+        (Some(cfg(16_384)), Some(128 * 1024), Some(9830)),
+        (Some(cfg(65_536)), Some(128 * 1024), Some(39_321)),
+        // `output_limit` меньше доли окна — он и есть предел.
+        (Some(cfg(16_384)), Some(2000), Some(2000)),
+        (None, Some(2000), Some(2000)),
+        (None, None, None),
+    ];
+    for (i, (spill, output_limit, want)) in cases.into_iter().enumerate() {
+        let (s, j, run) = setup(&format!("output-budget-{i}")).await;
+        let log = SharedLog::default();
+        let mut tool = web_tool(ok("page"), &log);
+        tool.spec.output_limit = output_limit;
+        let budgets = Arc::clone(&tool.budgets);
+        let reg = registry(vec![Arc::new(tool)]);
+        let e = ToolEnv::new(
+            run,
+            dir("output-budget-project"),
+            RunMode::Auto,
+            true,
+            spill,
+        );
+        let calls = [planned("c1", "web_fetch", json!({}))];
+        let (_tx, mut sig) = signal_channel();
+        run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+        assert_eq!(*budgets.lock().unwrap(), [want], "случай {i}");
+    }
+}
+
+/// Инструмент, который строит `digest` по пределу слота (как `web_fetch`, I2): `digest`
+/// ровно `output_budget − DIGEST_RESERVE` байт, `content` вдвое длиннее предела.
+struct BudgetTool {
+    spec: ToolSpec,
+}
+
+impl Tool for BudgetTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, _args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        let limit = cx.output_budget.expect("output_budget");
+        let line = "passage text\n";
+        // Последний символ — не перевод строки (хотя бы один `z`).
+        let mut digest = line.repeat((limit - DIGEST_RESERVE - 1) / line.len());
+        digest.push_str(&"z".repeat(limit - DIGEST_RESERVE - digest.len()));
+        Box::pin(async move {
+            ToolOutput {
+                taint: Some(taint_origin::WEB.into()),
+                digest: Some(digest),
+                ..ToolOutput::ok("w".repeat(limit * 2))
+            }
+        })
+    }
+}
+
+/// I2: `digest` в пределе `output_budget − DIGEST_RESERVE` приходит в контекст целиком — с
+/// меткой и указателем выгрузки, без обрезки головой и хвостом — на окнах 16k и 64k.
+#[tokio::test]
+async fn digest_within_reserve_is_not_cut() {
+    for n_ctx in [16_384u32, 65_536] {
+        let project = dir("digest-reserve-project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (s, j, run) = setup(&format!("digest-reserve-{n_ctx}")).await;
+        let mut spec = web_tool(ok("x"), &SharedLog::default()).spec;
+        spec.output_limit = Some(128 * 1024);
+        let reg = registry(vec![Arc::new(BudgetTool { spec })]);
+        let e = ToolEnv::new(
+            run,
+            project,
+            RunMode::Auto,
+            true,
+            Some(SpillCfg { n_ctx, share: 0.15 }),
+        );
+        let calls = [planned("c1", "web_fetch", json!({}))];
+        let (_tx, mut sig) = signal_channel();
+        let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+        let (_, text, _) = result_of(&o.results[0]);
+        let limit = spill_limit_bytes(n_ctx, 0.15, Some(128 * 1024));
+        assert!(text.len() <= limit, "{n_ctx}: {} > {limit}", text.len());
+        assert!(
+            text.starts_with("[untrusted content: web]\npassage text\n"),
+            "{n_ctx}: {}",
+            &text[..80]
+        );
+        assert!(!text.contains("… omitted "), "{n_ctx}: digest обрезан");
+        let digest_end = text.find("\n[output digest; full output: search ").unwrap();
+        assert_eq!(
+            digest_end - "[untrusted content: web]\n".len(),
+            limit - DIGEST_RESERVE,
+            "{n_ctx}: digest не целиком"
+        );
+    }
+}
+
+/// M4 ревью задачи 8: два `web_fetch` одного пакета идут одновременно (группа чтений,
+/// рандеву на `Barrier`); у каждого свой дедлайн, а его события `web.request` несут его
+/// `call_id` и стоят между его `tool.started` и `tool.finished`.
+#[tokio::test]
+async fn parallel_web_fetch_have_own_requests() {
+    let (s, j, run) = setup("web-parallel").await;
+    let log = SharedLog::default();
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        requests: vec![request("https://site.test/a", None, 200)].into(),
+        ..ToolOutput::ok("page")
+    };
+    let mut tool = web_tool(out, &log);
+    tool.barrier = Some(Arc::new(Barrier::new(2)));
+    let deadlines = Arc::clone(&tool.deadlines);
+    let reg = registry(vec![Arc::new(tool)]);
+    let calls = [
+        planned("c1", "web_fetch", json!({"url": "https://site.test/a"})),
+        planned("c2", "web_fetch", json!({"url": "https://site.test/a"})),
+    ];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    for r in &o.results {
+        let (id, text, is_error) = result_of(r);
+        assert!(!is_error, "{id}: {text}");
+        assert_eq!(
+            text, "[untrusted content: web]\npage",
+            "{id}: рандеву не прошло"
+        );
+    }
+    let got = deadlines.lock().unwrap().clone();
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(Option::is_some), "{got:?}");
+    let all = s.read_run(run, Seq(0), 10_000).await.unwrap();
+    for id in ["c1", "c2"] {
+        let at = |kind: EventKind| -> Vec<u64> {
+            all.iter()
+                .filter(|e| e.kind == kind && e.payload["call_id"] == id)
+                .map(|e| e.seq.0)
+                .collect()
+        };
+        let (started, web, finished) = (
+            at(EventKind::ToolStarted),
+            at(EventKind::WebRequest),
+            at(EventKind::ToolFinished),
+        );
+        assert_eq!(
+            (started.len(), web.len(), finished.len()),
+            (1, 1, 1),
+            "{id}"
+        );
+        assert!(started[0] < web[0] && web[0] < finished[0], "{id}");
+    }
 }

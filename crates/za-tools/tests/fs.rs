@@ -86,6 +86,7 @@ fn cx(root: &Path, run: RunId) -> ToolCx {
         effect_key: EffectKey::derive(run, 1, 1),
         paths: Vec::new(),
         deadline: None,
+        output_budget: None,
     }
 }
 

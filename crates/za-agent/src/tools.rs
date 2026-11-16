@@ -345,6 +345,18 @@ enum Cut {
     None,
 }
 
+impl Cut {
+    /// Фактический предел результата в контексте, байт после экранирования: его получает
+    /// инструмент как `ToolCx::output_budget` (R1-C2 D110, I2 ревью задачи 8).
+    fn limit(&self) -> Option<usize> {
+        match self {
+            Cut::Spill(job) => Some(job.limit),
+            Cut::Limit(n) => Some(*n),
+            Cut::None => None,
+        }
+    }
+}
+
 /// Вызов инструмента в слоте: всё, что нужно замыканию.
 struct ToolJob {
     tool: Arc<dyn Tool>,
@@ -1284,6 +1296,22 @@ fn untrusted_line(origins: &[String]) -> String {
     format!("{UNTRUSTED_MARK}{}]", origins.join(", "))
 }
 
+/// Дописать строку слота отдельной строкой к `content` и к `digest`, если он есть: длинный
+/// результат пакет показывает через `digest` (D86), и строка слота не должна теряться
+/// (I1 ревью задачи 8).
+fn push_line(out: &mut ToolOutput, line: &str) {
+    let push = |s: &mut String| {
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(line);
+    };
+    push(&mut out.content);
+    if let Some(d) = out.digest.as_mut() {
+        push(d);
+    }
+}
+
 /// Строка о нарушенном постусловии (TOOL-004).
 fn postcondition_text(what: &str) -> String {
     format!("{POSTCONDITION_FAILED}{what}]")
@@ -1394,6 +1422,8 @@ fn tool_action(
             paths: planned.clone(),
             // Ставит слот от старта вызова (D107).
             deadline: None,
+            // Предел слота на этом окне, а не `output_limit` инструмента (I2 ревью задачи 8).
+            output_budget: cut.limit(),
         },
         timeout: spec.timeout,
         cut,
@@ -2041,26 +2071,33 @@ impl Live {
         cx.deadline = Some(call_deadline(std::time::Instant::now(), timeout));
         let mut out = match tokio::time::timeout(timeout, tool.call(args, cx)).await {
             Ok(o) => o,
-            Err(_) => ToolOutput::error(timeout_text(timeout)),
+            Err(_) => {
+                // Сетевой инструмент обязан вернуться к своему дедлайну (D107): при внешнем
+                // тайм-ауте его журнал обращений брошен вместе с future (M8 ревью задачи 8).
+                if spec.risk == RiskClass::Network {
+                    tracing::warn!(
+                        key = %self.key,
+                        tool = %self.name,
+                        "внешний тайм-аут слота: сетевые обращения вызова не записаны"
+                    );
+                }
+                ToolOutput::error(timeout_text(timeout))
+            }
         };
         // (6a) Сетевые обращения вызова (D112): события до `tool.finished`, в квитанцию
         // записи не попадают. Реплей квитанции замыкание не запускает — повтора нет.
         let requests = std::mem::take(&mut out.requests);
         self.web_requests(&requests, masker.as_deref(), fref).await;
         self.crash_at(true, halt).await;
+        // Строки слота (здесь и в (8)) идут и в `digest`: длинный результат показывается
+        // им (I1 ревью задачи 8).
         if secret_skipped {
-            if !out.content.is_empty() && !out.content.ends_with('\n') {
-                out.content.push('\n');
-            }
-            out.content.push_str(SECRET_NO_CHECKPOINT);
+            push_line(&mut out, SECRET_NO_CHECKPOINT);
         }
         // (8) Постусловия (TOOL-004).
         let failed = check_posts(&roots.project, &out.post).await;
         for what in &failed {
-            if !out.content.is_empty() && !out.content.ends_with('\n') {
-                out.content.push('\n');
-            }
-            out.content.push_str(&postcondition_text(what));
+            push_line(&mut out, &postcondition_text(what));
             out.is_error = true;
         }
         // (9) Изменённые файлы.
@@ -2091,8 +2128,13 @@ impl Live {
         out.digest = out
             .digest
             .map(|d| clean_invisible(&d, level).0.into_owned());
+        // Метка — первой строкой и у `digest` (I1 ревью задачи 8): длинный результат модель
+        // видит через него, а метка должна быть в первой строке того, что она видит (D110).
+        // Место под строку — в `DIGEST_RESERVE`.
         if tainted {
-            out.content = format!("{}\n{}", untrusted_line(&origins), out.content);
+            let mark = untrusted_line(&origins);
+            out.content = format!("{mark}\n{}", out.content);
+            out.digest = out.digest.map(|d| format!("{mark}\n{d}"));
         }
         // (11) Маскировка секретов (D90): до квитанции и до выгрузки.
         if let Some(m) = masker.as_deref() {
@@ -2606,5 +2648,31 @@ mod tests {
             ["network", "outside_project"]
         );
         assert_eq!(of(&bash, &none, Some("network"), false), ["network"]);
+    }
+
+    /// I1/I2 ревью задачи 8: запас `DIGEST_RESERVE` покрывает строки слота вокруг `digest`
+    /// в худшем случае — все известные происхождения и самый длинный ключ эффекта.
+    #[test]
+    fn digest_reserve_covers_slot_lines() {
+        use crate::context::{SPILL_DIGEST_POINTER, SPILL_DIR, SPILL_SEARCH};
+        let all: Vec<String> = [
+            taint_origin::OUTSIDE_PROJECT,
+            taint_origin::UNTRUSTED_PROJECT,
+            taint_origin::NETWORK,
+            taint_origin::TOOL,
+            taint_origin::WEB,
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mark = untrusted_line(&all).len() + 1;
+        let key = EffectKey::derive(RunId::new(), u64::MAX, u64::MAX);
+        let path = format!("{SPILL_DIR}/{}.txt", spill_name(&key));
+        // Указатель и перевод строки перед ним (`spill_digest`).
+        let pointer = format!("{SPILL_DIGEST_POINTER}{SPILL_SEARCH}{path}]").len() + 1;
+        assert!(
+            mark + pointer <= za_core::DIGEST_RESERVE,
+            "{mark} + {pointer} > {}",
+            za_core::DIGEST_RESERVE
+        );
     }
 }
