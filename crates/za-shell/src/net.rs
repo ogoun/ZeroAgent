@@ -16,13 +16,13 @@
 //! хосты из URL только добавляются); хост записан не буквально (`$`, `%`, `{…}`, текст
 //! после `]`); сокет `/dev/tcp`, `/dev/udp` в слове или перенаправлении; сегмент с
 //! подстановкой или вложенной интерпретацией (`has_subst`, в том числе `ssh host команда`)
-//! или неразобран; ключ подмены адреса — `ssh -J|-S|-F`, `sftp|scp -S|-D`, `curl -x`,
+//! или неразобран; ключ подмены адреса — `ssh -J|-S|-F|-W|-L|-R|-D`, `sftp|scp -S|-D`, `curl -x`,
 //! `--proxy`, `--connect-to`, `--resolve`, `-K`, `wget -e|-i|--config`, `rsync -e`,
 //! `iwr -Proxy|-WebSession`, переменные `*_proxy`, `GIT_SSH*`, `POSIXLY_CORRECT`. Белые
 //! списки (третье ревью задачи 3): ключ `-o` у `ssh`, `scp`, `sftp` и ключ `git -c` вне
 //! списка — `unknown`; глобальная опция git вне таблицы — подкоманда и хост неизвестны.
-//! Присваивание переменной в любом сегменте команды — хост сетевой команды неизвестен
-//! ([`command_hosts`], проход 3c). Без правил по домену ни хосты, ни `unknown` ни на что не
+//! Присваивание переменной в любом сегменте команды (во вложенном коде — по правилам его
+//! языка) — хост сетевой команды неизвестен ([`command_hosts`], проход 3c). Без правил по домену ни хосты, ни `unknown` ни на что не
 //! влияют (D105).
 
 use crate::classify::{git_cfg, git_split, net_cmd, uses_dev_net};
@@ -159,10 +159,11 @@ const SSH_KEYS: &[&str] = &["port", "user", "identityfile", "identitiesonly", "c
     "requesttty", "forwardagent", "addkeystoagent", "visualhostkey", "escapechar"];
 
 /// `ssh` (OpenSSH 9.x; со значением — как у вложенной интерпретации `ssh host команда`);
-/// `-S` — сокет мастер-соединения: соединение идёт к хосту мастера (проход 3c).
+/// `-S` — сокет мастер-соединения: соединение идёт к хосту мастера (проход 3c); туннели и
+/// SOCKS `-W`, `-L`, `-R`, `-D` ведут трафик к хосту не из адреса (m3 прохода fix-4).
 #[rustfmt::skip]
-const SSH: Spec = Spec { flags: "1246afgknqstvxyACGKMNTVXY", vals: "bceilmopBDEILOPQRwW",
-    bad_short: "FJS", o_keys: SSH_KEYS, ..NONE };
+const SSH: Spec = Spec { flags: "1246afgknqstvxyACGKMNTVXY", vals: "bceilmopBEIOPQw",
+    bad_short: "DFJLRSW", o_keys: SSH_KEYS, ..NONE };
 
 /// `sftp` — свои опции (`-P port`, `-s subsystem`); `-S`, `-D` — программа вместо ssh.
 #[rustfmt::skip]
@@ -262,9 +263,10 @@ pub(crate) fn git_global(a: &[String]) -> (usize, bool) {
 
 /// Хосты команды целиком (D104): хосты всех сегментов без повторов и признак `unknown`.
 /// `segs` — сегменты [`crate::segments`] (с телами подстановок и вложенным кодом).
-/// Присваивание переменной в любом сегменте (проход 3c) делает хост сетевой команды
-/// неизвестным: переменная окружения меняет адрес (`https_proxy`, `POSIXLY_CORRECT`,
-/// `GIT_SSH_COMMAND`, `$PSDefaultParameterValues`).
+/// Присваивание переменной в любом сегменте (проход 3c), во вложенном коде — по правилам
+/// его языка ([`nested_any`]), делает хост сетевой команды неизвестным: переменная
+/// окружения меняет адрес (`https_proxy`, `POSIXLY_CORRECT`, `GIT_SSH_COMMAND`,
+/// `$PSDefaultParameterValues`).
 pub fn command_hosts(segs: &[Segment], d: Dialect) -> NetHosts {
     let mut out = NetHosts::default();
     for s in segs {
@@ -277,20 +279,40 @@ pub fn command_hosts(segs: &[Segment], d: Dialect) -> NetHosts {
         }
     }
     // Сетевой сегмент всегда даёт хост или `unknown`: хосты есть — сетевая команда есть.
-    out.unknown |= !out.hosts.is_empty() && segs.iter().any(|s| assigns(s, Lang::from(d)));
+    out.unknown |= !out.hosts.is_empty()
+        && segs
+            .iter()
+            .any(|s| nested_any(s, Lang::from(d), 0, &assigns));
     out
+}
+
+/// `f` верно для сегмента или для сегмента его вложенного кода, который проверяется своим
+/// языком на любой глубине (I1 ревью fix-4: `pwsh -c "[Environment]::…"` из bash). Глубже
+/// [`crate::MAX_NEST`] — `true`: неизвестное не считается безопасным.
+fn nested_any(seg: &Segment, lang: Lang, depth: u8, f: &impl Fn(&Segment, Lang) -> bool) -> bool {
+    if f(seg, lang) {
+        return true;
+    }
+    let Some(Inner::Code(code, l)) = analyze(&seg.argv, lang).and_then(|c| c.inner) else {
+        return false;
+    };
+    depth >= crate::MAX_NEST
+        || lex_code(&code, l, 1, 0)
+            .iter()
+            .any(|s| nested_any(s, l, depth + 1, f))
 }
 
 /// Сегмент присваивает или меняет переменную (Ruling прохода 3b, сомнение 2): `VAR=…`
 /// отдельно, перед командой или после обёртки; `env`, `export`, `set`, `unset`, `read`,
 /// `for X in`, `source`, `.`; PowerShell — выражение `$…` или `[…]` (`$env:X = …`,
-/// `$x = …`, `[Environment]::…`), `Set-Variable`, диски `env:`, `variable:`.
+/// `$x = …`, `[Environment]::…`), `Set-Variable`, `Import-Module` (m5 ревью fix-4), диски
+/// `env:`, `variable:`.
 fn assigns(seg: &Segment, lang: Lang) -> bool {
     #[rustfmt::skip]
     const NAMES: &[&str] = &["export", "declare", "typeset", "local", "readonly", "set", "unset",
         "setenv", "env", "read", "mapfile", "readarray", "getopts", "let", "source", "select",
         "set-variable", "sv", "new-variable", "nv", "clear-variable", "clv", "remove-variable",
-        "rv"];
+        "rv", "import-module", "ipmo"];
     let (w, pwsh) = (&seg.argv, lang == Lang::Pwsh);
     if w.first()
         .is_some_and(|x| x == "." || (pwsh && x.starts_with(['$', '['])))
@@ -314,7 +336,8 @@ fn assigns(seg: &Segment, lang: Lang) -> bool {
     }
 }
 
-/// Хосты сегмента и сегментов его строки вложенной интерпретации (D104).
+/// Хосты сегмента и сегментов его строки вложенной интерпретации (D104). Без правила
+/// присваиваний: для правил по домену — [`command_hosts`] (m6 ревью fix-4).
 pub fn network_hosts(seg: &Segment, d: Dialect) -> NetHosts {
     let lang = Lang::from(d);
     let mut out = NetHosts::default();

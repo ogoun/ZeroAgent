@@ -741,7 +741,7 @@ fn bad_domain_pattern_rejected() {
         "a..b",
         "evil.test..",
         // I1 ревью задачи 4: такой `deny` молча не совпал бы ни с одним хостом — ошибка
-        // сборки. Метка — только `[a-z0-9-]` и `*`, `?`; IP — только литералом.
+        // сборки. Метка — только `[a-z0-9_-]` и `*`, `?`; IP — только литералом.
         "evil.test/*",
         "*.evil.test:443",
         "https://*.evil.test",
@@ -763,6 +763,9 @@ fn bad_domain_pattern_rejected() {
         ("*", "a.test"),
         ("*.evil.test", "a.evil.test"),
         ("api-?.evil.test", "api-1.evil.test"),
+        // Ruling прохода fix-4: `_` в метке допустим.
+        ("a_b.evil.test", "a_b.evil.test"),
+        ("*.Svc_X.test", "_tcp.svc_x.test"),
         ("10.0.0.1", "10.0.0.1"),
         ("[::1]", "[::1]"),
         ("::1", "[::1]"),

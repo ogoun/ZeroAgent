@@ -5,6 +5,12 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, проход fix-4, переносы в задачу 5 (m3 и сомнение 2):
+  - `za-shell`: туннели и SOCKS у `ssh` (`-W`, `-L`, `-R`, `-D`) — подмена адреса, хост неизвестен, как у `-J`. У `sftp` и `scp` таких ключей нет: `-D` у них уже подмена, `-R` и `-l` — другие опции;
+  - `za-agent`: в метке шаблона `domain` допустим `_` (`_dmarc.example.com`, `*.a_b.test`); README обновлён;
+  - `za-shell` (I1 ревью fix-4): присваивание во вложенном коде проверяется правилами его языка на любой глубине — `pwsh -c "[Environment]::SetEnvironmentVariable(…); iwr …"` и `powershell -c 'Set-Item env:X 1; …'` из bash дают `unknown`; `Import-Module`, `ipmo` — присваивание (m5);
+  - `za-agent` (m3 ревью fix-4): шаблон `domain` с glob в последней метке (`a.1*`) больше не считается IP-адресом;
+  - миграция: `ssh -L|-R|-D|-W`, присваивание во вложенном PowerShell и `Import-Module` при правилах по домену теперь спрашиваются (причина `rule`); шаблоны `domain` с `_` и `a.1*` больше не ошибка конфигурации.
 - R1-C2, задача 3, проходы 3c и 3d (хосты сетевых команд; третье ревью задачи 3):
   - `za-shell`: `command_hosts(segs, dialect) -> NetHosts` — хосты команды целиком. Присваивание переменной в любом сегменте (`export`, `VAR=…`, `env`, `set`, `unset`, `read`, `for X in`, `source`, PowerShell `$env:X = …`, `$x = …`, `Set-Variable`, `Set-Item env:…`) делает хост сетевой команды неизвестным. `za_core::net::shell_hosts` собирает через неё;
   - `za-shell`: `ssh -S` (мастер-соединение) — подмена адреса. Ключи `-o` у `ssh`, `scp`, `sftp` проверяются по белому списку: `ControlPath`, `ControlMaster`, `ProxyCommand`, `ProxyJump`, `LocalCommand` и любой незнакомый ключ — `unknown`. Перечень `ssh_opts` удалён, и `-o` у `rsync` (owner) и `git clone` (origin) больше не даёт лишний `unknown`;

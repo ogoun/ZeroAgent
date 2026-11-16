@@ -1681,6 +1681,79 @@ fn hosts_table_git_globals_and_ssh_keys() {
     check_hosts(t);
 }
 
+/// I1 ревью fix-4: присваивание во вложенном коде проверяется языком этого кода, на любой
+/// глубине (bash → PowerShell → bash…): у bash `[…]` и `Set-Item env:` не присваивания, у
+/// PowerShell — да.
+#[test]
+fn hosts_table_nested_assignments() {
+    let t: &[(&str, Dialect, &[&str], bool)] = &[
+        (
+            "pwsh -Command \"[Environment]::SetEnvironmentVariable('X','1'); iwr https://a.test/\"",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "powershell -c 'Set-Item env:X 1; iwr https://a.test/'",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "bash -c 'pwsh -c \"Set-Item env:X 1; iwr https://a.test/\"'",
+            B,
+            &[],
+            true,
+        ),
+        (
+            "bash -c 'export X=1; curl https://a.test/'",
+            P,
+            &["a.test"],
+            true,
+        ),
+        // Без присваиваний во вложенном коде хост известен.
+        (
+            "pwsh -Command \"iwr https://a.test/ -UseBasicParsing\"",
+            B,
+            &["a.test"],
+            false,
+        ),
+        ("bash -c 'curl -s https://a.test/'", P, &["a.test"], false),
+        // m5 ревью fix-4: загрузка модуля PowerShell — как `source` у bash.
+        (
+            "Import-Module ./m.psm1; iwr https://a.test/",
+            P,
+            &["a.test"],
+            true,
+        ),
+        ("ipmo m; iwr https://a.test/", P, &["a.test"], true),
+    ];
+    check_hosts(t);
+}
+
+/// m3 прохода fix-4: туннели и SOCKS у ssh (`-W`, `-L`, `-R`, `-D`) ведут трафик к хосту,
+/// которого в адресе нет, — хост неизвестен, как у `-J`. У `sftp` и `scp` таких ключей нет:
+/// `-D` у них уже ключ подмены, `-R` и `-l` — другие опции.
+#[test]
+fn hosts_table_ssh_forwarding() {
+    let t: &[(&str, Dialect, &[&str], bool)] = &[
+        ("ssh -L 8080:localhost:80 me@a.test", B, &["a.test"], true),
+        ("ssh -L8080:localhost:80 a.test", B, &["a.test"], true),
+        ("ssh -NfL 8080:localhost:80 a.test", B, &["a.test"], true),
+        ("ssh -R 9000:localhost:22 a.test", B, &["a.test"], true),
+        ("ssh -D 1080 a.test", B, &["a.test"], true),
+        ("ssh -qD1080 a.test", B, &["a.test"], true),
+        ("ssh -W b.test:22 a.test", B, &["a.test"], true),
+        // Прочие опции со значением по-прежнему без `unknown`.
+        ("ssh -p 22 -l me -i k a.test", B, &["a.test"], false),
+        ("ssh -E log -c aes128-ctr a.test", B, &["a.test"], false),
+        // У `scp` `-R` — флаг (копирование между удалёнными через первый хост), `-l` — лимит.
+        ("scp -R -l 100 x b.test:y", B, &["b.test"], false),
+        ("sftp -R 8 -l 100 me@b.test", B, &["b.test"], false),
+    ];
+    check_hosts(t);
+}
+
 /// I2 третьего ревью задачи 3: глобальные опции git со значением (`--attr-source`,
 /// `--shallow-file`) не прячут подкоманду — сетевой признак и метка необратимости
 /// остаются; незнакомая глобальная опция — подкоманда неизвестна: сеть и `unparsed`.
