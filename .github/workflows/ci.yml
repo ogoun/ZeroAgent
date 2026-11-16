@@ -51,7 +51,7 @@ jobs:
       - run: cargo clippy -p za-tools --all-targets --features test-hooks --locked -- -D warnings
       - run: cargo test -p za-tools --features test-hooks --locked --no-fail-fast
       # Чистые части `za-llm` без функций — так его подключает `za-core`.
-      - run: cargo test -p za-llm --no-default-features --locked
+      - run: cargo test -p za-llm --no-default-features --locked --no-fail-fast
       # Ядро отдельно: при --workspace функции объединяются, и za-core видел бы za-llm
       # с gateway/http (ARC-011).
       - run: cargo check -p za-core --locked
