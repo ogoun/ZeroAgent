@@ -24,7 +24,7 @@ Confirm each suspicion in the code or with a run before you write it down.
 
 ## Write up
 - Open with one line: does the change do what it is for, as far as you checked.
-- Then the findings, ordered by how hard their damage would be to undo once the change is in use: effects that cannot be taken back first, then wrong results, then extra work for the next reader. Write each one as a short scenario: the place (file and line), the input or sequence, what happens, what should happen. Propose a fix only when it is not obvious.
+- Then the findings, ordered by how hard their damage would be to undo once the change is in use: effects that cannot be taken back first, then wrong results, then extra work for the next reader. Write each one as a short scenario: the place (file and line), the input or sequence, what happens, what should happen. Add a suggested fix only when the scenario leaves the right behavior open, or when the direct repair would break something else; then say which way you would go and why.
 - Close with what you could not check, such as another OS, a job that runs only in CI, or missing data.
 
 ## Stop when

@@ -37,6 +37,7 @@ pack![
     "doubt",
     "grill",
     "handoff",
+    "orient",
     "research-with-citations",
     "retro",
     "review",
@@ -45,5 +46,4 @@ pack![
     "spec",
     "tdd",
     "tickets",
-    "wayfinder",
 ];

@@ -16,7 +16,7 @@ Leave the work so that someone with no memory of this session can continue it wi
 7. Risks: what may break, what is fragile, what needs care.
 
 ## Where
-Put the note where the project keeps such notes (a plan or progress file); otherwise in your final reply. Keep it under one screen.
+Look in AGENTS.md and docs/ for a place meant for status or handoff notes, and use it. If the work follows a plan, for example a file in docs/plans/, add the note to that plan. If the project has neither, give the note in your final reply instead of creating new folders for it. Keep it short enough to read in a minute.
 
 ## Stop when
 A reader could take the next step from the note alone.

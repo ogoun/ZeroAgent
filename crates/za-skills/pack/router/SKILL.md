@@ -10,7 +10,7 @@ Pick at most one skill for the current step, or none.
 - clarify a vague request: grill
 - write down what to build and how to tell it is done: spec
 - split agreed work into tasks: tickets
-- get to know unfamiliar code: wayfinder
+- find where a change goes in unfamiliar code: orient
 - write code test first: tdd
 - find the cause of a fault: diagnose
 - check a change: review
@@ -31,7 +31,7 @@ A skill catalog, when one is shown, may list more skills; each description says 
 5. To load it, call the skill tool with the exact name if that tool is listed. If it is not, tell the user which skill fits: they can load it by typing a slash and its name, for example /tdd.
 
 ## A typical path for a new feature
-grill, spec, tickets, then for each ticket tdd, review and doubt. In an unfamiliar codebase start with wayfinder.
+grill, spec, tickets, then for each ticket tdd, review and doubt. In an unfamiliar codebase start with orient.
 
 ## No skill when
 - The task is a small, clear change or a direct question.

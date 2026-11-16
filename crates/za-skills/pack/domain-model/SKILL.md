@@ -14,15 +14,14 @@ Agree on the words of the problem, and keep decisions where the next reader will
 5. Keep the glossary where the project keeps docs (look for an existing one first), and use its words in code, tests and messages.
 
 ## Decisions
-Write a record when a later reader would otherwise reopen the question: an option was dropped for a reason, the choice binds other code or stored data, or a known risk was accepted.
-1. Find the project's decision records (often docs/adr) and follow their format and numbering.
-2. If there is no format yet, write the context, the decision, the options dropped and why, the consequences and any accepted risk.
-3. Keep it under a page. Link the code or plan it affects.
-4. A later decision replaces an earlier one through a new record that names it. Do not rewrite old records.
+Record a decision once it is made, if any of these holds: other code, stored data or users will rely on it; the obvious option was turned down and is likely to be suggested again; or its reason comes from the user or from facts the code cannot show.
+1. Look for existing records first: AGENTS.md or docs/ say where, docs/adr is common. If a record already covers the question, the new decision gets its own record that names the one it replaces. The old text stays as it was, apart from a status line if the format has one.
+2. Follow the numbering and layout of the latest record. With no layout yet, write the decision in one sentence, then the facts and constraints behind it, each rejected option with the reason it lost, what changes for code and data, and the signal that should make someone revisit it.
+3. Keep it to about a page and link the plan and code it affects. When the decision was the user's, ask them to confirm the wording.
 
 ## Stop when
 Every key term has one meaning, and each open decision is either recorded or listed as open.
 
 ## Do not
 - Invent terms that neither the user nor the code uses.
-- Record choices that are cheap to undo.
+- Write a record for a question that is still open: list it as open instead.

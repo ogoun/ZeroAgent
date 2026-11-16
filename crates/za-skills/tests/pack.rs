@@ -17,6 +17,7 @@ fn pack_is_complete_and_valid() {
             "doubt",
             "grill",
             "handoff",
+            "orient",
             "research-with-citations",
             "retro",
             "review",
@@ -24,8 +25,7 @@ fn pack_is_complete_and_valid() {
             "source-driven",
             "spec",
             "tdd",
-            "tickets",
-            "wayfinder"
+            "tickets"
         ]
     );
     for (n, t) in bundled() {

@@ -280,7 +280,7 @@ Agent Skills — стандарт (AAIF, Linux Foundation), версий спе�
 
 | Набор | Состав |
 |---|---|
-| Core pack (подписанный, редактируемый; тексты пишем сами, чужие скиллы не копируем, N-13) | grill, spec, tickets, wayfinder, tdd, diagnose, review, doubt, source-driven, research-with-citations, domain-model/ADR, retro, handoff, router |
+| Core pack (подписанный, редактируемый; тексты пишем сами, чужие скиллы не копируем, N-13) | grill, spec, tickets, orient (было wayfinder; переименован в R1-C2, fix-12b), tdd, diagnose, review, doubt, source-driven, research-with-citations, domain-model/ADR, retro, handoff, router |
 | Опциональные паки | `pm`, `marketing-seo`, `docs-office`, `deploy`, `re`, `gamedev`, `career`, `compliance-finance` |
 | Паки-интеграции | DocuSeal, Coolify, OpenPencil, Ghidra/REA, Godot/Unity/Blender |
 

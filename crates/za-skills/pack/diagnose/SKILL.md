@@ -1,6 +1,6 @@
 ---
 name: diagnose
-description: Use when a bug, failing test, crash or wrong output needs its root cause found before any fix is written.
+description: Use when something behaves differently from what you expect and the cause is unknown: a failing test, a wrong result, a crash or a fault that comes and goes.
 ---
 # Diagnose
 
