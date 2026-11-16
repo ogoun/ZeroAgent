@@ -7,6 +7,11 @@
 //! Крюк передаёт обёртка `Hooked` над `DirectRunner`: она вставляет флаг после `extract` и
 //! укорачивает тайм-аут, сам `ProcessExtractor` крюков не знает. `za_jail_tree` здесь не
 //! используется: `CARGO_BIN_EXE_*` есть только у тестов пакета-владельца бинарника.
+//!
+//! Ответ `extract html` укладывается в `HTML_OUTPUT_MAX` при любом входе (m-A1 повторного
+//! ревью финального прохода): экранирование JSON (`\`, `"`, управляющие символы) не
+//! превращает текст в бюджете в ошибку `TooLarge`, в том числе сквозь `web_fetch` (шлюз
+//! `za-web` и поддельный сайт `support::fake_web` на `127.0.0.1`).
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -14,18 +19,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use za_core::BoxFuture;
+use axum::http::StatusCode;
 use za_core::extract::{
     ExtractError, Extractor, HtmlRequest, Markdown, PDF_MAX_BYTES, PdfRequest, PdfText,
 };
+use za_core::{BoxFuture, ToolCx, call_deadline};
 use za_jail::{CommandSpec, DirectRunner, Output, Runner, RunnerError};
-use zero_agent::extract::ProcessExtractor;
+use za_protocol::{EffectKey, RunId};
 use zero_agent::extract::hooks::HANG_PID_FILE;
+use zero_agent::extract::{HTML_OUTPUT_MAX, ProcessExtractor};
+
+// Поддельный сайт (`support::fake_web`) и общий помощник каталогов (`support::process`,
+// `test-support/unique_dir.rs`): второй `#[path]` того же файла — `clippy::duplicate_mod`.
+mod support;
 
 #[path = "../../../test-support/pdf.rs"]
 mod pdf;
-#[path = "../../../test-support/unique_dir.rs"]
-mod shared_dir;
 
 /// Множитель времени тестов: `ZA_TEST_TIME_SCALE` (целое 1–6, по умолчанию 1).
 fn scale() -> u32 {
@@ -46,7 +55,7 @@ async fn within<T>(base: Duration, what: &str, f: impl Future<Output = T>) -> T 
 }
 
 fn dir(name: &str) -> PathBuf {
-    shared_dir::unique_dir("zero-agent-extract", name)
+    support::process::unique_dir("zero-agent-extract", name)
 }
 
 fn exe() -> PathBuf {
@@ -216,20 +225,169 @@ async fn process_extractor_pdf_errors() {
     assert_eq!(r, Err(ExtractError::InputTooLarge));
 }
 
-/// m8 ревью задачи 10: вывод подпроцесса больше предела (`HTML_OUTPUT_MAX`, 4 МиБ) —
-/// `TooLarge`, а не обрезанный JSON. Обратная косая черта у `htmd` экранируется (`\\`), а в
-/// JSON ещё раз: 2 МиБ входа дают около 8 МиБ ответа.
+/// Обёртка запуска с пределом захвата stdout `limit` вместо `HTML_OUTPUT_MAX`.
+struct Capped {
+    limit: usize,
+}
+
+impl Runner for Capped {
+    fn run(&self, mut spec: CommandSpec) -> BoxFuture<'static, Result<Output, RunnerError>> {
+        spec.capture_limit = self.limit;
+        DirectRunner.run(spec)
+    }
+}
+
+/// m8 ревью задачи 10: вывод подпроцесса больше предела захвата — `TooLarge`, а не
+/// обрезанный JSON. Сам подпроцесс укладывает ответ в `HTML_OUTPUT_MAX` (m-A1 повторного
+/// ревью финального прохода, тесты ниже), поэтому граница родителя проверяется пределом
+/// захвата меньше ответа.
 #[tokio::test(flavor = "multi_thread")]
 async fn html_output_over_limit_is_too_large() {
     let tmp = dir("html_too_large");
-    let body = "\\".repeat(za_extract::HTML_MAX_BYTES - 64);
+    let ex = ProcessExtractor::new(Arc::new(Capped { limit: 64 }), exe(), tmp.clone());
     let r = within(
         Duration::from_secs(60),
-        "extract html с большим выводом",
-        extractor(&tmp).html(html(&format!("<p>{body}</p>"))),
+        "extract html с выводом больше предела захвата",
+        ex.html(html(&format!("<p>{}</p>", "word ".repeat(100)))),
     )
     .await;
     assert_eq!(r, Err(ExtractError::TooLarge));
+}
+
+/// Длина stdout подпроцесса для ответа `md`: строка JSON той же формы (`{"ok": …}`) и
+/// перевод строки.
+fn reply_len(md: &Markdown) -> usize {
+    serde_json::to_string(&serde_json::json!({ "ok": md }))
+        .unwrap()
+        .len()
+        + 1
+}
+
+/// Разбор `page` подпроцессом: ответ обязан уложиться в предел вывода, иначе родитель
+/// вернул бы `TooLarge`.
+async fn fitted(tmp: &Path, page: String, what: &str) -> Markdown {
+    let md = within(
+        Duration::from_secs(60),
+        what,
+        extractor(tmp).html(html(&page)),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{what}: ожидался текст, а не {e:?}"));
+    assert!(
+        reply_len(&md) <= HTML_OUTPUT_MAX,
+        "{what}: {}",
+        reply_len(&md)
+    );
+    md
+}
+
+/// m-A1 повторного ревью финального прохода: текст в бюджете → ответ в пределе. `htmd`
+/// удваивает `\` (2,2 МБ текста — в бюджете `HTML_OUTPUT_BUDGET`), JSON удваивает ещё раз:
+/// прежде ответ был 4,4 МБ при пределе 4 МиБ, и `web_fetch` отвечал ошибкой. Теперь
+/// подпроцесс сам меряет готовую строку JSON и повторяет разбор линейным извлечением.
+#[tokio::test(flavor = "multi_thread")]
+async fn escaped_backslashes_reply_fits_limit() {
+    let tmp = dir("html_backslashes");
+    let n = 1_100_000;
+    let md = fitted(&tmp, format!("<p>{}</p>", "\\".repeat(n)), "1,1 МБ `\\`").await;
+    assert!(md.simplified, "повтор линейным извлечением");
+    assert_eq!(md.text.len(), n);
+    assert!(md.text.bytes().all(|b| b == b'\\'));
+}
+
+/// m-A1: 2 МиБ `"` (весь предел входа) — JSON удваивает каждый, и даже линейный текст не
+/// укладывается. Текст режется по границе символа с учётом экранирования: ответ в пределе и
+/// не короче нужного (ещё один `"` — уже больше предела). Признак обрезки — `simplified`,
+/// как у страницы сверх бюджета.
+#[tokio::test(flavor = "multi_thread")]
+async fn escaped_quotes_reply_is_cut_to_limit() {
+    let tmp = dir("html_quotes");
+    let page = format!("<p>{}", "\"".repeat(za_extract::HTML_MAX_BYTES - 3));
+    let md = fitted(&tmp, page, "2 МиБ `\"`").await;
+    assert!(md.simplified);
+    assert!(md.text.bytes().all(|b| b == b'"'), "только кавычки");
+    assert!(
+        reply_len(&md) + 2 > HTML_OUTPUT_MAX,
+        "обрезано лишнее: {}",
+        reply_len(&md)
+    );
+}
+
+/// m-A1: управляющие символы JSON пишет шестью байтами (`\u0001`): ответ в пределе, текст
+/// обрезан. `extract html` — самостоятельная граница: на фильтр `za-web` (нечитаемый текст
+/// туда не доходит) подпроцесс не полагается.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_chars_reply_fits_limit() {
+    let tmp = dir("html_controls");
+    let page = format!("<p>{}", "a\u{1}".repeat(za_extract::HTML_MAX_BYTES / 2 - 2));
+    let md = fitted(&tmp, page, "управляющие символы").await;
+    assert!(md.simplified);
+    assert!(
+        md.text.contains('\u{1}'),
+        "управляющие символы дошли до ответа"
+    );
+    assert!(
+        md.text.len() < za_extract::HTML_MAX_BYTES - 4,
+        "{}",
+        md.text.len()
+    );
+}
+
+/// m-A1 сквозь `web_fetch`: страница с 1,1 МБ `\` в `<p>` даёт текст, а не ошибку
+/// `TooLarge`. Шлюз `za-web` с подменой имени (признак `test-hooks`) и поддельный сайт на
+/// `127.0.0.1`; HTML разбирает настоящий подпроцесс.
+#[test]
+fn web_fetch_of_backslash_page_returns_text() {
+    use za_web::{WebConfig, WebGateway, web_fetch_tool};
+    let n = 1_100_000;
+    let page = format!("<p>{}</p>", "\\".repeat(n));
+    let site = support::fake_web::FakeHttp::start(move |p| {
+        if p == "/robots.txt" {
+            support::fake_web::reply(StatusCode::NOT_FOUND, "text/plain", "")
+        } else {
+            support::fake_web::reply(StatusCode::OK, "text/html; charset=utf-8", page.clone())
+        }
+    });
+    let tmp = dir("web_fetch_backslashes");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let out = rt.block_on(async {
+        let cfg = WebConfig {
+            ports: vec![site.port],
+            host_interval: Duration::ZERO,
+            ..WebConfig::default()
+        };
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], site.port));
+        let gw = WebGateway::new(cfg)
+            .unwrap()
+            .with_test_resolve(vec![("site.test".into(), addr)]);
+        let tool = web_fetch_tool(Arc::new(gw), Arc::new(extractor(&tmp)));
+        let run = RunId::new();
+        let cx = ToolCx {
+            run,
+            project_dir: tmp.clone(),
+            call_id: "c1".into(),
+            effect_key: EffectKey::derive(run, 0, 0),
+            paths: Vec::new(),
+            deadline: Some(call_deadline(
+                std::time::Instant::now(),
+                scaled(Duration::from_secs(60)),
+            )),
+            output_budget: None,
+        };
+        let url = format!("http://site.test:{}/page", site.port);
+        within(
+            Duration::from_secs(120),
+            "web_fetch страницы с `\\`",
+            tool.call(serde_json::json!({ "url": url }), cx),
+        )
+        .await
+    });
+    let head: String = out.content.chars().take(300).collect();
+    assert!(!out.is_error, "{head}");
+    assert!(out.content.contains(&"\\".repeat(n)), "{head}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -9,7 +9,10 @@
 //! `work_dir("tmp")/<run>`), дерево процессов убивает тайм-аут и бросок future вызова.
 //!
 //! - `extract html`: HTML (UTF-8, не больше 2 МиБ — родитель режет до записи в stdin) на stdin,
-//!   тайм-аут [`HTML_TIMEOUT`], вывод не больше [`HTML_OUTPUT_MAX`].
+//!   тайм-аут [`HTML_TIMEOUT`], вывод не больше [`HTML_OUTPUT_MAX`]. Предел держит сам
+//!   подпроцесс при любом входе: готовый JSON меряется до печати, сверх предела — линейное
+//!   извлечение, затем обрезка текста с учётом экранирования (m-A1 повторного ревью
+//!   финального прохода).
 //! - `extract pdf <path> <first> <count> <max_chars>`: путь копии (не файл проекта, TOCTOU
 //!   D98), файл не больше 32 МиБ, тайм-аут [`PDF_TIMEOUT`], вывод не больше [`PDF_OUTPUT_MAX`].
 //!
@@ -262,14 +265,109 @@ pub fn cmd_html() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let html = String::from_utf8_lossy(&buf).into_owned();
-    parse_and_print(move || {
-        let md = za_extract::html_to_markdown(&html);
-        Reply::Ok(Markdown {
-            title: md.title,
-            text: md.text,
-            simplified: md.simplified,
+    parse_and_print(move || Reply::Ok(html_reply(&html)))
+}
+
+/// Текст страницы для ответа `extract html`: строка JSON [`Reply`] вместе с переводом строки
+/// не длиннее [`HTML_OUTPUT_MAX`] при любом входе (m-A1 повторного ревью финального
+/// прохода). Бюджет `htmd` (`za_extract::HTML_OUTPUT_BUDGET`) считается в байтах Markdown, а
+/// JSON удваивает `\` и `"` и пишет управляющие символы шестью байтами (`\u0001`): текст в
+/// бюджете давал ответ больше предела, и `web_fetch` отвечал ошибкой. Поэтому готовый ответ
+/// меряется здесь, в самом подпроцессе: `extract html` — самостоятельная граница и на фильтр
+/// `za-web` не полагается.
+/// - Не уложился — повтор линейным извлечением (`simplified`): без разметки текст короче.
+/// - Не уложился и так — текст режется по границе символа с учётом экранирования
+///   ([`cut_to_fit`]); признак обрезки — `simplified`, как у страницы сверх бюджета.
+fn html_reply(html: &str) -> Markdown {
+    let full = markdown(za_extract::html_to_markdown(html));
+    if fits(&full) {
+        return full;
+    }
+    let simple = if full.simplified {
+        full
+    } else {
+        let html = &html[..html.floor_char_boundary(za_extract::HTML_MAX_BYTES)];
+        markdown(za_extract::linear::linear_extract(html))
+    };
+    if fits(&simple) {
+        return simple;
+    }
+    cut_to_fit(simple)
+}
+
+/// Итог `za_extract` в форме ответа (`za_core::extract::Markdown`).
+fn markdown(md: za_extract::Markdown) -> Markdown {
+    Markdown {
+        title: md.title,
+        text: md.text,
+        simplified: md.simplified,
+    }
+}
+
+/// Длина строки JSON ответа `{"ok": md}` без перевода строки; считается без копии текста.
+fn reply_len(md: &Markdown) -> usize {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    // Строки и логический признак сериализуются всегда; на ошибке — «не укладывается».
+    match serde_json::to_writer(&mut c, &Reply::Ok(md)) {
+        Ok(()) => c.0,
+        Err(_) => usize::MAX,
+    }
+}
+
+/// Ответ вместе с переводом строки укладывается в [`HTML_OUTPUT_MAX`].
+fn fits(md: &Markdown) -> bool {
+    reply_len(md) < HTML_OUTPUT_MAX
+}
+
+/// Длина символа внутри строки JSON у `serde_json`: `"`, `\` и короткие последовательности
+/// (`\b`, `\f`, `\n`, `\r`, `\t`) — два байта, прочие U+0000–U+001F — шесть (`\u00XX`),
+/// остальное — байты UTF-8 как есть.
+fn json_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => c.len_utf8(),
+    }
+}
+
+/// Самый длинный префикс текста по границе символа, с которым ответ укладывается в
+/// [`HTML_OUTPUT_MAX`]; признак `simplified`. Заголовок не длиннее
+/// `za_extract::TITLE_MAX_BYTES` (6 КиБ после экранирования), поэтому место под текст есть
+/// всегда.
+fn cut_to_fit(mut md: Markdown) -> Markdown {
+    let text = std::mem::take(&mut md.text);
+    md.simplified = true;
+    let room = (HTML_OUTPUT_MAX - 1).saturating_sub(reply_len(&md));
+    let mut used = 0usize;
+    let end = text
+        .char_indices()
+        .find_map(|(i, c)| {
+            used += json_len(c);
+            (used > room).then_some(i)
         })
-    })
+        .unwrap_or(text.len());
+    md.text = text;
+    md.text.truncate(end);
+    // Страховка от расхождения `json_len` с `serde_json`: каждый байт текста даёт в JSON не
+    // меньше байта, поэтому снятие лишнего числа байт укладывает ответ за один шаг.
+    while !fits(&md) && !md.text.is_empty() {
+        let over = reply_len(&md).saturating_sub(HTML_OUTPUT_MAX - 1);
+        let end = md
+            .text
+            .floor_char_boundary(md.text.len().saturating_sub(over));
+        md.text.truncate(end);
+    }
+    md
 }
 
 /// `zero-agent extract pdf <path> <first> <count> <max_chars>`: файл не больше 32 МиБ,
@@ -420,5 +518,61 @@ mod tests {
             (back.pages_total, back.pages, back.truncated),
             (3, vec![(2, "b".into())], true)
         );
+    }
+
+    /// `json_len` совпадает с `serde_json` на всём ASCII и на многобайтовых символах, в том
+    /// числе на U+2028 и U+FEFF, которые `serde_json` не экранирует.
+    #[test]
+    fn json_len_matches_serde_json() {
+        let samples = (0u8..=0x7f).map(char::from).chain([
+            'ж',
+            '€',
+            '\u{2028}',
+            '\u{feff}',
+            '\u{10ffff}',
+            '😀',
+        ]);
+        for c in samples {
+            let quoted = serde_json::to_string(&c.to_string()).unwrap();
+            assert_eq!(json_len(c), quoted.len() - 2, "{c:?}");
+        }
+        let md = Markdown {
+            title: Some("t\"\u{1}".into()),
+            text: "a\\\n\u{1f}ж".into(),
+            simplified: false,
+        };
+        let line = serde_json::to_string(&Reply::Ok(&md)).unwrap();
+        assert_eq!(reply_len(&md), line.len());
+    }
+
+    /// m-A1: обрезка даёт самый длинный префикс по границе символа, с которым ответ
+    /// укладывается в предел: следующий символ уже не помещается. Заголовок с
+    /// управляющими символами занимает место в ответе и не теряется.
+    #[test]
+    fn cut_to_fit_keeps_longest_prefix() {
+        let title = Some("\u{1}".repeat(za_extract::TITLE_MAX_BYTES));
+        for unit in ["\"", "\u{1}", "ж\\", "a\u{1f}b\""] {
+            let md = cut_to_fit(Markdown {
+                title: title.clone(),
+                text: unit.repeat(HTML_OUTPUT_MAX),
+                simplified: false,
+            });
+            assert!(md.simplified && md.title == title, "{unit:?}");
+            assert!(fits(&md), "{unit:?}: {}", reply_len(&md));
+            let next = unit.repeat(HTML_OUTPUT_MAX)[md.text.len()..]
+                .chars()
+                .next()
+                .unwrap();
+            let mut longer = md.clone();
+            longer.text.push(next);
+            assert!(!fits(&longer), "{unit:?}: обрезано лишнее");
+        }
+        // Короткий текст не меняется, кроме признака.
+        let md = cut_to_fit(Markdown {
+            title: None,
+            text: "short".into(),
+            simplified: false,
+        });
+        assert_eq!((md.text.as_str(), md.simplified), ("short", true));
     }
 }
