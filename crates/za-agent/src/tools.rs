@@ -68,6 +68,7 @@ use crate::context::{
     SPILL_NOT_SAVED, SpillCfg, spill, spill_cut, spill_digest, spill_limit_bytes, spill_name,
 };
 use crate::driver::{CrashHook, CrashPoint, FaultHook, FaultPoint, INJECTED_FAULT};
+use crate::exposure::{Exposure, RULE_OF_TWO_MARK, untrusted_origin};
 use crate::policy::{
     Decision, Grant, GrantMode, GrantSource, PolicyCx, PolicySnapshot, covers, decide,
     subject_paths,
@@ -118,62 +119,6 @@ pub struct FinishArgs {
 /// Допустимые значения `FinishArgs::status`.
 const FINISH_STATUSES: [&str; 3] = ["done", "partial", "blocked"];
 
-/// Экспозиция Rule of Two (SEC-052, R1-C2 D106): три независимых свойства run. Вызовов не
-/// прерывает — решение заказчика 2026-11-11 «Не спрашивать» (ADR 0006): пишется в журнал
-/// (`exposure.changed`) и аудит (`rule_of_two`); `decide` и `PolicyCx` её не получают.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Exposure {
-    /// В контексте недоверенное содержимое: метка любого происхождения, кроме
-    /// `outside_project`.
-    pub untrusted: bool,
-    /// Исполнен нативный вызов с путём вне проекта, в том числе по гранту.
-    pub private: bool,
-    /// Исполнен нативный сетевой вызов (`risk = Network`).
-    pub external: bool,
-}
-
-impl Exposure {
-    /// `untrusted` по меткам: любое происхождение, кроме `outside_project` — чтение вне
-    /// проекта даёт свойство `private`, а не недоверенный ввод (D106, preflight 1.9).
-    pub fn untrusted_from(taint: &BTreeSet<String>) -> bool {
-        untrusted_origin(taint)
-    }
-
-    /// Флаги, установленные хотя бы в одном из двух.
-    pub fn union(self, o: Self) -> Self {
-        Self {
-            untrusted: self.untrusted || o.untrusted,
-            private: self.private || o.private,
-            external: self.external || o.external,
-        }
-    }
-
-    /// Вызов с флагами `call` ставит третье свойство при двух, установленных в `self` —
-    /// снимке начала пакета (D106).
-    pub fn third_by(self, call: Self) -> bool {
-        self.count() == 2 && self.union(call).count() == 3
-    }
-
-    /// Вызов с флагами `call` ставит флаг, которого в `self` нет.
-    fn adds(self, call: Self) -> bool {
-        self.union(call) != self
-    }
-
-    fn count(self) -> usize {
-        [self.untrusted, self.private, self.external]
-            .into_iter()
-            .filter(|b| *b)
-            .count()
-    }
-}
-
-/// Среди происхождений есть недоверенное (не `outside_project`).
-fn untrusted_origin<'a>(origins: impl IntoIterator<Item = &'a String>) -> bool {
-    origins
-        .into_iter()
-        .any(|o| o != taint_origin::OUTSIDE_PROJECT)
-}
-
 /// Итог пакета вызовов.
 #[derive(Debug, Default)]
 pub struct ToolsOutcome {
@@ -205,8 +150,9 @@ pub struct ToolsOutcome {
     /// Флаги экспозиции исполненных вызовов (D106; вживую и по квитанции): драйвер
     /// объединяет их с флагами run. Отклонённый вызов флаг не ставит.
     pub exposure: Exposure,
-    /// `call_id` исполненных вызовов, поставивших третье свойство при двух в снимке начала
-    /// пакета ([`ToolEnv::exposure`]); запись аудита `rule_of_two` о каждом пишет слот.
+    /// `call_id` исполненных вызовов, исполненных при всех трёх свойствах — снимок начала
+    /// пакета ([`ToolEnv::exposure`]) плюс вклад самого вызова (Ruling I1 ревью задачи 5).
+    /// О каждом есть запись аудита `rule_of_two`: её пишет слот, признак — в квитанции.
     pub rule_of_two: Vec<String>,
     /// `call_id` исполненных вызовов, поставивших флаг, которого в снимке начала пакета не
     /// было (`calls` события `exposure.changed`).
@@ -253,8 +199,9 @@ pub struct ToolEnv {
     pub step: u64,
     /// Набор доверенных файлов для прерывания `Trust`; `None` — пустой набор.
     pub trust_set: Option<TrustSetFn>,
-    /// Экспозиция run на начало пакета (D106): по ней одной считается «третий» вызов —
-    /// аргументы вызовов пакета выбраны до их результатов.
+    /// Экспозиция run на начало пакета (D106): вызов исполняется при всех трёх свойствах,
+    /// если их дают она и вклад самого вызова, — аргументы вызовов пакета выбраны до их
+    /// результатов.
     pub exposure: Exposure,
 }
 
@@ -356,6 +303,11 @@ struct Receipt {
     /// Нативный сетевой вызов дошёл до инструмента (D106: `external`).
     #[serde(default, skip_serializing_if = "is_false")]
     external: bool,
+    /// Вызов исполнен при всех трёх свойствах, запись аудита `rule_of_two` о нём есть
+    /// (Ruling I1, m2 ревью задачи 5): реплей квитанции даёт `ToolsOutcome.rule_of_two`
+    /// без повторной записи.
+    #[serde(default, skip_serializing_if = "is_false")]
+    rule_of_two: bool,
 }
 
 impl Receipt {
@@ -410,6 +362,30 @@ struct ToolJob {
     decision: Value,
 }
 
+impl ToolJob {
+    /// Флаги вызова, известные до инструмента (D106, Ruling m2 ревью задачи 5): `private`
+    /// и `external` — по путям решения и спецификации, как в [`Live::tool`] (смена класса
+    /// пути после решения — отказ вызова); `untrusted` — по происхождениям без метки
+    /// самого результата: её даёт только инструмент.
+    fn exposure_before(&self) -> Exposure {
+        let spec = self.tool.spec();
+        let native = spec.kind != ToolKind::Exec;
+        let origins = origins_of(
+            spec,
+            &self.subjects,
+            &self.raw,
+            &self.planned,
+            &self.roots,
+            None,
+        );
+        Exposure {
+            untrusted: untrusted_origin(&origins),
+            private: native && self.planned.iter().any(|p| !p.inside),
+            external: native && spec.risk == RiskClass::Network,
+        }
+    }
+}
+
 /// Что делает слот вызова вживую.
 enum Action {
     Tool(Box<ToolJob>),
@@ -436,7 +412,8 @@ struct Job {
     crash: Option<CrashHook>,
     /// Аргументы `finish` принятого вызова.
     finish: Option<FinishArgs>,
-    /// Экспозиция на начало пакета (D106): «третий» вызов пишет запись аудита.
+    /// Экспозиция на начало пакета (D106): вызов при всех трёх свойствах пишет запись
+    /// аудита.
     exposure: Exposure,
 }
 
@@ -1499,7 +1476,7 @@ fn finish_part(
     match ex.result {
         Ok(v) => Ok(match serde_json::from_value::<Receipt>(v.clone()) {
             Ok(r) => {
-                note_exposure(call, r.exposure(), st, out);
+                note_exposure(call, &r, st, out);
                 st.taint.extend(r.origins);
                 if let Some(g) = r.grant {
                     st.grants.push(g.clone());
@@ -1516,12 +1493,14 @@ fn finish_part(
 }
 
 /// Флаги исполненного вызова в итог пакета (D106): объединение флагов, вызов с новым
-/// флагом и «третий» вызов — по снимку начала пакета, вживую и при реплее одинаково.
-fn note_exposure(call: &ToolCall, f: Exposure, st: &BatchState, out: &mut ToolsOutcome) {
+/// флагом (по снимку начала пакета) и вызов с записью аудита `rule_of_two` — по
+/// квитанции, вживую и при реплее одинаково.
+fn note_exposure(call: &ToolCall, r: &Receipt, st: &BatchState, out: &mut ToolsOutcome) {
+    let f = r.exposure();
     if st.exposure.adds(f) {
         out.exposure_calls.push(call.id.clone());
     }
-    if st.exposure.third_by(f) {
+    if r.rule_of_two {
         out.rule_of_two.push(call.id.clone());
     }
     out.exposure = out.exposure.union(f);
@@ -1726,23 +1705,37 @@ impl Live {
     ) -> Result<Value, String> {
         let started = Instant::now();
         let mut halt = Some(halt);
-        let (args, decision, paths) = match &action {
+        let (args, decision, paths, before) = match &action {
             Action::Tool(t) => (
                 mask_value(t.masker.as_deref(), &t.args),
                 t.decision.clone(),
                 path_classes(&t.raw, &t.planned),
+                t.exposure_before(),
             ),
-            _ => (Value::Null, Value::Null, Value::Null),
+            _ => (Value::Null, Value::Null, Value::Null, Exposure::default()),
         };
+        // D106, Ruling I1, m1, m2 ревью задачи 5: вызов, исполняемый при всех трёх
+        // свойствах (снимок начала пакета плюс вклад вызова), — запись аудита до вызова,
+        // вместе с `tool.started`: отмена посреди вызова её не теряет, а повтор замыкания
+        // после сбоя процесса не дублирует (одна запись на ключ эффекта). Реплей квитанции
+        // замыкание не запускает. Без записи вызов не исполняется — как грант (SEC-090).
+        let at_start = self.exposure.union(before);
+        let marked = at_start.all();
+        if marked && !self.rule_of_two(at_start, fref).await {
+            return Err(JOURNAL_FAILED.to_owned());
+        }
         let mut payload =
             json!({ "call_id": self.call_id, "name": self.name, "effect_key": self.key });
-        if let Some(o) = payload.as_object_mut()
-            && !args.is_null()
-        {
-            o.insert("arguments".into(), args);
-            o.insert("decision".into(), decision);
-            // Разрешённые пути вызова (D98, I1): при реплее без квитанции сверка с ними.
-            o.insert("paths".into(), paths);
+        if let Some(o) = payload.as_object_mut() {
+            if !args.is_null() {
+                o.insert("arguments".into(), args);
+                o.insert("decision".into(), decision);
+                // Разрешённые пути вызова (D98, I1): при реплее без квитанции сверка с ними.
+                o.insert("paths".into(), paths);
+            }
+            if marked {
+                o.insert(RULE_OF_TWO_MARK.into(), Value::Bool(true));
+            }
         }
         if !self
             .append(EventKind::ToolStarted, Actor::Runtime, payload, false, fref)
@@ -1751,7 +1744,7 @@ impl Live {
             tracing::error!(key = %self.key, "tool.started не записано, инструмент не вызван");
             return Err(JOURNAL_FAILED.to_owned());
         }
-        let receipt = match action {
+        let mut receipt = match action {
             Action::Tool(t) => self.tool(*t, fref, &mut halt).await,
             Action::Answer(a) => Receipt {
                 out: ToolOutput::ok(a),
@@ -1763,14 +1756,24 @@ impl Live {
             },
             Action::Grant(g) => self.grant(g, fref).await?,
         };
-        // D106: «третий» вызов — запись аудита при живом исполнении, как у гранта: реплей
-        // квитанции после паузы её не повторяет, а вызов до паузы записан, даже если run
-        // потом не продолжен. Вызов уже исполнен: сбой записи — ошибка журнала (пауза
-        // `store`), квитанция остаётся.
-        let call = receipt.exposure();
-        if self.exposure.third_by(call) {
-            self.rule_of_two(self.exposure.union(call), fref).await;
+        // Третье свойство дала только метка результата (до инструмента её не знать) —
+        // запись после вызова, отметка в `tool.finished`. Без записи результат не
+        // выдаётся: недоверенного содержимого в контексте нет, свойств два; флаги
+        // `private` и `external` исполненного вызова остаются.
+        let at_end = self.exposure.union(receipt.exposure());
+        let mut marked_after = false;
+        if !marked && at_end.all() {
+            marked_after = self.rule_of_two(at_end, fref).await;
+            if !marked_after {
+                receipt = Receipt {
+                    out: ToolOutput::error(JOURNAL_FAILED),
+                    private: receipt.private,
+                    external: receipt.external,
+                    ..Receipt::default()
+                };
+            }
         }
+        receipt.rule_of_two = marked || marked_after;
         let tainted = !receipt.origins.is_empty();
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Инструмент уже отработал: квитанция фиксирует его итог, а ошибка
@@ -1784,15 +1787,13 @@ impl Live {
             tracing::error!(key = %self.key, "tool.finished не записано");
             *fref = Some(StoreError::Io(INJECTED_FAULT.into()));
         } else {
-            self.append(
-                EventKind::ToolFinished,
-                Actor::Tool,
-                json!({ "call_id": self.call_id, "is_error": receipt.out.is_error,
-                    "duration_ms": duration_ms, "tainted": tainted }),
-                tainted,
-                fref,
-            )
-            .await;
+            let mut payload = json!({ "call_id": self.call_id, "is_error": receipt.out.is_error,
+                "duration_ms": duration_ms, "tainted": tainted });
+            if marked_after && let Some(o) = payload.as_object_mut() {
+                o.insert(RULE_OF_TWO_MARK.into(), Value::Bool(true));
+            }
+            self.append(EventKind::ToolFinished, Actor::Tool, payload, tainted, fref)
+                .await;
         }
         serde_json::to_value(&receipt).map_err(|e| {
             tracing::error!(key = %self.key, error = %e, "итог инструмента не сериализуется");
@@ -1800,18 +1801,38 @@ impl Live {
         })
     }
 
-    /// Запись аудита `rule_of_two {call_id, tool, exposure}` (D106), объект — run.
-    async fn rule_of_two(&self, exposure: Exposure, fref: &mut Option<StoreError>) {
-        let a = AuditNew {
-            actor: AUDIT_ACTOR.into(),
-            action: audit_action::RULE_OF_TWO.into(),
-            target: self.run.to_string(),
-            payload: json!({"call_id": self.call_id, "tool": self.name, "exposure": exposure}),
+    /// Запись аудита `rule_of_two {call_id, tool, exposure, effect_key}` (D106), объект —
+    /// run; одна на ключ эффекта: повтор замыкания после сбоя процесса новой не даёт.
+    /// `false` — запись не удалась (ошибка журнала в `fref`, run встанет на паузу `store`).
+    async fn rule_of_two(&self, exposure: Exposure, fref: &mut Option<StoreError>) -> bool {
+        let injected = self
+            .fault
+            .as_ref()
+            .is_some_and(|h| h(FaultPoint::RuleOfTwoAudit { step: self.step }));
+        let r = if injected {
+            // Тест: ошибка записи аудита, как настоящая.
+            Err(StoreError::Io(INJECTED_FAULT.into()))
+        } else {
+            let a = AuditNew {
+                actor: AUDIT_ACTOR.into(),
+                action: audit_action::RULE_OF_TWO.into(),
+                target: self.run.to_string(),
+                payload: json!({"call_id": self.call_id, "tool": self.name, "exposure": exposure}),
+            };
+            self.journal.store().append_audit_once(a, &self.key).await
         };
-        if let Err(e) = self.journal.store().append_audit(a).await {
-            tracing::error!(key = %self.key, error = %e, "запись аудита rule_of_two не удалась");
-            if fref.is_none() {
-                *fref = Some(e);
+        match r {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                tracing::info!(key = %self.key, "запись аудита rule_of_two уже есть: повтор вызова");
+                true
+            }
+            Err(e) => {
+                tracing::error!(key = %self.key, error = %e, "запись аудита rule_of_two не удалась");
+                if fref.is_none() {
+                    *fref = Some(e);
+                }
+                false
             }
         }
     }
@@ -1918,7 +1939,9 @@ impl Live {
             })
             .collect();
         // D106: нативный вызов, дошедший до инструмента с путём вне проекта, — `private`;
-        // нативный сетевой — `external`. `bash` в свойства не входит.
+        // нативный сетевой — `external`. `bash` в свойства не входит. До вызова те же флаги
+        // даёт `ToolJob::exposure_before` (классы путей здесь совпали с решением). Ошибка
+        // самого инструмента флаги не снимает: запрос мог уйти (m3 ревью задачи 5).
         let native = spec.kind != ToolKind::Exec;
         let private = native && !outside.is_empty();
         let external = native && spec.risk == RiskClass::Network;
@@ -2036,9 +2059,9 @@ impl Live {
         Receipt {
             out,
             origins,
-            grant: None,
             private,
             external,
+            ..Receipt::default()
         }
     }
 }
@@ -2338,6 +2361,32 @@ mod tests {
     fn finish_status_checked() {
         assert!(finish_args(&json!({"status": "done", "result": "r"})).is_ok());
         assert!(finish_args(&json!({"status": "ok", "result": "r"})).is_err());
+    }
+
+    /// D106, решение заказчика «не спрашивать» (m5 ревью задачи 5): экспозиция вопросов
+    /// не добавляет — причины `rule_of_two` в порядке причин одобрения нет.
+    #[test]
+    fn reason_order_has_no_rule_of_two() {
+        assert!(!REASON_ORDER.contains(&audit_action::RULE_OF_TWO));
+        assert_eq!(REASON_ORDER.len(), 6);
+    }
+
+    /// Квитанция без признаков R1-C2 читается: флагов и отметки `rule_of_two` нет; отметка
+    /// пишется только истинной.
+    #[test]
+    fn receipt_rule_of_two_flag_roundtrip() {
+        let r: Receipt =
+            serde_json::from_value(json!({"content": "c", "is_error": false, "external": true}))
+                .unwrap();
+        assert!(r.external && !r.private && !r.rule_of_two);
+        let marked = Receipt {
+            rule_of_two: true,
+            ..r
+        };
+        let v = serde_json::to_value(&marked).unwrap();
+        assert_eq!(v["rule_of_two"], true);
+        let plain = serde_json::to_value(Receipt::default()).unwrap();
+        assert!(plain.get("rule_of_two").is_none(), "{plain}");
     }
 
     #[test]

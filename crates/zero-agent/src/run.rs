@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use za_agent::{
     AuditHead, EnvInfo, Grant, GrantMode, GrantSource, LoopDeps, LoopError, LoopOutcome,
-    PolicyError, PolicySnapshot, ResumeChange, RunSpec, TrustSetFn, WorkMode, builtin_tools,
-    control_channel, git_branch, resume_run, start_run,
+    PolicyError, PolicySnapshot, ResumeChange, RuleOfTwoNotice, RunSpec, TrustSetFn, WorkMode,
+    builtin_tools, control_channel, git_branch, resume_run, start_run,
 };
 use za_core::paths::{self, Roots};
 use za_core::{
@@ -963,7 +963,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 record_start(&store, &project, run, Some(&prep.policy), &prep.grants).await?;
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
-            let outcome = drive(&bus, fut, &ctl, args.crash, masker.clone()).await;
+            let outcome = drive(&store, &bus, fut, &ctl, args.crash, masker.clone()).await;
             cleanup_run_tmp(&project, run).await;
             report(&store, &project, run, outcome, &masker).await
         }
@@ -1021,7 +1021,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             change.budget = budget;
             change.input = r.input;
             let fut = resume_run(&deps, r.run, change, rx);
-            let outcome = drive(&bus, fut, &ctl, args.crash, masker.clone()).await;
+            let outcome = drive(&store, &bus, fut, &ctl, args.crash, masker.clone()).await;
             cleanup_run_tmp(&project, r.run).await;
             report(&store, &project, r.run, outcome, &masker).await
         }
@@ -1129,12 +1129,12 @@ struct Printer {
     /// сводка для истории, а не ответ, и не печатаются.
     compacting: bool,
     crash: Option<RunCrash>,
-    /// Строка Rule of Two (D106) уже напечатана: один раз на run.
-    rule_of_two_shown: bool,
+    /// Строка Rule of Two (D106): одна на run, по первому вызову при всех трёх свойствах.
+    rule_of_two: RuleOfTwoNotice,
 }
 
-/// Строка D106 (SEC-052): «третий» вызов исполнен по решению заказчика «не спрашивать».
-/// Модели не уходит.
+/// Строка D106 (SEC-052): вызов исполнен при всех трёх свойствах по решению заказчика
+/// «не спрашивать». Модели не уходит.
 const RULE_OF_TWO_LINE: &str = "zero-agent: в этом запуске сошлись недоверенное содержимое, ваши файлы вне проекта и обращение в сеть (SEC-052); вызов выполнен, запись в аудите";
 
 impl Printer {
@@ -1188,8 +1188,9 @@ impl Printer {
                     eprintln!("zero-agent: повтор запроса к модели, ответ печатается заново");
                 }
             }
-            EventKind::ExposureChanged => {
-                if self.rule_of_two_first(p) {
+            // D106, Ruling I1 ревью задачи 5: отметка `rule_of_two` вызова.
+            EventKind::ToolStarted | EventKind::ToolFinished => {
+                if self.rule_of_two.on_event(&ev.event.kind, p) {
                     eprintln!("{RULE_OF_TWO_LINE}");
                 }
             }
@@ -1207,18 +1208,6 @@ impl Printer {
             }
             _ => {}
         }
-    }
-
-    /// Первое за run событие `exposure.changed` с «третьим» вызовом (`rule_of_two`
-    /// непуст; о каждом таком вызове — запись аудита `rule_of_two`, D106).
-    fn rule_of_two_first(&mut self, p: &Value) -> bool {
-        let hit = p
-            .get("rule_of_two")
-            .and_then(Value::as_array)
-            .is_some_and(|a| !a.is_empty());
-        let first = hit && !self.rule_of_two_shown;
-        self.rule_of_two_shown |= hit;
-        first
     }
 
     fn lag(&mut self, n: u64) {
@@ -1265,8 +1254,26 @@ async fn ctrl_c() {
     }
 }
 
-/// Ведёт цикл: печатает ответ по шине, обрабатывает Ctrl+C.
+/// У run есть запись аудита `rule_of_two` (D106): строка SEC-052 о нём уже положена.
+/// Ошибка чтения — `false` с предупреждением: лишняя строка лучше пропущенной.
+async fn rule_of_two_recorded(store: &ProjectStore, run: RunId) -> bool {
+    match store
+        .audit_by(audit_action::RULE_OF_TWO, &run.to_string())
+        .await
+    {
+        Ok(v) => !v.is_empty(),
+        Err(e) => {
+            tracing::warn!(error = %e, "записи аудита rule_of_two не прочитаны");
+            false
+        }
+    }
+}
+
+/// Ведёт цикл: печатает ответ по шине, обрабатывает Ctrl+C. Строка SEC-052 — одна на run
+/// (Ruling I1, m4 ревью задачи 5): resume run с записью `rule_of_two` её не повторяет, а
+/// событие, потерянное при отставании шины, восполняет проверка аудита в конце.
 async fn drive(
+    store: &ProjectStore,
     bus: &EventBus,
     fut: impl std::future::Future<Output = Result<LoopOutcome, LoopError>>,
     ctl: &za_agent::RunControl,
@@ -1276,6 +1283,7 @@ async fn drive(
     // Подписка до первого опроса цикла: future ленив, ни одно событие не теряется.
     let mut rx = bus.subscribe();
     let mut printer = Printer::new(crash, masker);
+    printer.rule_of_two = RuleOfTwoNotice::new(rule_of_two_recorded(store, ctl.run_id()).await);
     let mut fut = std::pin::pin!(fut);
     let mut interrupt = Box::pin(ctrl_c());
     let mut presses = 0u32;
@@ -1315,6 +1323,13 @@ async fn drive(
         _ => None,
     };
     printer.finish(answer);
+    if printer.rule_of_two.pending()
+        && printer
+            .rule_of_two
+            .at_end(rule_of_two_recorded(store, ctl.run_id()).await)
+    {
+        eprintln!("{RULE_OF_TWO_LINE}");
+    }
     outcome
 }
 
@@ -1769,18 +1784,30 @@ async fn reask_trust(
 mod tests {
     use super::*;
 
-    /// D106: строка Rule of Two — один раз на run, только по событию с «третьим» вызовом.
+    /// D106, Ruling I1 ревью задачи 5: строка Rule of Two — одна на run, по отметке
+    /// `rule_of_two` вызова (`tool.started`), а не по `exposure.changed`; два вызова при
+    /// трёх свойствах — одна строка; resume run с записью — без строки.
     #[test]
     fn rule_of_two_line_once_per_run() {
         let mut p = Printer::default();
-        let ev = |r: Value| {
-            json!({"untrusted": true, "private": true, "external": true,
-            "calls": ["w1"], "rule_of_two": r})
-        };
-        assert!(!p.rule_of_two_first(&ev(json!([]))));
-        assert!(!p.rule_of_two_first(&json!({"untrusted": true})));
-        assert!(p.rule_of_two_first(&ev(json!(["w1"]))));
-        assert!(!p.rule_of_two_first(&ev(json!(["w2"]))));
+        assert!(p.rule_of_two.pending());
+        let marked = |id: &str| json!({"call_id": id, "rule_of_two": true});
+        assert!(!p.rule_of_two.on_event(
+            &EventKind::ExposureChanged,
+            &json!({"untrusted": true, "private": true, "external": true,
+                "calls": ["w1"], "rule_of_two": ["w1"]})
+        ));
+        assert!(
+            p.rule_of_two
+                .on_event(&EventKind::ToolStarted, &marked("w1"))
+        );
+        assert!(
+            !p.rule_of_two
+                .on_event(&EventKind::ToolStarted, &marked("w2"))
+        );
+        assert!(!p.rule_of_two.pending());
+        let mut resumed = RuleOfTwoNotice::new(true);
+        assert!(!resumed.on_event(&EventKind::ToolStarted, &marked("w3")));
         assert!(RULE_OF_TWO_LINE.contains("SEC-052"));
     }
 

@@ -32,6 +32,7 @@ mod conversation;
 mod detect;
 mod driver;
 mod exit;
+mod exposure;
 mod inspect;
 mod memory;
 mod policy;
@@ -66,6 +67,7 @@ pub use driver::{
     start_run,
 };
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
+pub use exposure::{Exposure, RuleOfTwoNotice, rule_of_two_marked};
 pub use inspect::{BlockCost, InspectError, Inspection, RunMetrics, inspect, run_metrics};
 pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};
 pub use policy::{
@@ -93,8 +95,8 @@ pub use state::{
     Snapshot,
 };
 pub use tools::{
-    ASK_USER_TOOL, Exposure, FINISH_TOOL, FinishArgs, REQUEST_GRANT_TOOL, ToolEnv, ToolsOutcome,
-    TrustSetFn, UNTRUSTED_MARK, builtin_tools, request_grant_tool, run_tools,
+    ASK_USER_TOOL, FINISH_TOOL, FinishArgs, REQUEST_GRANT_TOOL, ToolEnv, ToolsOutcome, TrustSetFn,
+    UNTRUSTED_MARK, builtin_tools, request_grant_tool, run_tools,
 };
 pub use turn::{
     COMPACT_EFFECT, COMPACT_KIND, CallVerdict, ControlFlags, DELTA_FLUSH_AFTER, DELTA_FLUSH_BYTES,

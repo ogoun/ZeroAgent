@@ -1095,7 +1095,9 @@ fn rule_of_two_never_asks() {
             .decide(&bash_spec(), &bash(&r, &format!("cat {}", pat("/etc/x")))),
         Decision::Allow
     );
-    // В порядке причин одобрения нет `rule_of_two` (REASON_ORDER R1-C1 без изменений).
+    // В текстах для модели нет `rule_of_two`. Что его нет и в порядке причин одобрения
+    // (`REASON_ORDER` R1-C1), проверяет модульный тест
+    // `tools::tests::reason_order_has_no_rule_of_two`.
     assert!(
         !runtime_texts()
             .iter()

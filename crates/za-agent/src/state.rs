@@ -15,9 +15,10 @@ use crate::context::{ContextMeter, UserInput};
 use crate::conversation::Conversation;
 use crate::detect::DetectorState;
 use crate::exit::LoopExit;
+use crate::exposure::Exposure;
 use crate::policy::{Grant, PolicySnapshot};
 use crate::request::{FrozenPrefix, RunSetup};
-use crate::tools::{Exposure, FinishArgs};
+use crate::tools::FinishArgs;
 use crate::turn::{Reviewed, Signals};
 
 /// Версия формата снимка: 4 — R1-C2 (D130: экспозиция Rule of Two и активные скиллы; обе

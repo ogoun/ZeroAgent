@@ -1,6 +1,8 @@
 //! Журнал аудита (таблица `audit`, миграция 0003; SEC-090, SEC-091, R1-C1 D91).
 //!
-//! Одобрения, гранты, доверие к проекту, загрузка политики, восстановление чекпоинтов.
+//! Одобрения, гранты, доверие к проекту, загрузка политики, восстановление чекпоинтов,
+//! вызовы при всех трёх свойствах Rule of Two (`rule_of_two`, R1-C2 D106; одна запись на
+//! ключ эффекта — [`ProjectStore::append_audit_once`]).
 //! Записи связаны hash-цепочкой: `hash` записи — BLAKE3 от `prev_hash`, одного нулевого
 //! байта и канонического JSON объекта `{seq, actor, action, target, payload, ts}`;
 //! `prev_hash` первой записи — [`AUDIT_GENESIS`] (64 символа «0»).
@@ -75,6 +77,44 @@ impl ProjectStore {
     /// Добавляет запись в конец цепочки; возвращает её такой, какой она записана.
     pub async fn append_audit(&self, a: AuditNew) -> Result<AuditEntry, StoreError> {
         self.write_durable(move |c| insert(c, &a)).await
+    }
+
+    /// Запись, единственная на ключ эффекта (R1-C2 D106, Ruling m2 ревью задачи 5): в
+    /// объект `payload` ставится `effect_key = key`; если запись того же `action` и
+    /// `target` с этим ключом уже есть — новой нет, `Ok(None)`. Проверка и вставка — одна
+    /// транзакция писателя. Так повтор замыкания слота после сбоя процесса (намерение без
+    /// квитанции) записи не дублирует.
+    pub async fn append_audit_once(
+        &self,
+        mut a: AuditNew,
+        key: &str,
+    ) -> Result<Option<AuditEntry>, StoreError> {
+        if let Some(o) = a.payload.as_object_mut() {
+            o.insert("effect_key".into(), Value::String(key.to_owned()));
+        }
+        let key = key.to_owned();
+        self.write_durable(move |c| {
+            let same = by_action_target(c, &a.action, &a.target)?
+                .iter()
+                .any(|e| e.payload.get("effect_key").and_then(Value::as_str) == Some(&key));
+            if same {
+                return Ok(None);
+            }
+            insert(c, &a).map(Some)
+        })
+        .await
+    }
+
+    /// Записи с этими `action` и `target` по возрастанию `seq` (записи `rule_of_two` run,
+    /// D106). Цепочка не проверяется: это просмотр.
+    pub async fn audit_by(
+        &self,
+        action: &str,
+        target: &str,
+    ) -> Result<Vec<AuditEntry>, StoreError> {
+        let (action, target) = (action.to_owned(), target.to_owned());
+        self.read(move |c| by_action_target(c, &action, &target))
+            .await
     }
 
     /// Закрыть прерывание и записать аудит одной транзакцией (D91); false — прерывание уже решено.
@@ -267,6 +307,25 @@ fn insert(c: &Connection, a: &AuditNew) -> Result<AuditEntry, StoreError> {
         payload: a.payload.clone(),
         ts,
     })
+}
+
+/// Записи с `action` и `target` по возрастанию `seq`; строка без поля или с `payload` не
+/// JSON — [`StoreError::Corrupt`].
+fn by_action_target(
+    c: &Connection,
+    action: &str,
+    target: &str,
+) -> Result<Vec<AuditEntry>, StoreError> {
+    let mut stmt = c.prepare(&format!(
+        "{COLS} WHERE action = ?1 AND target = ?2 ORDER BY seq"
+    ))?;
+    let rows = stmt.query_map(params![action, target], raw_entry)?;
+    rows.map(|r| {
+        let raw = r?;
+        let seq = raw.seq;
+        entry_from(raw).ok_or_else(|| corrupt(&format!("запись аудита {seq}")))
+    })
+    .collect()
 }
 
 /// Проход по цепочке в снимке `c`: номер подряд с 1, `prev_hash` — хэш предыдущей,

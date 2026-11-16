@@ -259,7 +259,7 @@ impl Tool for BashStub {
 }
 
 /// Инструмент с текстами для хэша промптов (D94) и выводом по аргументу `out` с
-/// необязательным `digest`.
+/// необязательными `digest` и меткой результата `taint` (`ToolOutput.taint`).
 pub struct TextStub {
     pub spec: ToolSpec,
 }
@@ -281,6 +281,7 @@ impl Tool for TextStub {
         Box::pin(async move {
             ToolOutput {
                 digest: args["digest"].as_str().map(str::to_owned),
+                taint: args["taint"].as_str().map(str::to_owned),
                 ..ToolOutput::ok(args["out"].as_str().unwrap_or_default())
             }
         })
@@ -293,13 +294,23 @@ impl Tool for TextStub {
 
 /// Сетевое чтение с контрактом `web_fetch` таблицы D123 (R1-C2): `kind = Read`,
 /// `risk = Network`, `tainted`, тайм-аут 60 с, вывод 128 КиБ; результат — `page <url>` с
-/// меткой `web`. Настоящий `web_fetch` — в `za-web` (задача 8). `calls` — число вызовов.
+/// меткой `web`. Настоящий `web_fetch` — в `za-web` (задача 8). `calls` — число вызовов;
+/// `hold` — вызов не завершается (отмена посреди вызова).
 pub struct WebStub {
     pub spec: ToolSpec,
     pub calls: Arc<AtomicUsize>,
+    pub hold: bool,
 }
 
 impl WebStub {
+    /// Вызов, который держится, пока future не брошен (тест отмены).
+    pub fn holding() -> Self {
+        Self {
+            hold: true,
+            ..Self::new()
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
@@ -319,6 +330,7 @@ impl WebStub {
                 tainted: true,
             },
             calls: Arc::default(),
+            hold: false,
         }
     }
 }
@@ -338,7 +350,11 @@ impl Tool for WebStub {
     fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let url = args["url"].as_str().unwrap_or_default().to_owned();
+        let hold = self.hold;
         Box::pin(async move {
+            if hold {
+                std::future::pending::<()>().await;
+            }
             ToolOutput {
                 taint: Some(za_protocol::taint_origin::WEB.to_owned()),
                 ..ToolOutput::ok(format!("page {url}"))

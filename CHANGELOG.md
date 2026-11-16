@@ -5,6 +5,14 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, ревью задачи 5 (Rule of Two; Ruling I1, m1, m2, minor m3–m6, m8):
+  - `za-agent`: запись аудита `rule_of_two` получает каждый вызов, исполняемый при всех трёх свойствах — снимок начала пакета плюс вклад самого вызова (`Exposure::all`), а не только вызов, поставивший третье свойство при двух. «Чтение по гранту, затем `web_fetch`, затем ещё `web_fetch`» даёт две записи (прежде — ни одной). `Exposure::third_by` удалён;
+  - `za-agent`: запись делается до вызова, вместе с `tool.started` (отметка `"rule_of_two": true`): отмена посреди вызова её не теряет. Если третье свойство дала только метка результата, запись — после вызова, отметка в `tool.finished`. Признак записи хранится в квитанции (`Receipt.rule_of_two`): `ToolsOutcome.rule_of_two` при реплее берётся из неё;
+  - `za-agent`: сбой записи — как у аудита гранта (D72, D91). До вызова: вызов не исполняется, квитанция-отказ, пауза `store`. После вызова: результат не выдаётся, флаги `private`/`external` остаются. Точка сбоя тестов `FaultPoint::RuleOfTwoAudit`;
+  - `za-store`: `append_audit_once(a, key)` — запись, единственная на ключ эффекта (`payload.effect_key`; повтор замыкания слота после сбоя процесса её не дублирует), и `audit_by(action, target)`. Payload `rule_of_two` — `{call_id, tool, exposure, effect_key}`;
+  - `za-agent`: модуль `exposure` — `Exposure`, `rule_of_two_marked`, `RuleOfTwoNotice` (строка SEC-052 один раз на run);
+  - `zero-agent`: строка SEC-052 печатается по первой отметке `rule_of_two` в `tool.started`/`tool.finished`, а не по `exposure.changed`. Resume run, у которого запись `rule_of_two` уже есть, строку не повторяет. Событие, потерянное при отставании шины, восполняет проверка аудита в конце процесса (m4);
+  - миграция: записей `rule_of_two` в аудите больше, по одной на вызов при всех трёх свойствах, включая `bash`, чтение внутри проекта и `finish`. Снимок v4 не меняется, в квитанциях появилось поле `rule_of_two`.
 - R1-C2, задача 6 (сетевой шлюз; D107, D108, D112, D124, D128, D129, ADR 0006):
   - `za-web` (новый крейт): `WebGateway::get(url, deadline)` — фильтр адресов в резолвере по разрешающему списку (реестры IANA special-purpose, снимок 2025-10-09), порты `80, 443, 8080, 8443`, до пяти редиректов на тот же хост, без прокси, cookie и `Accept-Encoding`, `Content-Encoding` кроме `identity` — ошибка, тело до 5 МиБ, 60 запросов в минуту и 500 мс к хосту, `robots.txt` (RFC 9309, кэш 24 ч), дедлайн вызова внутри шлюза с журналом обращений; `parse_url`, `check_ip`, `robots_allows`, `RateLimiter`; `get_provider` до задачи 9 отказывает;
   - `za-web`: признак сборки `test-hooks` — `with_test_resolve`, `with_inner_resolver`, `za_web::dns` (только тестам);
@@ -13,9 +21,9 @@
   - CI: `clippy` и тесты `za-web` с признаком `test-hooks`.
 - R1-C2, задача 5 (Rule of Two без вопросов, снимок v4; D106, D130, ADR 0006):
   - `za-agent`: `Exposure { untrusted, private, external }` и `Exposure::untrusted_from` (любое происхождение метки, кроме `outside_project`); `ToolEnv.exposure` — снимок на начало пакета; `ToolsOutcome.exposure`, `rule_of_two`, `exposure_calls`. Флаги вызова хранятся в квитанции (`private`, `external`), реплей даёт те же значения. `decide`, `PolicyCx`, `REASON_ORDER` не менялись: сочетание трёх свойств вызов не останавливает (решение заказчика 2026-11-11);
-  - `za-agent`: запись аудита `rule_of_two {call_id, tool, exposure}` пишет слот «третьего» вызова при живом исполнении; драйвер после пакета пишет `exposure.changed {untrusted, private, external, calls, rule_of_two}` (после пакета, остановленного на прерывании, — нет: шаг доигрывается при resume);
+  - `za-agent`: запись аудита `rule_of_two` пишет слот вызова при живом исполнении (условие и место записи уточнены ревью задачи 5, см. выше); драйвер после пакета пишет `exposure.changed {untrusted, private, external, calls, rule_of_two}` (после пакета, остановленного на прерывании, — нет: шаг доигрывается при resume);
   - `za-agent`: снимок v4 — `Snapshot.exposure`, `Snapshot.skills` (`ActiveSkill`, пусто до задачи 13); снимки v1–v3 читаются, фикстура v3 — `tests/golden/r1c1_v3.json`;
-  - `zero-agent`: строка stderr SEC-052 один раз на `run` по первому событию с «третьим» вызовом;
+  - `zero-agent`: строка stderr SEC-052 один раз на run (источник строки уточнён ревью задачи 5, см. выше);
   - README: раздел «Rule of Two: экспозиция run», отмена SEC-052 и SEC-053 решением заказчика; ADR 0006;
   - миграция: `SNAPSHOT_V = 4`, снимок версии 5 и выше не читается («версия снимка 5»); литералы `ToolEnv {…}` и `LoopState {…}` получают `exposure` (и `skills`); квитанции нативных вызовов вне проекта и сетевых — поля `private`, `external`.
 - R1-C2, проход fix-4, переносы в задачу 5 (m3 и сомнение 2):

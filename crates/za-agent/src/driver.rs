@@ -70,6 +70,7 @@ use crate::detect::{
     promise_without_action, retry_params, thinking_timeout,
 };
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
+use crate::exposure::Exposure;
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
 use crate::policy::{Grant, PolicySnapshot, grants_text};
 use crate::prompt::{
@@ -81,9 +82,7 @@ use crate::request::{
 };
 use crate::resume::state_block;
 use crate::state::{AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit};
-use crate::tools::{
-    Exposure, FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools,
-};
+use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools};
 use crate::turn::{
     CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed, Signal,
     TurnError, TurnOutput, model_turn_masked, output_tps, report_parse_errors, review,
@@ -132,6 +131,9 @@ pub enum FaultPoint {
     BeforeToolFinished { step: u64 },
     /// внутри замыкания слота `request_grant` шага: запись аудита гранта не удалась
     GrantAudit { step: u64 },
+    /// внутри замыкания слота вызова шага, исполняемого при всех трёх свойствах Rule of
+    /// Two: запись аудита `rule_of_two` не удалась (R1-C2, Ruling m1 ревью задачи 5)
+    RuleOfTwoAudit { step: u64 },
     /// эффект `boundary` шага записан: следующая запись журнала не удалась (Ruling I1)
     AfterBoundary { step: u64 },
     /// эффект `context` первой оценки шага записан: следующая запись не удалась
@@ -142,7 +144,7 @@ pub enum FaultPoint {
 
 /// true — в точке случается сбой журнала: замыкание `boundary` возвращает
 /// `EffectFailure::Transient`, слот вызова — ошибку записи `tool.finished` (`GrantAudit` —
-/// записи аудита гранта), точки
+/// записи аудита гранта, `RuleOfTwoAudit` — записи аудита `rule_of_two`), точки
 /// `After*` — ошибку записи журнала после эффекта (`StoreError::Io`), как настоящая (D72).
 pub type FaultHook = Arc<dyn Fn(FaultPoint) -> bool + Send + Sync>;
 
@@ -2723,8 +2725,10 @@ async fn backoff(deps: &LoopDeps, st: &mut LoopState, d: Duration) -> Result<(),
 }
 
 /// `exposure.changed {untrusted, private, external, calls, rule_of_two}` (D106): флаги run
-/// после пакета, вызовы с новым флагом и «третьи» вызовы (о них — записи аудита
-/// `rule_of_two`; по непустому `rule_of_two` бинарник печатает строку SEC-052).
+/// после пакета, вызовы с новым флагом и вызовы пакета, исполненные при всех трёх
+/// свойствах (о них — записи аудита `rule_of_two`). Пишется, только если флаги изменились;
+/// вызовы при трёх свойствах в следующих пакетах видны по аудиту и отметке `rule_of_two`
+/// в `tool.started`/`tool.finished` (по ней бинарник печатает строку SEC-052).
 async fn exposure_changed(
     deps: &LoopDeps,
     st: &mut LoopState,

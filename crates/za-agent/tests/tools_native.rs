@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 use za_agent::{
     CallVerdict, CompactInput, ContextConfig, CrashPoint, EnvInfo, Exposure, FaultPoint, Grant,
     GrantMode, GrantSource, LoopDeps, LoopError, LoopOutcome, PlannedCall, PolicyConfig,
-    PolicySnapshot, ResumeChange, Rule, RuleAction, RunSetup, RunSpec, Snapshot, TaskBlock,
-    ToolEnv, ToolsOutcome, TrustSetFn, builtin_tools, compact, control_channel, freeze,
+    PolicySnapshot, ResumeChange, Rule, RuleAction, RuleOfTwoNotice, RunSetup, RunSpec, Snapshot,
+    TaskBlock, ToolEnv, ToolsOutcome, TrustSetFn, builtin_tools, compact, control_channel, freeze,
     grants_text, prompt_texts_hash, prompt_texts_hash_for, reasoning_for, render_task,
     request_grant_tool, resume_run, run_tools, signal_channel, start_run,
 };
@@ -119,6 +119,17 @@ impl Bx {
         step: u64,
         calls: &[PlannedCall],
     ) -> ToolsOutcome {
+        self.try_batch(reg, env, step, calls).await.unwrap()
+    }
+
+    /// Как [`Self::batch`], с ошибкой эффекта (`Store` — сбой журнала в пакете).
+    async fn try_batch(
+        &self,
+        reg: &ToolRegistry,
+        env: &ToolEnv,
+        step: u64,
+        calls: &[PlannedCall],
+    ) -> Result<ToolsOutcome, za_core::EffectError> {
         let mut ctx = RunCtx::resume_at(self.store.clone(), self.run, step, 0);
         let mut env = env.clone();
         env.step = step;
@@ -128,7 +139,6 @@ impl Bx {
             run_tools(&mut ctx, &self.j, reg, &env, calls, &mut sig),
         )
         .await
-        .unwrap()
     }
 
     async fn events(&self) -> Vec<Event> {
@@ -1720,25 +1730,116 @@ async fn third_property_allowed_and_recorded() {
             "call_id": "w1",
             "tool": "web_fetch",
             "exposure": {"untrusted": true, "private": true, "external": true},
+            "effect_key": format!("{}:1:0", b.run),
         })
     );
-    // Решение `tool.started` — разрешение режимом, а не вопрос.
+    // Решение `tool.started` — разрешение режимом, а не вопрос; отметка `rule_of_two` —
+    // запись аудита сделана до вызова.
     let evs = b.events().await;
     let st = of_kind(&evs, EventKind::ToolStarted);
     assert_eq!(st[0].payload["decision"]["action"], "allow");
+    assert_eq!(st[0].payload["rule_of_two"], true);
     assert!(of_kind(&evs, EventKind::InterruptOpened).is_empty());
     // Реплей: тот же итог, записи аудита не дублируются.
     let again = b.batch(&reg, &env, 1, &calls).await;
     assert_eq!(again.rule_of_two, ["w1"]);
     assert_eq!(web_calls.load(Ordering::SeqCst), 1);
     assert_eq!(rule_of_two_audit(&b.store).await.len(), 1);
-    // Одно свойство в снимке — сетевой вызов не «третий».
+    // Ruling I1 ревью задачи 5: одно свойство в снимке, сетевой вызов добавляет два —
+    // вызов исполняется при всех трёх и тоже получает запись.
     let mut env = b.env(RunMode::Auto);
     env.exposure = exposure(false, true, false);
     let calls = [pc("w2", "web_fetch", json!({"url": "https://a.test/"}))];
     let out = b.batch(&reg, &env, 2, &calls).await;
+    assert_eq!(out.rule_of_two, ["w2"]);
+    let audit = rule_of_two_audit(&b.store).await;
+    assert_eq!(audit.len(), 2);
+    assert_eq!(audit[1].payload["call_id"], "w2");
+}
+
+/// Ruling I1 ревью задачи 5: запись получает каждый вызов, исполняемый при всех трёх
+/// свойствах (снимок начала пакета плюс вклад вызова), а не только переход в три. При
+/// трёх свойствах в снимке — и сетевой вызов, и чтение внутри проекта без своего вклада;
+/// при двух в снимке вызов без недостающего свойства записи не получает.
+#[tokio::test]
+async fn every_call_under_three_properties_recorded() {
+    let b = bx("every_call_three").await;
+    std::fs::write(b.d.roots.project.join("in.txt"), "in").unwrap();
+    let reg = registry(vec![Arc::new(ReadStub::new()), Arc::new(WebStub::new())]);
+    let mut env = b.env(RunMode::Auto);
+    env.exposure = exposure(true, true, true);
+    let calls = [
+        pc("in1", "read", json!({"path": "in.txt"})),
+        pc("w1", "web_fetch", json!({"url": "https://a.test/"})),
+    ];
+    let out = b.batch(&reg, &env, 1, &calls).await;
+    assert_eq!(out.executed, ["in1", "w1"]);
+    assert_eq!(out.rule_of_two, ["in1", "w1"]);
+    assert_eq!(audit_ids(&rule_of_two_audit(&b.store).await), ["in1", "w1"]);
+    // Два свойства в снимке: чтение внутри проекта третьего не даёт — записи нет.
+    let mut env = b.env(RunMode::Auto);
+    env.exposure = exposure(true, true, false);
+    let calls = [pc("in2", "read", json!({"path": "in.txt"}))];
+    let out = b.batch(&reg, &env, 2, &calls).await;
     assert!(out.rule_of_two.is_empty());
+    assert_eq!(rule_of_two_audit(&b.store).await.len(), 2);
+    let evs = b.events().await;
+    let marked: Vec<&str> = of_kind(&evs, EventKind::ToolStarted)
+        .iter()
+        .filter(|e| e.payload["rule_of_two"] == true)
+        .map(|e| e.payload["call_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(marked, ["in1", "w1"]);
+}
+
+/// Ruling I1 ревью задачи 5: третье свойство дала только метка результата (её до вызова
+/// не знать) — запись после вызова, отметка в `tool.finished`. Сбой этой записи —
+/// результат не выдаётся (ошибка журнала, как у гранта), недоверенного содержимого в
+/// контексте нет; флаги `private`/`external` исполненного вызова остаются.
+#[tokio::test]
+async fn third_property_from_result_label_recorded_after_call() {
+    let b = bx("third_from_label").await;
+    let reg = registry(vec![Arc::new(TextStub::new("probe"))]);
+    let mut env = b.env(RunMode::Auto);
+    env.exposure = exposure(false, true, true);
+    let calls = [pc("t1", "probe", json!({"out": "x", "taint": "web"}))];
+    let out = b.batch(&reg, &env, 1, &calls).await;
+    assert_eq!(out.rule_of_two, ["t1"]);
+    assert_eq!(out.exposure, exposure(true, false, false));
     assert_eq!(rule_of_two_audit(&b.store).await.len(), 1);
+    let evs = b.events().await;
+    assert!(
+        of_kind(&evs, EventKind::ToolStarted)[0]
+            .payload
+            .get("rule_of_two")
+            .is_none()
+    );
+    assert_eq!(
+        of_kind(&evs, EventKind::ToolFinished)[0].payload["rule_of_two"],
+        true
+    );
+    // Без метки результата — два свойства, записи нет.
+    let calls = [pc("t2", "probe", json!({"out": "x"}))];
+    let out = b.batch(&reg, &env, 2, &calls).await;
+    assert!(out.rule_of_two.is_empty());
+    // Сбой записи после вызова.
+    let mut faulty = env.clone();
+    faulty.fault = Some(Arc::new(|p| matches!(p, FaultPoint::RuleOfTwoAudit { .. })));
+    let calls = [pc(
+        "t3",
+        "probe",
+        json!({"out": "secret page", "taint": "web"}),
+    )];
+    let r = b.try_batch(&reg, &faulty, 3, &calls).await;
+    assert!(matches!(r, Err(za_core::EffectError::Store(_))), "{r:?}");
+    assert_eq!(rule_of_two_audit(&b.store).await.len(), 1);
+    // Реплей шага: квитанция — отказ без содержимого, свойства `untrusted` нет.
+    let again = b.batch(&reg, &env, 3, &calls).await;
+    let (text, is_error) = content(&again, 0);
+    assert!(is_error && text.contains("journal write failed"), "{text}");
+    assert!(!text.contains("secret page"), "{text}");
+    assert!(again.rule_of_two.is_empty());
+    assert_eq!(again.exposure, Exposure::default());
 }
 
 /// D106, preflight 1.10: свойства берутся со снимка начала пакета. Группа одновременных
@@ -1764,6 +1865,206 @@ async fn exposure_uses_batch_start_snapshot() {
     assert_eq!(out.exposure, exposure(true, true, true));
     assert_eq!(out.exposure_calls, ["r1", "w1"]);
     assert!(rule_of_two_audit(&b.store).await.is_empty());
+}
+
+/// Ruling m2 ревью задачи 5: запись `rule_of_two` делается до вызова, вместе с
+/// `tool.started` (оно несёт отметку), — отмена посреди вызова её не теряет.
+#[tokio::test]
+async fn rule_of_two_survives_cancel_mid_call() {
+    let b = bx("rot_cancel").await;
+    let web = WebStub::holding();
+    let web_calls = Arc::clone(&web.calls);
+    let reg = registry(vec![Arc::new(web)]);
+    let mut env = b.env(RunMode::Auto);
+    env.exposure = exposure(false, true, false);
+    env.step = 1;
+    let calls = [pc("w1", "web_fetch", json!({"url": "https://a.test/"}))];
+    let mut ctx = RunCtx::resume_at(b.store.clone(), b.run, 1, 0);
+    let (tx, mut sig) = signal_channel();
+    // Отмена — по событию: инструмент вызван и держит вызов.
+    let cancel = async {
+        while web_calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tx.cancel();
+    };
+    let (out, ()) = within("run_tools под отменой", async {
+        tokio::join!(
+            run_tools(&mut ctx, &b.j, &reg, &env, &calls, &mut sig),
+            cancel
+        )
+    })
+    .await;
+    let out = out.unwrap();
+    assert!(out.cancelled);
+    assert!(out.results.is_empty());
+    let audit = rule_of_two_audit(&b.store).await;
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].payload["call_id"], "w1");
+    let evs = b.events().await;
+    assert_eq!(
+        of_kind(&evs, EventKind::ToolStarted)[0].payload["rule_of_two"],
+        true
+    );
+    assert!(of_kind(&evs, EventKind::ToolFinished).is_empty());
+}
+
+/// `call_id` записей аудита по порядку.
+fn audit_ids(a: &[za_store::AuditEntry]) -> Vec<String> {
+    a.iter()
+        .map(|e| e.payload["call_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Строки SEC-052, которые бинарник напечатал бы по событиям run (D106): одна на run.
+async fn rule_of_two_lines(l: &Lx) -> usize {
+    let mut notice = RuleOfTwoNotice::default();
+    let lines = events_of(&l.store, l.run)
+        .await
+        .iter()
+        .filter(|e| notice.on_event(&e.kind, &e.payload))
+        .count();
+    lines + usize::from(notice.at_end(!rule_of_two_audit(&l.store).await.is_empty()))
+}
+
+/// Ruling I1 ревью задачи 5: чтение по гранту, затем `web_fetch`, затем ещё `web_fetch` —
+/// оба сетевых вызова исполнены при всех трёх свойствах: две записи аудита и одна строка
+/// SEC-052 на run. Флаги run меняет только первый: событие `exposure.changed` у пакета
+/// второго не пишется.
+#[tokio::test]
+async fn grant_read_then_two_fetches_two_records_one_line() {
+    let (l, web_calls) = lx_web("rot_two_fetches");
+    let a = l.d.outside.join("a.txt");
+    std::fs::write(&a, "hello").unwrap();
+    let mut sp = spec(&l, RunMode::Auto);
+    sp.grants = vec![grant_ro(&l.d.outside)];
+    l.model
+        .push(calls(&[("r1", "read", json!({"path": s(&a)}))]));
+    l.model.push(calls(&[(
+        "w1",
+        "web_fetch",
+        json!({"url": "https://a.test/?q=hello"}),
+    )]));
+    l.model.push(calls(&[(
+        "w2",
+        "web_fetch",
+        json!({"url": "https://b.test/?q=hello"}),
+    )]));
+    l.model.push(answer("ok"));
+    assert_eq!(start(&l, sp).await.unwrap(), done("ok"));
+    assert_eq!(web_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(audit_ids(&rule_of_two_audit(&l.store).await), ["w1", "w2"]);
+    assert_eq!(
+        exposure_events(&l).await,
+        [
+            json!({"untrusted": false, "private": true, "external": false,
+                "calls": ["r1"], "rule_of_two": []}),
+            json!({"untrusted": true, "private": true, "external": true,
+                "calls": ["w1"], "rule_of_two": ["w1"]}),
+        ]
+    );
+    assert_eq!(rule_of_two_lines(&l).await, 1);
+}
+
+/// Ruling m1 ревью задачи 5: сбой записи аудита `rule_of_two` — как у аудита гранта (D72,
+/// D91): без записи вызов не исполняется, run встаёт на паузу `store`; после resume —
+/// отказ из квитанции, без вызова и без флага `external`.
+#[tokio::test]
+async fn rule_of_two_audit_failure_blocks_call() {
+    let (l, web_calls) = lx_web("rot_fault");
+    let a = l.d.outside.join("a.txt");
+    std::fs::write(&a, "hello").unwrap();
+    let mut sp = spec(&l, RunMode::Auto);
+    sp.grants = vec![grant_ro(&l.d.outside)];
+    l.model
+        .push(calls(&[("r1", "read", json!({"path": s(&a)}))]));
+    l.model.push(calls(&[(
+        "w1",
+        "web_fetch",
+        json!({"url": "https://a.test/?q=hello"}),
+    )]));
+    let mut faulty = l.deps.clone();
+    faulty.fault = Some(Arc::new(|p| matches!(p, FaultPoint::RuleOfTwoAudit { .. })));
+    let (_ctl, rx) = control_channel(l.store.clone(), l.run);
+    let o = within("start_run", start_run(&faulty, l.run, sp, rx))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            o,
+            LoopOutcome::Paused {
+                interrupt: None,
+                ..
+            }
+        ),
+        "{o:?}"
+    );
+    assert_eq!(web_calls.load(Ordering::SeqCst), 0);
+    assert!(rule_of_two_audit(&l.store).await.is_empty());
+    let evs = events_of(&l.store, l.run).await;
+    assert!(
+        of_kind(&evs, EventKind::ToolStarted)
+            .iter()
+            .all(|e| e.payload["call_id"] != "w1")
+    );
+    l.model.push(answer("ok"));
+    assert_eq!(
+        resume(&l, &l.deps, ResumeChange::default()).await.unwrap(),
+        done("ok")
+    );
+    assert_eq!(web_calls.load(Ordering::SeqCst), 0);
+    let r = last_results(&l.model);
+    let w1 = r.iter().find(|(id, ..)| id == "w1").unwrap();
+    assert_eq!(w1.1, "internal error: journal write failed");
+    assert!(w1.2);
+    assert!(rule_of_two_audit(&l.store).await.is_empty());
+    let (_, v) = l.store.latest_snapshot(l.run).await.unwrap().unwrap();
+    let snap: Snapshot = serde_json::from_value(v).unwrap();
+    assert_eq!(snap.exposure, exposure(false, true, false));
+    assert_eq!(rule_of_two_lines(&l).await, 0);
+}
+
+/// Ruling m2 ревью задачи 5: сбой процесса после вызова (намерение без квитанции) — при
+/// resume замыкание слота повторяется (`web_fetch` — `ReadOnly`), а запись аудита — нет:
+/// она одна на ключ эффекта. Строка SEC-052 — одна.
+#[tokio::test]
+async fn rule_of_two_not_duplicated_on_retry_after_crash() {
+    let (mut l, web_calls) = lx_web("rot_crash");
+    let a = l.d.outside.join("a.txt");
+    std::fs::write(&a, "hello").unwrap();
+    let mut sp = spec(&l, RunMode::Auto);
+    sp.grants = vec![grant_ro(&l.d.outside)];
+    l.model
+        .push(calls(&[("r1", "read", json!({"path": s(&a)}))]));
+    l.model.push(calls(&[(
+        "w1",
+        "web_fetch",
+        json!({"url": "https://a.test/?q=hello"}),
+    )]));
+    l.deps.crash = Some(Arc::new(|p| {
+        p == CrashPoint::InTool {
+            step: 2,
+            after_call: true,
+        }
+    }));
+    assert!(matches!(start(&l, sp).await, Err(LoopError::Halted)));
+    assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rule_of_two_audit(&l.store).await.len(), 1);
+    l.deps.crash = None;
+    l.model.push(answer("ok"));
+    assert_eq!(
+        resume(&l, &l.deps, ResumeChange::default()).await.unwrap(),
+        done("ok")
+    );
+    assert_eq!(web_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(audit_ids(&rule_of_two_audit(&l.store).await), ["w1"]);
+    let evs = events_of(&l.store, l.run).await;
+    let marked = of_kind(&evs, EventKind::ToolStarted)
+        .iter()
+        .filter(|e| e.payload["call_id"] == "w1" && e.payload["rule_of_two"] == true)
+        .count();
+    assert_eq!(marked, 2);
+    assert_eq!(rule_of_two_lines(&l).await, 1);
 }
 
 fn lx_web(name: &str) -> (Lx, Arc<std::sync::atomic::AtomicUsize>) {

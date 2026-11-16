@@ -1450,3 +1450,43 @@ async fn snapshot_v3_reads_with_default_exposure() {
     assert_eq!(after.exposure, za_agent::Exposure::default());
     assert!(after.skills.is_empty());
 }
+
+/// m6 ревью задачи 5: снимок v3 недоверенного run (метка `untrusted_project`, флагов
+/// экспозиции в нём нет) — после resume снимок начала пакета берёт `untrusted` по меткам
+/// (`LoopState::exposure_now`), и после пакета флаг run установлен.
+#[tokio::test]
+async fn snapshot_v3_untrusted_label_resumes_untrusted() {
+    let f = fx("v3_untrusted");
+    f.model.push(server_error());
+    assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+    let (_, mut v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    let o = v.as_object_mut().unwrap();
+    o.insert("v".into(), json!(3));
+    assert!(o.remove("exposure").is_some() && o.remove("skills").is_some());
+    o.insert("taint".into(), json!(["untrusted_project"]));
+    let last = events(&f.store, f.run).await.last().unwrap().seq;
+    f.store.save_snapshot(f.run, last, v).await.unwrap();
+    f.model.push(calls(&[("c1", "echo")]));
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    let (_, after) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(after.v, 4);
+    assert_eq!(
+        after.exposure,
+        za_agent::Exposure {
+            untrusted: true,
+            ..za_agent::Exposure::default()
+        }
+    );
+    // Снимок начала пакета уже нёс `untrusted` по меткам: флаги пакетом не изменены,
+    // события `exposure.changed` нет (без `exposure_now` оно было бы).
+    let evs = events(&f.store, f.run).await;
+    assert!(
+        !evs.iter().any(|e| e.kind == EventKind::ExposureChanged),
+        "{:?}",
+        evs.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>()
+    );
+}
