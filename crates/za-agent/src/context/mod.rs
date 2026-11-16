@@ -60,17 +60,14 @@ pub struct ContextBudget {
     pub compaction_reserve: u32,
     /// Каталог скиллов в описании `activate_skill` (R1-C2 D117): своя колонка, а не
     /// остаток слота Tools — нативные, встроенные и веб занимают слот 16k уже без каталога.
-    #[serde(default = "default_catalog")]
+    /// Значения по умолчанию нет (m2 ревью задачи 13): колонка зависит от окна, и запись
+    /// без поля — ошибка разбора, а не 1500 на любом окне. Бюджет не хранится — он
+    /// строится [`ContextBudget::for_context`] по `n_ctx`.
     pub catalog: u32,
 }
 
 /// Потолок каталога скиллов на окне 64k+, токены (D117).
 pub const CATALOG_LIMIT: u32 = 1500;
-
-/// Колонка каталога у значения без неё (снимков бюджета нет, поле — для полноты формы).
-fn default_catalog() -> u32 {
-    CATALOG_LIMIT
-}
 
 impl ContextBudget {
     /// Строка таблицы 2.3 по `n_ctx` (D40): меньше 16384 — 8k; меньше 32768 — 16k;
@@ -78,6 +75,12 @@ impl ContextBudget {
     /// скиллов (D117): 16k — 300, 32k — 600, 64k+ — [`CATALOG_LIMIT`]; у окна 8k (там
     /// тир small, `activate_skill` и каталога нет — он виден только при `--tier
     /// standard`) — как у 16k.
+    ///
+    /// Примечание к строкам 8k и 16k (R1-C2 D169): слот Tools 550 и 800 рассчитан на набор
+    /// tier small, и рантайм читает его только у small (`small_instructions`). Набор
+    /// standard на окне 16k бывает только по `--tier`: его предел CI — слот окна 32k (1500)
+    /// и колонка каталога окна, 1800 на 16k и 2100 на 32k (`standard_tools_cases`); резерв
+    /// вывода хода standard на 16k — 5120 (D40), рабочая часть окна ≈ 9,7k.
     pub fn for_context(n_ctx: u32) -> ContextBudget {
         let (prompt, tools, output_reserve, compaction_reserve, catalog) = if n_ctx < 16_384 {
             (800, Some(550), 1000, 1000, 300)

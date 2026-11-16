@@ -1700,86 +1700,118 @@ fn sized_skill(name: &str, tokens: usize) -> String {
     format!("---\nname: {name}\ndescription: Use when {name} is needed.\n---\n{body}")
 }
 
-/// D118: после компакции первое сообщение новой эпохи получает блоки активных скиллов
-/// из их блобов, новые первыми, в пределах `skill_recall_limit(n_ctx)`; не поместившийся
-/// старший снимается со списка активных строкой `[skill "…" unloaded by compaction; …]`.
-#[tokio::test]
-async fn compaction_recalls_active_skills() {
-    let texts = [sized_skill("review", 1980), sized_skill("tdd", 1980)];
+/// Каталог из двух заглушек поставки `review` и `tdd` с телами около `sizes` токенов.
+fn sized_catalog(sizes: [usize; 2]) -> Arc<za_skills::Catalog> {
+    let texts = [
+        sized_skill("review", sizes[0]),
+        sized_skill("tdd", sizes[1]),
+    ];
     let catalog = Arc::new(za_skills::Catalog::bundled_for_tests(&[
         ("review", texts[0].as_str()),
         ("tdd", texts[1].as_str()),
     ]));
     assert_eq!(catalog.skills.len(), 2);
-    let with_skills = |f: &mut Fx| {
-        f.deps.capabilities = vec![za_agent::skills_capability(Arc::clone(&catalog))];
-        f.deps.skills = Some(Arc::clone(&catalog));
-    };
-    let standard = || RunSpec {
+    catalog
+}
+
+/// Скиллы `catalog` в run: capability с каталогом и каталог исполнения.
+fn with_skills(f: &mut Fx, catalog: &Arc<za_skills::Catalog>) {
+    f.deps.capabilities = vec![za_agent::skills_capability(Arc::clone(catalog))];
+    f.deps.skills = Some(Arc::clone(catalog));
+}
+
+/// Задача run с тиром standard.
+fn standard_spec() -> RunSpec {
+    RunSpec {
         tier: Some(Tier::Standard),
         ..spec()
-    };
-    let n_ctx = 24_000;
-    assert_eq!(za_agent::skill_recall_limit(n_ctx), 3000);
-    // Оценка первого запроса run с тем же набором (байты / 4).
-    let mut p = fx("recall_probe", scripted(n_ctx));
-    with_skills(&mut p);
+    }
+}
+
+/// Ход с вызовом `activate_skill {name}`.
+fn activate_turn(id: &str, name: &str) -> Script {
+    finished(
+        vec![Part::ToolCall(ToolCall {
+            id: id.into(),
+            name: "activate_skill".into(),
+            arguments: json!({ "name": name }),
+            raw_arguments: None,
+        })],
+        FinishReason::ToolCalls,
+        Usage::default(),
+    )
+}
+
+/// Оценка запроса run после активаций `review` и `tdd` (байты / 4): пробный run с тем же
+/// набором инструментов и задачей.
+async fn activated_estimate(name: &str, n_ctx: u32, catalog: &Arc<za_skills::Catalog>) -> u32 {
+    let mut p = fx(name, scripted(n_ctx));
+    with_skills(&mut p, catalog);
+    p.model.push(activate_turn("s1", "review"));
+    p.model.push(activate_turn("s2", "tdd"));
     p.model.push(answer("ok"));
     let (_ctl, rx) = control_channel(p.store.clone(), p.run);
-    within("start_run", start_run(&p.deps, p.run, standard(), rx))
+    let out = within("start_run", start_run(&p.deps, p.run, standard_spec(), rx))
         .await
         .unwrap();
-    let base = ContextMeter::default()
+    assert_eq!(out, done("ok"));
+    ContextMeter::default()
         .estimate(
-            &p.model.calls()[0].request,
+            &p.model.calls()[2].request,
             p.model.as_ref(),
             &EndpointId("a".into()),
         )
         .await
-        .tokens;
-    // Порог компакции на окне 24000 и тире standard: оценка + резерв ≥ 0,75 × 24000.
-    let reserve = za_agent::output_plan(
+        .tokens
+}
+
+/// Резерв хода top standard на окне `n_ctx` (D40) — мера порогов вместе с оценкой.
+fn standard_reserve(n_ctx: u32) -> u32 {
+    za_agent::output_plan(
         &za_agent::ContextBudget::for_context(n_ctx),
         &reasoning_for(Tier::Standard),
     )
-    .max_output_tokens;
+    .max_output_tokens
+}
+
+/// Шаги эффектов `context` прохода `pass` по порядку.
+fn pass_steps(evs: &[Event], pass: u32) -> Vec<u64> {
+    intents(evs, "context")
+        .into_iter()
+        .filter(|i| i.payload["args"]["pass"] == pass)
+        .filter_map(|i| i.payload["args"]["step"].as_u64())
+        .collect()
+}
+
+/// D118: после компакции первое сообщение новой эпохи получает блоки активных скиллов
+/// из их блобов, новые первыми, в пределах `skill_recall_limit(n_ctx)`; не поместившийся
+/// старший снимается со списка активных строкой `[skill "…" unloaded by compaction; …]`.
+/// Хвост — короткий последний ход: запас до порога (D169) больше предела recall, и
+/// ограничивает именно `skill_recall_limit`.
+#[tokio::test]
+async fn compaction_recalls_active_skills() {
+    let catalog = sized_catalog([1980, 1980]);
+    let n_ctx = 24_000;
+    assert_eq!(za_agent::skill_recall_limit(n_ctx), 3000);
+    let activated = activated_estimate("recall_probe", n_ctx, &catalog).await;
+    // Порог компакции на окне 24000 и тире standard: оценка + резерв ≥ 0,75 × 24000.
+    let reserve = standard_reserve(n_ctx);
     let threshold = 18_000 - reserve;
-    let window = n_ctx - reserve;
-    // Две активации (~4000) и запись `note`: оценка шага 4 — между порогом и окном.
-    let target = (threshold + window) / 2;
-    let note_tokens = target - base - 4100;
-    assert!(
-        base + 4100 < 15_600 - reserve,
-        "удаление результатов до записи"
-    );
+    // Крупная запись `note` до активаций, затем короткая: оценка после второй активации
+    // ниже порога, после короткой записи — на 150 выше. Ход добавляет около tokens + 13.
+    let tail = 300;
+    let early = threshold + 150 - activated - 13 - (tail + 13);
 
     let mut f = fx("recall", scripted(n_ctx));
-    with_skills(&mut f);
-    f.model.push(finished(
-        vec![Part::ToolCall(ToolCall {
-            id: "s1".into(),
-            name: "activate_skill".into(),
-            arguments: json!({"name": "review"}),
-            raw_arguments: None,
-        })],
-        FinishReason::ToolCalls,
-        Usage::default(),
-    ));
-    f.model.push(finished(
-        vec![Part::ToolCall(ToolCall {
-            id: "s2".into(),
-            name: "activate_skill".into(),
-            arguments: json!({"name": "tdd"}),
-            raw_arguments: None,
-        })],
-        FinishReason::ToolCalls,
-        Usage::default(),
-    ));
-    f.model.push(note("n1", note_tokens));
+    with_skills(&mut f, &catalog);
+    f.model.push(note("n1", early));
+    f.model.push(activate_turn("s1", "review"));
+    f.model.push(activate_turn("s2", "tdd"));
+    f.model.push(note("n2", tail));
     f.model.push(summary("finish"));
     f.model.push(answer("готово"));
     let (_ctl, rx) = control_channel(f.store.clone(), f.run);
-    let out = within("start_run", start_run(&f.deps, f.run, standard(), rx))
+    let out = within("start_run", start_run(&f.deps, f.run, standard_spec(), rx))
         .await
         .unwrap();
     assert_eq!(out, done("готово"));
@@ -1801,8 +1833,73 @@ async fn compaction_recalls_active_skills() {
     );
     let evs = events(&f.store, f.run).await;
     assert_eq!(of_kind(&evs, EventKind::ContextCompacted).len(), 1);
+    assert!(alerts(&evs, "compaction_insufficient").is_empty());
     let (_, snap) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
     let snap: Snapshot = serde_json::from_value(snap).unwrap();
     assert_eq!(snap.skills.len(), 1);
     assert_eq!(snap.skills[0].name, "tdd");
+}
+
+/// D169 (I2 ревью задачи 13): recall не больше запаса новой эпохи до порога компакции. На
+/// окне 16k у standard резерв хода 5120, порог оценки 7168; хвост — последний ход с
+/// крупной записью. Оба скилла (около 1950 токенов) помещаются в `skill_recall_limit`
+/// 2048, но вместе с хвостом увели бы новую эпоху за порог: `compaction_insufficient` и
+/// подавление компакций (D70). В запас входит только младший `tdd`, старший снят строкой.
+#[tokio::test]
+async fn compaction_recall_fits_headroom() {
+    let catalog = sized_catalog([1500, 400]);
+    let n_ctx = 16_384;
+    assert_eq!(za_agent::skill_recall_limit(n_ctx), 2048);
+    let reserve = standard_reserve(n_ctx);
+    assert_eq!(reserve, 5120);
+    let threshold = 12_288 - reserve;
+    let activated = activated_estimate("room_probe", n_ctx, &catalog).await;
+    // Запись `note` поднимает оценку на 150 выше порога (ход — около tokens + 13).
+    let big = threshold + 150 - activated - 13;
+
+    let mut f = fx("recall_room", scripted(n_ctx));
+    with_skills(&mut f, &catalog);
+    f.model.push(activate_turn("s1", "review"));
+    f.model.push(activate_turn("s2", "tdd"));
+    f.model.push(note("n1", big));
+    f.model.push(summary("finish"));
+    f.model.push(answer("готово"));
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let out = within("start_run", start_run(&f.deps, f.run, standard_spec(), rx))
+        .await
+        .unwrap();
+    assert_eq!(out, done("готово"));
+    assert_eq!(compactions(&f.model), 1);
+    let evs = events(&f.store, f.run).await;
+    // Компакция по порогу, не аварийная: оценка шага между порогом и окном.
+    let steps = pass_steps(&evs, 2);
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    let before = context_tokens(&evs, steps[0], 0).unwrap();
+    assert!(
+        before >= u64::from(threshold) && before < u64::from(n_ctx - reserve),
+        "оценка до компакции {before}, порог {threshold}"
+    );
+    assert!(
+        alerts(&evs, "compaction_insufficient").is_empty(),
+        "{:?}",
+        alerts(&evs, "compaction_insufficient")
+    );
+    let after = context_tokens(&evs, steps[0], 2).unwrap();
+    assert!(after < u64::from(threshold), "после компакции {after}");
+    let last = turn_requests(&f.model).pop().unwrap();
+    let first = text_of(&last.messages[0]);
+    assert!(
+        first.contains("<skill_content name=\"tdd\" source=\"bundled\""),
+        "{first}"
+    );
+    assert!(!first.contains("<skill_content name=\"review\""));
+    assert!(
+        first.ends_with(
+            "\n\n[skill \"review\" unloaded by compaction; activate it again if needed]"
+        )
+    );
+    let (_, snap) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    let snap: Snapshot = serde_json::from_value(snap).unwrap();
+    let names: Vec<&str> = snap.skills.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["tdd"]);
 }

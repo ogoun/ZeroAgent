@@ -2,7 +2,8 @@
 //! `<skill_content>`, экранирование, дедупликация, проверка хэша, ресурсы, без выгрузки),
 //! каталог в описании инструмента (ограждение и свой бюджет), `/имя` на любом тире и
 //! карточка роутера на top small, очистка ввода до разбора `/имя`, golden описаний
-//! встроенных инструментов.
+//! встроенных инструментов. Ревью задачи 13: `/имя` после карточки роутера (I1), предел
+//! текста активации по окну (D169).
 //!
 //! Скиллы поставки в тестах — заглушки `Catalog::bundled_for_tests` (признак `test-hooks`
 //! крейта `za-skills`, D128): хэш у них настоящий, `load` сверяет его так же, как у
@@ -817,6 +818,139 @@ async fn slash_in_input_appends_block() {
     let input = snap.user_inputs.last().expect("нет ввода");
     let text = f.store.get_blob(&input.text).await.unwrap().unwrap();
     assert_eq!(String::from_utf8(text).unwrap(), "/tdd now");
+}
+
+/// Ruling I1 ревью задачи 13: карточка роутера не закрывает `/имя` того же скилла — на
+/// small это единственный путь к полному тексту (D119). Запись `by: "router"` заменяется
+/// записью `by: "user"`, к вводу дописывается блок `<skill_content>`.
+#[tokio::test]
+async fn slash_after_router_card_loads_full_text() {
+    let cat = stubs(&[
+        (
+            "tdd",
+            "Use when you write a failing test first, then the code.",
+            "Write the failing test.\nRun it and watch it fail.\nWrite the code.",
+        ),
+        (
+            "review",
+            "Use when asked to review a diff before merge.",
+            "Read the diff.",
+        ),
+    ]);
+    let f = fx("router_then_slash", cat, 8192);
+    f.model
+        .push(vec![Err(ModelError::new(ErrorClass::Server, "500"))]);
+    let out = start(
+        &f,
+        spec(&f, "write a failing test first for the parser", Tier::Small),
+    )
+    .await;
+    assert!(
+        matches!(out, LoopOutcome::Paused { ref reason, .. } if reason == "provider"),
+        "{out:?}"
+    );
+    let snap = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.skills.len(), 1);
+    assert_eq!(
+        (snap.skills[0].name.as_str(), snap.skills[0].by.as_str()),
+        ("tdd", "router")
+    );
+    f.model.push(answer("ok"));
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let change = ResumeChange {
+        input: Some("/tdd now".into()),
+        ..ResumeChange::default()
+    };
+    let out = within("resume_run", resume_run(&f.deps, f.run, change, rx))
+        .await
+        .unwrap();
+    assert_eq!(out, done("ok"));
+    let req = last_request(&f);
+    let msg = req
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(text_of)
+        .find(|t| t.starts_with("/tdd now"))
+        .expect("нет ввода");
+    let block = msg
+        .strip_prefix("/tdd now\n\n")
+        .unwrap_or_else(|| panic!("{msg}"));
+    assert!(
+        block.starts_with("<skill_content name=\"tdd\" source=\"bundled\" hash=\""),
+        "{block}"
+    );
+    assert!(
+        block.ends_with("Run it and watch it fail.\nWrite the code.\n</skill_content>"),
+        "{block}"
+    );
+    let evs = events(&f.store, f.run).await;
+    let by: Vec<&str> = of_kind(&evs, EventKind::SkillActivated)
+        .iter()
+        .map(|e| e.payload["by"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(by, ["router", "user"]);
+    // Одна запись на имя: recall после компакции поднимет полный блок, а не карточку.
+    let snap = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.skills.len(), 1, "{:?}", snap.skills);
+    let s = &snap.skills[0];
+    assert_eq!(
+        (s.name.as_str(), s.by.as_str(), s.call_id.as_deref()),
+        ("tdd", "user", None)
+    );
+    let blob = f.store.get_blob(&s.content).await.unwrap().unwrap();
+    assert_eq!(String::from_utf8(blob).unwrap(), block);
+}
+
+/// D169: предел текста активации — `min(64 КиБ, n_ctx / 4 токена)` по оценке байты / 4,
+/// то есть не больше `n_ctx` байт. На small 8k и 16k `/имя` скилла около 100 КиБ даёт блок
+/// в этом пределе с пометкой обрезки, и run идёт дальше, а не встаёт на паузу `context`
+/// (D49): первое сообщение помещается в окно.
+#[tokio::test]
+async fn big_slash_skill_is_cut_to_window() {
+    let body: String = (0..2500)
+        .map(|i| format!("Step {i:04}: do the next small thing carefully.\n"))
+        .collect();
+    assert!(body.len() > 100 * 1024, "{}", body.len());
+    for n_ctx in [16_384u32, 8192] {
+        let f = fx(
+            &format!("big_slash_{n_ctx}"),
+            stubs(&[("big", "Use when big.", &body)]),
+            n_ctx,
+        );
+        // На 8k блок с префиксом близок к порогу компакции (сейчас ниже, 2026-11-16): если
+        // порог будет пройден, первым придёт запрос сводки, и первый ответ — её сводка;
+        // иначе он и есть ответ run. Пауза `context` недопустима в обоих случаях.
+        f.model.push(answer(
+            "## Decisions\nd\n## Files changed\n-\n## Errors\n-\n## Next step\nok",
+        ));
+        f.model.push(answer("ok"));
+        let out = start(&f, spec(&f, "/big go", Tier::Small)).await;
+        assert!(
+            matches!(
+                out,
+                LoopOutcome::Finished {
+                    status: RunStatus::Done,
+                    ..
+                }
+            ),
+            "{n_ctx}: {out:?}"
+        );
+        let first = text_of(&f.model.calls()[0].request.messages[0]);
+        let at = first
+            .find("<skill_content name=\"big\"")
+            .unwrap_or_else(|| panic!("{n_ctx}: нет блока"));
+        let block = &first[at..];
+        let limit = n_ctx as usize;
+        assert_eq!(za_agent::skill_output_limit(n_ctx), limit);
+        assert!(block.len() <= limit, "{n_ctx}: {}", block.len());
+        assert!(block.len() > limit - 1024, "{n_ctx}: {}", block.len());
+        assert!(
+            block.ends_with("\n</skill_content>\n[skill truncated; load parts with file]"),
+            "{n_ctx}: {}",
+            &block[block.len().saturating_sub(120)..]
+        );
+    }
 }
 
 // ---- Golden встроенных инструментов (D123) ----

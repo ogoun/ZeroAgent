@@ -95,7 +95,7 @@ pub use request::{
 pub use resume::{ResumeChange, resume_run, state_block};
 pub use skills::{
     ACTIVATE_SKILL_TOOL, CARD_LIMIT, SKILL_OUTPUT_LIMIT, SKILLS_CAPABILITY, activate_skill_tool,
-    skill_recall_limit, skills_capability,
+    skill_output_limit, skill_recall_limit, skills_capability,
 };
 pub use state::{
     ActiveSkill, AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit, SNAPSHOT_V,

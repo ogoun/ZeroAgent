@@ -781,6 +781,108 @@ async fn prune_failure_is_journaled() {
     assert_eq!(last.epoch, 0);
 }
 
+/// m4 ревью задачи 13 (D118): драйвер передаёт `prune` вызовы активных скиллов. Run как
+/// у [`threshold_run`] с тиром standard (у small нет `activate_skill`, резерв на 8k тот
+/// же — 3072): активация `s1` и большой результат `c0` пять ходов назад, удаление на
+/// границе 7. Результат `c0` заменён, результат активного скилла — нет.
+#[tokio::test]
+async fn prune_at_boundary_keeps_active_skill() {
+    let d = dir("threshold_skill");
+    let body = "Keep this step of the method in mind.\n".repeat(120);
+    let skill = format!("---\nname: tdd\ndescription: Use when testing.\n---\n{body}");
+    let catalog = Arc::new(za_skills::Catalog::bundled_for_tests(&[(
+        "tdd",
+        skill.as_str(),
+    )]));
+    assert_eq!(catalog.skills.len(), 1);
+    let store = ProjectStore::open(&d.join("store")).unwrap();
+    let model = Arc::new(
+        ScriptedModel::new(default_caps(BackendKind::LlamaCpp))
+            .with_context(8192)
+            .with_token_counter(|s| (s.len() / 100) as u32),
+    );
+    let mut reg = ToolRegistry::default();
+    for t in builtin_tools() {
+        reg.register(t).unwrap();
+    }
+    reg.register(Arc::new(Dump {
+        spec: tool_spec("dump", None),
+    }))
+    .unwrap();
+    let deps = LoopDeps {
+        capabilities: vec![za_agent::skills_capability(Arc::clone(&catalog))],
+        memory: Arc::new(NoMemory),
+        skills: Some(catalog),
+        crash: None,
+        fault: None,
+        ..LoopDeps::new(
+            Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
+            model.clone(),
+            Arc::new(reg),
+        )
+    };
+    model.push(vec![Ok(StreamEvent::Finished {
+        message: Message {
+            role: Role::Assistant,
+            parts: vec![Part::ToolCall(ToolCall {
+                id: "s1".into(),
+                name: "activate_skill".into(),
+                arguments: json!({ "name": "tdd" }),
+                raw_arguments: None,
+            })],
+        },
+        finish: FinishReason::ToolCalls,
+        usage: Usage::default(),
+    })]);
+    model.push(dump_turn("c0", 4000, 0));
+    for k in 3..=5 {
+        model.push(dump_turn(&format!("c{k}"), 10, 0));
+    }
+    // Граница 7: оценка 2400 + 4000 / 100 + 4 = 2444, с резервом 3072 — между порогами
+    // удаления и компакции (расчёт у `threshold_run`).
+    model.push(dump_turn("c6", 4000, 2400));
+    model.push(answer("готово"));
+    let run = RunId::new();
+    let spec = RunSpec {
+        tier: Some(Tier::Standard),
+        ..run_spec(&d)
+    };
+    let (_ctl, rx) = control_channel(store.clone(), run);
+    let out = tokio::time::timeout(limit(), start_run(&deps, run, spec, rx))
+        .await
+        .expect("start_run не завершился в срок")
+        .unwrap();
+    assert!(matches!(out, LoopOutcome::Finished { .. }), "{out:?}");
+    let evs = events(&store, run).await;
+    let pruned: Vec<&Event> = evs
+        .iter()
+        .filter(|e| e.kind == EventKind::ContextPruned)
+        .collect();
+    assert_eq!(pruned.len(), 1, "context.pruned: {pruned:?}");
+    assert_eq!(pruned[0].payload["count"], 1, "{}", pruned[0].payload);
+    let calls = model.calls();
+    assert_eq!(calls.len(), 7);
+    let last = &calls[6].request.messages;
+    let result = |id: &str| {
+        last.iter()
+            .flat_map(|m| &m.parts)
+            .find_map(|p| match p {
+                Part::ToolResult {
+                    call_id, content, ..
+                } if call_id == id => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("нет результата {id}"))
+    };
+    assert_eq!(result("c0"), removed(run, &"y".repeat(4000)));
+    let s1 = result("s1");
+    assert!(s1.starts_with("<skill_content name=\"tdd\""), "{s1}");
+    assert!(
+        s1.contains(body.trim_end()),
+        "результат активного скилла заменён"
+    );
+}
+
 // ---- Финальное ревью R1-B2, m5: выгрузка не пишет через ссылки ----
 
 /// Ссылка-каталог `link` → `target`: на Windows — junction (`mklink /J`, прав

@@ -81,7 +81,7 @@ use crate::request::{
     FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message_with, freeze_for,
 };
 use crate::resume::state_block;
-use crate::skills::user_skill;
+use crate::skills::{add_active, loaded_names, skill_output_limit, user_skill};
 use crate::state::{AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools};
 use crate::turn::{
@@ -491,6 +491,7 @@ async fn step_zero(
         &[],
         &spec.task,
         router_on(spec.role, tier),
+        skill_output_limit(n_ctx),
     )
     .await
     .map_err(effect_err)?;
@@ -544,7 +545,9 @@ async fn step_zero(
     let mut skills = Vec::new();
     let task_text = match task_skill {
         Some((block, active)) => {
-            skills.extend(active);
+            if let Some(s) = active {
+                add_active(&mut skills, s);
+            }
             format!("{}\n\n{block}", spec.task)
         }
         None => spec.task.clone(),
@@ -1156,6 +1159,7 @@ async fn push_inbox(
                     &st.skills,
                     &text,
                     router_on(st.setup.role, st.setup.tier),
+                    skill_output_limit(st.setup.n_ctx),
                 )
                 .await
                 .map_err(effect_err)?;
@@ -1164,7 +1168,10 @@ async fn push_inbox(
                 let text = escape_untrusted(&text);
                 let message = match skill {
                     Some((block, active)) => {
-                        st.skills.extend(active);
+                        // Одна запись на имя: `/имя` после карточки роутера заменяет её.
+                        if let Some(s) = active {
+                            add_active(&mut st.skills, s);
+                        }
                         format!("{text}\n\n{block}")
                     }
                     None => text.clone(),
@@ -2343,7 +2350,7 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         trust_set: deps.trust_set.clone(),
         exposure: st.exposure_now(),
         skills: deps.skills.clone(),
-        active_skills: st.skills.iter().map(|s| s.name.clone()).collect(),
+        active_skills: loaded_names(&st.skills),
     };
     // Флаги наблюдаются рядом с пакетом (D26): `pausing`/`cancelling` пишутся сразу,
     // не дожидаясь конца идущего инструмента. На сигналы пакет реагирует сам.
@@ -2406,7 +2413,9 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
     // загруженные скиллы.
     st.taint.append(&mut out.taint);
     st.grants.append(&mut out.grants);
-    st.skills.append(&mut out.skills);
+    for s in out.skills.drain(..) {
+        add_active(&mut st.skills, s);
+    }
     match out.trusted {
         Some(true) => st.trust_granted(),
         Some(false) => st.trust_refused = true,

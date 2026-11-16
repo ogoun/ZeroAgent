@@ -5,7 +5,8 @@
 //! с рубрикой [`COMPACT_RUBRIC`], без инструментов и мышления, вывод не больше
 //! `compaction_reserve`) и `memory.after` (recovery памяти). Итог — история новой эпохи:
 //! первое сообщение (`<env>` run, recovery, блок [`summary_block`], блоки активных
-//! скиллов — R1-C2 D118), хвост ([`split_tail`]) и рецитация задачи (CTX-014).
+//! скиллов — R1-C2 D118, в пределах запаса новой эпохи до порога компакции — D169), хвост
+//! ([`split_tail`]) и рецитация задачи (CTX-014).
 //!
 //! Аварийная компакция (D49) берёт вход меньше окна: первое сообщение и наибольший
 //! суффикс истории с точки разреза ([`cut_points`]), помещающийся в
@@ -26,7 +27,7 @@ use za_llm::{
 use za_protocol::{BlobHash, EffectClass};
 use za_store::{ProjectStore, StoreError};
 
-use super::{ContextBudget, TEMPLATE_TOKENS, UserInput, message_text};
+use super::{ContextBudget, TEMPLATE_TOKENS, UserInput, message_text, output_plan};
 use crate::conversation::{Conversation, HistoryError, cut_points, split_tail};
 use crate::memory::{MemoryPort, memory_budget};
 use crate::prompt::{ControlAction, ControlFrom, approx_tokens, escape_untrusted, render_control};
@@ -409,20 +410,41 @@ pub async fn compact(
         recitation.push_str("\n\n");
         recitation.push_str(&crate::request::grants_block(g));
     }
-    // Активные скиллы (D118): после сводки, в пределах recall; снятые — строкой.
-    let tail_msgs = &input.conv.messages()[split.min(input.conv.messages().len())..];
-    let (recalled, skills) = crate::skills::recall(&store, input.skills, tail_msgs, n_ctx)
-        .await
-        .map_err(|e| store_err(ctx, e))?;
     let mut first = new_first(input.env, recovery, &summary);
-    if !recalled.is_empty() {
-        first.push_str("\n\n");
-        first.push_str(&recalled);
+    let rebase = |first: String| {
+        input
+            .conv
+            .rebased(
+                user_message(first),
+                split,
+                vec![user_message(recitation.clone())],
+            )
+            .map_err(history_err)
+    };
+    let mut conv = rebase(first.clone())?;
+    let opts = TurnOptions::default();
+    // Активные скиллы (D118): после сводки, в пределах recall и запаса новой эпохи до
+    // порога компакции (D169) — оценка новой эпохи без них и резерв хода (D40) той же
+    // меры, что у порогов драйвера; снятые — строкой. Чистая функция состояния: реплей
+    // строит ту же эпоху.
+    let mut skills = Vec::new();
+    if !input.skills.is_empty() {
+        let estimate =
+            approx_request_tokens(&build_request(input.frozen, input.setup, &conv, &opts));
+        let reserve = output_plan(&budget, &input.setup.reasoning).max_output_tokens;
+        let limit =
+            crate::skills::recall_budget(n_ctx, input.setup.context.compact_at, reserve, estimate);
+        let tail_msgs = &input.conv.messages()[split.min(input.conv.messages().len())..];
+        let (recalled, kept) = crate::skills::recall(&store, input.skills, tail_msgs, limit)
+            .await
+            .map_err(|e| store_err(ctx, e))?;
+        skills = kept;
+        if !recalled.is_empty() {
+            first.push_str("\n\n");
+            first.push_str(&recalled);
+            conv = rebase(first)?;
+        }
     }
-    let conv = input
-        .conv
-        .rebased(user_message(first), split, vec![user_message(recitation)])
-        .map_err(history_err)?;
     let user_inputs = input
         .user_inputs
         .iter()
@@ -431,7 +453,6 @@ pub async fn compact(
             ..u.clone()
         })
         .collect();
-    let opts = TurnOptions::default();
     let before =
         approx_request_tokens(&build_request(input.frozen, input.setup, input.conv, &opts));
     let after = approx_request_tokens(&build_request(input.frozen, input.setup, &conv, &opts));

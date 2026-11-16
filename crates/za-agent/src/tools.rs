@@ -220,7 +220,9 @@ pub struct ToolEnv {
     pub exposure: Exposure,
     /// Каталог скиллов run для `activate_skill` (R1-C2 D118); `None` — скиллов нет.
     pub skills: Option<Arc<za_skills::Catalog>>,
-    /// Имена активных скиллов run на начало пакета: повтор без `file` — без эффекта.
+    /// Имена скиллов run с загруженным полным текстом на начало пакета: повтор без `file`
+    /// — без эффекта. Скилл только с карточкой роутера сюда не входит (Ruling I1 ревью
+    /// задачи 13).
     pub active_skills: BTreeSet<String>,
 }
 
@@ -781,11 +783,17 @@ async fn prepare(
             let recorded = observe_store(ctx, row)?
                 .filter(|r| r.name == crate::skills::SKILL_LOAD_EFFECT)
                 .map(|r| r.args);
+            // Предел блока — по окну run (D169), как предел слота у прочих инструментов;
+            // без окна — `output_limit` инструмента.
+            let limit = env.spill.map_or(crate::skills::SKILL_OUTPUT_LIMIT, |c| {
+                crate::skills::skill_output_limit(c.n_ctx)
+            });
             return match plan_activation(
                 env.skills.as_deref(),
                 &st.skills,
                 &call.arguments,
                 recorded.as_ref(),
+                limit,
             ) {
                 Activation::Done { text, is_error } => Ok(Prep::Done(result(call, text, is_error))),
                 Activation::Load(job) => run(slots, Action::Skill(job), None),

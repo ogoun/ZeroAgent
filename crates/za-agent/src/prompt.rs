@@ -720,14 +720,18 @@ pub const STANDARD_MIN_WINDOW: u32 = 32_768;
 /// (`ContextBudget::catalog`).
 ///
 /// Лимит — слот Tools тира и колонка каталога окна: каталог — своя колонка, а не остаток
-/// слота (D117). Слот Tools берётся по окну, но не меньше окна [`STANDARD_MIN_WINDOW`]:
-/// набор standard на окне 16k бывает только по `--tier`, а слот 16k (800) рассчитан на набор
-/// small и превышен нативными, встроенными и вебом уже без каталога (preflight 3.7). Колонка
-/// каталога — по самому окну, как её берёт `freeze`.
+/// слота (D117). Слот Tools берётся по окну, но не меньше окна [`STANDARD_MIN_WINDOW`]
+/// (R1-C2 D169): набор standard на окне 16k бывает только по `--tier`, а слот 16k (800)
+/// рассчитан на набор small и превышен нативными, встроенными и вебом уже без каталога
+/// (preflight 3.7). Итог — 1800 на 16k и 2100 на 32k. Колонка каталога — по самому окну,
+/// как её берёт `freeze`.
+///
+/// Префикс не собран — ошибка, а не случай с пустым текстом: 0 токенов прошёл бы любой
+/// лимит (m1 ревью задачи 13).
 pub fn standard_tools_cases(
     tools: &[std::sync::Arc<dyn za_core::Tool>],
     caps: &[za_core::Capability],
-) -> Vec<BudgetCase> {
+) -> Result<Vec<BudgetCase>, crate::request::PrefixError> {
     let mut reg = za_core::ToolRegistry::default();
     let all = crate::tools::builtin_tools()
         .into_iter()
@@ -764,25 +768,19 @@ pub fn standard_tools_cases(
         let slot = crate::context::ContextBudget::for_context(n_ctx.max(STANDARD_MIN_WINDOW))
             .tools
             .unwrap_or(u32::MAX);
-        let text = match crate::request::freeze(&setup, &schemas, caps, None) {
-            Ok(f) => za_llm::render_tools(&za_llm::PromptBlocks {
-                tools: f.tools,
-                ..Default::default()
-            }),
-            // Повтор имени отсеян реестром выше; ошибка префикса — пустой случай с
-            // предупреждением, CI его увидит по нулю.
-            Err(e) => {
-                tracing::warn!(error = %e, "префикс случая бюджета не собран");
-                String::new()
-            }
-        };
+        // Повтор имени отсеян реестром выше, но ошибку префикса не прячем.
+        let frozen = crate::request::freeze(&setup, &schemas, caps, None)?;
+        let text = za_llm::render_tools(&za_llm::PromptBlocks {
+            tools: frozen.tools,
+            ..Default::default()
+        });
         out.push(BudgetCase {
             name: format!("top/standard/tools@{window}"),
             text,
             limit: slot.saturating_add(budget.catalog),
         });
     }
-    out
+    Ok(out)
 }
 
 /// Предел блока `AGENTS.md`, токены: «`AGENTS.md` и резерв ≤ 700» распределения Full

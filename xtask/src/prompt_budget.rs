@@ -246,8 +246,8 @@ impl Extractor for NoExtractor {
 
 /// Случаи `top/standard/tools@{16k,32k}` (R1-C2 D117): нативные инструменты `native`,
 /// `web_fetch` и `web_search` поверх шлюза без обращений (адрес поставщика — только для
-/// построения) и capability скиллов с каталогом поставки. Шлюз не строится — случаев нет и
-/// ошибка в выводе (CI увидит пропажу случаев в тесте).
+/// построения) и capability скиллов с каталогом поставки. Шлюз или префикс не строится —
+/// ошибка, и команда выходит с кодом 2 (m1 ревью задачи 13).
 fn standard_cases(native: &[Arc<dyn za_core::Tool>]) -> Result<Vec<za_agent::BudgetCase>, String> {
     let gw =
         Arc::new(za_web::WebGateway::new(za_web::WebConfig::default()).map_err(|e| e.to_string())?);
@@ -266,14 +266,29 @@ fn standard_cases(native: &[Arc<dyn za_core::Tool>]) -> Result<Vec<za_agent::Bud
         ..za_skills::DiscoverInput::default()
     });
     let caps = [za_agent::skills_capability(Arc::new(catalog))];
-    Ok(standard_tools_cases(&tools, &caps))
+    standard_tools_cases(&tools, &caps).map_err(|e| e.to_string())
+}
+
+/// Случаи без пустого текста: пустой текст — несобранный случай (0 токенов прошёл бы
+/// любой лимит), это ошибка сборки (m1 ревью задачи 13).
+fn checked(cases: Vec<za_agent::BudgetCase>) -> Result<Vec<za_agent::BudgetCase>, String> {
+    let empty: Vec<&str> = cases
+        .iter()
+        .filter(|c| c.text.trim().is_empty())
+        .map(|c| c.name.as_str())
+        .collect();
+    if empty.is_empty() {
+        Ok(cases)
+    } else {
+        Err(format!("пустой текст случаев: {}", empty.join(", ")))
+    }
 }
 
 /// Все случаи CI-лимита: фиксированные тексты ([`budget_cases`]), префикс top small с
 /// нативными инструментами ([`small_prefix_cases`]) и описания top standard с вебом и
 /// каталогом ([`standard_cases`]). Инструменты только описываются: оболочка и `ZA_HOME` —
-/// заглушки (описания от них не зависят, D97).
-pub fn all_cases() -> Vec<za_agent::BudgetCase> {
+/// заглушки (описания от них не зависят, D97). Не собран хоть один случай — ошибка.
+pub fn all_cases() -> Result<Vec<za_agent::BudgetCase>, String> {
     let deps = NativeDeps {
         runner: std::sync::Arc::new(za_jail::DirectRunner),
         tracker: ReadTracker::new(),
@@ -292,11 +307,11 @@ pub fn all_cases() -> Vec<za_agent::BudgetCase> {
     let native = native_capability(&deps).tools;
     let mut cases = budget_cases();
     cases.extend(small_prefix_cases(&native));
-    match standard_cases(&native) {
-        Ok(c) => cases.extend(c),
-        Err(e) => eprintln!("prompt-budget: случаи top/standard/tools не собраны: {e}"),
-    }
-    cases
+    cases.extend(
+        standard_cases(&native)
+            .map_err(|e| format!("случаи top/standard/tools не собраны: {e}"))?,
+    );
+    checked(cases)
 }
 
 /// Аргументы команды: `--llama <http://host:port>` или ничего.
@@ -309,7 +324,8 @@ fn parse_args(args: &[String]) -> Result<Option<String>, String> {
 }
 
 /// Точка входа команды `prompt-budget`: таблица `случай | cl100k | o200k | qwen≈ |
-/// точно | лимит`; код 1 — есть превышение, 2 — ошибка аргументов или `/tokenize`.
+/// точно | лимит`; код 1 — есть превышение, 2 — ошибка аргументов, сборки случаев или
+/// `/tokenize`.
 pub fn run(args: &[String]) -> ExitCode {
     let llama = match parse_args(args) {
         Ok(v) => v,
@@ -319,7 +335,13 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let cases = all_cases();
+    let cases = match all_cases() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("prompt-budget: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let width = cases.iter().map(|c| c.name.len()).max().unwrap_or(0).max(6);
     println!(
         "{:<width$} | {:>6} | {:>6} | {:>6} | {:>6} | {:>5}",
@@ -392,9 +414,25 @@ mod tests {
         assert!(n.abs_diff(203) <= 5, "worker core: {n} cl100k");
     }
 
+    /// m1 ревью задачи 13: случай с пустым текстом (префикс не собран) — ошибка сборки
+    /// случаев, а не 0 токенов, проходящий любой лимит; команда выходит с кодом 2.
+    #[test]
+    fn empty_case_is_a_collection_error() {
+        let case = |name: &str, text: &str| za_agent::BudgetCase {
+            name: name.into(),
+            text: text.into(),
+            limit: 10,
+        };
+        let ok = checked(vec![case("a", "x")]).unwrap();
+        assert_eq!(ok.len(), 1);
+        let err = checked(vec![case("a", "x"), case("top/standard/tools@16k", "")]).unwrap_err();
+        assert!(err.contains("top/standard/tools@16k"), "{err}");
+        assert!(all_cases().is_ok());
+    }
+
     #[test]
     fn all_cases_within_limits() {
-        for case in all_cases() {
+        for case in all_cases().unwrap() {
             let c = count(&case.text);
             assert!(
                 !over_limit(&c, case.limit),
@@ -409,7 +447,7 @@ mod tests {
     /// `for_run(Top, Small)`; заглушки `finish` нет, лимиты 550 и 1800.
     #[test]
     fn prompt_budget_has_real_tool_cases() {
-        let cases = all_cases();
+        let cases = all_cases().unwrap();
         let tools = cases.iter().find(|c| c.name == "top/small/tools").unwrap();
         assert_eq!(tools.limit, 550);
         for name in ["read", "search", "edit", "bash"] {
@@ -450,7 +488,7 @@ mod tests {
     /// проверяет общий `all_cases_within_limits` (m6 ревью задачи 12).
     #[test]
     fn prompt_budget_has_skill_cases() {
-        let cases = all_cases();
+        let cases = all_cases().unwrap();
         let texts = za_agent::runtime_texts();
         let hashed: Vec<(&str, &str)> = texts
             .iter()
@@ -472,7 +510,7 @@ mod tests {
     /// R1-C2 D117 (preflight 3.7, 5.10): случаи `top/standard/tools@{16k,32k}` — настоящий
     /// набор run с тиром standard: нативные, встроенные, веб и `activate_skill` с каталогом
     /// 14 скиллов поставки в ограждении; лимит — слот Tools тира (не меньше окна 32k) и
-    /// колонка каталога окна (300 и 600).
+    /// колонка каталога окна (300 и 600): 1800 и 2100 (D169).
     #[test]
     fn prompt_budget_has_standard_cases() {
         use za_protocol::Tier;
@@ -484,7 +522,7 @@ mod tests {
             Tier::for_context(za_agent::STANDARD_MIN_WINDOW - 1),
             Tier::Small
         );
-        let cases = all_cases();
+        let cases = all_cases().unwrap();
         for (window, n_ctx, limit) in [("16k", 16_384, 1500 + 300), ("32k", 32_768, 1500 + 600)] {
             let c = cases
                 .iter()
