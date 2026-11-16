@@ -24,6 +24,10 @@ pub struct PdfText {
     /// Номер страницы (с 1) и её текст без пробелов по краям; пустой — страница без
     /// текстового слоя.
     pub pages: Vec<(u32, String)>,
+    /// Текст окна обрезан по `max_chars`: страница обрезана или следующие страницы окна не
+    /// прочитаны.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Ошибка разбора PDF. Текст — для модели (английский, ASCII): потребитель пишет
@@ -44,7 +48,8 @@ const REASON_MAX: usize = 160;
 
 /// Текст страниц `first..first + count` (нумерация с 1; `first` 0 — как 1) документа
 /// `bytes`, всего не больше `max_chars` символов: страница, на которой предел исчерпан,
-/// обрезается, следующие не читаются. Страницы за концом документа не возвращаются,
+/// обрезается, следующие не читаются ([`PdfText::truncated`]: текст, ровно равный пределу,
+/// без непрочитанных страниц окна не обрезан). Страницы за концом документа не возвращаются,
 /// [`PdfText::pages_total`] известно всегда. Ошибка страницы — ошибка вызова с номером
 /// страницы: модель может читать окно после неё.
 pub fn pdf_pages(
@@ -70,14 +75,22 @@ pub fn pdf_pages(
     let last = first.saturating_add(count).saturating_sub(1).min(total);
     let mut pages = Vec::new();
     let mut left = max_chars;
+    let mut truncated = false;
     for n in first..=last {
-        if left == 0 || count == 0 {
+        if count == 0 {
+            break;
+        }
+        if left == 0 {
+            truncated = true;
             break;
         }
         let text = page_text(&doc, n)?;
         let text = text.trim();
         let cut = match text.char_indices().nth(left) {
-            Some((i, _)) => &text[..i],
+            Some((i, _)) => {
+                truncated = true;
+                &text[..i]
+            }
             None => text,
         };
         left -= cut.chars().count();
@@ -86,6 +99,7 @@ pub fn pdf_pages(
     Ok(PdfText {
         pages_total: total,
         pages,
+        truncated,
     })
 }
 

@@ -54,6 +54,22 @@ fn text_limit_cuts_pages() {
     assert_eq!(total, 15, "{:?}", t.pages);
     assert_eq!(t.pages.len(), 2, "{:?}", t.pages);
     assert_eq!(t.pages[1].1, "bbbbb");
+    assert!(t.truncated);
+}
+
+/// m5 ревью задачи 10: текст ровно в предел обрезанным не считается, если страницы окна
+/// прочитаны все; непрочитанная страница окна после исчерпанного предела — обрыв.
+#[test]
+fn exact_fit_is_not_truncated() {
+    let doc = pdf_with_pages(&["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"]);
+    let t = pdf_pages(&doc, 1, 2, 20).unwrap();
+    assert_eq!(t.pages.len(), 2);
+    assert!(!t.truncated, "{t:?}");
+    let t = pdf_pages(&doc, 1, 3, 20).unwrap();
+    assert_eq!(t.pages.len(), 2);
+    assert!(t.truncated, "{t:?}");
+    let t = pdf_pages(&doc, 1, 3, 100).unwrap();
+    assert!(!t.truncated, "{t:?}");
 }
 
 #[test]
@@ -90,6 +106,42 @@ fn truncated_pdf_is_malformed() {
 fn encrypted_is_encrypted() {
     assert_eq!(
         pdf_pages(&pdf::encrypted_pdf(), 1, 10, 100_000),
+        Err(ExtractError::Encrypted)
+    );
+}
+
+/// PDF двух страниц, зашифрованный средствами `lopdf` (реэкспорт `pdf-extract`, только в
+/// тесте): RC4 40 бит (V1, R2), пароль владельца задан, пароль пользователя — `user`.
+fn rc4_encrypted(user: &str) -> Vec<u8> {
+    use pdf_extract::{Document, EncryptionState, EncryptionVersion, Object, Permissions};
+    let mut doc = Document::load_mem(&two_page_pdf()).expect("исходный PDF");
+    let id = Object::string_literal("0123456789abcdef");
+    doc.trailer.set("ID", Object::Array(vec![id.clone(), id]));
+    let state = EncryptionState::try_from(EncryptionVersion::V1 {
+        document: &doc,
+        owner_password: "owner secret",
+        user_password: user,
+        permissions: Permissions::PRINTABLE,
+    })
+    .expect("параметры шифрования");
+    doc.encrypt(&state).expect("шифрование");
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("запись PDF");
+    // Документ действительно зашифрован: текста страниц в открытом виде нет.
+    assert!(bytes.windows(8).any(|w| w == b"/Encrypt"));
+    assert!(!bytes.windows(5).any(|w| w == b"alpha"));
+    bytes
+}
+
+/// m7 ревью задачи 10: документ, закрытый только паролем владельца (пароль пользователя
+/// пуст, шифрование ради прав), читается: `lopdf` при загрузке сам пробует пустой пароль и
+/// расшифровывает. С непустым паролем пользователя тот же документ — `Encrypted`.
+#[test]
+fn owner_password_only_is_read() {
+    let t = pdf_pages(&rc4_encrypted(""), 1, 10, 100_000).expect("пустой пароль подходит");
+    assert_eq!(t.pages, vec![(1, "alpha".into()), (2, "beta".into())]);
+    assert_eq!(
+        pdf_pages(&rc4_encrypted("user"), 1, 10, 100_000),
         Err(ExtractError::Encrypted)
     );
 }

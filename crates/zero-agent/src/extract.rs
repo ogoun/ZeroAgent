@@ -16,7 +16,8 @@
 //! Ответ — одна строка JSON в stdout ([`Reply`]): `{"ok": …}` (та же форма, что
 //! `za_core::extract::{Markdown, PdfText}`) или причина отказа разборщика. Ненулевой код
 //! выхода, сигнал, неразбираемый ответ — `ExtractError::Failed`, тайм-аут — `Timeout`,
-//! вывод больше предела — `TooLarge`.
+//! вывод больше предела — `TooLarge`, вход больше предела (ответ `too_large`) —
+//! `InputTooLarge`.
 //!
 //! **Память подпроцесса не ограничена** (принятый риск R1-C2, ADR 0006): бомба распаковки
 //! `FlateDecode` в PDF может занять память машины. Предел — Job Object и `RLIMIT_AS` через
@@ -70,48 +71,33 @@ pub struct ProcessExtractor {
     runner: Arc<dyn Runner>,
     exe: PathBuf,
     /// `work_dir("tmp")/<run>`: рабочий и временный каталог подпроцесса; создаёт вызывающий.
-    tmp_dir: Option<PathBuf>,
+    tmp_dir: PathBuf,
 }
 
 impl ProcessExtractor {
-    /// Извлекатель без своего временного каталога: у `pdf` им служит каталог копии
-    /// (`work_dir("tmp")/<run>`, туда её кладут `read` и `web_fetch`), у `html` временного
-    /// каталога нет (разбор файлов не создаёт), рабочий — каталог `exe`.
-    pub fn new(runner: Arc<dyn Runner>, exe: PathBuf) -> Self {
+    /// Извлекатель с рабочим и временным каталогом подпроцесса `tmp_dir` —
+    /// `work_dir("tmp")/<run>` проекта run (D127; Global Constraints: системные `%TEMP%` и
+    /// `/tmp` запрещены). Каталог обязателен (m3 ревью задачи 10): без него у HTML-подпроцесса
+    /// не было бы `TMP`, а рабочим каталогом стал бы каталог `exe`. Туда же `read` и
+    /// `web_fetch` кладут копию PDF.
+    pub fn new(runner: Arc<dyn Runner>, exe: PathBuf, tmp_dir: PathBuf) -> Self {
         Self {
             runner,
             exe,
-            tmp_dir: None,
+            tmp_dir,
         }
     }
 
-    /// Рабочий и временный каталог подпроцесса — `work_dir("tmp")/<run>` проекта run
-    /// (Global Constraints: системные `%TEMP%` и `/tmp` запрещены).
-    pub fn with_tmp_dir(mut self, dir: PathBuf) -> Self {
-        self.tmp_dir = Some(dir);
-        self
-    }
-
-    /// Спецификация запуска: `EnvMode::Clear`, вывод сырыми байтами (JSON).
-    fn spec(
-        &self,
-        args: Vec<OsString>,
-        timeout: Duration,
-        capture_limit: usize,
-        near: Option<&Path>,
-    ) -> CommandSpec {
-        let tmp = self.tmp_dir.clone().or_else(|| near.map(Path::to_path_buf));
-        let cwd = tmp
-            .clone()
-            .or_else(|| self.exe.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from("."));
+    /// Спецификация запуска: `EnvMode::Clear`, вывод сырыми байтами (JSON), рабочий и
+    /// временный каталог — `tmp_dir`.
+    fn spec(&self, args: Vec<OsString>, timeout: Duration, capture_limit: usize) -> CommandSpec {
         CommandSpec {
             args,
             env_mode: EnvMode::Clear,
-            tmp_dir: tmp,
+            tmp_dir: Some(self.tmp_dir.clone()),
             capture_limit,
             raw_stdout: true,
-            ..CommandSpec::new(&self.exe, cwd, timeout)
+            ..CommandSpec::new(&self.exe, self.tmp_dir.clone(), timeout)
         }
     }
 }
@@ -126,7 +112,6 @@ impl Extractor for ProcessExtractor {
             vec!["extract".into(), "html".into()],
             HTML_TIMEOUT,
             HTML_OUTPUT_MAX,
-            None,
         );
         spec.stdin = Some(html.into_bytes());
         let run = self.runner.run(spec);
@@ -143,7 +128,7 @@ impl Extractor for ProcessExtractor {
             req.count.to_string().into(),
             req.max_chars.to_string().into(),
         ];
-        let spec = self.spec(args, PDF_TIMEOUT, PDF_OUTPUT_MAX, req.path.parent());
+        let spec = self.spec(args, PDF_TIMEOUT, PDF_OUTPUT_MAX);
         let run = self.runner.run(spec);
         Box::pin(async move { reply(run.await) })
     }
@@ -177,7 +162,8 @@ fn reply<T: DeserializeOwned>(r: Result<Output, RunnerError>) -> Result<T, Extra
         Ok(Reply::Ok(v)) => Ok(v),
         Ok(Reply::Encrypted) => Err(ExtractError::Encrypted),
         Ok(Reply::Malformed(why)) => Err(ExtractError::Malformed(why)),
-        Ok(Reply::TooLarge) => Err(ExtractError::TooLarge),
+        // Вход больше предела (PDF больше 32 МиБ) — не вывод (m2 ревью задачи 10).
+        Ok(Reply::TooLarge) => Err(ExtractError::InputTooLarge),
         Err(e) => {
             tracing::warn!(error = %e, "ответ подпроцесса извлечения не разобран");
             Err(ExtractError::Failed(FAILED_REPLY.into()))
@@ -236,6 +222,7 @@ pub fn cmd_pdf(path: &Path, first: u32, count: u32, max_chars: usize) -> ExitCod
             Ok(t) => Reply::Ok(PdfText {
                 pages_total: t.pages_total,
                 pages: t.pages,
+                truncated: t.truncated,
             }),
             Err(za_extract::ExtractError::Encrypted) => Reply::Encrypted,
             Err(za_extract::ExtractError::Malformed(why)) => Reply::Malformed(why),
@@ -336,11 +323,22 @@ mod tests {
         let ok: Reply<PdfText> = Reply::Ok(PdfText {
             pages_total: 2,
             pages: vec![(1, "a".into())],
+            truncated: false,
         });
         assert_eq!(
             serde_json::to_string(&ok).unwrap(),
-            r#"{"ok":{"pages_total":2,"pages":[[1,"a"]]}}"#
+            r#"{"ok":{"pages_total":2,"pages":[[1,"a"]],"truncated":false}}"#
         );
+        // Ответ без поля `truncated` (прежняя форма) читается как необрезанный.
+        let old: Reply<PdfText> =
+            serde_json::from_str(r#"{"ok":{"pages_total":2,"pages":[[1,"a"]]}}"#).unwrap();
+        assert!(matches!(
+            old,
+            Reply::Ok(PdfText {
+                truncated: false,
+                ..
+            })
+        ));
         assert_eq!(
             serde_json::to_string(&Reply::<PdfText>::Encrypted).unwrap(),
             r#""encrypted""#
@@ -349,8 +347,12 @@ mod tests {
         let t = za_extract::PdfText {
             pages_total: 3,
             pages: vec![(2, "b".into())],
+            truncated: true,
         };
         let back: PdfText = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
-        assert_eq!((back.pages_total, back.pages), (3, vec![(2, "b".into())]));
+        assert_eq!(
+            (back.pages_total, back.pages, back.truncated),
+            (3, vec![(2, "b".into())], true)
+        );
     }
 }

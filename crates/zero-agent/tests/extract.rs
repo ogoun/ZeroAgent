@@ -54,7 +54,7 @@ fn exe() -> PathBuf {
 }
 
 fn extractor(tmp: &Path) -> ProcessExtractor {
-    ProcessExtractor::new(Arc::new(DirectRunner), exe()).with_tmp_dir(tmp.to_path_buf())
+    ProcessExtractor::new(Arc::new(DirectRunner), exe(), tmp.to_path_buf())
 }
 
 /// Обёртка запуска: флаг `flag` после `extract`, свой тайм-аут.
@@ -87,7 +87,7 @@ impl Runner for Recording {
 }
 
 fn hooked(tmp: &Path, flag: &'static str, timeout: Option<Duration>) -> ProcessExtractor {
-    ProcessExtractor::new(Arc::new(Hooked { flag, timeout }), exe()).with_tmp_dir(tmp.to_path_buf())
+    ProcessExtractor::new(Arc::new(Hooked { flag, timeout }), exe(), tmp.to_path_buf())
 }
 
 fn html(text: &str) -> HtmlRequest {
@@ -153,7 +153,7 @@ async fn process_extractor_pdf_roundtrip() {
     let tmp = dir("pdf");
     let path = tmp.join("pdf-x.pdf");
     std::fs::write(&path, pdf::two_page_pdf()).unwrap();
-    let ex = ProcessExtractor::new(Arc::new(DirectRunner), exe());
+    let ex = extractor(&tmp);
     let t = within(
         Duration::from_secs(60),
         "extract pdf",
@@ -166,6 +166,7 @@ async fn process_extractor_pdf_roundtrip() {
         PdfText {
             pages_total: 2,
             pages: vec![(1, "alpha".into()), (2, "beta".into())],
+            truncated: false,
         }
     );
     let mut req = pdf_request(&path);
@@ -178,11 +179,12 @@ async fn process_extractor_pdf_roundtrip() {
 }
 
 /// Отказы разборщика PDF доходят до родителя своими видами: битый — `Malformed`,
-/// зашифрованный — `Encrypted`, файл больше 32 МиБ — `TooLarge`.
+/// зашифрованный — `Encrypted`, файл больше 32 МиБ — `InputTooLarge` (вход, а не вывод: m2
+/// ревью задачи 10).
 #[tokio::test(flavor = "multi_thread")]
 async fn process_extractor_pdf_errors() {
     let tmp = dir("pdf_errors");
-    let ex = ProcessExtractor::new(Arc::new(DirectRunner), exe());
+    let ex = extractor(&tmp);
     let bad = tmp.join("bad.pdf");
     std::fs::write(&bad, b"%PDF-1.4 garbage").unwrap();
     let r = within(
@@ -209,6 +211,22 @@ async fn process_extractor_pdf_errors() {
         Duration::from_secs(60),
         "PDF больше 32 МиБ",
         ex.pdf(pdf_request(&big)),
+    )
+    .await;
+    assert_eq!(r, Err(ExtractError::InputTooLarge));
+}
+
+/// m8 ревью задачи 10: вывод подпроцесса больше предела (`HTML_OUTPUT_MAX`, 4 МиБ) —
+/// `TooLarge`, а не обрезанный JSON. Обратная косая черта у `htmd` экранируется (`\\`), а в
+/// JSON ещё раз: 2 МиБ входа дают около 8 МиБ ответа.
+#[tokio::test(flavor = "multi_thread")]
+async fn html_output_over_limit_is_too_large() {
+    let tmp = dir("html_too_large");
+    let body = "\\".repeat(za_extract::HTML_MAX_BYTES - 64);
+    let r = within(
+        Duration::from_secs(60),
+        "extract html с большим выводом",
+        extractor(&tmp).html(html(&format!("<p>{body}</p>"))),
     )
     .await;
     assert_eq!(r, Err(ExtractError::TooLarge));
@@ -243,7 +261,7 @@ async fn html_over_2_mib_is_cut_before_stdin() {
     let page = format!("<p>{}</p>", "слово ".repeat(300_000));
     assert!(page.len() > 2 * 1024 * 1024);
     let rec = Arc::new(Recording::default());
-    let ex = ProcessExtractor::new(rec.clone(), exe()).with_tmp_dir(tmp.clone());
+    let ex = ProcessExtractor::new(rec.clone(), exe(), tmp.clone());
     let md = within(
         Duration::from_secs(60),
         "extract html 3 МиБ",

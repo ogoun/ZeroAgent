@@ -62,6 +62,11 @@ pub struct PdfText {
     pub pages_total: u32,
     /// Номер страницы (с 1) и её текст; пустой текст — страница без текстового слоя.
     pub pages: Vec<(u32, String)>,
+    /// Текст окна обрезан по `max_chars`: последняя страница обрезана или следующие страницы
+    /// окна не прочитаны (m5 ревью задачи 10). `#[serde(default)]`: ответ без поля —
+    /// `false`.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Ошибка извлечения. Текст — для модели (английский, ASCII, D23); потребитель добавляет
@@ -77,9 +82,13 @@ pub enum ExtractError {
     /// Разборщик не уложился в свой предел времени.
     #[error("extractor timed out")]
     Timeout,
-    /// Вход или вывод разборщика больше предела.
+    /// Вывод разборщика больше предела.
     #[error("extractor output too large")]
     TooLarge,
+    /// Вход больше предела разборщика (PDF больше [`PDF_MAX_BYTES`]): разбора не было (m2
+    /// ревью задачи 10). Потребители проверяют предел сами, до вызова.
+    #[error("document too large for the extractor")]
+    InputTooLarge,
     /// Подпроцесс упал или вернул неразбираемый ответ; строка — причина.
     #[error("extractor failed: {0}")]
     Failed(String),
@@ -125,9 +134,13 @@ pub fn pdf_too_large_text() -> String {
     format!("pdf larger than {PDF_MAX_BYTES} bytes")
 }
 
-/// Ошибка извлечения PDF для модели: `pdf: <причина>` (D113).
+/// Ошибка извлечения PDF для модели: `pdf: <причина>` (D113); вход больше предела — тот же
+/// текст, что у проверки потребителя до разбора ([`pdf_too_large_text`]).
 pub fn pdf_error_text(e: &ExtractError) -> String {
-    format!("pdf: {e}")
+    match e {
+        ExtractError::InputTooLarge => pdf_too_large_text(),
+        _ => format!("pdf: {e}"),
+    }
 }
 
 /// Первая страница окна за концом документа.
@@ -136,9 +149,10 @@ pub fn pdf_past_end_text(first: u32, total: u32) -> String {
 }
 
 /// Текст страниц PDF для модели (D113): `[pdf: N pages; showing a-b]`, затем по странице
-/// `--- page n ---` и её текст; страница без текста — `[page n: no text layer]`. Текст
-/// длиной в предел `max_chars` — пометка обрыва на последней странице. `first` — первая
-/// запрошенная страница; окно за концом документа — `Err` с текстом для модели.
+/// `--- page n ---` и её текст; страница без текста — `[page n: no text layer]`. Текст,
+/// обрезанный извлекателем ([`PdfText::truncated`]), — пометка обрыва на последней странице
+/// с пределом `max_chars`. `first` — первая запрошенная страница; окно за концом документа —
+/// `Err` с текстом для модели.
 pub fn render_pdf(t: &PdfText, first: u32, max_chars: usize) -> Result<String, String> {
     let (Some(a), Some(b)) = (t.pages.first(), t.pages.last()) else {
         if t.pages_total == 0 {
@@ -155,8 +169,7 @@ pub fn render_pdf(t: &PdfText, first: u32, max_chars: usize) -> Result<String, S
             out.push_str(text.trim());
         }
     }
-    let chars: usize = t.pages.iter().map(|(_, s)| s.chars().count()).sum();
-    if chars >= max_chars {
+    if t.truncated {
         out.push_str(&format!(
             "\n[text cut at {max_chars} characters on page {}]",
             b.0
@@ -171,6 +184,7 @@ pub fn pdf_sample() -> String {
     let t = PdfText {
         pages_total: 12,
         pages: vec![(1, "Text".to_owned()), (2, String::new())],
+        truncated: true,
     };
     render_pdf(&t, 1, 4).unwrap_or_default()
 }
@@ -216,5 +230,46 @@ impl Drop for PdfCopy {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!(path = %self.0.display(), error = %e, "копия PDF не удалена"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// m5 ревью задачи 10: пометка обрыва — только у текста, который извлекатель обрезал;
+    /// текст ровно в предел без обрыва её не получает.
+    #[test]
+    fn cut_marker_follows_truncated() {
+        let mut t = PdfText {
+            pages_total: 3,
+            pages: vec![(1, "abcd".to_owned())],
+            truncated: false,
+        };
+        assert_eq!(
+            render_pdf(&t, 1, 4).unwrap(),
+            "[pdf: 3 pages; showing 1-1]
+--- page 1 ---
+abcd"
+        );
+        t.truncated = true;
+        assert!(render_pdf(&t, 1, 4).unwrap().ends_with(
+            "
+[text cut at 4 characters on page 1]"
+        ));
+    }
+
+    /// m2 ревью задачи 10: отказ подпроцесса по размеру входа — тот же текст, что у
+    /// потребителя до разбора, а не «вывод слишком велик».
+    #[test]
+    fn input_too_large_text() {
+        assert_eq!(
+            pdf_error_text(&ExtractError::InputTooLarge),
+            "pdf larger than 33554432 bytes"
+        );
+        assert_eq!(
+            pdf_error_text(&ExtractError::TooLarge),
+            "pdf: extractor output too large"
+        );
     }
 }

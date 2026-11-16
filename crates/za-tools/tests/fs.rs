@@ -300,6 +300,7 @@ impl StubPdf {
             pages: PdfText {
                 pages_total: total,
                 pages: pages.iter().map(|(n, t)| (*n, (*t).to_owned())).collect(),
+                truncated: false,
             },
             ..Self::default()
         })
