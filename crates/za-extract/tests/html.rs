@@ -925,6 +925,39 @@ fn empty_thead_keeps_header_row_of_body() {
     assert_eq!(lines, 3, "пустая строка thead");
 }
 
+/// m-4 повторного ревью fix-10b (побочный эффект m-2): пустой `thead` перед телом без строки
+/// из одних `th` остаётся заголовком таблицы, и `htmd` печатает строки таблицы `| 1 | 2 |`, а
+/// не ячейки отдельными абзацами. То же со смешанной первой строкой.
+#[test]
+fn empty_thead_before_data_rows_keeps_table_rows() {
+    let html = "<table><thead></thead><tbody><tr><td>1</td><td>2</td></tr>\
+        <tr><td>3</td><td>4</td></tr></tbody></table>";
+    let m = html_to_markdown(html);
+    assert!(!m.text.contains("1\n\n2"), "ячейки абзацами: {:?}", m.text);
+    let lines = table_lines(&m.text);
+    assert!(
+        lines.iter().any(|l| l.contains('1') && l.contains('2')),
+        "{:?}",
+        m.text
+    );
+    assert!(
+        lines.iter().any(|l| l.contains('3') && l.contains('4')),
+        "{:?}",
+        m.text
+    );
+    let html = "<table><thead><tr></tr></thead><tbody><tr><th>Key</th><td>value</td></tr>\
+        <tr><td>a</td><td>b</td></tr></tbody></table>";
+    let m = html_to_markdown(html);
+    let lines = table_lines(&m.text);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Key") && l.contains("value")),
+        "{:?}",
+        m.text
+    );
+}
+
 /// m6 ревью задачи 10. Многострочный `thead`: `htmd` читает только первую строку, остальные
 /// пропадали. Первая строка — заголовок, следующие — строки данных перед телом.
 #[test]
@@ -1162,6 +1195,38 @@ fn quote_prefixes_over_budget_are_simplified() {
     assert!(m.simplified);
     assert!(m.text.len() < 100_000, "{} байт", m.text.len());
     assert!(m.text.contains('x'));
+}
+
+/// I-1 повторного ревью fix-10b: текст формулы `<span class="math math-display">` `htmd`
+/// выводит как есть, с переводами строк, и цитата ставит префикс на каждую из них — тот же
+/// класс, что у `pre`. Общее правило оценки: перевод строки в любом текстовом узле — строка,
+/// которой достаётся префикс. 20 000 строк формулы под 120 цитатами (43 КБ; было 4,8 МБ
+/// текста) и 2 МиБ под 240 цитатами (было больше 15 с) — `simplified` за ≤ ~1 с в release.
+#[test]
+fn math_text_lines_under_quotes_are_simplified() {
+    let math = |body: String| format!("<span class=\"math math-display\">{body}</span>");
+    let small = nested(
+        "<blockquote>",
+        "</blockquote>",
+        120,
+        &math("x\n".repeat(20_000)),
+    );
+    assert!(small.len() < 45_000, "{}", small.len());
+    let m = bounded_within("math 120", small, release_second());
+    assert!(m.simplified);
+    assert!(m.text.len() < 100_000, "{} байт", m.text.len());
+    assert!(m.text.contains('x'));
+    let big = nested(
+        "<blockquote>",
+        "</blockquote>",
+        240,
+        &math(format!("a\n{}a", rep("q\n", 2 * MIB - 8 * 1024))),
+    );
+    assert!(big.len() <= HTML_MAX_BYTES, "{}", big.len());
+    let m = bounded_within("math 240", big, release_second());
+    assert!(m.simplified);
+    assert!(m.text.len() < 4 * MIB, "{} байт", m.text.len());
+    assert!(m.text.contains('q'));
 }
 
 /// 2 МиБ строк `pre` под предельной вложенностью цитат, списков и их смеси. До исправления

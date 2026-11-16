@@ -26,9 +26,12 @@
 //!   из `thead` только первую строку (m6 ревью задачи 10);
 //! - `thead` после выбранного заголовка, в том числе пустой, становится `tbody`: у `htmd`
 //!   он заменил бы заголовок. Пустой `thead` до заголовка (без ячеек в строке, которую `htmd`
-//!   взял бы заголовком) тоже становится `tbody`: иначе `htmd` считал бы заголовок выбранным,
-//!   и таблица вышла бы без строки заголовка и разделителя (m-2 повторного ревью fix-10).
-//!   Пустые строки выбор заголовка не сдвигают — `htmd` их пропускает;
+//!   взял бы заголовком) тоже становится `tbody`, если за ним заголовок есть — строка из одних
+//!   `th` или следующий непустой `thead`: иначе `htmd` считал бы заголовок выбранным, и
+//!   таблица вышла бы без строки заголовка и разделителя (m-2 повторного ревью fix-10).
+//!   Заголовка за ним нет — `thead` остаётся, и `htmd` печатает строки таблицы `| 1 | 2 |`
+//!   без заголовка; без `thead` ячейки вышли бы отдельными абзацами (m-4 повторного ревью
+//!   fix-10b). Пустые строки выбор заголовка не сдвигают — `htmd` их пропускает;
 //! - во всех прочих строках `th` становятся `td`.
 //!
 //! Текст и порядок ячеек не меняются. Таблица, где после замены нет ни `th`, ни `thead`,
@@ -111,10 +114,17 @@ pub(crate) fn normalize_table(table: &Handle) {
     let mut first = true;
     let old = std::mem::take(&mut *table.children.borrow_mut());
     let mut kept: Vec<Handle> = Vec::with_capacity(old.len());
-    for section in old {
-        // Пустой `thead` до заголовка — тело (m-2 повторного ревью fix-10): у `htmd` он
-        // занял бы место заголовка, и таблица вышла бы без строки заголовка и разделителя.
-        let section = if is_html(&section, "thead") && !header && is_empty_head(&section) {
+    for (i, section) in old.iter().cloned().enumerate() {
+        // Пустой `thead` до заголовка — тело, если за ним `htmd` взял бы заголовок (m-2
+        // повторного ревью fix-10): иначе тот занял бы место заголовка, и таблица вышла бы без
+        // строки заголовка и разделителя. Заголовка дальше нет — `thead` остаётся: без него
+        // в таблице не осталось бы ни `th`, ни `thead`, и `htmd` вывел бы ячейки абзацами, а
+        // не строками таблицы (m-4 повторного ревью fix-10b).
+        let section = if is_html(&section, "thead")
+            && !header
+            && is_empty_head(&section)
+            && header_follows(&section, &old[i + 1..])
+        {
             renamed(&section, "tbody", table)
         } else {
             section
@@ -175,6 +185,42 @@ fn is_empty_head(thead: &Handle) -> bool {
     let head = rows_of(thead).into_iter().next();
     let (th, td) = cell_counts(head.as_ref().unwrap_or(thead));
     th + td == 0
+}
+
+/// Возьмёт ли `htmd` строку заголовка, если пустой `thead` станет телом: первая непустая
+/// строка — его собственная (после пустой первой) или секций `rest` за ним — из одних `th`,
+/// или дальше идёт непустой `thead` (его первую строку [`normalize_table`] делает
+/// заголовком). Пустые строки и пустые `thead` выбор не сдвигают.
+fn header_follows(thead: &Handle, rest: &[Handle]) -> bool {
+    // Решение по первой непустой строке; `None` — непустых строк нет.
+    let decide = |rows: Vec<Handle>| {
+        rows.iter().find_map(|row| {
+            let (th, td) = cell_counts(row);
+            (th + td > 0).then_some(td == 0)
+        })
+    };
+    if let Some(d) = decide(rows_of(thead)) {
+        return d;
+    }
+    for section in rest {
+        if is_html(section, "thead") && !is_empty_head(section) {
+            return true;
+        }
+        let rows = if is_html(section, "tr") {
+            vec![Rc::clone(section)]
+        } else if ["tbody", "tfoot", "thead"]
+            .iter()
+            .any(|s| is_html(section, s))
+        {
+            rows_of(section)
+        } else {
+            Vec::new()
+        };
+        if let Some(d) = decide(rows) {
+            return d;
+        }
+    }
+    false
 }
 
 /// Строки `tr` среди детей секции.
@@ -790,6 +836,21 @@ mod tests {
             ),
             (names(&["tbody", "tbody"]), v(&[&[], &["th"], &["td"]]))
         );
+        // m-4 повторного ревью fix-10b: за пустым `thead` нет строки из одних `th` — он
+        // остаётся, и `htmd` печатает строки таблицы, а не обходит детей.
+        assert_eq!(
+            layout(
+                "<table><thead></thead><tbody><tr><td>1</td><td>2</td></tr><tr><th>k</th><td>3</td></tr></tbody></table>"
+            ),
+            (
+                names(&["thead", "tbody"]),
+                v(&[&["td", "td"], &["td", "td"]])
+            )
+        );
+        assert_eq!(
+            layout("<table><thead><tr></tr></thead><tr><th>k</th><td>v</td></tr></table>"),
+            (names(&["thead", "tbody"]), v(&[&[], &["td", "td"]]))
+        );
         // Тело до `thead`: заголовок — строка `thead` (у `htmd` он и так первый в выводе).
         assert_eq!(
             layout(
@@ -835,6 +896,8 @@ mod tests {
         "<table><tr><th>h<table><tr><th>i</th></tr><tr><td>j</td></tr></table></th><th>k</th></tr><tr><td>v</td><td>w</td></tr></table>",
         // m-1: заголовок короче строк — без дополнения недостающие ячейки заголовка пустые.
         "<table><tr><th>a</th></tr><tr><td>1</td><td>two</td><td>three three</td></tr></table>",
+        // m-4 повторного ревью fix-10b: пустой `thead` перед строками из одних `td`.
+        "<table><thead></thead><tbody><tr><td>1</td><td>2</td></tr><tr><td>3</td><td>four</td></tr></tbody></table>",
     ];
 
     /// Подготовленное дерево, как в `html_to_markdown`.
