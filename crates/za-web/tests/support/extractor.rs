@@ -1,5 +1,6 @@
 //! Заглушка извлекателя (D113, D127) для тестов `web_fetch`: HTML → текст без тегов,
-//! PDF → заданные страницы. Настоящий разбор — `za-extract` в подпроцессе (задача 10).
+//! PDF → заданные страницы. Настоящий разбор — `za-extract` в подпроцессе
+//! (`zero-agent/tests/extract.rs`).
 
 #![allow(dead_code)]
 
@@ -16,7 +17,11 @@ pub struct StubExtractor {
     /// Разбор HTML возвращает `simplified = true` (страница слишком сложная, D127).
     pub html_simplified: bool,
     pub pdf_seen: Mutex<Vec<PdfRequest>>,
+    /// Размер копии PDF в момент вызова (`None` — файла нет).
+    pub pdf_copy_len: Mutex<Vec<Option<u64>>>,
     pub pdf_pages: PdfText,
+    /// Ответ вместо страниц PDF.
+    pub pdf_error: Option<ExtractError>,
 }
 
 impl StubExtractor {
@@ -40,9 +45,27 @@ impl StubExtractor {
         })
     }
 
+    /// Разбор PDF отвечает страницами `pages` из `total`.
+    pub fn with_pdf(pages: &[(u32, &str)], total: u32) -> Arc<Self> {
+        Arc::new(Self {
+            pdf_pages: PdfText {
+                pages_total: total,
+                pages: pages.iter().map(|(n, t)| (*n, (*t).to_owned())).collect(),
+            },
+            ..Self::default()
+        })
+    }
+
     /// Принятые запросы HTML.
     pub fn html_requests(&self) -> Vec<HtmlRequest> {
         self.html_seen.lock().unwrap().clone()
+    }
+
+    /// Принятые запросы PDF и размер копии в момент вызова.
+    pub fn pdf_requests(&self) -> Vec<(PdfRequest, Option<u64>)> {
+        let seen = self.pdf_seen.lock().unwrap().clone();
+        let lens = self.pdf_copy_len.lock().unwrap().clone();
+        seen.into_iter().zip(lens).collect()
     }
 }
 
@@ -60,9 +83,14 @@ impl Extractor for StubExtractor {
     }
 
     fn pdf(&self, req: PdfRequest) -> BoxFuture<'static, Result<PdfText, ExtractError>> {
+        let len = std::fs::metadata(&req.path).ok().map(|m| m.len());
+        self.pdf_copy_len.lock().unwrap().push(len);
         self.pdf_seen.lock().unwrap().push(req);
-        let pages = self.pdf_pages.clone();
-        Box::pin(async move { Ok(pages) })
+        let r = match &self.pdf_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(self.pdf_pages.clone()),
+        };
+        Box::pin(async move { r })
     }
 }
 

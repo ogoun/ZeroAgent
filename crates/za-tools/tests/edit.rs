@@ -148,7 +148,7 @@ impl Kit {
         let t = ReadTracker::new();
         Self {
             cx: Cx::new(root),
-            read: read_tool(t.clone()),
+            read: read_tool(t.clone(), None),
             edit: edit_tool(t.clone(), home(root)),
             multi: multi_edit_tool(t, home(root)),
         }
@@ -435,7 +435,7 @@ async fn edit_keeps_bom_permissions_refuses_cp1251() {
     // Не UTF-8: отказ, байты целы; трекер такой файл не отмечает (Carry задачи 6).
     let tracker = ReadTracker::new();
     let o = call_cx(
-        &read_tool(tracker.clone()),
+        &read_tool(tracker.clone(), None),
         k.cx.next(),
         json!({"path": "ru.txt"}),
     )
@@ -883,7 +883,7 @@ async fn swap_before_rename_is_refused() {
     let tracker = ReadTracker::new();
     let mut cx = Cx::new(&root);
     let r = call_cx(
-        &read_tool(tracker.clone()),
+        &read_tool(tracker.clone(), None),
         cx.next(),
         json!({"path": "a.rs"}),
     )
@@ -923,7 +923,7 @@ async fn link_swapped_in_before_rename_is_refused() {
     let tracker = ReadTracker::new();
     let mut cx = Cx::new(&root);
     let r = call_cx(
-        &read_tool(tracker.clone()),
+        &read_tool(tracker.clone(), None),
         cx.next(),
         json!({"path": "a.rs"}),
     )
@@ -965,7 +965,7 @@ async fn crash_before_rename_keeps_file_and_retry_completes() {
     let tracker = ReadTracker::new();
     let mut cx = Cx::new(&root);
     let r = call_cx(
-        &read_tool(tracker.clone()),
+        &read_tool(tracker.clone(), None),
         cx.next(),
         json!({"path": "a.rs"}),
     )

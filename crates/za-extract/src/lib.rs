@@ -1,5 +1,5 @@
-//! Разбор враждебного содержимого (R1-C2 D113, D127): HTML в Markdown ([`html_to_markdown`]),
-//! позже — текст PDF (задача 10).
+//! Разбор враждебного содержимого (R1-C2 D113, D127): HTML в Markdown ([`html_to_markdown`])
+//! и текст страниц PDF ([`pdf_pages`]).
 //!
 //! Функции крейта вызываются **только в подпроцессе** `zero-agent extract <html|pdf>` через
 //! `za_jail::Runner` (тайм-аут, предел вывода, `EnvMode::Clear`). Разборщики обходят дерево
@@ -15,6 +15,8 @@ pub mod guard;
 pub mod html;
 pub mod linear;
 mod merge;
+mod pdf;
 mod table;
 
 pub use html::{HTML_MAX_BYTES, Markdown, html_to_markdown};
+pub use pdf::{ExtractError, PdfText, pdf_pages};

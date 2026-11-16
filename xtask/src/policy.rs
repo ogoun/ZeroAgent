@@ -13,7 +13,8 @@
 //! у `reqwest` в сборке workspace (с тестами) нет функций сжатия, cookie, SOCKS, HTTP/2 и
 //! корней ОС; HTTP-клиент `reqwest` строится только в `crates/za-web/src/gateway.rs` и
 //! `crates/za-llm`. R1-C2 (D113, D127): `za-extract` — без крейтов workspace, от него —
-//! только `zero-agent`; `htmd`, `html5ever`, `markup5ever_rcdom` — только у `za-extract`.
+//! только `zero-agent`; `htmd`, `html5ever`, `markup5ever_rcdom`, `pdf-extract`, `lopdf` —
+//! только у `za-extract`.
 //! R1-C2 (D114): `za-skills` — только от `za-protocol` и `za-core` (все виды); `za-agent`
 //! может зависеть от него, а он от `za-agent` — нет.
 
@@ -84,9 +85,16 @@ const WEB_USERS: &[&str] = &["zero-agent", "xtask"];
 /// Кто может зависеть от `za-extract` (все виды, D113, D127): только бинарник — его скрытая
 /// подкоманда `extract` и есть подпроцесс разбора.
 const EXTRACT_USERS: &[&str] = &["zero-agent"];
-/// Разборщики враждебного HTML — прямая зависимость (все виды) только у `za-extract` (D127):
-/// в процессе агента рекурсивный обход DOM переполнил бы стек на глубокой вложенности.
-const EXTRACT_ONLY_DEPS: &[&str] = &["htmd", "html5ever", "markup5ever_rcdom"];
+/// Разборщики враждебного HTML и PDF — прямая зависимость (все виды) только у `za-extract`
+/// (D113, D127): в процессе агента рекурсивный обход DOM переполнил бы стек на глубокой
+/// вложенности, а паника или вечный цикл разборщика PDF — уронили бы или повесили агента.
+const EXTRACT_ONLY_DEPS: &[&str] = &[
+    "htmd",
+    "html5ever",
+    "markup5ever_rcdom",
+    "pdf-extract",
+    "lopdf",
+];
 /// Функции `reqwest`, которых не должно быть в сборке (D107, D129): распаковка тела
 /// (`Accept-Encoding`), cookie, SOCKS и HTTP/2–3, корни хранилища ОС и системный TLS.
 const REQWEST_FORBIDDEN_FEATURES: &[&str] = &[
@@ -1068,7 +1076,7 @@ version = \"0.0.1\"
             kind: Some("dev".into()),
             ..dep(name)
         };
-        for ok in ["htmd", "markup5ever_rcdom", "serde"] {
+        for ok in ["htmd", "markup5ever_rcdom", "pdf-extract", "serde"] {
             assert!(check_direction(&meta("za-extract", ok)).is_empty(), "{ok}");
         }
         for bad in ["za-core", "za-protocol", "za-jail", "za-web", "zero-agent"] {

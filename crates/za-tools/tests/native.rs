@@ -31,6 +31,7 @@ fn deps() -> NativeDeps {
             project_id: "0".into(),
         },
         mask: None,
+        extractor: None,
     }
 }
 

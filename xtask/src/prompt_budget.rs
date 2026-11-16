@@ -240,6 +240,8 @@ pub fn all_cases() -> Vec<za_agent::BudgetCase> {
             project_id: "0".into(),
         },
         mask: None,
+        // Описание `read` от извлекателя не зависит (D113).
+        extractor: None,
     };
     let mut cases = budget_cases();
     cases.extend(small_prefix_cases(&native_capability(&deps).tools));

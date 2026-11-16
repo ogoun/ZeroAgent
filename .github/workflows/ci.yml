@@ -66,6 +66,12 @@ jobs:
         run: cargo clippy -p za-extract --all-targets --features test-hooks --locked -- -D warnings
       - if: ${{ !cancelled() }}
         run: cargo test -p za-extract --features test-hooks --locked --no-fail-fast
+      # Извлекатель в отдельном процессе (D113, D127, задача 10): крюки бинарника
+      # `extract --hang` и `extract --crash` есть только с признаком `test-hooks`.
+      - if: ${{ !cancelled() }}
+        run: cargo clippy -p zero-agent --all-targets --features test-hooks --locked -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo test -p zero-agent --features test-hooks --test extract --locked --no-fail-fast
       # Чистые части `za-llm` без функций — так его подключает `za-core`.
       - if: ${{ !cancelled() }}
         run: cargo test -p za-llm --no-default-features --locked --no-fail-fast

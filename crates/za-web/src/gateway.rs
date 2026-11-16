@@ -10,7 +10,8 @@
 //!
 //! **Вызов** [`WebGateway::get`]: разбор и проверка URL, порт из `WebConfig::ports`, замок
 //! хоста (запросы к одному хосту идут по одному: `robots.txt` запрашивается один раз,
-//! интервал хоста соблюдается), `robots.txt`, лимитер, запрос, тело до `max_bytes`.
+//! интервал хоста соблюдается), `robots.txt`, лимитер, запрос, тело до `max_bytes` (у PDF —
+//! до 32 МиБ, D113).
 //! Редиректы исполняет сам шлюз, а не `reqwest` (`Policy::none`): каждый переход — своя
 //! запись журнала, своя проверка URL и порта, `robots.txt` и место в лимитере. До 5
 //! переходов на тот же хост (`http` → `https` можно, обратно — нет); иначе
@@ -47,11 +48,12 @@ use reqwest::{Client, redirect};
 use tokio::time::{Instant, timeout_at};
 use url::Url;
 use za_core::NetRequest;
+use za_core::extract::PDF_MAX_BYTES;
 use za_core::net::normalize_host;
 use za_protocol::net_outcome;
 
 use crate::addr::{FilteredResolver, ResolveFail, SystemResolver, check_url};
-use crate::convert::non_identity_coding;
+use crate::convert::{non_identity_coding, pdf_declared, starts_with_pdf};
 use crate::limit::RateLimiter;
 use crate::robots::{ROBOTS_MAX_BYTES, Rules};
 use crate::{Body, FetchError, Fetched, WebConfig, WebError};
@@ -70,6 +72,9 @@ const NOT_PROVIDER: &str = "not the configured search provider";
 pub const PROVIDER_MAX_BYTES: u64 = 1024 * 1024;
 /// Предел времени запроса к поставщику поиска (D111, D126).
 pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
+/// Предел тела PDF у страницы `web_fetch` (D113): [`PDF_MAX_BYTES`] и ещё байт — тело больше
+/// предела приходит обрезанным (`Body::truncated`), и `web_fetch` отказывает без разбора.
+const PDF_BODY_LIMIT: usize = PDF_MAX_BYTES + 1;
 
 /// Заголовки каждого запроса клиента поставщика (M2 ревью задачи 9): ответ — JSON, без
 /// сжатия (D107: распаковки нет), тексты ошибок SearXNG (`unresponsive_engines`) — на
@@ -274,7 +279,14 @@ impl WebGateway {
         let deadline = deadline.min(Instant::now() + PROVIDER_TIMEOUT);
         let mut rec = record(url.as_str());
         let r = self
-            .request(&p.client, &url, PROVIDER_MAX_BYTES, deadline, &mut rec)
+            .request(
+                &p.client,
+                &url,
+                PROVIDER_MAX_BYTES,
+                false,
+                deadline,
+                &mut rec,
+            )
             .await;
         // Любой 3xx — переход не исполняется (M3 ревью задачи 9): и без `Location`, и с
         // `Location`, который не разбирается (у `exchange` это ошибка сети).
@@ -314,7 +326,14 @@ impl WebGateway {
             }
             let mut rec = record(url.as_str());
             let r = self
-                .request(&self.client, &url, self.cfg.max_bytes, deadline, &mut rec)
+                .request(
+                    &self.client,
+                    &url,
+                    self.cfg.max_bytes,
+                    true,
+                    deadline,
+                    &mut rec,
+                )
                 .await;
             finish(&mut rec, &r, &url);
             log.push(rec);
@@ -414,6 +433,7 @@ impl WebGateway {
                     &self.client,
                     &url,
                     ROBOTS_MAX_BYTES as u64,
+                    false,
                     deadline,
                     &mut rec,
                 )
@@ -455,13 +475,14 @@ impl WebGateway {
     }
 
     /// Один `GET` клиентом `client` (страниц или поставщика): место в общем лимитере,
-    /// запрос, заголовки, тело до `limit`. Запись `rec` заполняется по ходу; дедлайн — на
-    /// каждом шаге.
+    /// запрос, заголовки, тело до `limit` (у PDF при `pdf` — до [`PDF_BODY_LIMIT`]). Запись
+    /// `rec` заполняется по ходу; дедлайн — на каждом шаге.
     async fn request(
         &self,
         client: &Client,
         url: &Url,
         limit: u64,
+        pdf: bool,
         deadline: Instant,
         rec: &mut NetRequest,
     ) -> Result<Resp, FetchError> {
@@ -469,7 +490,7 @@ impl WebGateway {
             .acquire(url.host_str().unwrap_or_default(), deadline)
             .await?;
         let t0 = Instant::now();
-        let r = exchange(client, url, limit, deadline, rec).await;
+        let r = exchange(client, url, limit, pdf, deadline, rec).await;
         rec.ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
         r
     }
@@ -609,10 +630,16 @@ fn with_host(url: &Url, host: &str) -> Option<Url> {
 }
 
 /// Один обмен: запрос, заголовки, тело до `limit` (см. `WebGateway::request`).
+///
+/// При `pdf` (страница `web_fetch`, D113) предел PDF — [`PDF_BODY_LIMIT`] вместо `limit`:
+/// обрезанный на `max_bytes` PDF не разобрать (таблица `xref` в конце файла). PDF — по
+/// заголовку `application/pdf`, а без заголовка типа — по сигнатуре в начале тела; её
+/// проверка — один раз, на границе `limit` (D109: других эвристик нет).
 async fn exchange(
     client: &Client,
     url: &Url,
     limit: u64,
+    pdf: bool,
     deadline: Instant,
     rec: &mut NetRequest,
 ) -> Result<Resp, FetchError> {
@@ -650,13 +677,25 @@ async fn exchange(
         .map(str::to_string);
     let length = resp.content_length();
     let (mut bytes, mut truncated) = (Vec::new(), false);
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let declared = pdf_declared(content_type.as_deref());
+    let mut limit = match declared {
+        Some(true) if pdf => PDF_BODY_LIMIT,
+        _ => usize::try_from(limit).unwrap_or(usize::MAX),
+    };
+    // Без заголовка типа PDF узнаётся по сигнатуре — только у страницы и один раз.
+    let mut may_sniff = pdf && declared.is_none();
     loop {
         let chunk = timeout_at(deadline, resp.chunk())
             .await
             .map_err(|_| FetchError::Timeout)?
             .map_err(|e| FetchError::Network(body_error(&e)))?;
         let Some(chunk) = chunk else { break };
+        if may_sniff && bytes.len() + chunk.len() >= limit {
+            may_sniff = false;
+            if starts_with_pdf(&bytes, &chunk) {
+                limit = limit.max(PDF_BODY_LIMIT);
+            }
+        }
         let room = limit - bytes.len();
         if chunk.len() > room {
             bytes.extend_from_slice(&chunk[..room]);

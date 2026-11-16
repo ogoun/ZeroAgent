@@ -11,6 +11,10 @@
 //! - **`Content-Encoding`**, отличный от `identity`, — ошибка без распаковки (D107).
 
 use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE};
+use za_core::extract::PDF_SIGNATURE;
+
+/// Отметка порядка байт UTF-8.
+const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// Типы, которые уходят извлекателю HTML (D109, D127).
 pub const HTML_TYPES: &[&str] = &["text/html", "application/xhtml+xml"];
@@ -182,16 +186,36 @@ fn is_ws(b: u8) -> bool {
 
 /// Тип по сигнатуре в начале тела после BOM и пробелов (D109).
 fn sniff(bytes: &[u8]) -> Kind {
-    let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let start = body.iter().position(|&b| !is_ws(b)).unwrap_or(body.len());
-    let body = &body[start..];
-    if body.starts_with(b"%PDF-") {
+    if starts_with_pdf(bytes, &[]) {
         return Kind::Pdf;
     }
+    let body = bytes.strip_prefix(BOM).unwrap_or(bytes);
+    let start = body.iter().position(|&b| !is_ws(b)).unwrap_or(body.len());
+    let body = &body[start..];
     if tag_prefix(body, b"<!doctype html") || tag_prefix(body, b"<html") {
         return Kind::Html;
     }
     Kind::Text
+}
+
+/// Тело, начало которого — `head`, а продолжение — `tail`, по сигнатуре — PDF: `%PDF-` после
+/// BOM и пробелов (то же правило, что у [`convert`] без заголовка типа). Две части — для шлюза:
+/// он решает на границе `max_bytes`, не склеивая уже прочитанное с новым куском (D113).
+pub(crate) fn starts_with_pdf(head: &[u8], tail: &[u8]) -> bool {
+    let all = head.iter().chain(tail).copied();
+    let bom = all.clone().take(BOM.len()).eq(BOM.iter().copied());
+    all.skip(if bom { BOM.len() } else { 0 })
+        .skip_while(|&b| is_ws(b))
+        .take(PDF_SIGNATURE.len())
+        .eq(PDF_SIGNATURE.iter().copied())
+}
+
+/// Заголовок `Content-Type` объявляет PDF: `Some(true)` — `application/pdf`, `Some(false)` —
+/// другой тип, `None` — заголовка нет или он пуст (тип — по сигнатуре, D109).
+pub(crate) fn pdf_declared(content_type: Option<&str>) -> Option<bool> {
+    content_type
+        .and_then(MediaType::parse)
+        .map(|t| t.essence == "application/pdf")
 }
 
 /// `body` начинается с `prefix` без учёта регистра, и дальше — конец, пробел или `>`
@@ -322,4 +346,24 @@ fn attributes(s: &[u8]) -> (Vec<(String, String)>, usize) {
 /// Позиция `needle` в `hay`.
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_signature_across_parts() {
+        assert!(starts_with_pdf(b"%PDF-1.7", b""));
+        assert!(starts_with_pdf(b"%PD", b"F-1.7"));
+        assert!(starts_with_pdf(b"", b"%PDF-1.7"));
+        assert!(starts_with_pdf(b"\xEF\xBB", b"\xBF \r\n%PDF-"));
+        assert!(!starts_with_pdf(b"%PDF", b""));
+        assert!(!starts_with_pdf(b"<html>", b"%PDF-"));
+        assert!(!starts_with_pdf(b"%pdf-1.4", b""));
+        assert_eq!(pdf_declared(Some("Application/PDF; q=1")), Some(true));
+        assert_eq!(pdf_declared(Some("text/html")), Some(false));
+        assert_eq!(pdf_declared(Some(" ")), None);
+        assert_eq!(pdf_declared(None), None);
+    }
 }

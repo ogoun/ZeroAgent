@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::response::Response;
 use serde_json::{Value, json};
 use support::extractor::StubExtractor;
 use support::{Server, drip, redirect, scaled, serve, text, typed, within};
@@ -608,4 +609,131 @@ fn golden_descriptions() {
 #[test]
 fn stub_is_extractor() {
     let _: Arc<dyn Extractor> = StubExtractor::new();
+}
+
+// ---- PDF (D113, задача 10) ----
+
+/// Байты «PDF» для заглушки: сигнатура и двоичный комментарий.
+const PDF_BYTES: &[u8] = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj << >> endobj\n%%EOF\n";
+
+/// Каталог проекта вызова: копия PDF кладётся в его `.zero-agent/work/tmp/<run>/`.
+fn project(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("za-web-fetch")
+        .join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Вызов с каталогом проекта `root` и run `run`.
+async fn fetch_in(tool: &Arc<dyn Tool>, root: &Path, run: RunId, args: Value) -> ToolOutput {
+    let d = call_deadline(std::time::Instant::now(), scaled(LONG));
+    let cx = ToolCx {
+        run,
+        project_dir: root.to_path_buf(),
+        effect_key: EffectKey::derive(run, 3, 1),
+        ..cx(Some(d))
+    };
+    within(LONG * 2, "web_fetch", tool.call(args, cx)).await
+}
+
+#[tokio::test]
+async fn fetch_pdf_uses_extractor() {
+    let s = site(|_| typed(200, "application/pdf", PDF_BYTES.to_vec())).await;
+    let ex = StubExtractor::with_pdf(&[(1, "alpha"), (2, "")], 30);
+    let tool = web_fetch_tool(gateway(&s), ex.clone());
+    let root = project("pdf_ok");
+    let run = RunId::new();
+    let out = fetch_in(&tool, &root, run, json!({"url": page_url(&s, "/doc.pdf")})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(out.taint.as_deref(), Some("web"));
+    assert_eq!(
+        out.content,
+        format!(
+            "url: {}\nstatus: 200\ntype: application/pdf\n\n[pdf: 30 pages; showing 1-2]\n\
+             --- page 1 ---\nalpha\n--- page 2 ---\n[page 2: no text layer]",
+            page_url(&s, "/doc.pdf")
+        )
+    );
+    // Первые 20 страниц; копия тела — в `work/tmp/<run>` проекта, после вызова её нет.
+    let seen = ex.pdf_requests();
+    assert_eq!(seen.len(), 1);
+    let (req, len) = &seen[0];
+    assert_eq!((req.first, req.count), (1, 20));
+    assert_eq!(*len, Some(PDF_BYTES.len() as u64));
+    let tmp = std::fs::canonicalize(root.join(format!(".zero-agent/work/tmp/{run}"))).unwrap();
+    let parent = std::fs::canonicalize(req.path.parent().unwrap()).unwrap();
+    assert_eq!(parent, tmp);
+    assert!(!req.path.exists(), "копия не удалена");
+    assert!(ex.html_requests().is_empty());
+}
+
+/// Тело PDF больше 32 МиБ: ответ обрезан, а обрезанный PDF не разбирается — отказ без
+/// вызова извлекателя. Предел PDF — не `max_bytes` (5 МиБ): PDF в 6 МиБ без заголовка
+/// типа (сигнатура в начале тела) разбирается целиком.
+#[tokio::test]
+async fn fetch_pdf_over_32_mib_refused() {
+    let mut big = PDF_BYTES.to_vec();
+    big.resize(33 * 1024 * 1024, b' ');
+    let mut mid = PDF_BYTES.to_vec();
+    mid.resize(6 * 1024 * 1024, b' ');
+    let s = site(move |p| match p {
+        "/big.pdf" => typed(200, "application/pdf", big.clone()),
+        _ => Response::new(axum::body::Body::from(mid.clone())),
+    })
+    .await;
+    let ex = StubExtractor::with_pdf(&[(1, "alpha")], 1);
+    let tool = web_fetch_tool(gateway(&s), ex.clone());
+    let root = project("pdf_big");
+    let out = fetch_in(
+        &tool,
+        &root,
+        RunId::new(),
+        json!({"url": page_url(&s, "/big.pdf")}),
+    )
+    .await;
+    assert!(out.is_error);
+    assert_eq!(out.content, "pdf larger than 33554432 bytes");
+    assert!(
+        ex.pdf_requests().is_empty(),
+        "обрезанный PDF не разбирается"
+    );
+    let out = fetch_in(
+        &tool,
+        &root,
+        RunId::new(),
+        json!({"url": page_url(&s, "/mid")}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("type: application/pdf\n"),
+        "{}",
+        out.content
+    );
+    let seen = ex.pdf_requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1, Some(6 * 1024 * 1024));
+}
+
+/// Ошибка извлечения PDF — `pdf: <причина>`, результат-ошибка.
+#[tokio::test]
+async fn fetch_pdf_extract_error_text() {
+    let s = site(|_| typed(200, "application/pdf", PDF_BYTES.to_vec())).await;
+    let ex = Arc::new(StubExtractor {
+        pdf_error: Some(ExtractError::Encrypted),
+        ..StubExtractor::default()
+    });
+    let tool = web_fetch_tool(gateway(&s), ex);
+    let root = project("pdf_err");
+    let out = fetch_in(
+        &tool,
+        &root,
+        RunId::new(),
+        json!({"url": page_url(&s, "/d.pdf")}),
+    )
+    .await;
+    assert!(out.is_error);
+    assert_eq!(out.content, "pdf: document is encrypted");
 }

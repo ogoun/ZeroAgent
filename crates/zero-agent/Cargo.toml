@@ -26,6 +26,13 @@ za-secrets = { path = "../za-secrets" }
 # Обход доверенных деревьев (`trust_set` — через `za_skills::tree_listing`, R1-C2 D116) и,
 # с задачи 14, каталог скиллов.
 za-skills = { path = "../za-skills" }
+# Разборщики враждебного HTML и PDF (R1-C2 D113, D127): работают только в скрытой подкоманде
+# `zero-agent extract` — подпроцессе, который запускает `extract::ProcessExtractor`.
+za-extract = { path = "../za-extract" }
+# Сетевой шлюз (D107): инструменты `web_fetch` и `web_search` подключает задача 14; здесь —
+# цель признака `test-hooks` (D128: подмены резолвера шлюза включаются вместе с крюками
+# бинарника).
+za-web = { path = "../za-web" }
 clap.workspace = true
 # `macros` — `join!` проверок doctor и `select!` команды `run`, `time` — ожидание зондов и
 # `resources --watch`, `signal` — Ctrl+C команды `run` (пауза, второй — выход).
@@ -43,7 +50,20 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[features]
+# Тестовые крюки (D128): `extract --hang`, `extract --crash` бинарника и подмены резолвера
+# шлюза. Обычная и release-сборка их не содержат.
+test-hooks = ["za-web/test-hooks"]
+
+# Сквозной тест извлекателя в подпроцессе (тайм-аут, бросок future, падение) — только с
+# крюками; обычный `cargo test` его пропускает, не ломаясь.
+[[test]]
+name = "extract"
+required-features = ["test-hooks"]
+
 [dev-dependencies]
+# Жив ли подпроцесс извлекателя после тайм-аута и броска future (тест `extract`).
+sysinfo.workspace = true
 # Поддельный llama-server в процессе теста `r1a_models` (axum на многопоточном runtime).
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "net", "time"] }
 axum.workspace = true

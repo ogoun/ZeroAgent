@@ -1095,6 +1095,9 @@ fn deps(
             let m = masker.clone();
             Arc::new(move |s: &str| m.mask(s).into_owned())
         }),
+        // Извлекатель PDF в подпроцессе (`ProcessExtractor`, D113) подключается в задаче 14
+        // вместе с `web_fetch`; до неё `read` отвечает на PDF `binary file …`.
+        extractor: None,
     })];
     // D103: секретные файлы (имя, известные значения, PEM) в чекпоинты не входят.
     let mut checkpointer =

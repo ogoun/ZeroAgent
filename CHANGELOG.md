@@ -5,6 +5,13 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, задача 10 (извлекатель в отдельном процессе, D113, D127):
+  - `read` читает PDF страницами (`start` — первая страница, `limit` — число страниц, по умолчанию 10, не больше 50): текст извлекает подпроцесс по копии файла в `.zero-agent/work/tmp/<run>/`; PDF больше 32 МиБ — отказ; без извлекателя — прежний ответ `binary file …` (теперь и для PDF без NUL в начале);
+  - `web_fetch` читает PDF (`application/pdf` или сигнатура без заголовка типа): тело до 32 МиБ вместо `max_bytes`, первые 20 страниц; больше 32 МиБ — отказ без разбора;
+  - `zero-agent extract <html|pdf>` — скрытая подкоманда разбора в подпроцессе (`ProcessExtractor`), крюки `--hang` и `--crash` — только с признаком `test-hooks`;
+  - `za-extract`: `pdf_pages` поверх `pdf-extract 0.12.1` (новая зависимость, MIT);
+  - `za-core`: общие пределы и тексты PDF (`za_core::extract`), `PdfCopy`;
+  - `za-tools`: `read_tool(tracker, extractor)` и `NativeDeps.extractor` — изменение сигнатуры.
 - R1-C2, задача 12 (core pack, D120):
   - `za-skills`: 14 скиллов поставки своими текстами — `diagnose`, `domain-model`, `doubt`, `grill`, `handoff`, `research-with-citations` (3–10 вызовов поиска и чтения, страница открыта перед цитированием, ответ — вывод и список ссылок, непроверенное помечено; CAP-003), `retro`, `review`, `router`, `source-driven`, `spec`, `tdd`, `tickets`, `wayfinder`. Файлы — `crates/za-skills/pack/<name>/SKILL.md`, frontmatter только `name` и `description`. `bundled()` отдаёт их по порядку имён; новые `PACK`, `PACK_TEXT_NAMES`, `PACK_TOKEN_LIMIT` (700);
   - `za-agent`: зависимость от `za-skills`; тексты поставки входят в `runtime_texts()` и хэш промптов под именами `skills/<name>`, `budget_cases()` получил 14 случаев `skills/<name>` с пределом 700. Версия промптов — прежняя `r1c2.1` (D131), golden `prompts.hash` обновлён;

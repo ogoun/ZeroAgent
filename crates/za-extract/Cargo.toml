@@ -20,12 +20,18 @@ markup5ever_rcdom.workspace = true
 # Онлайн-страж разбора (`TreeSink` поверх `RcDom`) и линейное извлечение токенизатором
 # без построителя дерева (ревью задачи 7, D127).
 html5ever.workspace = true
-# `Markdown` уходит из подпроцесса JSON-ом той же формы, что `za_core::extract::Markdown`.
+# Текст страниц PDF (D113): `lopdf` разбирает документ, `pdf-extract` — текст страницы.
+pdf-extract.workspace = true
+# `Markdown` и `PdfText` уходят из подпроцесса JSON-ом той же формы, что
+# `za_core::extract::{Markdown, PdfText}`.
 serde.workspace = true
+# Ошибка разбора PDF (`ExtractError`).
+thiserror.workspace = true
 
 [features]
 # Намеренный сбой подпроцесса для теста `deep_nesting_kills_only_child` (D128): в продукте
-# крюка нет. Крюк `extract --crash` бинарника — задача 10.
+# крюка нет. Сквозной тест падения подпроцесса через `za_jail::Runner` — у бинарника
+# (`zero-agent/tests/extract.rs`, крюки `extract --crash` и `extract --hang`).
 test-hooks = []
 
 # Тест падения подпроцесса компилируется только с крюком (D128). Обычный `cargo test`

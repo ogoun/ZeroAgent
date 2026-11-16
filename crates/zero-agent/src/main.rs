@@ -211,6 +211,64 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Разбор враждебного HTML или PDF в отдельном процессе (R1-C2 D113, D127): запускает
+    /// только сам агент (`ProcessExtractor` через `za_jail::Runner`). Ответ — JSON в stdout.
+    #[command(hide = true)]
+    Extract(ExtractCli),
+}
+
+/// `zero-agent extract [--hang|--crash] <html|pdf>` (скрытая).
+#[derive(Debug, clap::Args)]
+struct ExtractCli {
+    /// Тест (D128): не завершаться — проверка тайм-аута и броска future.
+    #[cfg(feature = "test-hooks")]
+    #[arg(long)]
+    hang: bool,
+    /// Тест (D128): аварийно завершиться — проверка падения подпроцесса.
+    #[cfg(feature = "test-hooks")]
+    #[arg(long)]
+    crash: bool,
+    #[command(subcommand)]
+    what: ExtractCmd,
+}
+
+#[derive(Debug, Subcommand)]
+enum ExtractCmd {
+    /// HTML (UTF-8) на stdin → JSON `{"ok": {title, text, simplified}}`.
+    Html,
+    /// Текст страниц PDF → JSON `{"ok": {pages_total, pages}}`.
+    Pdf {
+        /// Файл PDF (копия в рабочем каталоге run), не больше 32 МиБ.
+        path: PathBuf,
+        /// Первая страница, с 1.
+        first: u32,
+        /// Сколько страниц.
+        count: u32,
+        /// Предел текста всех страниц, символов.
+        max_chars: usize,
+    },
+}
+
+/// Подкоманда `extract` — синхронно, без рантайма tokio: подпроцесс только разбирает вход.
+fn cmd_extract(e: ExtractCli) -> ExitCode {
+    #[cfg(feature = "test-hooks")]
+    {
+        if e.hang {
+            zero_agent::extract::hooks::hang();
+        }
+        if e.crash {
+            zero_agent::extract::hooks::crash();
+        }
+    }
+    match e.what {
+        ExtractCmd::Html => zero_agent::extract::cmd_html(),
+        ExtractCmd::Pdf {
+            path,
+            first,
+            count,
+            max_chars,
+        } => zero_agent::extract::cmd_pdf(&path, first, count, max_chars),
+    }
 }
 
 /// Аргументы `inspect`.
@@ -575,6 +633,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode, AppError> {
+    if let Cmd::Extract(e) = cli.cmd {
+        return Ok(cmd_extract(e));
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -668,6 +729,8 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             let home = home::za_home()?;
             Ok(inspector::cmd_stats(&home, &project, run, json).await?)
         }
+        // `run` вызывает `extract` до рантайма; здесь — тот же разбор.
+        Cmd::Extract(e) => Ok(cmd_extract(e)),
         Cmd::Audit {
             project,
             verify,

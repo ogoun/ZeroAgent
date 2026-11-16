@@ -3,12 +3,15 @@
 //! и с git, предметы вызова для политики, трекер чтений.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use za_core::extract::{
+    ExtractError, Extractor, HtmlRequest, Markdown, PDF_MAX_CHARS, PdfRequest, PdfText,
+};
 use za_core::paths::{ResolvedPath, Roots, classify, resolve};
-use za_core::{Access, Approval, RiskClass, Tool, ToolCx, ToolKind, ToolOutput};
+use za_core::{Access, Approval, BoxFuture, RiskClass, Tool, ToolCx, ToolKind, ToolOutput};
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier};
 use za_tools::{
     GLOB_MAX, READ_DEFAULT_LIMIT, READ_MAX_BYTES, ReadTracker, SEARCH_MAX, TrackError, WalkLimits,
@@ -103,7 +106,7 @@ async fn call(tool: &Arc<dyn Tool>, root: &Path, args: Value) -> ToolOutput {
 }
 
 fn read() -> Arc<dyn Tool> {
-    read_tool(ReadTracker::new())
+    read_tool(ReadTracker::new(), None)
 }
 
 fn roots(root: &Path) -> Roots {
@@ -279,6 +282,255 @@ async fn read_binary_is_described() {
     );
 }
 
+// ---- read: PDF через извлекатель (R1-C2 D113, задача 10) ----
+
+/// Заглушка извлекателя: запоминает запросы и содержимое копии в момент вызова; отвечает
+/// заданными страницами, ошибкой или не отвечает вовсе (`hang`).
+#[derive(Default)]
+struct StubPdf {
+    pages: PdfText,
+    error: Option<ExtractError>,
+    hang: bool,
+    seen: Mutex<Vec<(PdfRequest, Option<Vec<u8>>)>>,
+}
+
+impl StubPdf {
+    fn pages(pages: &[(u32, &str)], total: u32) -> Arc<Self> {
+        Arc::new(Self {
+            pages: PdfText {
+                pages_total: total,
+                pages: pages.iter().map(|(n, t)| (*n, (*t).to_owned())).collect(),
+            },
+            ..Self::default()
+        })
+    }
+
+    fn seen(&self) -> Vec<(PdfRequest, Option<Vec<u8>>)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Extractor for StubPdf {
+    fn html(&self, _req: HtmlRequest) -> BoxFuture<'static, Result<Markdown, ExtractError>> {
+        Box::pin(async { Err(ExtractError::Failed("not used".into())) })
+    }
+
+    fn pdf(&self, req: PdfRequest) -> BoxFuture<'static, Result<PdfText, ExtractError>> {
+        let copy = std::fs::read(&req.path).ok();
+        self.seen.lock().unwrap().push((req, copy));
+        let r = match &self.error {
+            Some(e) => Err(e.clone()),
+            None => Ok(self.pages.clone()),
+        };
+        let hang = self.hang;
+        Box::pin(async move {
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            r
+        })
+    }
+}
+
+fn read_pdf_tool(stub: &Arc<StubPdf>) -> Arc<dyn Tool> {
+    let ex: Arc<dyn Extractor> = stub.clone();
+    read_tool(ReadTracker::new(), Some(ex))
+}
+
+/// Байты «PDF»: сигнатура и двоичный комментарий без NUL — разбирает заглушка.
+const PDF_BYTES: &[u8] = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj << >> endobj\n%%EOF\n";
+
+#[tokio::test]
+async fn read_pdf_pages() {
+    let root = unique_dir("read_pdf_pages");
+    write(&root, "doc.pdf", PDF_BYTES);
+    let stub = StubPdf::pages(&[(1, "alpha"), (2, "beta")], 2);
+    let o = call(
+        &read_pdf_tool(&stub),
+        &root,
+        json!({"path": "doc.pdf", "start": 1, "limit": 2}),
+    )
+    .await;
+    assert!(!o.is_error, "{}", o.content);
+    assert_eq!(
+        o.content,
+        "[pdf: 2 pages; showing 1-2]\n--- page 1 ---\nalpha\n--- page 2 ---\nbeta"
+    );
+    let seen = stub.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!((seen[0].0.first, seen[0].0.count), (1, 2));
+    // Страница без текстового слоя и окно за концом документа.
+    let stub = StubPdf::pages(&[(3, "gamma"), (4, "")], 9);
+    let o = call(
+        &read_pdf_tool(&stub),
+        &root,
+        json!({"path": "doc.pdf", "start": 3, "limit": 2}),
+    )
+    .await;
+    assert_eq!(
+        o.content,
+        "[pdf: 9 pages; showing 3-4]\n--- page 3 ---\ngamma\n--- page 4 ---\n[page 4: no text layer]"
+    );
+    let stub = StubPdf::pages(&[], 2);
+    let o = call(
+        &read_pdf_tool(&stub),
+        &root,
+        json!({"path": "doc.pdf", "start": 5}),
+    )
+    .await;
+    assert!(o.is_error);
+    assert_eq!(
+        o.content,
+        "start 5 is past the last page of the pdf (2 pages)"
+    );
+}
+
+#[tokio::test]
+async fn read_pdf_limit_capped_at_50() {
+    let root = unique_dir("read_pdf_limit");
+    write(&root, "doc.pdf", PDF_BYTES);
+    let stub = StubPdf::pages(&[(1, "a")], 1);
+    let tool = read_pdf_tool(&stub);
+    call(&tool, &root, json!({"path": "doc.pdf", "limit": 500})).await;
+    call(&tool, &root, json!({"path": "doc.pdf"})).await;
+    let counts: Vec<(u32, u32)> = stub
+        .seen()
+        .iter()
+        .map(|(r, _)| (r.first, r.count))
+        .collect();
+    // Предел 50 страниц; по умолчанию — 10 страниц с первой (а не 500 строк).
+    assert_eq!(counts, vec![(1, 50), (1, 10)]);
+    assert!(
+        stub.seen()
+            .iter()
+            .all(|(r, _)| r.max_chars == PDF_MAX_CHARS)
+    );
+}
+
+#[tokio::test]
+async fn read_pdf_uses_copy_in_work_tmp() {
+    let root = unique_dir("read_pdf_copy");
+    write(&root, "docs/doc.pdf", PDF_BYTES);
+    let stub = StubPdf::pages(&[(1, "alpha")], 1);
+    let run = RunId::new();
+    let o = call_in(
+        &read_pdf_tool(&stub),
+        &root,
+        run,
+        json!({"path": "docs/doc.pdf"}),
+    )
+    .await;
+    assert!(!o.is_error, "{}", o.content);
+    let seen = stub.seen();
+    let (req, copy) = &seen[0];
+    // Копия — в `.zero-agent/work/tmp/<run>/`, а не путь проекта (TOCTOU D98), с теми же
+    // байтами; после вызова её нет.
+    let tmp = std::fs::canonicalize(root.join(format!(".zero-agent/work/tmp/{run}"))).unwrap();
+    let parent = std::fs::canonicalize(req.path.parent().unwrap()).unwrap();
+    assert_eq!(parent, tmp, "{}", req.path.display());
+    assert!(
+        req.path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("pdf-"),
+        "{}",
+        req.path.display()
+    );
+    assert_eq!(copy.as_deref(), Some(PDF_BYTES));
+    assert!(
+        !req.path.exists(),
+        "копия не удалена: {}",
+        req.path.display()
+    );
+    assert!(std::fs::read_dir(&tmp).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn read_pdf_over_32_mib_refused() {
+    let root = unique_dir("read_pdf_big");
+    let mut big = PDF_BYTES.to_vec();
+    big.resize(33 * 1024 * 1024, b' ');
+    write(&root, "big.pdf", &big);
+    let stub = StubPdf::pages(&[(1, "a")], 1);
+    let o = call(&read_pdf_tool(&stub), &root, json!({"path": "big.pdf"})).await;
+    assert!(o.is_error);
+    assert_eq!(o.content, "pdf larger than 33554432 bytes");
+    assert!(stub.seen().is_empty(), "извлекатель не вызывается");
+    // Ровно 32 МиБ — разбирается.
+    big.truncate(32 * 1024 * 1024);
+    write(&root, "edge.pdf", &big);
+    let o = call(&read_pdf_tool(&stub), &root, json!({"path": "edge.pdf"})).await;
+    assert!(!o.is_error, "{}", o.content);
+    assert_eq!(stub.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn read_pdf_without_extractor_is_binary() {
+    let root = unique_dir("read_pdf_binary");
+    // NUL в начале нет: PDF узнаётся по сигнатуре до проверки NUL.
+    write(&root, "doc.pdf", PDF_BYTES);
+    let o = call(&read(), &root, json!({"path": "doc.pdf"})).await;
+    assert!(!o.is_error);
+    assert_eq!(
+        o.content,
+        format!(
+            "binary file, {} bytes, type application/pdf",
+            PDF_BYTES.len()
+        )
+    );
+}
+
+#[tokio::test]
+async fn read_pdf_extract_error_text() {
+    let root = unique_dir("read_pdf_error");
+    write(&root, "doc.pdf", PDF_BYTES);
+    for (e, want) in [
+        (ExtractError::Encrypted, "pdf: document is encrypted"),
+        (
+            ExtractError::Malformed("bad xref".into()),
+            "pdf: malformed document: bad xref",
+        ),
+        (ExtractError::Timeout, "pdf: extractor timed out"),
+    ] {
+        let stub = Arc::new(StubPdf {
+            error: Some(e),
+            ..StubPdf::default()
+        });
+        let o = call(&read_pdf_tool(&stub), &root, json!({"path": "doc.pdf"})).await;
+        assert!(o.is_error);
+        assert_eq!(o.content, want);
+    }
+}
+
+/// Извлекатель не ответил до дедлайна вызова: ошибка тайм-аута раньше внешнего тайм-аута
+/// слота, копия удалена.
+#[tokio::test]
+async fn read_pdf_deadline_removes_copy() {
+    let root = unique_dir("read_pdf_deadline");
+    write(&root, "doc.pdf", PDF_BYTES);
+    let stub = Arc::new(StubPdf {
+        hang: true,
+        ..StubPdf::default()
+    });
+    let run = RunId::new();
+    let cx = ToolCx {
+        deadline: Some(Instant::now() + Duration::from_millis(300)),
+        ..cx(&root, run)
+    };
+    let limit = Duration::from_secs(30 * u64::from(scale()));
+    let o = tokio::time::timeout(
+        limit,
+        read_pdf_tool(&stub).call(json!({"path": "doc.pdf"}), cx),
+    )
+    .await
+    .expect("read не ответил после дедлайна");
+    assert!(o.is_error);
+    assert_eq!(o.content, "pdf: extractor timed out");
+    let seen = stub.seen();
+    assert!(!seen[0].0.path.exists(), "копия не удалена");
+}
+
 #[tokio::test]
 async fn read_crlf_bom_cp1251_shown() {
     let root = unique_dir("read_encodings");
@@ -348,7 +600,7 @@ async fn read_marks_tracker_with_file_hash() {
     let root = unique_dir("read_tracker");
     write(&root, "a.txt", "\u{FEFF}one\r\ntwo\r\n");
     let tracker = ReadTracker::new();
-    let read = read_tool(tracker.clone());
+    let read = read_tool(tracker.clone(), None);
     let run = RunId::new();
     let o = call_in(&read, &root, run, json!({"path": "a.txt", "limit": 1})).await;
     assert!(!o.is_error);

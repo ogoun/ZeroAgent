@@ -15,6 +15,15 @@
 //!
 //! Пути в выводе — [`display`]: внутри проекта относительные через `/`, снаружи абсолютные.
 //! Экранирование и предел размера результата — на стороне пакета (D94, D44).
+//!
+//! PDF у `read` (R1-C2 D113) — две части. Блокирующая ([`read_blocking`]) узнаёт PDF по
+//! сигнатуре `%PDF-` в начале файла (до проверки NUL) и копирует его байты (не больше
+//! [`PDF_MAX_BYTES`]) из уже открытого дескриптора в `work_dir("tmp/<run>")/pdf-<effect>.pdf`:
+//! подпроцесс извлекателя путь проекта повторно не открывает (TOCTOU, D98). Асинхронная
+//! зовёт [`Extractor::pdf`] с копией до дедлайна вызова и удаляет копию при любом исходе, в
+//! том числе при броске future. `start` и `limit` у PDF — страницы (по умолчанию 10, не
+//! больше 50). Без извлекателя PDF — прежний ответ `binary file, N bytes, type
+//! application/pdf`.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read};
@@ -30,13 +39,18 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch}
 use ignore::{DirEntry, WalkBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use za_core::extract::{
+    ExtractError, Extractor, FAILED_REPLY, FAILED_START, PDF_MAX_BYTES, PDF_MAX_CHARS,
+    PDF_SIGNATURE, PdfCopy, PdfRequest, failed_exit_text, pdf_copy_error_text, pdf_error_text,
+    pdf_past_end_text, pdf_sample, pdf_too_large_text, render_pdf,
+};
 use za_core::paths::{
     DriveScope, LexPath, ResolvedPath, Roots, classify, display, open_checked, read_dir_checked,
     resolve, stat_checked,
 };
 use za_core::{
     Access, Approval, BoxFuture, RawPath, RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput,
-    ToolSchema, ToolSpec,
+    ToolSchema, ToolSpec, call_deadline,
 };
 use za_protocol::{EffectClass, RunId, RunRole, Tier};
 
@@ -57,6 +71,9 @@ const SIMILAR_MAX: usize = 3;
 const WALK_MARGIN: Duration = Duration::from_secs(1);
 /// Отметка порядка байт UTF-8.
 const BOM: &[u8] = b"\xEF\xBB\xBF";
+/// Страниц PDF у `read` по умолчанию и самое большее (D113).
+const PDF_DEFAULT_PAGES: u32 = 10;
+const PDF_MAX_PAGES: u32 = 50;
 /// Каталоги, в которые обход не заходит (D87): репозиторий и служебные файлы агента.
 const SKIP_DIRS: &[&str] = &[".git", ".zero-agent"];
 /// Предел памяти `search` на строку (I2): файл со строкой длиннее пропускается.
@@ -229,17 +246,23 @@ pub(crate) async fn blocking<F>(f: F) -> ToolOutput
 where
     F: FnOnce() -> ToolOutput + Send + 'static,
 {
+    blocking_value(f).await.unwrap_or_else(|o| o)
+}
+
+/// [`blocking`] с любым результатом; сбой задачи — `Err` с результатом-ошибкой.
+async fn blocking_value<T, F>(f: F) -> Result<T, ToolOutput>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
     let scoped = move || {
         let _drives = DriveScope::enter();
         f()
     };
-    match tokio::task::spawn_blocking(scoped).await {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::error!(error = %e, "задача файлового инструмента упала");
-            ToolOutput::error(INTERNAL)
-        }
-    }
+    tokio::task::spawn_blocking(scoped).await.map_err(|e| {
+        tracing::error!(error = %e, "задача файлового инструмента упала");
+        ToolOutput::error(INTERNAL)
+    })
 }
 
 /// Канонический корень проекта и разрешённый путь (блокирующая).
@@ -334,20 +357,29 @@ struct ReadArgs {
 struct ReadTool {
     spec: ToolSpec,
     tracker: Arc<ReadTracker>,
+    /// Извлекатель текста PDF (D113); `None` — PDF читается как двоичный файл.
+    extractor: Option<Arc<dyn Extractor>>,
 }
 
 /// Инструмент `read(path, start=1, limit=500)`; прочитанный текстовый файл (целиком в
-/// пределах [`READ_MAX_BYTES`]) отмечается в `tracker`.
-pub fn read_tool(tracker: Arc<ReadTracker>) -> Arc<dyn Tool> {
+/// пределах [`READ_MAX_BYTES`]) отмечается в `tracker`. PDF — страницами через `extractor`
+/// (D113), без него — `binary file …`.
+pub fn read_tool(
+    tracker: Arc<ReadTracker>,
+    extractor: Option<Arc<dyn Extractor>>,
+) -> Arc<dyn Tool> {
     let schema = ToolSchema {
         name: "read".into(),
-        description: "Read a text file. Returns numbered lines: line number, tab, text.".into(),
+        description: "Read a text file. Returns numbered lines: line number, tab, text. A PDF \
+file is read by pages: start is the first page, limit the number of pages (default 10, at most \
+50)."
+            .into(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File path, relative to the project root" },
-                "start": { "type": "integer", "minimum": 1, "description": "First line (default 1)" },
-                "limit": { "type": "integer", "minimum": 1, "description": "Number of lines (default 500)" }
+                "start": { "type": "integer", "minimum": 1, "description": "First line, or first page of a PDF (default 1)" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Number of lines (default 500), or of PDF pages (default 10)" }
             },
             "required": ["path"],
             "additionalProperties": false
@@ -356,6 +388,7 @@ pub fn read_tool(tracker: Arc<ReadTracker>) -> Arc<dyn Tool> {
     Arc::new(ReadTool {
         spec: spec(schema, Tier::Small, 30, 128 * 1024),
         tracker,
+        extractor,
     })
 }
 
@@ -366,7 +399,10 @@ impl Tool for ReadTool {
 
     fn call(&self, args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
         let tracker = self.tracker.clone();
+        let extractor = self.extractor.clone();
+        let timeout = self.spec.timeout;
         Box::pin(async move {
+            let started = Instant::now();
             let a: ReadArgs = match parse(args) {
                 Ok(a) => a,
                 Err(o) => return o,
@@ -378,18 +414,35 @@ impl Tool for ReadTool {
                 }
                 (s, l) => (
                     usize::try_from(s).unwrap_or(usize::MAX),
-                    l.map_or(READ_DEFAULT_LIMIT, |l| {
-                        usize::try_from(l).unwrap_or(usize::MAX)
-                    }),
+                    l.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
                 ),
             };
             let lex = match classify(&cx.project_dir, &a.path) {
                 Ok(l) => l,
                 Err(e) => return ToolOutput::error(e.to_string()),
             };
+            // Дедлайн вызова: извлекатель PDF прерывается раньше внешнего тайм-аута слота.
+            let deadline = cx
+                .deadline
+                .unwrap_or_else(|| call_deadline(started, timeout));
+            let pdf = extractor.is_some().then(|| PdfTarget {
+                run: cx.run,
+                stem: cx.effect_key.file_stem(),
+            });
             let run = cx.run;
-            blocking(move || read_blocking(&cx.project_dir, &lex, start, limit, run, &tracker))
-                .await
+            let lines = limit.unwrap_or(READ_DEFAULT_LIMIT);
+            let step = blocking_value(move || {
+                read_blocking(&cx.project_dir, &lex, start, lines, run, pdf, &tracker)
+            })
+            .await;
+            match (step, extractor) {
+                (Err(o) | Ok(ReadStep::Done(o)), _) => o,
+                (Ok(ReadStep::Pdf(copy)), Some(ex)) => {
+                    read_pdf(ex, copy, start, limit, deadline).await
+                }
+                // Копия делается только при извлекателе; сюда не попасть.
+                (Ok(ReadStep::Pdf(_)), None) => ToolOutput::error(INTERNAL),
+            }
         })
     }
 
@@ -427,39 +480,131 @@ impl Tool for ReadTool {
                 past_end_text(10, 3, true),
             ),
             ("runtime/fs.read.too_large", TOO_LARGE.to_owned()),
+            // PDF (D113): страницы, пределы, ошибки извлекателя.
+            ("runtime/fs.read.pdf", pdf_sample()),
+            (
+                "runtime/fs.read.pdf_bad_reply",
+                pdf_error_text(&ExtractError::Failed(FAILED_REPLY.into())),
+            ),
+            (
+                "runtime/fs.read.pdf_copy_error",
+                pdf_copy_error_text(io::ErrorKind::PermissionDenied),
+            ),
+            (
+                "runtime/fs.read.pdf_crashed",
+                pdf_error_text(&ExtractError::Failed(failed_exit_text("exit code 101"))),
+            ),
+            (
+                "runtime/fs.read.pdf_encrypted",
+                pdf_error_text(&ExtractError::Encrypted),
+            ),
+            (
+                "runtime/fs.read.pdf_malformed",
+                pdf_error_text(&ExtractError::Malformed("parser panicked".into())),
+            ),
+            (
+                "runtime/fs.read.pdf_no_start",
+                pdf_error_text(&ExtractError::Failed(FAILED_START.into())),
+            ),
+            (
+                "runtime/fs.read.pdf_output_too_large",
+                pdf_error_text(&ExtractError::TooLarge),
+            ),
+            ("runtime/fs.read.pdf_past_end", pdf_past_end_text(5, 2)),
+            (
+                "runtime/fs.read.pdf_timeout",
+                pdf_error_text(&ExtractError::Timeout),
+            ),
+            ("runtime/fs.read.pdf_too_large", pdf_too_large_text()),
         ]
     }
 }
 
+/// Куда класть копию PDF (D113): `work_dir("tmp/<run>")/pdf-<stem>.pdf` проекта вызова.
+struct PdfTarget {
+    run: RunId,
+    /// Основа имени по ключу эффекта вызова (`EffectKey::file_stem`).
+    stem: String,
+}
+
+/// Итог блокирующей части `read`: готовый результат или копия PDF для извлекателя.
+enum ReadStep {
+    Done(ToolOutput),
+    Pdf(PdfCopy),
+}
+
+/// Асинхронная часть `read` у PDF (D113): извлекатель с копией до дедлайна вызова, затем
+/// удаление копии (бросок [`PdfCopy`]). `start` — первая страница, `limit` — число страниц
+/// (по умолчанию [`PDF_DEFAULT_PAGES`], не больше [`PDF_MAX_PAGES`]).
+async fn read_pdf(
+    extractor: Arc<dyn Extractor>,
+    copy: PdfCopy,
+    start: usize,
+    limit: Option<usize>,
+    deadline: Instant,
+) -> ToolOutput {
+    let first = u32::try_from(start).unwrap_or(u32::MAX);
+    let count = limit.map_or(PDF_DEFAULT_PAGES, |l| {
+        u32::try_from(l).unwrap_or(u32::MAX).min(PDF_MAX_PAGES)
+    });
+    let req = PdfRequest {
+        path: copy.path().to_path_buf(),
+        first,
+        count,
+        max_chars: PDF_MAX_CHARS,
+    };
+    let deadline = tokio::time::Instant::from_std(deadline);
+    let r = tokio::time::timeout_at(deadline, extractor.pdf(req)).await;
+    drop(copy);
+    match r {
+        Err(_) => ToolOutput::error(pdf_error_text(&ExtractError::Timeout)),
+        Ok(Err(e)) => ToolOutput::error(pdf_error_text(&e)),
+        Ok(Ok(t)) => match render_pdf(&t, first, PDF_MAX_CHARS) {
+            Ok(text) => ToolOutput::ok(text),
+            Err(text) => ToolOutput::error(text),
+        },
+    }
+}
+
+/// Блокирующая часть `read`: разрешение пути, чтение строк или (при `pdf`) копия PDF.
 fn read_blocking(
     project: &Path,
     lex: &LexPath,
     start: usize,
     limit: usize,
     run: RunId,
+    pdf: Option<PdfTarget>,
     tracker: &ReadTracker,
-) -> ToolOutput {
+) -> ReadStep {
     let (root, r) = match resolve_in(project, lex) {
         Ok(x) => x,
-        Err(o) => return o,
+        Err(o) => return ReadStep::Done(o),
     };
     match stat_checked(&r) {
         Ok(m) if m.is_dir() => {
-            return ToolOutput::error(directory_text(&display(&root, &r.path)));
+            return ReadStep::Done(ToolOutput::error(directory_text(&display(&root, &r.path))));
         }
         Ok(_) => {}
-        Err(e) => return open_error(&root, &r, &e),
+        Err(e) => return ReadStep::Done(open_error(&root, &r, &e)),
     }
-    match read_file(&r, start, limit) {
-        Ok((out, hash)) => {
+    let pdf = pdf.map(|to| (root.as_path(), to));
+    match read_file(&r, start, limit, pdf) {
+        Ok(FileRead::Text(out, hash)) => {
             // Ошибка (`start` за концом) — файл модель не видела, трекер не отмечается (M3).
             if let Some(h) = hash.filter(|_| !out.is_error) {
                 tracker.mark(run, &r.path, &h);
             }
-            out
+            ReadStep::Done(out)
         }
-        Err(e) => open_error(&root, &r, &e),
+        Ok(FileRead::Pdf(copy)) => ReadStep::Pdf(copy),
+        Err(e) => ReadStep::Done(open_error(&root, &r, &e)),
     }
+}
+
+/// Итог [`read_file`]: текст (результат и хэш для трекера) или копия PDF.
+enum FileRead {
+    Text(ToolOutput, Option<String>),
+    Pdf(PdfCopy),
 }
 
 /// Чтение строк `start..start + limit` файла `r` (блокирующая: только в `spawn_blocking`).
@@ -471,23 +616,59 @@ fn read_blocking(
 /// декодированы с заменой), невидимые и bidi-символы в показанных строках (они не
 /// удаляются: `old` у `edit` должен совпасть с файлом), файл больше [`READ_MAX_BYTES`].
 pub fn read_at(r: &ResolvedPath, start: usize, limit: usize) -> io::Result<ToolOutput> {
-    read_file(r, start, limit).map(|(o, _)| o)
+    Ok(match read_file(r, start, limit, None)? {
+        FileRead::Text(o, _) => o,
+        // Без места копии PDF не копируется.
+        FileRead::Pdf(_) => ToolOutput::error(INTERNAL),
+    })
 }
 
 /// [`read_at`] и BLAKE3 (hex) сырых байт файла — если файл прочитан целиком и это текст
 /// в UTF-8 (Carry задачи 6 в задачу 7): правку файла не в UTF-8 `edit` отвергает, и
-/// трекер его не отмечает.
+/// трекер его не отмечает. PDF (сигнатура `%PDF-`, проверяется до NUL) при `pdf` —
+/// копия байт (не больше [`PDF_MAX_BYTES`]) в рабочий каталог проекта `pdf.0`; без `pdf` —
+/// `binary file …`.
 fn read_file(
     r: &ResolvedPath,
     start: usize,
     limit: usize,
-) -> io::Result<(ToolOutput, Option<String>)> {
+    pdf: Option<(&Path, PdfTarget)>,
+) -> io::Result<FileRead> {
     let f = open_checked(r, false)?;
     let mut bytes = Vec::new();
     (&f).take(BINARY_SNIFF as u64).read_to_end(&mut bytes)?;
+    if bytes.starts_with(PDF_SIGNATURE) {
+        let size = f.metadata()?.len();
+        let Some((root, to)) = pdf else {
+            return Ok(FileRead::Text(
+                ToolOutput::ok(binary_text(size, "application/pdf")),
+                None,
+            ));
+        };
+        let too_large = || FileRead::Text(ToolOutput::error(pdf_too_large_text()), None);
+        if size > PDF_MAX_BYTES as u64 {
+            return Ok(too_large());
+        }
+        // Файл мог вырасти после `metadata`: предел — по прочитанным байтам.
+        let rest = (PDF_MAX_BYTES + 1).saturating_sub(bytes.len()) as u64;
+        (&f).take(rest).read_to_end(&mut bytes)?;
+        if bytes.len() > PDF_MAX_BYTES {
+            return Ok(too_large());
+        }
+        return Ok(match PdfCopy::write(root, to.run, &to.stem, &bytes) {
+            Ok(copy) => FileRead::Pdf(copy),
+            Err(e) => {
+                tracing::warn!(error = %e, "копия PDF не создана");
+                FileRead::Text(ToolOutput::error(pdf_copy_error_text(e.kind())), None)
+            }
+        });
+    }
     if bytes.contains(&0) {
         let size = f.metadata()?.len();
-        return Ok((ToolOutput::ok(binary_text(size, mime(&bytes))), None));
+        return Ok(FileRead::Text(
+            ToolOutput::ok(binary_text(size, mime(&bytes))),
+            None,
+        ));
     }
     let rest = (READ_MAX_BYTES + 1).saturating_sub(bytes.len()) as u64;
     (&f).take(rest).read_to_end(&mut bytes)?;
@@ -498,7 +679,7 @@ fn read_file(
     let hash = (!capped && std::str::from_utf8(&bytes).is_ok())
         .then(|| blake3::hash(&bytes).to_hex().to_string());
     let text = bytes.strip_prefix(BOM).unwrap_or(&bytes);
-    Ok((render(text, start, limit, capped), hash))
+    Ok(FileRead::Text(render(text, start, limit, capped), hash))
 }
 
 fn render(text: &[u8], start: usize, limit: usize, capped: bool) -> ToolOutput {

@@ -3,12 +3,13 @@
 //! цикла агента (`run`, `answer`, R1-B1), инспектора запроса и метрик run (`inspect`, `stats`,
 //! R1-B2), журнала аудита и выгрузки журнала (`audit`, `journal export`), набора доверенных
 //! файлов проекта и доверия к нему (`trust`), чекпоинтов рабочей копии (`checkpoints`),
-//! секретов (`secret list`, R1-C1).
+//! секретов (`secret list`, R1-C1), извлекатель в отдельном процессе (`extract`, R1-C2).
 
 pub mod audit;
 pub mod checkpoints;
 pub mod config;
 pub mod doctor;
+pub mod extract;
 pub mod home;
 pub mod inspect;
 pub mod journal;
