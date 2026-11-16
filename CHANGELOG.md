@@ -5,6 +5,13 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, проход fix-14 (ревью задач 14 и 15):
+  - веб-инструмент замороженного префикса, выключенный конфигурацией во время паузы, после resume не исполняется и отвечает модели `web_fetch: web tools are disabled by configuration since this run started` (`web_search` без `[web.search] url` — `web_search: web search is not configured since this run started`) вместо `unknown tool`; в stderr resume — строка о выключенном вебе или поиске. Префикс не меняется (кэш). `za-core`: `ToolRegistry::withdraw`/`withdrawn`; `za-web`: `WEB_DISABLED`, `SEARCH_UNCONFIGURED`, `withdrawn_text`, образцы в `Tool::texts`;
+  - `za-core`: `ExtractError::Unavailable` и извлекатель `extract::Unavailable` (любой вызов — `extraction is unavailable in this session`);
+  - `za-agent`: `STANDARD_TOOLS_LIMIT` (1700), `DEFAULT_N_CTX` — публичная;
+  - CI: тесты `zero-agent` с признаком `test-hooks` идут целиком (`r1c2_web_skills`, `skills`, `extract`), а не одна цель `extract`; страж обычной сборки `tests/hooks_absent.rs` (бинарник без признака отвергает `run --web-resolve`, `extract --hang` и `--crash`, D128);
+  - приёмка: `rule_of_two_two_fetches_in_ask_mode` (два внешних вызова в режиме `ask` — две записи `rule_of_two`, одна строка SEC-052), `read_pdf_through_binary` (`read` PDF через подпроцесс), `disabled_web_tool_explains_after_resume`; у `live_llama_s1` — требование окна от 32k и понятная первая проверка;
+  - README: маска секрета в аргументах модели до вызова (сайт получает маску), замороженный набор веб-инструментов, `web_fetch` без извлекателя, предел `max_bytes`, предупреждение D169 при неизвестном окне и на resume; статусы R1-B2 и R1-C1 (выполнены и слиты в `main`) и открытое по R1-C2.
 - R1-C2, задача 15 (приёмка R1-C2):
   - приёмочные тесты бинарника `crates/zero-agent/tests/r1c2_web_skills.rs` (только с признаком `test-hooks`): S1 с поиском у поддельного SearXNG и ссылками в ответе, отказ локального адреса и адреса SearXNG для `web_fetch` без соединения, команда после чтения страницы без вопроса, Rule of Two без паузы, `activate_skill`, `/имя` и карточка роутера на small, resume после сбоя посреди `web_fetch` и после его квитанции, resume run с веб-инструментами, маска секрета в URL, переменные прокси без действия; живой шаг `live_llama_s1` (`#[ignore]`, `LLAMA_TEST_URL`, `SEARXNG_TEST_URL`);
   - скрытый `zero-agent run --crash-at after-boundary:N` (только для тестов): аварийное завершение после записи эффекта границы шага N, до снимка шага — квитанции шага N − 1 есть, снимка после них нет, resume реплеит их без повторного вызова;
@@ -17,7 +24,7 @@
   - команда `zero-agent skills list [--project DIR]`: скиллы по источникам с путями и предупреждениями, пропущенные с причинами, корни, не прочитанные пределом `max_entries`; у недоверенного проекта — «проект не доверен» и отличие доверия;
   - `doctor`: строки `web`, `search` (пробный запрос к своему SearXNG через исключение D126, подсказки на 403 — формат `json`, на 429 — `server.limiter` или `pass_ip`), `extract` (проба подпроцесса), `skills`, `window` (тир standard или full на окне меньше 32k, D169); то же предупреждение — на старте `run`;
   - печать `run`: `zero-agent: веб: GET <адрес> → <код>, <размер>`, отказ и сбой обращения (D112), `zero-agent: скилл <имя> (<источник>)` (D122);
-  - запись аудита `policy.loaded` получает `web_disabled` (`config` или `project`) и `search_host`; запись пишется и при их смене;
+  - запись аудита `policy.loaded` получает `web_disabled` (`config` или `project`) и `search_host`; запись пишется и при их смене (в задаче 14 — только у нового run; resume — с прохода fix-14, см. «Исправлено»);
   - `za-agent`: событие `skill.catalog {count, by_source, skipped, warnings}` на шаге 0 нового run (`catalog_payload`);
   - `za-skills`: `Limits::entries` — предел записей обхода корня `user` и `extra` (по умолчанию 1000, `[skills] max_entries`);
   - скрытый `run --web-resolve host=ip:port` — только с признаком `test-hooks` (D128);
@@ -242,6 +249,12 @@
 - `zero-agent`: ключи `Gateway` берутся из кэша `StoreSecrets`, прочитанного при старте команды, вместо `EnvSecrets`; для пользователя правило `ZA_SECRET_<KEY_REF>` прежнее. `journal export` и `audit` маскируют и шаблоны ключей, а не только значения `ZA_SECRET_*` из окружения выгрузки (ревью задачи 4, m4); печать ответа `run` проходит ту же маску.
 
 ### Исправлено
+- R1-C2, проход fix-14 (ревью задачи 14):
+  - `zero-agent run --resume` пишет `policy.loaded` с действующим снимком политики при каждом resume (I1): смена `[web.search] url` (`search_host`) и выключение веба (`web_disabled`) между стартом и продолжением при том же хэше политики теперь видны в аудите (D105, D126), дубликат последней записи не пишется. Отчёт и запись CHANGELOG задачи 14 называли это поведение и для resume — это было неверно до этого прохода;
+  - предел D169 проверяется по частям (m1): `top/standard/tools@{16k,32k}` — описания без каталога, не больше 1700 (замер 1539 по оценке байты/4, 1341 cl100k), `top/standard/catalog@{16k,32k,64k}` — каталог, не больше колонки окна 300/600/1500 (замер 70/480/480). Сумма 1800/2100 скрывала, что описания без каталога уже больше слота 32k (1500), а запас занимала у колонки каталога;
+  - без пути к бинарнику (`current_exe`) `web_search` и `web_fetch` остаются (m2): `web_fetch` читает текст, JSON и XML, на HTML и PDF отвечает `html:`/`pdf: extraction is unavailable in this session`; `read` — по-прежнему `binary file` на PDF;
+  - предупреждение D169 печатается и при неизвестном окне модели (run считает его 8192, D43) при явном `--tier standard`/`full`, и на `run --resume --model` с моделью меньшего окна (m4);
+  - `[web] max_bytes` — не больше 33554432 (32 МиБ, предел тела PDF): больше бесполезно и опасно для памяти, опечатка на порядок — ошибка конфигурации (m8).
 - R1-C2, задача 14 (переносы): корень `extra` больше предела записей больше не останавливает следующие корни списка — пропускается только он (`za-skills`, m2 ревью задачи 12); ADR 0006 и подсказки — по верной причине `limiter` SearXNG: с ним API `format=json` пропускает не больше 4 запросов в час с адреса, заголовки не помогают (m1 повторного ревью fix-9s); тест `output_fits_limit` ловит отсутствие вычета `DIGEST_RESERVE` (m3).
 - R1-C2, I1 ревью прохода fix-13 (`za-extract`): выбор заголовка таблицы за пустыми `thead` считается одним обратным проходом по секциям, а не поиском вперёд от каждого пустого `thead`. 2 МиБ идущих подряд `<thead>` разбираются за ~0,35 с в release (было больше 30 с, тайм-аут подпроцесса 10 с); вывод корпуса из 17 страниц не изменился. Тест `many_empty_theads_are_linear`.
 - R1-C2, сверка N-13 после прохода fix-12c (`za-skills`, core pack): последние формулировки, совпадавшие с чужими наборами по критерию N-13, заменены своими — описание `review` (было 7 слов и конструкция чужого описания), строка `grill` о внутренних названиях, загрузка скилла и «без скилла» в `router`, строка о тестах в `review`, вступление `retro`, строка `spec` в списке `router`. Фикстуры описаний в `za-agent/tests/skills.rs` — нейтральный текст. Версия промптов прежняя `r1c2.1`, golden `prompts.hash` обновлён.
