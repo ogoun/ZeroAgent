@@ -5,6 +5,10 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, задача 12 (core pack, D120):
+  - `za-skills`: 14 скиллов поставки своими текстами — `diagnose`, `domain-model`, `doubt`, `grill`, `handoff`, `research-with-citations` (3–10 вызовов поиска и чтения, страница открыта перед цитированием, ответ — вывод и список ссылок, непроверенное помечено; CAP-003), `retro`, `review`, `router`, `source-driven`, `spec`, `tdd`, `tickets`, `wayfinder`. Файлы — `crates/za-skills/pack/<name>/SKILL.md`, frontmatter только `name` и `description`. `bundled()` отдаёт их по порядку имён; новые `PACK`, `PACK_TEXT_NAMES`, `PACK_TOKEN_LIMIT` (700);
+  - `za-agent`: зависимость от `za-skills`; тексты поставки входят в `runtime_texts()` и хэш промптов под именами `skills/<name>`, `budget_cases()` получил 14 случаев `skills/<name>` с пределом 700. Версия промптов — прежняя `r1c2.1` (D131), golden `prompts.hash` обновлён;
+  - `cargo xtask prompt-budget`: случаи `skills/<name>` (261–337 токенов cl100k, предел 700).
 - R1-C2, переносы ревью задачи 11 в задачу 12 (`za-skills`):
   - `za-skills`: ресурс-ссылка в пределах корня источника, но за пределы каталога скилла, в `SkillMeta.files` не входит; вместо неё предупреждение `file <path> is not listed: link outside the skill directory` (m1). Раньше модель увидела бы файл, который `load` не отдаёт;
   - `za-skills`: ссылка или junction на каталог внутри корня — значение `external-link`. На Windows открытие каталога давало `PermissionDenied`, и одна такая ссылка делала нечитаемым всё дерево: источник `user`/`extra` пропускался с `unreadable`, а `trust_set` проекта падал. Это унаследовано от R1-C1, на Unix значение и раньше было `external-link`, у прежде читаемых деревьев хэш не меняется;

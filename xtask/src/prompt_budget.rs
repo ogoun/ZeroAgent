@@ -10,7 +10,9 @@
 //!
 //! Случаи префикса top small (`top/small/tools`, `top/small/prefix/{mode}`, R1-C1 D93)
 //! считаются по настоящему набору run `for_run(Top, Small)`: встроенные инструменты и
-//! `za_tools::native_capability()` ([`all_cases`]).
+//! `za_tools::native_capability()` ([`all_cases`]). Случаи `skills/<name>` — тексты
+//! core pack целиком, не больше 700 токенов каждый (R1-C2 D120): их даёт
+//! `za_agent::budget_cases()` с теми же текстами, что входят в хэш промптов.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -387,6 +389,32 @@ mod tests {
                 c.name,
                 c.limit
             );
+        }
+    }
+
+    /// R1-C2 D120: у каждого из 14 скиллов поставки — случай `skills/<name>` с пределом 700
+    /// и тем же текстом, что в хэше промптов (`za_agent::runtime_texts`); все в пределах
+    /// по cl100k, o200k и оценке Qwen.
+    #[test]
+    fn prompt_budget_has_skill_cases() {
+        let cases = all_cases();
+        let texts = za_agent::runtime_texts();
+        let hashed: Vec<(&str, &str)> = texts
+            .iter()
+            .filter(|(n, _)| n.starts_with("skills/"))
+            .map(|(n, t)| (*n, t.as_str()))
+            .collect();
+        let skills: Vec<(&str, &str)> = cases
+            .iter()
+            .filter(|c| c.name.starts_with("skills/"))
+            .map(|c| (c.name.as_str(), c.text.as_str()))
+            .collect();
+        assert_eq!(skills.len(), 14);
+        assert_eq!(skills, hashed);
+        for c in cases.iter().filter(|c| c.name.starts_with("skills/")) {
+            assert_eq!(c.limit, 700, "{}", c.name);
+            let n = count(&c.text);
+            assert!(!over_limit(&n, c.limit), "{}: {n:?}", c.name);
         }
     }
 

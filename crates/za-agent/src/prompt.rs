@@ -154,7 +154,8 @@ const RUNTIME_TEXTS: &[(&str, &str)] = &[
 /// ([`RUNTIME_TEXTS`]) и образцы текстов, собираемых `format!`, — результат их функций
 /// рендера с фиксированными аргументами (ошибки инструментов, отказы нормализации,
 /// разметка сводки компакции; M-1 ревью задачи 5). Правка шаблона меняет образец, а
-/// значит и [`prompt_texts_hash`].
+/// значит и [`prompt_texts_hash`]. Тексты core pack — под именами `skills/<name>`
+/// ([`pack_texts`], R1-C2 D120).
 pub fn runtime_texts() -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = RUNTIME_TEXTS
         .iter()
@@ -163,9 +164,20 @@ pub fn runtime_texts() -> Vec<(&'static str, String)> {
         .chain(crate::policy::text_samples())
         .chain(crate::tools::text_samples())
         .chain(crate::turn::text_samples())
+        .chain(pack_texts().map(|(n, t)| (n, t.to_owned())))
         .collect();
     out.sort_by(|a, b| a.0.cmp(b.0));
     out
+}
+
+/// Тексты core pack (R1-C2 D120): `(skills/<name>, текст SKILL.md)` в порядке имён —
+/// `za_skills::bundled()` с именами `za_skills::PACK_TEXT_NAMES`. Текст — целиком, с
+/// frontmatter: модель видит описание в каталоге, а тело — при активации.
+fn pack_texts() -> impl Iterator<Item = (&'static str, &'static str)> {
+    za_skills::PACK_TEXT_NAMES
+        .into_iter()
+        .zip(za_skills::bundled())
+        .map(|(name, (_, text))| (name, *text))
 }
 
 /// BLAKE3 hex всех текстов, уходящих модели без подстановки (PRM-010): файлы
@@ -587,6 +599,9 @@ fn system_of(role: RunRole, overlay: Option<WorkMode>) -> String {
 ///   `"\n\n"` и `render_env(max_env())` (2000, 3000);
 /// - `orchestrator`, `orchestrator/{mode}` (500), `worker`, `worker/{mode}` (300) — Core
 ///   вместе с overlay;
+/// - `skills/<name>` — текст `SKILL.md` скилла поставки целиком
+///   (`za_skills::PACK_TOKEN_LIMIT`, 700; R1-C2 D120), под тем же именем, что в хэше
+///   промптов;
 /// - префикс top small с настоящими инструментами — [`small_prefix_cases`]: набор
 ///   инструментов собирает `xtask` (R1-C1 D93), `za-agent` от `za-tools` не зависит.
 pub fn budget_cases() -> Vec<BudgetCase> {
@@ -630,6 +645,13 @@ pub fn budget_cases() -> Vec<BudgetCase> {
                 role_limit(role, Tier::Small),
             ));
         }
+    }
+    for (name, text) in pack_texts() {
+        out.push(case(
+            name.to_owned(),
+            text.to_owned(),
+            za_skills::PACK_TOKEN_LIMIT,
+        ));
     }
     out
 }

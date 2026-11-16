@@ -2359,6 +2359,7 @@ dependencies = [
  "za-llm",
  "za-protocol",
  "za-secrets",
+ "za-skills",
  "za-store",
 ]
 
