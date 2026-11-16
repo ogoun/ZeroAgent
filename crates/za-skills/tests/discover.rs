@@ -377,8 +377,8 @@ fn discover_limits() {
     assert!(cat.skipped.is_empty(), "{:?}", reasons(&cat));
 
     // Предел записей обхода `user` и `extra` (ревью задачи 11, m3): ровно 1000 записей —
-    // скиллы найдены; 1001 — источник не читается, `limit reached: more than 1000
-    // entries`, следующий источник того же вида не обходится.
+    // скиллы найдены; 1001 — корень не читается, `limit reached: more than 1000
+    // entries`, а следующий корень `extra` обходится (m2 ревью задачи 12).
     assert_eq!(
         LOCAL_TREE_LIMITS,
         TreeLimits {
@@ -401,15 +401,51 @@ fn discover_limits() {
     let other = root.join("other");
     skill(&other, "b", "b", "second extra");
     let cat = discover(&DiscoverInput {
-        extra_dirs: vec![edge.clone(), other],
+        extra_dirs: vec![edge.clone(), other.clone()],
         ..DiscoverInput::default()
     });
-    assert!(cat.skills.is_empty(), "{:?}", cat.skills);
+    let names: Vec<&str> = cat.skills.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["b"], "{:?}", reasons(&cat));
+    assert_eq!(cat.skills[0].source, "extra");
     assert_eq!(
         reasons(&cat),
         [(
             edge.display().to_string(),
             "limit reached: more than 1000 entries".to_owned()
+        )]
+    );
+    // Предел записей задаёт `Limits::entries` (`[skills] max_entries`, задача 14): с
+    // пределом 1001 тот же корень читается; с пределом 2 корень `user` пропущен, а у
+    // `other` ровно 2 записи (`b`, `b/SKILL.md`) — он читается.
+    let cat = discover(&DiscoverInput {
+        extra_dirs: vec![edge.clone(), other.clone()],
+        limits: Limits {
+            entries: 1001,
+            ..Limits::default()
+        },
+        ..DiscoverInput::default()
+    });
+    assert!(
+        cat.get("a").is_some() && cat.get("b").is_some(),
+        "{:?}",
+        reasons(&cat)
+    );
+    assert!(cat.skipped.is_empty(), "{:?}", reasons(&cat));
+    let cat = discover(&DiscoverInput {
+        user_dir: Some(edge.clone()),
+        extra_dirs: vec![other],
+        limits: Limits {
+            entries: 2,
+            ..Limits::default()
+        },
+        ..DiscoverInput::default()
+    });
+    assert!(cat.get("b").is_some(), "{:?}", reasons(&cat));
+    assert_eq!(
+        reasons(&cat),
+        [(
+            edge.display().to_string(),
+            "limit reached: more than 2 entries".to_owned()
         )]
     );
 

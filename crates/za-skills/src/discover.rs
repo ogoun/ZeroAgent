@@ -30,16 +30,20 @@ use crate::tree::{
 pub const SKILL_FILE: &str = "SKILL.md";
 /// Каталоги, в которые обнаружение не заходит (D116).
 pub const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "__pycache__"];
-/// Пределы обхода `user` и `extra` (на хэш доверия проекта не влияют): 1 МиБ на файл, как
-/// у доверия, и 1000 записей (файлов, каталогов, ссылок) на корень источника. Обход идёт
+/// Пределы обхода `user` и `extra` по умолчанию (на хэш доверия проекта не влияют): 1 МиБ
+/// на файл, как у доверия, и 1000 записей (файлов, каталогов, ссылок) на корень источника;
+/// число записей задаёт [`Limits::entries`] (`[skills] max_entries` глобальной
+/// конфигурации, задача 14). Обход идёт
 /// на каждом старте run, и цель — не дольше ~2 с на корень (ревью задачи 11, m3). Цену
 /// задаёт число файлов, а не размер: на Windows значение файла (разрешение пути и
 /// `open_checked`) стоит ~1,25 мс, хэш 1 МиБ добавляет ~0,3 мс, а чтение `SKILL.md`
 /// скилла в `discover` — ещё ~2,3 мс. Замер (release, NTFS, тёплый кэш, 2026-11-16):
 /// 900 файлов по 1 МиБ — 1,75 с, 500 скиллов из одного `SKILL.md` (1000 записей) — 1,8 с,
 /// 5000 мелких файлов — 7,6 с. Сверх предела — `limit reached: more than 1000 entries`
-/// и остановка источника, без хэшей (перечень записей дешёвый). Следствие: предел D116
-/// «2000 каталогов на источник» у `user` и `extra` не достигается, он действует у проекта.
+/// и пропуск этого корня, без хэшей (перечень записей дешёвый); следующие корни `extra`
+/// обходятся (m2 ревью задачи 12: время ограничено пределом каждого корня). Следствие:
+/// предел D116 «2000 каталогов на источник» у `user` и `extra` при пределе 1000 записей не
+/// достигается, он действует у проекта.
 pub const LOCAL_TREE_LIMITS: TreeLimits = TreeLimits {
     max_file: 1 << 20,
     max_entries: 1000,
@@ -54,6 +58,11 @@ pub struct Limits {
     pub dirs: usize,
     /// Файлов-ресурсов на скилл (без `SKILL.md`).
     pub files_per_skill: usize,
+    /// Записей обхода на корень `user` и `extra` (`[skills] max_entries`, по умолчанию
+    /// [`LOCAL_TREE_LIMITS`]): сверх предела корень пропускается с причиной
+    /// `limit reached: more than <N> entries`, следующие корни обходятся. У проекта —
+    /// пределы доверия ([`TRUST_LIMITS`]), этот предел на них не действует.
+    pub entries: usize,
 }
 
 impl Default for Limits {
@@ -62,6 +71,7 @@ impl Default for Limits {
             depth: 6,
             dirs: 2000,
             files_per_skill: 100,
+            entries: LOCAL_TREE_LIMITS.max_entries,
         }
     }
 }
@@ -255,7 +265,9 @@ impl Discovery {
         });
     }
 
-    /// Каталог `user` или `extra`: обход и разбор.
+    /// Каталог `user` или `extra`: обход и разбор. Корень больше [`Limits::entries`]
+    /// записей пропускается целиком, источник не останавливается: следующие корни `extra`
+    /// обходятся (m2 ревью задачи 12).
     fn local(&mut self, source: &'static str, dir: &Path, limits: &Limits) {
         if self.stopped.contains(source) {
             return;
@@ -266,15 +278,15 @@ impl Discovery {
             Err(e) if tree::is_missing(&e) => return,
             Err(e) => return self.skip(shown, format!("unreadable: {e}")),
         };
-        let listing = match tree::listing_with(&roots, "", &LOCAL_TREE_LIMITS, SKIP_DIRS) {
+        let tree_limits = TreeLimits {
+            max_entries: limits.entries,
+            ..LOCAL_TREE_LIMITS
+        };
+        let listing = match tree::listing_with(&roots, "", &tree_limits, SKIP_DIRS) {
             Ok((Place::Link, _)) => {
-                self.stopped.insert(source);
                 return self.skip(
                     shown,
-                    format!(
-                        "limit reached: more than {} entries",
-                        LOCAL_TREE_LIMITS.max_entries
-                    ),
+                    format!("limit reached: more than {} entries", limits.entries),
                 );
             }
             Ok((_, Some(l))) => l,
