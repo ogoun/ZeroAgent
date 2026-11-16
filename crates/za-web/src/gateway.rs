@@ -10,8 +10,8 @@
 //!
 //! **Вызов** [`WebGateway::get`]: разбор и проверка URL, порт из `WebConfig::ports`, замок
 //! хоста (запросы к одному хосту идут по одному: `robots.txt` запрашивается один раз,
-//! интервал хоста соблюдается), `robots.txt`, лимитер, запрос, тело до `max_bytes` (у PDF —
-//! до 32 МиБ, D113).
+//! интервал хоста соблюдается), `robots.txt`, лимитер, запрос, тело до `max_bytes` (у PDF с
+//! кодом 2xx — до 32 МиБ, D113).
 //! Редиректы исполняет сам шлюз, а не `reqwest` (`Policy::none`): каждый переход — своя
 //! запись журнала, своя проверка URL и порта, `robots.txt` и место в лимитере. До 5
 //! переходов на тот же хост (`http` → `https` можно, обратно — нет); иначе
@@ -475,8 +475,8 @@ impl WebGateway {
     }
 
     /// Один `GET` клиентом `client` (страниц или поставщика): место в общем лимитере,
-    /// запрос, заголовки, тело до `limit` (у PDF при `pdf` — до [`PDF_BODY_LIMIT`]). Запись
-    /// `rec` заполняется по ходу; дедлайн — на каждом шаге.
+    /// запрос, заголовки, тело до `limit` (у PDF при `pdf` и коде 2xx — до
+    /// [`PDF_BODY_LIMIT`]). Запись `rec` заполняется по ходу; дедлайн — на каждом шаге.
     async fn request(
         &self,
         client: &Client,
@@ -631,8 +631,8 @@ fn with_host(url: &Url, host: &str) -> Option<Url> {
 
 /// Один обмен: запрос, заголовки, тело до `limit` (см. `WebGateway::request`).
 ///
-/// При `pdf` (страница `web_fetch`, D113) предел PDF — [`PDF_BODY_LIMIT`] вместо `limit`:
-/// обрезанный на `max_bytes` PDF не разобрать (таблица `xref` в конце файла). PDF — по
+/// При `pdf` (страница `web_fetch`, D113) и коде 2xx предел PDF — [`PDF_BODY_LIMIT`] вместо
+/// `limit`: обрезанный на `max_bytes` PDF не разобрать (таблица `xref` в конце файла). PDF — по
 /// заголовку `application/pdf`, а без заголовка типа — по сигнатуре в начале тела; её
 /// проверка — один раз, на границе `limit` (D109: других эвристик нет).
 async fn exchange(
@@ -678,6 +678,9 @@ async fn exchange(
     let length = resp.content_length();
     let (mut bytes, mut truncated) = (Vec::new(), false);
     let declared = pdf_declared(content_type.as_deref());
+    // PDF с кодом не 2xx не разбирается (`fetch::prepare`): тело — до `limit` (m9 ревью
+    // задачи 10).
+    let pdf = pdf && (200..300).contains(&status);
     let mut limit = match declared {
         Some(true) if pdf => PDF_BODY_LIMIT,
         _ => usize::try_from(limit).unwrap_or(usize::MAX),

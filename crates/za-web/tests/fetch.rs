@@ -699,6 +699,8 @@ async fn fetch_pdf_over_32_mib_refused() {
         ex.pdf_requests().is_empty(),
         "обрезанный PDF не разбирается"
     );
+    // Тело прочитано до предела PDF + 1 байт, а не до `max_bytes` (m1 ревью задачи 10).
+    assert_eq!(page_request(&out, "/big.pdf").bytes, 32 * 1024 * 1024 + 1);
     let out = fetch_in(
         &tool,
         &root,
@@ -715,6 +717,88 @@ async fn fetch_pdf_over_32_mib_refused() {
     let seen = ex.pdf_requests();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].1, Some(6 * 1024 * 1024));
+}
+
+/// Запись журнала о запросе страницы (адрес оканчивается на `path`).
+fn page_request<'a>(out: &'a ToolOutput, path: &str) -> &'a NetRequest {
+    out.requests
+        .iter()
+        .find(|r| r.url.ends_with(path))
+        .unwrap_or_else(|| panic!("нет запроса {path}: {:?}", out.requests))
+}
+
+/// m1 ревью задачи 10: тело с заголовком `application/pdf` читается дальше `max_bytes`
+/// (5 МиБ) — PDF в 6 МиБ целиком доходит до извлекателя.
+#[tokio::test]
+async fn declared_pdf_is_read_past_max_bytes() {
+    let mut mid = PDF_BYTES.to_vec();
+    mid.resize(6 * 1024 * 1024, b' ');
+    let s = site(move |_| typed(200, "application/pdf", mid.clone())).await;
+    let ex = StubExtractor::with_pdf(&[(1, "alpha")], 1);
+    let tool = web_fetch_tool(gateway(&s), ex.clone());
+    let root = project("pdf_declared");
+    let out = fetch_in(
+        &tool,
+        &root,
+        RunId::new(),
+        json!({"url": page_url(&s, "/declared.pdf")}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        page_request(&out, "/declared.pdf").bytes,
+        6 * 1024 * 1024,
+        "тело обрезано на max_bytes"
+    );
+    let seen = ex.pdf_requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1, Some(6 * 1024 * 1024));
+}
+
+/// m9 ревью задачи 10: PDF с кодом не 2xx не разбирается, поэтому и читается не дальше
+/// `max_bytes` — ни по заголовку `application/pdf`, ни по сигнатуре.
+#[tokio::test]
+async fn error_status_pdf_is_not_read_past_max_bytes() {
+    let mut big = PDF_BYTES.to_vec();
+    big.resize(6 * 1024 * 1024, b' ');
+    let s = site(move |p| {
+        let status = if p == "/gone.pdf" { 404 } else { 500 };
+        match p {
+            "/gone.pdf" | "/fail" => {
+                let mut r = typed(status, "application/pdf", big.clone());
+                if p == "/fail" {
+                    r.headers_mut().remove(axum::http::header::CONTENT_TYPE);
+                }
+                r
+            }
+            _ => text(404, ""),
+        }
+    })
+    .await;
+    let ex = StubExtractor::with_pdf(&[(1, "alpha")], 1);
+    let tool = web_fetch_tool(gateway(&s), ex.clone());
+    let root = project("pdf_status");
+    for (path, status) in [("/gone.pdf", 404), ("/fail", 500)] {
+        let out = fetch_in(
+            &tool,
+            &root,
+            RunId::new(),
+            json!({"url": page_url(&s, path)}),
+        )
+        .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.starts_with(&format!("HTTP {status}")),
+            "{}",
+            out.content
+        );
+        assert_eq!(
+            page_request(&out, path).bytes,
+            WebConfig::default().max_bytes,
+            "{path}: тело прочитано дальше max_bytes"
+        );
+    }
+    assert!(ex.pdf_requests().is_empty());
 }
 
 /// Ошибка извлечения PDF — `pdf: <причина>`, результат-ошибка.
