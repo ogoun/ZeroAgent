@@ -37,12 +37,19 @@ jobs:
           tool: cargo-deny
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      # `--no-fail-fast`: без него cargo останавливается на первом упавшем тестовом
+      # бинарнике, и остальные тесты платформы не запускаются (так Linux пять дней не
+      # проверял `za-tools`, `za-web`, `zero-agent` после одного падения, 2026-11-16).
+      - run: cargo test --workspace --locked --no-fail-fast
       # Тесты шлюза с тестовыми подменами резолвера (R1-C2 D128): только с признаком
       # `test-hooks`, обычная сборка его не содержит. Полная проверка задачи 15 —
       # `--features za-web/test-hooks,zero-agent/test-hooks` по всему workspace.
       - run: cargo clippy -p za-web --all-targets --features test-hooks --locked -- -D warnings
-      - run: cargo test -p za-web --features test-hooks --locked
+      - run: cargo test -p za-web --features test-hooks --locked --no-fail-fast
+      # Кэш проверки секретов чекпоинтов с подменой часов (D128): на Unix `ctime` в
+      # прошлое не сдвинуть, и без подмены тест кэша ждал бы порог racy по таймеру.
+      - run: cargo clippy -p za-tools --all-targets --features test-hooks --locked -- -D warnings
+      - run: cargo test -p za-tools --features test-hooks --locked --no-fail-fast
       # Чистые части `za-llm` без функций — так его подключает `za-core`.
       - run: cargo test -p za-llm --no-default-features --locked
       # Ядро отдельно: при --workspace функции объединяются, и za-core видел бы za-llm

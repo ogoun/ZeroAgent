@@ -167,7 +167,20 @@ impl GitCheckpointer {
 
     /// Фильтр секретов по содержимому (D103): и для чекпоинта git, и для копии файлов.
     pub fn with_secret_filter(mut self, f: SecretFilter) -> Self {
-        self.scan = SecretScan::new(Some(f));
+        self.scan = self.scan.with_filter(f);
+        self
+    }
+
+    /// Только с признаком `test-hooks` (D128): часы проверки секретов по содержимому
+    /// (нс от эпохи) вместо системных. Тест сдвигает «сейчас» за порог racy (2 с) и
+    /// получает запись кэша для только что записанного файла без ожидания: на Unix
+    /// `set_modified` ставит `ctime` на «сейчас», и в прошлое его не сдвинуть. Обычная и
+    /// release-сборка подмены не содержат: консервативная проверка «racy» в продукте
+    /// всегда идёт от системных часов. Фильтр, заданный позже, часы сохраняет.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn with_secret_clock_for_tests(mut self, clock: fn() -> u64) -> Self {
+        self.scan = self.scan.with_clock(clock);
         self
     }
 

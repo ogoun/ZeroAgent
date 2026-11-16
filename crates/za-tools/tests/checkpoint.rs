@@ -1989,8 +1989,22 @@ async fn content_secret_not_overwritten_by_restore() {
     }
 }
 
+/// Часы проверки секретов на 10 минут впереди системных (признак `test-hooks`).
+#[cfg(feature = "test-hooks")]
+fn ten_minutes_ahead() -> u64 {
+    let now = std::time::SystemTime::now() + Duration::from_secs(600);
+    let d = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+    u64::try_from(d.as_nanos()).unwrap()
+}
+
 /// Сомнение 2: итог проверки по содержимому кэшируется по stat и отпечатку набора
-/// значений; имя проверяется до кэша; смена отпечатка или файла — новая проверка.
+/// значений; имя проверяется до кэша; смена файла или фильтра — новая проверка.
+///
+/// Кэш не доверяет файлу, у которого `mtime` или `ctime` (Unix) моложе 2 с (racy).
+/// `set_modified` здесь не помогает: на Unix он ставит `ctime` на «сейчас». Поэтому часы
+/// проверки сдвинуты на 10 минут вперёд (`with_secret_clock_for_tests`, только с
+/// признаком `test-hooks`, D128), и тест не ждёт по таймеру.
+#[cfg(feature = "test-hooks")]
 #[tokio::test]
 async fn content_scan_cached_by_stat_and_fingerprint() {
     let c = case("secret-scan-cache");
@@ -1998,15 +2012,6 @@ async fn content_scan_cached_by_stat_and_fingerprint() {
     c.write("a.txt", "plain\n");
     c.write("b.txt", "other\n");
     c.write(".env", "MODE=dev\n");
-    // Файлы «старые»: кэш не доверяет файлам моложе 2 с (racy).
-    let old = std::time::SystemTime::now() - Duration::from_secs(600);
-    for rel in ["a.txt", "b.txt", ".env"] {
-        let f = std::fs::File::options()
-            .write(true)
-            .open(c.project.join(rel))
-            .unwrap();
-        f.set_modified(old).unwrap();
-    }
     let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
     let filter = |fp: u8| {
         let seen = seen.clone();
@@ -2016,7 +2021,10 @@ async fn content_scan_cached_by_stat_and_fingerprint() {
         })
     };
     let count = |what: &[u8]| seen.lock().unwrap().iter().filter(|b| *b == what).count();
-    let ck = c.ck().with_secret_filter(filter(1));
+    let ck = c
+        .ck()
+        .with_secret_clock_for_tests(ten_minutes_ahead)
+        .with_secret_filter(filter(1));
     let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
     assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
     assert_eq!(count(b"plain\n"), 1);
@@ -2030,7 +2038,8 @@ async fn content_scan_cached_by_stat_and_fingerprint() {
     create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
     assert_eq!(count(b"changed\n"), 1);
     assert_eq!(count(b"plain\n"), 1);
-    // Другой набор значений (отпечаток) — проверка заново.
+    // Новый фильтр (другой набор значений) — новый кэш, проверка заново; часы прежние.
+    // Сверку отпечатка в записи кэша проверяют модульные тесты `checkpoint::secret`.
     let ck = ck.with_secret_filter(filter(2));
     create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
     assert_eq!(count(b"plain\n"), 2);

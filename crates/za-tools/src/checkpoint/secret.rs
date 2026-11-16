@@ -9,6 +9,11 @@
 //! или stat файла — новая проверка. Отпечаток хранится только в памяти и на диск не
 //! пишется. Восстановление ([`SecretScan::now`]) запомненным итогом не пользуется и
 //! читает файл заново.
+//!
+//! Момент проверки берётся из часов [`SecretScan`] — [`now_ns`]. Подменить их может только
+//! сборка с признаком `test-hooks` (D128, `GitCheckpointer::with_secret_clock_for_tests`):
+//! на Unix `ctime` в прошлое не сдвинуть (`set_modified` ставит его на «сейчас»), и без
+//! подмены тест ждал бы [`RACY`] по таймеру. Обычная и release-сборка подмены не содержат.
 
 use std::collections::HashMap;
 use std::fs::Metadata;
@@ -145,12 +150,23 @@ impl Scanned {
     }
 }
 
+/// Часы проверки: наносекунды от эпохи. От их показания отсчитывается [`RACY`] записи.
+pub(crate) type Clock = fn() -> u64;
+
 /// Проверка «секрет ли файл» для чекпоинтов и восстановления: имя, затем фильтр с
 /// кэшем итогов в памяти. Клоны делят один кэш.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct SecretScan {
     filter: Option<SecretFilter>,
     cache: Arc<Mutex<HashMap<PathBuf, Scanned>>>,
+    /// Момент проверки ([`Scanned::at_ns`]); вне `test-hooks` — всегда [`now_ns`].
+    clock: Clock,
+}
+
+impl Default for SecretScan {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl SecretScan {
@@ -158,7 +174,24 @@ impl SecretScan {
         Self {
             filter,
             cache: Arc::default(),
+            clock: now_ns,
         }
+    }
+
+    /// Фильтр `f` с новым (пустым) кэшем; часы прежние.
+    pub(crate) fn with_filter(self, f: SecretFilter) -> Self {
+        Self {
+            clock: self.clock,
+            ..Self::new(Some(f))
+        }
+    }
+
+    /// Часы проверки `clock` вместо [`now_ns`] — только модульные тесты и признак
+    /// `test-hooks` (D128).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Секрет ли обычный файл `abs` (имя `rel`, stat `meta`): по имени, затем фильтром
@@ -184,7 +217,7 @@ impl SecretScan {
     /// Проверка содержимого фильтром `f` без кэша; итог записывается в кэш.
     fn scan(&self, f: &SecretFilter, rel: &str, abs: &Path, key: StatKey) -> bool {
         let fp = f.fingerprint();
-        let at_ns = now_ns();
+        let at_ns = (self.clock)();
         let mut buf = Vec::new();
         let read = std::fs::File::open(abs)
             .and_then(|file| file.take(SECRET_SCAN_MAX).read_to_end(&mut buf));
@@ -242,5 +275,111 @@ impl SecretScan {
     fn cached(&self, abs: &Path, key: StatKey, fp: [u8; 32]) -> Option<bool> {
         let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.get(abs).filter(|s| s.fits(key, fp)).map(|s| s.secret)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// Секунда в наносекундах.
+    const S: u64 = 1_000_000_000;
+    /// Показание часов проверки в тестах.
+    const AT: u64 = 1_000 * S;
+
+    fn at() -> u64 {
+        AT
+    }
+
+    /// stat с метками `mtime_ns` и `ctime_ns`; `ctime_ns` = 0 — как на Windows (без
+    /// `ctime` и `ino`).
+    fn key(mtime_ns: u64, ctime_ns: u64) -> StatKey {
+        StatKey {
+            size: 6,
+            mtime_ns,
+            ctime_ns,
+            ino: if ctime_ns == 0 { 0 } else { 42 },
+        }
+    }
+
+    fn entry(key: StatKey) -> Scanned {
+        Scanned {
+            key,
+            fingerprint: [1; 32],
+            at_ns: AT,
+            secret: false,
+        }
+    }
+
+    /// Запись годна, только если `mtime` и (Unix) `ctime` раньше проверки больше чем на
+    /// RACY. Ветку `ctime` CI Windows иначе не проверяет: там `ctime` в ключе — 0.
+    #[test]
+    fn fits_only_files_older_than_racy() {
+        let racy = u64::try_from(RACY.as_nanos()).unwrap();
+        let old = AT - 600 * S;
+        let fits = |k: StatKey| entry(k).fits(k, [1; 32]);
+        assert!(fits(key(old, old)));
+        // Windows: `ctime` нет — решает `mtime`.
+        assert!(fits(key(old, 0)));
+        // Unix после `set_modified`: `mtime` в прошлом, `ctime` — «сейчас».
+        assert!(!fits(key(old, AT - S / 10)));
+        // Ровно RACY до проверки — ещё не годится: «раньше» строгое.
+        assert!(!fits(key(AT - racy, old)));
+        assert!(!fits(key(old, AT - racy)));
+        assert!(fits(key(AT - racy - 1, AT - racy - 1)));
+        // `mtime` неизвестен.
+        assert!(!fits(key(0, 0)));
+    }
+
+    /// Запись годна только для того же stat и того же отпечатка набора значений.
+    #[test]
+    fn fits_only_same_stat_and_fingerprint() {
+        let old = AT - 600 * S;
+        let k = key(old, old);
+        let e = entry(k);
+        assert!(e.fits(k, [1; 32]));
+        assert!(!e.fits(k, [2; 32]));
+        assert!(!e.fits(StatKey { size: 7, ..k }, [1; 32]));
+        assert!(!e.fits(
+            StatKey {
+                mtime_ns: old + 1,
+                ..k
+            },
+            [1; 32]
+        ));
+        assert!(!e.fits(
+            StatKey {
+                ctime_ns: old + 1,
+                ..k
+            },
+            [1; 32]
+        ));
+        assert!(!e.fits(StatKey { ino: 43, ..k }, [1; 32]));
+    }
+
+    /// Момент записи — показание часов проверки; `with_filter` часы сохраняет.
+    #[test]
+    fn scan_stamps_entry_with_its_clock() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let n = calls.clone();
+        let f = SecretFilter::new([1; 32], move |_: &[u8]| {
+            n.fetch_add(1, Ordering::SeqCst);
+            false
+        });
+        let scan = SecretScan::default().with_clock(at).with_filter(f.clone());
+        // Любой читаемый файл: содержимое фильтру безразлично, stat — из ключа.
+        let abs = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let old = key(AT - 600 * S, AT - 600 * S);
+        assert!(!scan.scan(&f, "Cargo.toml", &abs, old));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(scan.cached(&abs, old, [1; 32]), Some(false));
+        assert_eq!(scan.cached(&abs, old, [2; 32]), None);
+        // Файл моложе RACY по часам проверки — запись не годится.
+        let fresh = key(AT - S, AT - S);
+        assert!(!scan.scan(&f, "Cargo.toml", &abs, fresh));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(scan.cached(&abs, fresh, [1; 32]), None);
     }
 }
