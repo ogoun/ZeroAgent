@@ -10,9 +10,10 @@
 //! онлайн-стражем ([`crate::guard`]): квадратичные классы `html5ever` (глубокая вложенность,
 //! реконструкция активных элементов форматирования, «Noah's Ark») прерываются до их
 //! разрастания. Соседние одинаковые строчные элементы сливаются до `htmd` за линейное время
-//! ([`crate::merge`]): у `htmd` это слияние квадратично. При превышении любого порога текст
-//! извлекается линейно без DOM ([`crate::linear`]) и результат несёт признак
-//! [`Markdown::simplified`].
+//! ([`crate::merge`]): у `htmd` это слияние квадратично. Выравнивание таблиц `htmd` идёт под
+//! бюджетом надбавки на страницу (`table::TableLayout`): сверх него таблица выводится
+//! без дополнения пробелами. При превышении любого порога текст извлекается линейно без DOM
+//! ([`crate::linear`]) и результат несёт признак [`Markdown::simplified`].
 //!
 //! Вызывается только в подпроцессе (D127, задача 10): обход DOM у `htmd` рекурсивный, и
 //! даже под стражем остаётся жёсткая граница — тайм-аут и предел вывода подпроцесса.
@@ -24,6 +25,7 @@ use htmd::{Element, HtmlToMarkdown};
 use markup5ever_rcdom::{Node, NodeData};
 use serde::{Deserialize, Serialize};
 
+use crate::table::TableLayout;
 use crate::{attrs, guard, linear};
 
 /// Предел входа: дальше HTML обрезается до разбора (D109).
@@ -82,12 +84,19 @@ pub fn html_to_markdown(html: &str) -> Markdown {
     }
 }
 
-/// Готовое дерево в Markdown: `htmd` со списком пропуска [`SKIPPED_TAGS`] и без картинок
-/// `data:`, серии пустых строк сжаты.
+/// Готовое дерево в Markdown: `htmd` со списком пропуска [`SKIPPED_TAGS`], без картинок
+/// `data:` и с выравниванием таблиц под бюджетом страницы ([`TableLayout`]), серии пустых
+/// строк сжаты.
 pub(crate) fn render(tree: &Rc<Node>) -> String {
+    render_with(tree, TableLayout::new())
+}
+
+/// [`render`] со своим обработчиком таблиц (модульные тесты бюджета выравнивания).
+pub(crate) fn render_with(tree: &Rc<Node>, tables: TableLayout) -> String {
     let converter = HtmlToMarkdown::builder()
         .skip_tags(SKIPPED_TAGS.to_vec())
         .add_handler(vec!["img"], drop_data_image)
+        .add_handler(vec!["table"], tables)
         .build();
     collapse_blank_lines(&converter.tree_to_markdown(tree))
 }

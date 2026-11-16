@@ -20,3 +20,4 @@ mod table;
 
 pub use html::{HTML_MAX_BYTES, Markdown, html_to_markdown};
 pub use pdf::{ExtractError, PdfText, pdf_pages};
+pub use table::TABLE_ALIGN_BUDGET;

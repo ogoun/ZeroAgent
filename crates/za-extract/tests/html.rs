@@ -904,6 +904,171 @@ fn wiki_like_keeps_table_values() {
     }
 }
 
+// --- Выравнивание таблиц (I1 ревью задачи 10) ---
+
+/// Предел «около 0,5 с в release» для таблиц (I1 ревью задачи 10): в release — 500 мс ×
+/// `ZA_TEST_TIME_SCALE`, в отладочной сборке — общий предел 30 с × масштаб, только от
+/// зависания.
+fn release_half_second() -> Duration {
+    if cfg!(debug_assertions) {
+        Duration::from_secs(30) * time_scale()
+    } else {
+        Duration::from_millis(500) * time_scale()
+    }
+}
+
+/// Строки текста, начинающиеся с `|` (строки таблиц Markdown).
+fn table_lines(text: &str) -> Vec<&str> {
+    text.lines().filter(|l| l.starts_with('|')).collect()
+}
+
+/// Таблица из ревью задачи 10 (I1): заголовок шириной 100 000 символов и 2000 строк по одной
+/// короткой ячейке, 138 КБ входа. `htmd` дополняет каждую строку пробелами до ширины столбца:
+/// 200 МБ вывода за 7 с в отладочной сборке. Надбавка выравнивания больше бюджета, таблица
+/// идёт без дополнения: те же ячейки, вывод порядка входа, ≤ 0,5 с в release.
+#[test]
+fn wide_column_table_is_not_padded() {
+    use za_extract::TABLE_ALIGN_BUDGET;
+    let mut html = format!(
+        "<table><thead><tr><th>{}</th></tr></thead><tbody>",
+        "a".repeat(100_000)
+    );
+    html.push_str(&"<tr><td>x</td></tr>".repeat(2000));
+    html.push_str("</tbody></table><p>after</p>");
+    assert!(
+        html.len() > 130_000 && html.len() < 140_000,
+        "{}",
+        html.len()
+    );
+    let m = bounded_within("wide column", html, release_half_second());
+    assert!(!m.simplified);
+    assert!(
+        (m.text.len() as u64) < TABLE_ALIGN_BUDGET,
+        "{} байт",
+        m.text.len()
+    );
+    assert!(m.text.len() < 200_000, "{} байт", m.text.len());
+    let lines = table_lines(&m.text);
+    // Заголовок, разделитель и 2000 строк данных — таблица Markdown сохранилась.
+    assert_eq!(lines.len(), 2002, "{}", &m.text[..200]);
+    assert!(lines[0].contains(&"a".repeat(100_000)));
+    assert_eq!(lines[1], "| --- |");
+    assert!(lines[2..].iter().all(|l| *l == "| x |"), "{}", lines[2]);
+    assert!(m.text.ends_with("after"));
+}
+
+/// Худший случай I1 в пределах 2 МиБ: ячейка шириной 1 МиБ и 55 000 строк (около 55 ГБ
+/// выровненного вывода). Без дополнения — около 1,2 МБ за время порядка разбора.
+#[test]
+fn two_mib_wide_table_is_bounded() {
+    let mut html = format!(
+        "<table><thead><tr><th>{}</th></tr></thead><tbody>",
+        "w".repeat(MIB)
+    );
+    while html.len() < HTML_MAX_BYTES - 64 {
+        html.push_str("<tr><td>y</td></tr>");
+    }
+    html.push_str("</tbody></table>");
+    let m = bounded_within("2 MiB wide", html, release_second());
+    assert!(!m.simplified);
+    assert!(m.text.len() < 2 * MIB, "{} байт", m.text.len());
+    assert!(table_lines(&m.text).len() > 50_000);
+}
+
+/// Бюджет выравнивания общий на страницу: 200 таблиц, у каждой надбавка около 1 МБ
+/// (ширина 3000 × 350 строк, 10 КБ входа), без общего бюджета дали бы 200 МБ. Выровнены
+/// только первые, пока надбавка укладывается в бюджет; остальные — без дополнения.
+#[test]
+fn align_budget_is_per_page() {
+    use za_extract::TABLE_ALIGN_BUDGET;
+    let mut html = String::from("<html><body>");
+    for i in 0..200 {
+        html.push_str(&format!(
+            "<table><tr><th>t{i} {}</th></tr>{}</table>",
+            "h".repeat(3000),
+            "<tr><td>z</td></tr>".repeat(350)
+        ));
+    }
+    html.push_str("</body></html>");
+    let input = html.len();
+    let m = bounded_within("200 tables", html, release_second());
+    assert!(!m.simplified);
+    assert!(
+        (m.text.len() as u64) < TABLE_ALIGN_BUDGET + input as u64,
+        "{} байт при входе {input}",
+        m.text.len()
+    );
+    // Первая таблица выровнена, последняя — нет.
+    let padded = table_lines(&m.text)
+        .iter()
+        .filter(|l| l.starts_with("| z ") && l.len() > 3000)
+        .count();
+    assert_eq!(padded, 350, "первая таблица не выровнена");
+    assert!(m.text.contains("t199"), "нет последней таблицы");
+    let tail = &m.text[m.text.find("t199").unwrap_or(0)..];
+    assert!(tail.contains("\n| z |\n"), "последняя таблица выровнена");
+}
+
+/// Недостающие ячейки `htmd` тоже дополняет: одна строка из 40 000 `th` и 40 000 строк по
+/// одной `td` дали бы 40 000 × 40 000 пустых ячеек (6 ГБ). Без дополнения строки короче —
+/// вывод порядка входа, а подсчёт надбавки идёт по ячейкам, а не по строкам × столбцы.
+#[test]
+fn missing_cells_are_not_padded() {
+    let mut html = String::from("<table><thead><tr>");
+    html.push_str(&"<th>h</th>".repeat(40_000));
+    html.push_str("</tr></thead><tbody>");
+    html.push_str(&"<tr><td>q</td></tr>".repeat(40_000));
+    html.push_str("</tbody></table>");
+    let input = html.len();
+    let m = bounded_within("missing cells", html, release_second());
+    assert!(!m.simplified);
+    assert!(
+        m.text.len() < input,
+        "{} байт при входе {input}",
+        m.text.len()
+    );
+    let lines = table_lines(&m.text);
+    assert_eq!(lines.len(), 40_002);
+    assert_eq!(lines[2], "| q |");
+}
+
+/// Ширину ячейки задаёт её Markdown, а не текст HTML: ссылка с адресом в 100 000 символов и
+/// коротким текстом занимает в выводе весь адрес. Оценка по тексту DOM её бы пропустила.
+#[test]
+fn long_link_target_counts_in_column_width() {
+    let mut html = format!(
+        "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td><a href=\"/{}\">x</a></td></tr>",
+        "p".repeat(100_000)
+    );
+    html.push_str(&"<tr><td>y</td></tr>".repeat(2000));
+    html.push_str("</tbody></table>");
+    let m = bounded_within("long link", html, release_half_second());
+    assert!(m.text.len() < 200_000, "{} байт", m.text.len());
+    assert!(m.text.contains(&format!("[x](/{})", "p".repeat(100_000))));
+    assert_eq!(table_lines(&m.text).len(), 2003);
+}
+
+/// `htmd` решает, выравнивать ли таблицу, по любому потомку с именем `th` или `thead` в любом
+/// пространстве имён (`has_explicit_headers`). `th` внутри `<math>` в ячейке делает таблицу
+/// «с заголовками», хотя ячеек `th` в ней нет. Решение о дополнении такой таблицы — то же:
+/// без дополнения.
+#[test]
+fn foreign_th_does_not_bring_back_padding() {
+    let mut html = format!(
+        "<table><tr><td>{}<math><th>m</th></math></td></tr>",
+        "a".repeat(100_000)
+    );
+    html.push_str(&"<tr><td>x</td></tr>".repeat(2000));
+    html.push_str("</table>");
+    let m = bounded_within("math th", html, release_half_second());
+    assert!(m.text.len() < 200_000, "{} байт", m.text.len());
+    assert!(
+        m.text.contains("\n| x |\n"),
+        "{}",
+        &m.text[m.text.len() - 100..]
+    );
+}
+
 /// Строит семь страниц с разнообразным, но обычным строением.
 fn realistic_pages() -> Vec<(&'static str, String)> {
     // 1. Длинная статья: разделы, заголовки, абзацы со ссылками и форматированием, списки.
