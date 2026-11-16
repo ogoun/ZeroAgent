@@ -285,10 +285,12 @@ async fn html_over_2_mib_is_cut_before_stdin() {
     );
 }
 
-/// 300 000 вложенных `<div>` (в пределах 2 МиБ): подпроцесс укладывается (страж даёт
-/// `simplified`) или падает — процесс теста жив, результат `Ok` или `Err(Failed)`.
+/// 300 000 вложенных `<div>` (в пределах 2 МиБ): страж даёт упрощённый разбор, подпроцесс
+/// не падает. Оракул строгий (m2 финального ревью извлечения): прежде тест принимал и
+/// `Err(Failed)`, и регрессия стража, после которой подпроцесс снова падает на глубине, его не
+/// роняла. Путь падения подпроцесса — `crashed_child_is_failed`.
 #[tokio::test(flavor = "multi_thread")]
-async fn deep_html_kills_only_child() {
+async fn deep_html_is_simplified_in_child() {
     let tmp = dir("deep");
     let page = format!("{}deep text", "<div>".repeat(300_000));
     let r = within(
@@ -298,9 +300,11 @@ async fn deep_html_kills_only_child() {
     )
     .await;
     match r {
-        Ok(md) => assert!(md.simplified, "глубокая вложенность — упрощённый разбор"),
-        Err(ExtractError::Failed(_)) => {}
-        Err(e) => panic!("ожидался Ok или Failed: {e:?}"),
+        Ok(md) => {
+            assert!(md.simplified, "глубокая вложенность — упрощённый разбор");
+            assert!(md.text.contains("deep text"), "{}", md.text);
+        }
+        Err(e) => panic!("ожидался упрощённый разбор, а не {e:?}"),
     }
 }
 
