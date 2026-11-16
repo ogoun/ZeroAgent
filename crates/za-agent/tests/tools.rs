@@ -606,6 +606,54 @@ async fn ask_user_answer_is_cleaned() {
     );
 }
 
+/// Minor 3 повторного ревью финального прохода: соседние каналы текста пользователя тоже
+/// очищаются уровнем `Clean::Input` до модели — запасная форма ответа `ask_user` без
+/// строкового `answer` (канонический JSON решения) и заметка отказа в одобрении.
+#[tokio::test]
+async fn user_note_and_fallback_answer_are_cleaned() {
+    let (s, j, run) = setup("ask_user_fallback_clean").await;
+    let reg = registry(builtin_tools());
+    let calls = [planned("q1", "ask_user", json!({"question": "какой?"}))];
+    let e = env(run, RunMode::Ask, true);
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let int = out.suspend.expect("вопрос");
+    s.resolve_interrupt(
+        &int.id,
+        json!({"answer": 5, "note": "a\u{202E}b\u{200B}c \u{1F468}\u{200D}\u{1F469}"}),
+    )
+    .await
+    .unwrap();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]),
+        (
+            "q1",
+            "{\"answer\":5,\"note\":\"abc \u{1F468}\u{200D}\u{1F469}\"}",
+            false
+        )
+    );
+
+    let (s, j, run) = setup("denied_note_clean").await;
+    let log = SharedLog::default();
+    let reg = registry(vec![tool("edit", ToolKind::Edit, 0, &log)]);
+    let calls = [planned("e1", "edit", json!({"path": "a"}))];
+    let e = env(run, RunMode::Ask, true);
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let id = out.suspend.expect("одобрение").id;
+    s.resolve_interrupt(
+        &id,
+        json!({"approved": false, "note": "no\u{202E}pe\u{E0041}"}),
+    )
+    .await
+    .unwrap();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]),
+        ("e1", "denied by user: nope", true)
+    );
+}
+
 #[tokio::test]
 async fn tool_output_escaped_and_verbatim() {
     let (s, j, run) = setup("escaped").await;

@@ -1590,24 +1590,32 @@ async fn read_or_open(ctx: &RunCtx, int: &Interrupt) -> Result<Option<Value>, St
     }
 }
 
-/// Результат отказа пользователя (D16): `denied by user: {note}`, заметка экранируется.
+/// Результат отказа пользователя (D16): `denied by user: {note}`. Заметка — ввод
+/// пользователя: очищается уровнем `Clean::Input` (SEC-051, D102; Minor 3 повторного ревью
+/// финального прохода), как ответ `ask_user`, и экранируется.
 fn denied_by_user(v: &Value) -> String {
     match v.get("note").and_then(Value::as_str) {
-        Some(note) if !note.is_empty() => format!("denied by user: {}", escape_untrusted(note)),
+        Some(note) if !note.is_empty() => format!(
+            "denied by user: {}",
+            escape_untrusted(&clean_invisible(note, Clean::Input).0)
+        ),
         _ => "denied by user".to_owned(),
     }
 }
 
 /// Ответ пользователя на `ask_user` (D16: `{"answer": str}`); иная форма — канонический JSON.
 /// Текст ответа пользователя на `ask_user` — очищенный уровнем `Clean::Input` (SEC-051, D102;
-/// Minor 9 финального ревью скиллов), как задача run и ввод `inbox`. Чистая функция
-/// записанного ответа: реплей даёт тот же текст.
+/// Minor 9 финального ревью скиллов), как задача run и ввод `inbox`; запасная форма тоже
+/// (Minor 3 повторного ревью финального прохода): `serde_json` не экранирует bidi и нулевую
+/// ширину. Чистая функция записанного ответа: реплей даёт тот же текст.
 fn answer(v: &Value) -> String {
     match v.get("answer").and_then(Value::as_str) {
         Some(a) => clean_invisible(a, Clean::Input).0.into_owned(),
         None => {
             tracing::warn!("ответ ask_user без строкового answer");
-            canonical_json(v)
+            clean_invisible(&canonical_json(v), Clean::Input)
+                .0
+                .into_owned()
         }
     }
 }
