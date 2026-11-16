@@ -14,7 +14,7 @@ fn pack_is_complete_and_valid() {
         [
             "diagnose",
             "domain-model",
-            "doubt",
+            "evidence",
             "grill",
             "handoff",
             "orient",

@@ -1,6 +1,6 @@
 ---
 name: router
-description: Use when you are unsure which skill fits the current step, or whether to load any skill at all.
+description: Use when the next step could go to more than one skill, or to none.
 ---
 # Router
 
@@ -14,7 +14,7 @@ Pick at most one skill for the current step, or none.
 - write code test first: tdd
 - find the cause of a fault: diagnose
 - check a change: review
-- check your own conclusion before reporting it: doubt
+- back a report on this run with tool results from its journal: evidence
 - rely on exact library or API behavior: source-driven
 - answer from web sources: research-with-citations
 - pin down terms or record a decision: domain-model
@@ -31,7 +31,7 @@ A skill catalog, when one is shown, may list more skills; each description says 
 5. To load it, call the skill tool with the exact name if that tool is listed. If it is not, tell the user which skill fits: they can load it by typing a slash and its name, for example /tdd.
 
 ## A typical path for a new feature
-grill, spec, tickets, then for each ticket tdd, review and doubt. In an unfamiliar codebase start with orient.
+grill, spec, tickets, then for each ticket tdd, review and evidence. In an unfamiliar codebase start with orient.
 
 ## No skill when
 - The task is a small, clear change or a direct question.

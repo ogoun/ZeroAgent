@@ -34,7 +34,7 @@ macro_rules! pack {
 pack![
     "diagnose",
     "domain-model",
-    "doubt",
+    "evidence",
     "grill",
     "handoff",
     "orient",

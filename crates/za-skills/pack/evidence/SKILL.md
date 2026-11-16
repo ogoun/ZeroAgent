@@ -1,10 +1,10 @@
 ---
-name: doubt
-description: Use when you are about to tell the user that work is done, a bug is fixed or something works, before you send that reply.
+name: evidence
+description: Use when a reply will report what this run did, so that each statement in it rests on a tool result from the run journal.
 ---
-# Doubt
+# Evidence
 
-Every tool call of this run and its result are kept in the run journal. A claim of success is worth only what that record shows, so hold each part of the claim against it before you report. Tools named here are used if available.
+Every tool call of this run and its result are kept in the run journal. A statement about what the run did is worth only what that record shows, so hold each part of the reply against it before you send it. Tools named here are used if available.
 
 ## Steps
 1. Split the reply you are about to send into single statements: what you changed, what now works, which checks pass, what you left alone. Count the implied ones too, such as "the other callers still work".
@@ -20,6 +20,6 @@ Every tool call of this run and its result are kept in the run journal. A claim 
 Every statement in the reply has an observation from this run, a named outside source, or an explicit "not checked".
 
 ## Do not
-- Use soft words such as "should work" or "probably fixed" to cover a missing check.
+- Describe an expectation as if it were an observation.
 - Count an edit as proof: it shows what you wrote, not how the code behaves.
 - Leave a failed or skipped check out of the reply. Report it with the line that shows it.
