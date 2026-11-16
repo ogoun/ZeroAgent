@@ -7,19 +7,22 @@
 //! **Строгое подмножество.** Хосты ищутся только у сегментов, которые сетевыми считает
 //! [`crate::is_network`]. Хост берётся из слова-URL со схемой, из адреса `ssh`, `sftp`,
 //! из scp-формы `[user@]host:path` у `scp`, `rsync`, из слова-репозитория подкоманды git
-//! (refspec не разбирается). Слово, которое нельзя однозначно отнести к хосту, — `unknown`,
-//! а не хост: хост не найден; имя удалённого репозитория git или незнакомая опция git; у
-//! команд загрузки (`curl`, `wget`, `iwr`…) — позиционное слово без схемы (адрес без схемы,
-//! значение незнакомой опции); адрес не URL (`nc`, `socat`, `telnet`…: хосты из URL только
-//! добавляются); хост записан не буквально (`$`, `%`, `{…}`, текст после `]`); сегмент с
-//! подстановкой или вложенной интерпретацией (`has_subst`, в том числе `ssh host команда`)
-//! или неразобран; ключ подмены адреса — `ssh -J`, `-o ProxyJump|ProxyCommand|HostName|
-//! Canonical*|Include` (и в связке `-vo`), `-F`, `sftp|scp -S`, `curl -x`, `--proxy`,
-//! `--connect-to`, `--resolve`, `-K`, `wget -e|-i`, `rsync -e`, `git -c` с прокси,
-//! `sshCommand` или `insteadOf`, переменные `*_proxy`, `GIT_SSH*`. Без правил по домену ни
-//! хосты, ни `unknown` ни на что не влияют (D105).
+//! (refspec не разбирается). Опции всех утилит разбирает одна функция [`walk`] по таблице
+//! утилиты ([`Spec`]): опция не точно из таблицы — незнакомая буква или имя, сокращение
+//! имени, значение у флага — даёт `unknown`. Слово, которое нельзя однозначно отнести к
+//! хосту, — `unknown`, а не хост: хост не найден; имя удалённого репозитория git или адрес
+//! git `<транспорт>::…`; у команд загрузки (`curl`, `wget`, `iwr`…) — позиционное слово без
+//! схемы; адрес не URL (`nc`, `socat`, `telnet`…: хосты из URL только добавляются); хост
+//! записан не буквально (`$`, `%`, `{…}`, текст после `]`); сокет `/dev/tcp`, `/dev/udp` в
+//! слове или перенаправлении; сегмент с подстановкой или вложенной интерпретацией
+//! (`has_subst`, в том числе `ssh host команда`) или неразобран; ключ подмены адреса —
+//! `ssh -J`, `-o ProxyJump|ProxyCommand|HostName|Canonical*|Include` (и в связке `-vo`),
+//! `-F`, `sftp|scp -S|-D`, `curl -x`, `--proxy`, `--connect-to`, `--resolve`, `-K`,
+//! `wget -e|-i|--config`, `rsync -e`, `git -c` с прокси, `sshCommand` или `insteadOf`,
+//! переменные `*_proxy`, `GIT_SSH*`, `POSIXLY_CORRECT`. Без правил по домену ни хосты, ни
+//! `unknown` ни на что не влияют (D105).
 
-use crate::classify::{git_split, net_cmd};
+use crate::classify::{git_split, net_cmd, uses_dev_net};
 use crate::command::{Inner, analyze};
 use crate::lex::lex_code;
 use crate::{Dialect, Lang, Segment};
@@ -35,107 +38,166 @@ pub struct NetHosts {
     pub unknown: bool,
 }
 
-/// Опции команды: со значением отдельным словом и ключи подмены адреса. Длинные имена —
-/// в нижнем регистре (PowerShell без учёта регистра), короткие — буквы.
+/// Таблица опций утилиты для [`walk`] — одна модель разбора для всех утилит (повторное
+/// ревью задачи 3). Таблица не обязана быть полной: опция вне неё даёт `unknown` (вопрос),
+/// но не хост. Ключ подмены адреса (`bad_*`) берёт значение. Без букв (`flags` и `vals`
+/// пусты) слово с `-` — имя целиком: PowerShell, git (`-q`; связка `-fu` и `-j4` —
+/// `unknown`).
 struct Spec {
     /// Опции, значение которых — адрес запроса (`curl --url`, `iwr -Uri`).
     urls: &'static [&'static str],
-    vals_short: &'static str,
+    /// Буквы без значения и со значением: связка `-sLo файл`, значение в слове `-ofile`.
+    flags: &'static str,
+    vals: &'static str,
+    flags_long: &'static [&'static str],
     vals_long: &'static [&'static str],
     bad_short: &'static str,
     bad_long: &'static [&'static str],
+    /// Имена без учёта регистра (PowerShell; в таблице — нижний регистр).
+    ci: bool,
+    /// Опции только до первого позиционного слова (getopt OpenSSH у `scp`).
+    posix: bool,
 }
 
+/// Опции неизвестны (`http`, `xh`, `aria2c`): любая опция — `unknown`.
+#[rustfmt::skip]
+const NONE: Spec = Spec { urls: &[], flags: "", vals: "", flags_long: &[], vals_long: &[],
+    bad_short: "", bad_long: &[], ci: false, posix: false };
+
+/// curl 8.x: длинные имена — только точные (сокращений curl не принимает).
 #[rustfmt::skip]
 const CURL: Spec = Spec {
     urls: &["--url"],
-    vals_short: "AbcCdDeEFHKmoPQrTuUwxXyYz",
-    vals_long: &["--data", "--data-raw", "--data-binary", "--data-urlencode", "--json",
-        "--header", "--output", "--output-dir", "--request", "--user", "--user-agent",
-        "--referer", "--cookie", "--cookie-jar", "--form", "--upload-file", "--write-out",
-        "--max-time", "--connect-timeout", "--retry", "--retry-delay", "--retry-max-time",
-        "--cacert", "--cert", "--key", "--range", "--continue-at", "--limit-rate",
-        "--dump-header", "--max-filesize", "--oauth2-bearer", "--proxy", "--preproxy", "--noproxy",
-        "--connect-to", "--resolve", "--config", "--doh-url"],
+    flags: "#012346aBfgGiIjJklLMnNOpqRsSvVZ",
+    vals: "AbcCdDeEFHmoPQrtTuUwXyYz",
+    flags_long: &["--silent", "--show-error", "--location", "--location-trusted", "--fail",
+        "--fail-with-body", "--fail-early", "--insecure", "--verbose", "--include",
+        "--show-headers", "--head", "--get", "--globoff", "--compressed", "--remote-name",
+        "--remote-name-all", "--remote-header-name", "--remote-time", "--create-dirs",
+        "--no-buffer", "--no-progress-meter", "--progress-bar", "--http1.0", "--http1.1",
+        "--http2", "--http3", "--ipv4", "--ipv6", "--tlsv1.2", "--tlsv1.3", "--ssl-reqd",
+        "--no-keepalive", "--raw", "--parallel", "--netrc", "--netrc-optional", "--append",
+        "--list-only", "--path-as-is", "--retry-all-errors", "--retry-connrefused", "--basic",
+        "--digest", "--anyauth", "--no-clobber", "--remove-on-error", "--version"],
+    vals_long: &["--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii",
+        "--json", "--url-query", "--header", "--output", "--output-dir", "--request", "--user",
+        "--user-agent", "--referer", "--cookie", "--cookie-jar", "--form", "--form-string",
+        "--upload-file", "--write-out", "--max-time", "--connect-timeout", "--retry",
+        "--retry-delay", "--retry-max-time", "--cacert", "--capath", "--cert", "--cert-type",
+        "--key", "--key-type", "--pass", "--range", "--continue-at", "--limit-rate",
+        "--dump-header", "--max-filesize", "--oauth2-bearer", "--noproxy", "--trace",
+        "--trace-ascii", "--stderr", "--speed-time", "--speed-limit", "--time-cond"],
     bad_short: "xK",
-    bad_long: &["--connect-to", "--resolve", "--config", "--doh-url"],
+    bad_long: &["--proxy", "--preproxy", "--connect-to", "--resolve", "--config", "--doh-url",
+        "--unix-socket", "--abstract-unix-socket", "--dns-servers"],
+    ..NONE
 };
 
+/// wget 1.x (getopt_long принимает сокращения — у нас они `unknown`); `-n` берёт буквы
+/// (`-nv`, `-np`); `-H` (обход чужих хостов) нет в таблице.
 #[rustfmt::skip]
 const WGET: Spec = Spec {
-    urls: &[],
-    vals_short: "aABDeIilOoPQRtTUwX",
+    flags: "46bcdEFhkKLmNpqrSvVx",
+    vals: "aABDIlnoOPQRtTUwX",
+    flags_long: &["--quiet", "--verbose", "--no-verbose", "--debug", "--continue",
+        "--timestamping", "--no-clobber", "--no-check-certificate", "--server-response",
+        "--spider", "--recursive", "--no-parent", "--mirror", "--page-requisites",
+        "--convert-links", "--adjust-extension", "--content-disposition", "--show-progress",
+        "--no-proxy", "--no-config", "--inet4-only", "--inet6-only", "--force-directories",
+        "--no-directories", "--no-host-directories", "--retry-connrefused", "--no-cache",
+        "--no-cookies", "--keep-session-cookies", "--https-only", "--save-headers", "--version"],
     vals_long: &["--output-file", "--append-output", "--output-document", "--directory-prefix",
-        "--tries", "--timeout", "--wait", "--user-agent", "--header", "--user", "--password",
-        "--post-data", "--level", "--accept", "--reject", "--domains", "--execute",
-        "--input-file"],
+        "--tries", "--timeout", "--connect-timeout", "--read-timeout", "--wait", "--waitretry",
+        "--user-agent", "--header", "--user", "--password", "--http-user", "--http-password",
+        "--post-data", "--post-file", "--body-data", "--body-file", "--method", "--referer",
+        "--level", "--accept", "--reject", "--domains", "--cut-dirs", "--max-redirect",
+        "--limit-rate", "--quota", "--load-cookies", "--save-cookies", "--ca-certificate",
+        "--progress"],
     bad_short: "ei",
-    bad_long: &["--execute", "--input-file"],
+    bad_long: &["--execute", "--input-file", "--config"],
+    ..NONE
 };
 
+/// `Invoke-WebRequest`, `Invoke-RestMethod`, `Start-BitsTransfer` (PowerShell принимает
+/// однозначный префикс имени — у нас он `unknown`).
 #[rustfmt::skip]
 const PWSH_WEB: Spec = Spec {
     urls: &["-uri", "-source"],
-    vals_short: "",
-    vals_long: &["-outfile", "-method", "-headers", "-body", "-contenttype", "-useragent",
-        "-timeoutsec", "-credential", "-infile", "-sessionvariable", "-websession",
-        "-maximumredirection", "-maximumretrycount", "-retryintervalsec", "-certificate",
-        "-certificatethumbprint", "-transferencoding", "-form", "-proxy", "-proxycredential",
-        "-destination"],
-    bad_short: "",
-    bad_long: &[],
+    flags_long: &["-usebasicparsing", "-usedefaultcredentials", "-disablekeepalive",
+        "-passthru", "-skipcertificatecheck", "-skipheadervalidation", "-skiphttperrorcheck",
+        "-noproxy", "-resume", "-asynchronous", "-verbose"],
+    vals_long: &["-outfile", "-method", "-custommethod", "-headers", "-body", "-contenttype",
+        "-useragent", "-timeoutsec", "-credential", "-authentication", "-token", "-infile",
+        "-sessionvariable", "-websession", "-maximumredirection", "-maximumretrycount",
+        "-retryintervalsec", "-certificate", "-certificatethumbprint", "-transferencoding",
+        "-form", "-proxycredential", "-sslprotocol", "-httpversion", "-destination",
+        "-displayname", "-description", "-priority", "-transfertype", "-erroraction", "-ea"],
+    bad_long: &["-proxy"],
+    ci: true,
+    ..NONE
 };
 
-/// Опции `ssh` со значением (как у вложенной интерпретации `ssh host команда`).
+/// `ssh` (OpenSSH 9.x; со значением — как у вложенной интерпретации `ssh host команда`).
 #[rustfmt::skip]
-const SSH: Spec = Spec {
-    urls: &[],
-    vals_short: "bcDEeFIiJLlmOopPQRSWwB",
-    vals_long: &[],
-    bad_short: "JF",
-    bad_long: &[],
-};
+const SSH: Spec = Spec { flags: "1246afgknqstvxyACGKMNTVXY", vals: "bceilmopBDEILOPQRSwW",
+    bad_short: "FJ", ..NONE };
 
-/// Опции `sftp` — свои (`-P port`, `-s subsystem`), не как у `ssh`; `-S` — программа
-/// соединения.
-const SFTP: Spec = Spec {
-    urls: &[],
-    vals_short: "BbcDFiJloPRSsX",
-    vals_long: &[],
-    bad_short: "JFS",
-    bad_long: &[],
-};
+/// `sftp` — свои опции (`-P port`, `-s subsystem`); `-S`, `-D` — программа вместо ssh.
+#[rustfmt::skip]
+const SFTP: Spec = Spec { flags: "1246AafhNpqrvC", vals: "bBcilosPRX", bad_short: "DFJS",
+    ..NONE };
 
-const SCP: Spec = Spec {
-    urls: &[],
-    vals_short: "cDFiJloPSX",
-    vals_long: &[],
-    bad_short: "JFS",
-    bad_long: &[],
-};
+/// `scp`: как `sftp`; getopt OpenSSH не переставляет опции — после первого позиционного
+/// слова все слова позиционные (`scp b:y -P a:x` копирует и на `a`).
+#[rustfmt::skip]
+const SCP: Spec = Spec { flags: "346ABCOpqRrsTv", vals: "ciloPX", bad_short: "DFJS",
+    posix: true, ..NONE };
 
+/// rsync 3.x (popt).
+#[rustfmt::skip]
 const RSYNC: Spec = Spec {
-    urls: &[],
-    vals_short: "eBfMT",
-    vals_long: &[
-        "--rsh",
-        "--exclude",
-        "--include",
-        "--filter",
-        "--rsync-path",
-    ],
+    flags: "0468aAbcCdDEFgHhiIJkKlLmnNoOpPqrRsStuUvVWxXyz",
+    vals: "BfMT@",
+    flags_long: &["--archive", "--verbose", "--quiet", "--recursive", "--compress",
+        "--checksum", "--delete", "--delete-after", "--delete-before", "--delete-excluded",
+        "--dry-run", "--progress", "--partial", "--human-readable", "--stats", "--update",
+        "--links", "--copy-links", "--safe-links", "--hard-links", "--perms", "--times",
+        "--group", "--owner", "--devices", "--specials", "--acls", "--xattrs", "--sparse",
+        "--whole-file", "--inplace", "--append-verify", "--backup", "--relative",
+        "--itemize-changes", "--mkpath", "--remove-source-files", "--ignore-existing",
+        "--existing", "--size-only", "--one-file-system", "--prune-empty-dirs", "--numeric-ids",
+        "--force", "--no-motd", "--ipv4", "--ipv6", "--cvs-exclude", "--ignore-times",
+        "--dirs", "--protect-args", "--secluded-args", "--list-only", "--version"],
+    vals_long: &["--exclude", "--include", "--filter", "--exclude-from", "--include-from",
+        "--files-from", "--chown", "--chmod", "--backup-dir", "--suffix", "--link-dest",
+        "--compare-dest", "--copy-dest", "--timeout", "--contimeout", "--bwlimit",
+        "--max-size", "--min-size", "--max-delete", "--info", "--out-format", "--log-file",
+        "--partial-dir", "--temp-dir", "--compress-level", "--block-size", "--password-file",
+        "--port"],
     bad_short: "e",
     bad_long: &["--rsh", "--rsync-path"],
+    ..NONE
 };
 
-/// Опции неизвестны (`http`, `xh`, `aria2c`): каждая — без значения, поэтому значение любой
-/// опции становится позиционным словом без схемы и даёт `unknown` (безопасная сторона).
-const NONE: Spec = Spec {
-    urls: &[],
-    vals_short: "",
-    vals_long: &[],
-    bad_short: "",
-    bad_long: &[],
+/// git `clone`, `fetch`, `pull`, `push`, `ls-remote`, `remote add`: флаги без значения и
+/// опции со значением (`--depth 1`, `--depth=1`). Не входят буквы с разным смыслом у
+/// подкоманд (`-u`: у `clone` — upload-pack, у `push` — set-upstream; `-s`, `-t`) и опции,
+/// меняющие адрес или добавляющие хосты (`-c`, `--config`, `--upload-pack`, `--bundle-uri`,
+/// `--recurse-submodules`, `--repo`). Ни один флаг не берёт значение ни у одной подкоманды.
+#[rustfmt::skip]
+const GIT: Spec = Spec {
+    flags_long: &["-q", "--quiet", "-v", "--verbose", "--progress", "--no-progress", "-4", "-6",
+        "--ipv4", "--ipv6", "--bare", "--mirror", "-n", "--no-checkout", "--dry-run",
+        "--single-branch", "--no-single-branch", "--tags", "--no-tags", "-l", "--local",
+        "--no-hardlinks", "--all", "-a", "--append", "-f", "--force", "-p", "--prune",
+        "--atomic", "--follow-tags", "--set-upstream", "-d", "--delete", "--no-verify",
+        "--unshallow", "--ff-only", "--ff", "--no-ff", "--rebase", "-r", "--no-rebase",
+        "--heads", "--refs", "--force-with-lease", "--signed", "--exit-code"],
+    vals_long: &["-b", "--branch", "-o", "--origin", "--push-option", "--server-option", "-j",
+        "--jobs", "--depth", "--deepen", "--shallow-since", "--shallow-exclude", "--filter",
+        "--reference", "--reference-if-able", "--separate-git-dir", "--template", "-m",
+        "--sort", "-X", "--strategy", "--strategy-option"],
+    ..NONE
 };
 
 /// Хосты сегмента и сегментов его строки вложенной интерпретации (D104).
@@ -168,7 +230,9 @@ fn seg_hosts(seg: &Segment, lang: Lang, out: &mut NetHosts) {
     if !net_cmd(seg, lang) {
         return;
     }
-    out.unknown |= seg.has_subst || seg.argv.iter().any(|w| redirecting_word(w));
+    // Сокет bash (`> /dev/tcp/h/80`) соединяется с хостом мимо разбора аргументов.
+    out.unknown |=
+        seg.has_subst || uses_dev_net(seg) || seg.argv.iter().any(|w| redirecting_word(w));
     let mut found = false;
     let mut add = |out: &mut NetHosts, h: Option<&str>| {
         found = true;
@@ -218,9 +282,12 @@ fn seg_hosts(seg: &Segment, lang: Lang, out: &mut NetHosts) {
         "git" => {
             let (i, _) = git_split(a);
             out.unknown |= git_opts(a.get(..i).unwrap_or(a)) || ssh_opts(a);
-            match git_repo(a, i) {
-                Some(r) => add(out, url_word(r).or_else(|| scp_host(r))),
-                None => out.unknown = true,
+            let r = git_repo(a, i).unwrap_or_default();
+            // `<транспорт>::<адрес>` — адрес толкует помощник `git remote-<транспорт>`: хост
+            // неизвестен (`found` не ставится), хост адреса-URL только добавляется.
+            match r.split_once("::").filter(|(t, _)| scheme(t)) {
+                Some((_, x)) => url_word(x).into_iter().for_each(|h| push(out, Some(h))),
+                None => add(out, url_word(r).or_else(|| scp_host(r))),
             }
         }
         // Прочие сетевые команды и выражения: адрес не URL (`nc`, `socat`…) или не
@@ -238,49 +305,50 @@ fn seg_hosts(seg: &Segment, lang: Lang, out: &mut NetHosts) {
     }
 }
 
-/// Позиционные слова и признак ключа подмены адреса.
-fn walk<'a>(args: &'a [String], spec: &Spec) -> (Vec<&'a str>, bool) {
-    let mut pos = Vec::new();
-    let mut bad = false;
-    let mut i = 0;
-    while let Some(a) = args.get(i) {
+/// Позиционные слова и признак `unknown` по таблице утилиты: ключ подмены адреса или опция
+/// не точно из таблицы. Опции — в любом месте (GNU getopt, popt, git, PowerShell), у
+/// `posix` — до первого позиционного слова.
+fn walk<'a>(args: &'a [String], s: &Spec) -> (Vec<&'a str>, bool) {
+    let (mut pos, mut bad, mut i) = (Vec::new(), false, 0);
+    let letters = !(s.flags.is_empty() && s.vals.is_empty());
+    while let Some(a) = args.get(i).map(String::as_str) {
         i += 1;
         if a == "--" {
             pos.extend(args[i..].iter().map(String::as_str));
             break;
         }
-        if a.len() < 2 || !a.starts_with('-') {
-            pos.push(a.as_str());
+        if a.len() < 2 || !a.starts_with('-') || (s.posix && !pos.is_empty()) {
+            pos.push(a);
             continue;
         }
-        let (name, val) = match a.split_once(['=', ':']) {
-            Some((n, v)) => (n.to_lowercase(), Some(v)),
-            None => (a.to_lowercase(), None),
-        };
-        if spec.urls.contains(&name.as_str()) {
-            match val {
-                Some(v) => pos.push(v),
-                None => pos.extend(args.get(i).map(String::as_str)),
+        if a.starts_with("--") || !letters {
+            let (n, v) = a
+                .split_once(['=', ':'])
+                .map_or((a, None), |(n, v)| (n, Some(v)));
+            let n = if s.ci {
+                n.to_lowercase()
+            } else {
+                n.to_string()
+            };
+            let has = |l: &[&str]| l.contains(&n.as_str());
+            let takes = has(s.urls) || has(s.vals_long) || has(s.bad_long);
+            bad |= has(s.bad_long) || !(takes || (has(s.flags_long) && v.is_none()));
+            let v = match v {
+                None if takes => args.get(i).map(String::as_str).inspect(|_| i += 1),
+                v => v,
+            };
+            if has(s.urls) {
+                pos.extend(v);
             }
-            i += usize::from(val.is_none());
             continue;
         }
-        if spec.vals_long.contains(&name.as_str()) || spec.bad_long.contains(&name.as_str()) {
-            bad |= spec.bad_long.contains(&name.as_str());
-            i += usize::from(val.is_none());
-            continue;
-        }
-        if a.starts_with("--") || spec.vals_short.is_empty() {
-            continue;
-        }
-        // Связка коротких опций: буква со значением забирает остаток слова или следующее.
-        let body = &a[1..];
-        for (k, ch) in body.char_indices() {
-            bad |= spec.bad_short.contains(ch);
-            if spec.vals_short.contains(ch) {
-                if k + ch.len_utf8() == body.len() {
-                    i += 1;
-                }
+        // Связка букв: буква со значением забирает остаток слова или следующее слово,
+        // незнакомая буква — `unknown`, остаток слова не разбирается.
+        for (k, ch) in a[1..].char_indices() {
+            let takes = s.vals.contains(ch) || s.bad_short.contains(ch);
+            bad |= s.bad_short.contains(ch) || !(takes || s.flags.contains(ch));
+            if !s.flags.contains(ch) {
+                i += usize::from(takes && k + ch.len_utf8() == a.len() - 1);
                 break;
             }
         }
@@ -289,13 +357,18 @@ fn walk<'a>(args: &'a [String], spec: &Spec) -> (Vec<&'a str>, bool) {
 }
 
 /// Слово меняет адрес или способ соединения: опция с `proxy`/`socks` в имени,
-/// присваивание переменной прокси или команды ssh у git (`https_proxy=…`, `GIT_SSH=…`).
+/// присваивание переменной прокси или команды ssh у git (`https_proxy=…`, `GIT_SSH=…`) или
+/// `POSIXLY_CORRECT` (wget, rsync перестают переставлять опции: URL после опции — адрес).
 fn redirecting_word(w: &str) -> bool {
     let l = w.to_lowercase();
     if l.starts_with('-') {
-        let name = l.split(['=', ':']).next().unwrap_or("");
-        // Отказ от прокси (`wget --no-proxy`, `curl --noproxy`) адрес не меняет.
-        return !matches!(name, "--no-proxy" | "--noproxy")
+        let name = l
+            .split(['=', ':'])
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('-');
+        // Отказ от прокси (`wget --no-proxy`, `curl --noproxy`, `iwr -NoProxy`) адрес не меняет.
+        return !matches!(name, "no-proxy" | "noproxy")
             && (name.contains("proxy") || name.contains("socks"));
     }
     let Some((name, _)) = l.split_once('=') else {
@@ -305,13 +378,20 @@ fn redirecting_word(w: &str) -> bool {
         && (name.contains("proxy")
             || name.contains("sshcommand")
             || name.contains("ssh_command")
-            || name == "git_ssh")
+            || matches!(name, "git_ssh" | "posixly_correct"))
 }
 
 /// `-o` с ключом, меняющим адрес (`ProxyJump`, `ProxyCommand`, `HostName`, `Canonical*`,
 /// `Include`), у `ssh`, `scp`, `sftp`, `rsync`, git — и в связке коротких опций (`-vo`,
 /// `-qoKey=…`). Буква `o` внутри значения другой опции даёт лишний `unknown`, не пропуск.
 fn ssh_opts(a: &[String]) -> bool {
+    const KEYS: [&str; 5] = [
+        "proxyjump",
+        "proxycommand",
+        "hostname",
+        "canonical",
+        "include",
+    ];
     a.iter().enumerate().any(|(i, x)| {
         let Some(k) = x
             .strip_prefix('-')
@@ -325,41 +405,15 @@ fn ssh_opts(a: &[String]) -> bool {
             v => v,
         };
         let v = v.trim_start().to_lowercase();
-        [
-            "proxyjump",
-            "proxycommand",
-            "hostname",
-            "canonical",
-            "include",
-        ]
-        .iter()
-        .any(|p| v.starts_with(p))
+        KEYS.iter().any(|p| v.starts_with(p))
     })
 }
 
-/// Флаги git без значения и опции со значением (`--depth 1`, `--depth=1`) у `clone`,
-/// `fetch`, `pull`, `push`, `ls-remote`, `remote add`. Не входят буквы с разным смыслом у
-/// подкоманд (`-u`, `-s`, `-t`) и опции, меняющие адрес или добавляющие хосты (`-c`,
-/// `--config`, `--upload-pack`, `--bundle-uri`, `--recurse-submodules`, `--repo`).
-#[rustfmt::skip]
-const GIT_FLAGS: &[&str] = &["-q", "--quiet", "-v", "--verbose", "--progress", "--no-progress",
-    "-4", "-6", "--ipv4", "--ipv6", "--bare", "--mirror", "-n", "--no-checkout", "--dry-run",
-    "--single-branch", "--no-single-branch", "--tags", "--no-tags", "-l", "--local",
-    "--no-hardlinks", "--all", "-a", "--append", "-f", "--force", "-p", "--prune", "--atomic",
-    "--follow-tags", "--set-upstream", "-d", "--delete", "--no-verify", "--unshallow",
-    "--ff-only", "--ff", "--no-ff", "--rebase", "-r", "--no-rebase", "--heads", "--refs",
-    "--force-with-lease", "--signed", "--exit-code"];
-#[rustfmt::skip]
-const GIT_VALS: &[&str] = &["-b", "--branch", "-o", "--origin", "--push-option",
-    "--server-option", "-j", "--jobs", "--depth", "--deepen", "--shallow-since",
-    "--shallow-exclude", "--filter", "--reference", "--reference-if-able", "--separate-git-dir",
-    "--template", "-m", "--sort", "-X", "--strategy", "--strategy-option"];
-
 /// Слово-репозиторий подкоманды git `a[i]` (D104, C1 ревью задачи 3): первое позиционное
 /// слово, у `remote add` — второе (после имени); refspec и каталог назначения не
-/// разбираются. `None` — слова нет или есть опция вне [`GIT_FLAGS`] и [`GIT_VALS`] (до
-/// или после адреса: git переставляет опции): её значение могло стать словом-репозиторием,
-/// а сама она — сменить адрес.
+/// разбираются. `None` — слова нет или опция не из таблицы [`GIT`] (до или после адреса: git
+/// переставляет опции): её значение могло стать словом-репозиторием, а сама она — сменить
+/// адрес.
 fn git_repo(a: &[String], i: usize) -> Option<&str> {
     let rest = a.get(i + 1..)?;
     let (skip, rest) = match (a[i].as_str(), rest.first().map(String::as_str)) {
@@ -367,23 +421,8 @@ fn git_repo(a: &[String], i: usize) -> Option<&str> {
         ("clone" | "fetch" | "pull" | "push" | "ls-remote", _) => (0, rest),
         _ => return None,
     };
-    let (mut pos, mut opts) = (Vec::new(), true);
-    let mut it = rest.iter().map(String::as_str);
-    while let Some(x) = it.next() {
-        if opts && x == "--" {
-            opts = false;
-        } else if opts && x.len() > 1 && x.starts_with('-') {
-            let n = x.split_once('=').map_or(x, |(n, _)| n);
-            if GIT_VALS.contains(&n) && n == x {
-                it.next();
-            } else if !GIT_VALS.contains(&n) && !GIT_FLAGS.contains(&n) {
-                return None;
-            }
-        } else {
-            pos.push(x);
-        }
-    }
-    pos.get(skip).copied()
+    let (pos, bad) = walk(rest, &GIT);
+    pos.get(skip).copied().filter(|_| !bad)
 }
 
 /// Глобальные опции git до подкоманды: `-c` и `--config-env` с прокси, `sshCommand`,
@@ -417,11 +456,16 @@ fn url_host(w: &str) -> Option<&str> {
     Some(strip_port(hostport))
 }
 
-/// Слово целиком — URL со схемой: до `://` только символы схемы.
+/// Слово целиком — URL со схемой: до `://` только схема.
 fn url_word(w: &str) -> Option<&str> {
     w.split_once("://")
-        .is_some_and(|(s, _)| s.chars().all(scheme_char))
+        .is_some_and(|(s, _)| scheme(s))
         .then(|| url_host(w))?
+}
+
+/// Схема URL и имя транспорта git: буква, затем буквы, цифры, `+`, `.`, `-`.
+fn scheme(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(scheme_char)
 }
 
 fn scheme_char(c: char) -> bool {
@@ -441,11 +485,11 @@ fn strip_port(hp: &str) -> &str {
     hp.rsplit_once(':').map_or(hp, |(h, _)| h)
 }
 
-/// Адрес `ssh`, `sftp`: `[user@]host[:path]`.
+/// Адрес `ssh`, `sftp`: `[user@]host[:path]`; после `]` — только `:…` (как [`strip_port`]).
 fn dest_host(d: &str) -> Option<&str> {
     let h = d.rsplit_once('@').map_or(d, |(_, h)| h);
     if h.starts_with('[') {
-        return h.find(']').map(|e| &h[..=e]);
+        return Some(strip_port(h));
     }
     Some(h.split(':').next().unwrap_or(h))
 }

@@ -15,7 +15,9 @@ use za_shell::{Dialect, Segment, network_hosts};
 /// Нормализованный хост: снята одна последняя точка, нижний регистр, IDN — в punycode,
 /// IP-литерал — в каноническую запись `url::Host` без скобок (WHATWG: `0x7f.1` →
 /// `127.0.0.1`, `[::FFFF:127.0.0.1]` → `::ffff:7f00:1`). `None` — хост неизвестен:
-/// пустой, с пустой меткой (`a..b`, `.a`, `evil.test..`) или недопустимый.
+/// пустой, с пустой меткой (`a..b`, `.a`, `evil.test..`) или недопустимый. Пустая метка
+/// проверяется и после отображения UTS 46: оно превращает `。` (U+3002) и похожие символы
+/// в точку (`a。.test`, `a.test。` — `None`).
 pub fn normalize_host(raw: &str) -> Option<String> {
     let s = raw.strip_suffix('.').unwrap_or(raw).to_lowercase();
     if s.is_empty() || (!s.starts_with('[') && s.split('.').any(str::is_empty)) {
@@ -23,7 +25,7 @@ pub fn normalize_host(raw: &str) -> Option<String> {
     }
     let host = Host::parse(&s).ok()?;
     match &host {
-        Host::Domain(d) if d.is_empty() => None,
+        Host::Domain(d) if d.split('.').any(str::is_empty) => None,
         Host::Domain(d) => Some(d.clone()),
         Host::Ipv4(ip) => Some(ip.to_string()),
         // Запись `url` (сжатие нулей, IPv4 внутри — шестнадцатерично), не `std`.

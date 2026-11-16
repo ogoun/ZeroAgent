@@ -1389,9 +1389,15 @@ fn hosts_table_review() {
         ("curl --noproxy '*' https://a.test/", &["a.test"], false),
         ("curl --noproxy=* https://a.test/", &["a.test"], false),
     ];
+    let t: Vec<_> = t.iter().map(|&(c, w, u)| (c, B, w, u)).collect();
+    check_hosts(&t);
+}
+
+/// Таблица `(команда, диалект, хосты, unknown)`: все расхождения — в одном сообщении.
+fn check_hosts(t: &[(&str, Dialect, &[&str], bool)]) {
     let mut bad = Vec::new();
-    for (cmd, want, unknown) in t {
-        let h = hosts_of(cmd, B);
+    for (cmd, d, want, unknown) in t {
+        let h = hosts_of(cmd, *d);
         let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
         if (&h.hosts, h.unknown) != (&want, *unknown) {
             bad.push(format!(
@@ -1401,6 +1407,111 @@ fn hosts_table_review() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Повторное ревью задачи 3: при правилах по домену хост берётся только из строгого
+/// подмножества форм — опция вне таблицы утилиты (незнакомая буква или имя, сокращение,
+/// приклеенное значение у незнакомого имени) даёт `unknown`.
+#[test]
+fn hosts_table_strict() {
+    let t: &[(&str, Dialect, &[&str], bool)] = &[
+        // N-C1: `<транспорт>::<адрес>` у git — адрес толкует помощник `git remote-<транспорт>`.
+        ("git clone https::https://b.test/r", B, &["b.test"], true),
+        ("git ls-remote x::b.test", B, &[], true),
+        ("git push a.test::r main", B, &[], true),
+        ("git remote add up ext::b.test", B, &[], true),
+        // N-I1: `-D` у sftp и scp — локальная программа вместо ssh.
+        ("sftp -D prog me@a.test", B, &["a.test"], true),
+        ("scp -D prog x b.test:y", B, &["b.test"], true),
+        // N-I2: сокет bash в перенаправлении у команды с разбором.
+        (
+            "curl https://a.test/ > /dev/tcp/b.test/80",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "git clone https://a.test/r 2>/dev/udp/b.test/53",
+            B,
+            &["a.test"],
+            true,
+        ),
+        // N-I3: сокращение имени и незнакомое имя с приклеенным значением.
+        ("wget --config=x https://a.test/", B, &["a.test"], true),
+        (
+            "wget --exec=use_proxy=on https://a.test/",
+            B,
+            &["a.test"],
+            true,
+        ),
+        ("wget --output-doc=x https://a.test/", B, &["a.test"], true),
+        ("curl --frobnicate=x https://a.test/", B, &["a.test"], true),
+        (
+            "iwr https://a.test/ -Prox:http://p.test:1",
+            P,
+            &["a.test"],
+            true,
+        ),
+        ("iwr https://a.test/ -OutF:x", P, &["a.test"], true),
+        // Незнакомая буква.
+        ("curl -W https://a.test/", B, &["a.test"], true),
+        ("sftp -Z x me@s.test", B, &["x"], true),
+        ("rsync --frobnicate x h.test:/y", B, &["h.test"], true),
+        // Значение известной опции не становится хостом.
+        ("rsync --chown root:root x h.test:/y", B, &["h.test"], false),
+        // scp (getopt OpenSSH) разбирает опции только до первого позиционного слова.
+        ("scp b.test:y -P a.test:x", B, &["b.test", "a.test"], false),
+        // POSIXLY_CORRECT: wget и rsync перестают переставлять опции.
+        (
+            "POSIXLY_CORRECT=1 wget https://a.test/ -O https://b.test/",
+            B,
+            &["a.test"],
+            true,
+        ),
+        // m1 ревью: после `]` у адреса ssh — не порт и не путь.
+        ("ssh me@[::1]x.test", B, &[], true),
+        // Частые формы остаются определёнными.
+        (
+            "curl -fsSL --retry 3 --compressed -H 'A: b' -o out https://a.test/",
+            B,
+            &["a.test"],
+            false,
+        ),
+        (
+            "wget -q -nv -nc -O out --no-check-certificate https://a.test/",
+            B,
+            &["a.test"],
+            false,
+        ),
+        (
+            "rsync -avz --delete --progress --exclude=.git x h.test:/y",
+            B,
+            &["h.test"],
+            false,
+        ),
+        ("ssh -At -p 22 -i key me@h.test", B, &["h.test"], false),
+        ("scp -rp -P 22 x me@h.test:y", B, &["h.test"], false),
+        (
+            "irm https://a.test/ -UseBasicParsing -ErrorAction Stop",
+            P,
+            &["a.test"],
+            false,
+        ),
+        ("iwr https://a.test/ -NoProxy", P, &["a.test"], false),
+        (
+            "Start-BitsTransfer -Source https://a.test/f -Destination f",
+            P,
+            &["a.test"],
+            false,
+        ),
+        (
+            "git clone --depth 1 -b main https://a.test/r",
+            B,
+            &["a.test"],
+            false,
+        ),
+    ];
+    check_hosts(t);
 }
 
 #[test]

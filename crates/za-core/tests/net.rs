@@ -29,6 +29,11 @@ fn normalize_host_table() {
         ("a..b", None),
         (".a", None),
         ("..", None),
+        // Точка, которую даёт отображение UTS 46 (U+3002), — те же проверки (m2 повторного
+        // ревью задачи 3).
+        ("a\u{3002}.test", None),
+        ("a.test\u{3002}", None),
+        ("a\u{3002}test", Some("a.test")),
     ] {
         assert_eq!(normalize_host(raw).as_deref(), want, "{raw}");
     }

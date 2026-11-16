@@ -683,7 +683,7 @@ fn net_object(a: &[String]) -> bool {
 }
 
 /// Сокет `/dev/tcp`, `/dev/udp` в словах или перенаправлениях.
-fn uses_dev_net(seg: &Segment) -> bool {
+pub(crate) fn uses_dev_net(seg: &Segment) -> bool {
     seg.argv
         .iter()
         .any(|a| dev_net(a) || a.contains("/dev/tcp/"))
