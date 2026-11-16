@@ -978,9 +978,9 @@ fn assert_continuous(e: &Env, run: RunId) {
 /// - веб выключен (`[web] enabled = false`) во время паузы: `web_fetch` после resume не
 ///   исполняется — сайт второго запроса страницы не получает.
 ///
-/// Запись аудита `policy.loaded` при resume здесь не проверяется: сейчас она не пишется,
-/// если хэш политики не изменился (I1 ревью задачи 14, проход fix-14). Место для проверки
-/// отмечено `AUDIT(fix-14)`.
+/// Запись аудита `policy.loaded` при resume (I1 ревью задачи 14, проход fix-14; места
+/// отмечены `AUDIT(fix-14)`): без изменений — дубликата нет; выключенный веб — новая запись
+/// с `web_disabled` при том же хэше политики.
 #[test]
 fn resume_keeps_frozen_web_tools() {
     let site = FakeHttp::start(docs_site);
@@ -1039,7 +1039,12 @@ fn resume_keeps_frozen_web_tools() {
         "{r:?}"
     );
     assert_continuous(&e, run);
-    // AUDIT(fix-14): после I1 — запись `policy.loaded` этого resume с `search_host`.
+    // AUDIT(fix-14): resume сверяет `policy.loaded` с действующим снимком (I1 ревью задачи
+    // 14); ничего не менялось — дубликата нет, запись старта называет хост поставщика.
+    let loaded = e.audit("policy.loaded");
+    assert_eq!(loaded.len(), 1, "{loaded:?}");
+    assert_eq!(loaded[0].payload["search_host"], "127.0.0.1", "{loaded:?}");
+    assert_eq!(loaded[0].payload["web_disabled"], Value::Null, "{loaded:?}");
 
     // `[web.search] url` добавлен во время паузы: поиска в run нет.
     let srv = Fake::start(N_CTX, true, fetch_pause_fetch);
@@ -1071,7 +1076,11 @@ fn resume_keeps_frozen_web_tools() {
     );
     assert!(result_of(&srv.bodies(), "f2").contains("# Spawning"));
     assert_continuous(&e, run);
-    // AUDIT(fix-14): после I1 — запись `policy.loaded` этого resume с `search_host`.
+    // AUDIT(fix-14): `web_search` в run нет, исключения D126 у run нет — `search_host`
+    // по-прежнему пуст, новой записи нет.
+    let loaded = e.audit("policy.loaded");
+    assert_eq!(loaded.len(), 1, "{loaded:?}");
+    assert_eq!(loaded[0].payload["search_host"], Value::Null, "{loaded:?}");
 
     // Веб выключен во время паузы: `web_fetch` после resume не исполняется.
     let site_off = FakeHttp::start(docs_site);
@@ -1116,7 +1125,16 @@ fn resume_keeps_frozen_web_tools() {
     );
     assert_eq!(count(&events, EventKind::WebRequest), 2, "{events:?}");
     assert_continuous(&e, run);
-    // AUDIT(fix-14): после I1 — запись `policy.loaded` этого resume с `web_disabled`.
+    // AUDIT(fix-14): веб выключен между стартом и resume — новая запись `policy.loaded` с
+    // `web_disabled = "config"` при том же хэше политики (I1 ревью задачи 14).
+    let loaded = e.audit("policy.loaded");
+    assert_eq!(loaded.len(), 2, "{loaded:?}");
+    assert_eq!(loaded[0].payload["web_disabled"], Value::Null, "{loaded:?}");
+    assert_eq!(loaded[1].payload["web_disabled"], "config", "{loaded:?}");
+    assert_eq!(
+        loaded[1].payload["hash"], loaded[0].payload["hash"],
+        "{loaded:?}"
+    );
 }
 
 // ---- Секрет в URL ----

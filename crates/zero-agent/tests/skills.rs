@@ -336,6 +336,65 @@ fn project_disables_web_tools() {
     );
 }
 
+/// Модель: поиск, вопрос пользователю (пауза), после ответа — второй поиск, ответ. Решает по
+/// числу результатов инструментов в последнем запросе (реплей после паузы её не путает).
+fn search_pause_search(seen: &[Value]) -> Response {
+    let results = seen.last().unwrap()["messages"]
+        .as_array()
+        .map_or(0, |m| m.iter().filter(|m| m["role"] == "tool").count());
+    match results {
+        0 => call_reply("s1", "web_search", "{\"query\":\"tokio spawn\"}"),
+        1 => call_reply("q1", "ask_user", "{\"question\":\"Искать дальше?\"}"),
+        2 => call_reply("s2", "web_search", "{\"query\":\"tokio join\"}"),
+        _ => text_reply(&["готово"]),
+    }
+}
+
+/// I1 ревью задачи 14: `[web.search] url` сменили во время паузы на другой хост — resume
+/// ищет у нового поставщика и пишет новую запись `policy.loaded` с его `search_host` (D105,
+/// D126: хост единственного исключения фильтра виден в аудите), хотя хэш политики тот же.
+#[test]
+fn resume_audits_new_search_host() {
+    let a = FakeHttp::start(searx);
+    let b = FakeHttp::start(searx);
+    let srv = Fake::start(N_CTX, true, search_pause_search);
+    let cfg = |url: &str| {
+        format!(
+            "{}\n[web.search]\nurl = \"{url}\"\n",
+            llama_config(&srv.base)
+        )
+    };
+    let e = env_in(GROUP, "resume-search-host", &cfg(&a.base));
+    let first = e.run_cmd(&["Найди про tokio"]);
+    assert_eq!(first.code(), Some(3), "{first:?}");
+    let id = support::process::interrupt_id(&first);
+    assert_eq!(e.answer(&id, "да").code(), Some(0));
+    std::fs::write(
+        e.home.join("config.toml"),
+        cfg(&format!("http://search-b.test:{}", b.port)),
+    )
+    .unwrap();
+    let resolve = format!("search-b.test=127.0.0.1:{}", b.port);
+    let run = run_id(&first).to_string();
+    let r = e.run_cmd(&["--web-resolve", &resolve, "--resume", &run]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert_eq!(a.requests().len(), 1, "{:?}", a.requests());
+    let probes = b.requests();
+    assert_eq!(probes.len(), 1, "{probes:?}");
+    assert!(probes[0].starts_with("/search?q=tokio+join"), "{probes:?}");
+    let loaded = e.audit("policy.loaded");
+    assert_eq!(loaded.len(), 2, "{loaded:?}");
+    assert_eq!(loaded[0].payload["search_host"], "127.0.0.1", "{loaded:?}");
+    assert_eq!(
+        loaded[1].payload["search_host"], "search-b.test",
+        "{loaded:?}"
+    );
+    assert_eq!(
+        loaded[1].payload["hash"], loaded[0].payload["hash"],
+        "{loaded:?}"
+    );
+}
+
 // ---- Каталог скиллов run (D114, D116) ----
 
 /// Недоверенный проект: в каталоге нет скиллов проекта (`skill.catalog.by_source.project

@@ -34,7 +34,8 @@
 //! без capability `skills` и `activate_skill`, m7 ревью задачи 13). Resume регистрирует
 //! веб-инструменты, только если они есть в замороженном префиксе run (новых инструментов
 //! посреди run нет, а выключенный сейчас веб не включается). `policy.loaded` получает
-//! `web_disabled` и `search_host`. Печать: строки `web.request` (D112), `skill.activated`
+//! `web_disabled` и `search_host` и сверяется с действующим снимком у нового run и у
+//! каждого resume (I1 ревью задачи 14). Печать: строки `web.request` (D112), `skill.activated`
 //! (D122) и предупреждение о тире standard на окне меньше 32k (D169).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -679,21 +680,21 @@ async fn wire(
     })
 }
 
-/// Записи бинарника в аудит прямо перед циклом (D78, D91): `policy.loaded` при смене
-/// хэша политики run (`policy` — `None`, если политика run не меняется), `grant.added` на
-/// каждый новый грант run (источник `cli` — actor `user`, `config` — `runtime`); затем
-/// голова цепочки — якорь снимка (после всех записей, m3 ревью задачи 13).
+/// Записи бинарника в аудит прямо перед циклом (D78, D91): `policy.loaded` с действующим
+/// снимком политики run — у нового run и у каждого resume (I1 ревью задачи 14: смена
+/// `web_disabled` или `search_host` при том же хэше видна в аудите; дубликат последней
+/// записи [`policy_loaded`] не пишет), `grant.added` на каждый новый грант run (источник
+/// `cli` — actor `user`, `config` — `runtime`); затем голова цепочки — якорь снимка (после
+/// всех записей, m3 ревью задачи 13).
 async fn record_start(
     store: &ProjectStore,
     project: &Path,
     run: RunId,
-    policy: Option<&PolicySnapshot>,
+    policy: &PolicySnapshot,
     web: &Wiring,
     grants: &[Grant],
 ) -> Result<Option<AuditHead>, RunError> {
-    if let Some(p) = policy {
-        policy_loaded(store, project, p, web).await?;
-    }
+    policy_loaded(store, project, policy, web).await?;
     grants_audit(store, run, grants).await?;
     Ok(store
         .audit_head()
@@ -802,10 +803,11 @@ async fn cleanup_run_tmp(project: &Path, run: RunId) {
     }
 }
 
-/// `policy.loaded` (D91): пишется, только если хэш снимка политики, `web_disabled` (кто
-/// выключил веб: `config`, `project` или `null`, D105) или `search_host` (хост поставщика
-/// поиска, если `web_search` зарегистрирован: правила по домену к поиску не применяются)
-/// отличаются от последней такой записи аудита. Цепочка аудита не сходится — запись не
+/// `policy.loaded` (D91): вызывается у нового run и у каждого resume с действующим снимком
+/// политики, а пишется, только если хэш снимка, `web_disabled` (кто выключил веб: `config`,
+/// `project` или `null`, D105) или `search_host` (хост поставщика поиска, если `web_search`
+/// зарегистрирован: правила по домену к поиску не применяются, D126) отличаются от
+/// последней такой записи аудита — дубликатов нет. Цепочка аудита не сходится — запись не
 /// пишется (`warn`): её сверит `audit --verify`.
 async fn policy_loaded(
     store: &ProjectStore,
@@ -912,15 +914,21 @@ async fn check_audit_anchor(store: &ProjectStore, snap: &Value) -> Result<(), Ru
     Ok(())
 }
 
-/// Отличия resume от снимка run (D92): доверие, политика, гранты. Доверие снимается
-/// только явным отзывом (`trust --revoke`): правка доверенных файлов посреди run (тем же
-/// агентом) доверие этого run не отменяет, предупреждение — в stderr.
+/// Отличия resume от снимка run (D92): доверие, политика, гранты — и отдельно действующий
+/// снимок политики, с которым run продолжается (для `policy.loaded` при каждом resume, I1
+/// ревью задачи 14; в `ResumeChange.policy` он попадает, только если хэш другой). Доверие
+/// снимается только явным отзывом (`trust --revoke`): правка доверенных файлов посреди run
+/// (тем же агентом) доверие этого run не отменяет, предупреждение — в stderr.
 ///
 /// Проектные `deny` и `ask` не теряются (I1 ревью задачи 13): если снимок доверенный, а
 /// проект сейчас не доверен (доверенные файлы изменились или доверие отозвано), проектная
 /// часть политики берётся из снимка run — она только ограничивает; глобальная — из
 /// нынешней конфигурации.
-fn resume_changes(p: &Prepared, cfg: &AgentConfig, snap: &Value) -> Result<ResumeChange, RunError> {
+fn resume_changes(
+    p: &Prepared,
+    cfg: &AgentConfig,
+    snap: &Value,
+) -> Result<(ResumeChange, PolicySnapshot), RunError> {
     let snap_trusted = snap
         .get("trusted")
         .and_then(Value::as_bool)
@@ -961,7 +969,7 @@ fn resume_changes(p: &Prepared, cfg: &AgentConfig, snap: &Value) -> Result<Resum
     } else {
         p.policy.clone()
     };
-    let policy = (effective.hash != snap_hash).then_some(effective);
+    let policy = (effective.hash != snap_hash).then(|| effective.clone());
     let had: Vec<Grant> = snap
         .get("grants")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -981,12 +989,15 @@ fn resume_changes(p: &Prepared, cfg: &AgentConfig, snap: &Value) -> Result<Resum
     {
         p.policy.check_mode(RunMode::Bypass)?;
     }
-    Ok(ResumeChange {
-        policy,
-        trusted,
-        grants_add,
-        ..ResumeChange::default()
-    })
+    Ok((
+        ResumeChange {
+            policy,
+            trusted,
+            grants_add,
+            ..ResumeChange::default()
+        },
+        effective,
+    ))
 }
 
 /// Оболочка `bash` (D85): `pwsh`/`powershell` на Windows, `bash`/`sh` иначе; не найдена —
@@ -1153,15 +1164,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 args.checkpoint_timeout,
             );
             deps.crash = crash_hook(args.crash);
-            deps.audit_head = record_start(
-                &store,
-                &project,
-                run,
-                Some(&prep.policy),
-                &wiring,
-                &prep.grants,
-            )
-            .await?;
+            deps.audit_head =
+                record_start(&store, &project, run, &prep.policy, &wiring, &prep.grants).await?;
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
             let outcome = drive(&store, &bus, fut, &ctl, args.crash, masker.clone()).await;
@@ -1180,7 +1184,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 .unwrap_or(Value::Null);
             check_audit_anchor(&store, &snap).await?;
             let prep = prepare(home, &project, &store, &cfg, &args.grants).await?;
-            let mut change = resume_changes(&prep, &cfg, &snap)?;
+            let (mut change, policy) = resume_changes(&prep, &cfg, &snap)?;
             // Веб-инструменты — только из замороженного префикса run: новых посреди run нет.
             let frozen = frozen_tools(&snap);
             let wiring = wire(
@@ -1221,11 +1225,12 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 args.checkpoint_timeout,
             );
             deps.crash = crash_hook(args.crash);
+            // I1 ревью задачи 14: `policy.loaded` — с действующим снимком при каждом resume.
             deps.audit_head = record_start(
                 &store,
                 &project,
                 r.run,
-                change.policy.as_ref(),
+                &policy,
                 &wiring,
                 &change.grants_add,
             )
