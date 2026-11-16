@@ -583,8 +583,10 @@ async fn requests_logged_including_robots_and_blocked() {
     assert_eq!(s.paths(), ["/robots.txt", "/page"]);
 }
 
+/// Без `[web.search] url` поставщика нет: `get_provider` отказывает до соединения (D126);
+/// исключение фильтра с поставщиком — `tests/search.rs`.
 #[tokio::test]
-async fn provider_is_refused_until_task_9() {
+async fn provider_refused_without_configured_endpoint() {
     let mut s = serve(|_| text(200, "x")).await;
     let gw = site(&s);
     let u = url(&format!("http://site.test:{}/search?q=x", s.port()));

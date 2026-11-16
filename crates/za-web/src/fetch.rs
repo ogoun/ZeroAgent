@@ -474,10 +474,18 @@ fn binary_char(c: char) -> bool {
     matches!(c, '\u{0}'..='\u{8}' | '\u{B}' | '\u{E}'..='\u{1A}' | '\u{1C}'..='\u{1F}')
 }
 
-/// Заголовок страницы для строки `title:`: пробелы, переводы строк и управляющие символы —
-/// один пробел (заголовок не подделает строку `status:`), не длиннее [`TITLE_MAX_CHARS`]
-/// символов с `...` на конце обрезанного. Пустой — `None`.
+/// Заголовок страницы для строки `title:` — [`one_line`] до [`TITLE_MAX_CHARS`] символов
+/// (заголовок не подделает строку `status:`).
 fn clean_title(raw: &str) -> Option<String> {
+    one_line(raw, TITLE_MAX_CHARS)
+}
+
+/// Текст в одну строку: пробелы, переводы строк и управляющие символы — один пробел, по
+/// краям — без них; не длиннее `max_chars` символов (не меньше 4) с `...` на конце
+/// обрезанного. Пустой — `None`. Общий у `web_fetch` (`title:`) и `web_search` (поля
+/// результата, D111): чужой текст не подделает строки результата.
+pub(crate) fn one_line(raw: &str, max_chars: usize) -> Option<String> {
+    let max_chars = max_chars.max(4);
     let mut out = String::new();
     let mut n = 0usize;
     let mut gap = false;
@@ -486,7 +494,7 @@ fn clean_title(raw: &str) -> Option<String> {
             gap = n > 0;
             continue;
         }
-        if n > TITLE_MAX_CHARS {
+        if n > max_chars {
             break;
         }
         if gap {
@@ -500,8 +508,8 @@ fn clean_title(raw: &str) -> Option<String> {
     if n == 0 {
         return None;
     }
-    if n > TITLE_MAX_CHARS {
-        let keep: String = out.chars().take(TITLE_MAX_CHARS - 3).collect();
+    if n > max_chars {
+        let keep: String = out.chars().take(max_chars - 3).collect();
         return Some(format!("{}...", keep.trim_end()));
     }
     Some(out)
@@ -516,8 +524,9 @@ fn header(url: &str, status: u16, kind: &str, title: Option<&str>) -> String {
     h
 }
 
-/// `HTTP <код> <фраза>` (D110); фразы нет у нестандартного кода.
-fn status_line(status: u16) -> String {
+/// `HTTP <код> <фраза>` (D110); фразы нет у нестандартного кода. Его же пишет `web_search`
+/// в ошибке поставщика.
+pub(crate) fn status_line(status: u16) -> String {
     match reqwest::StatusCode::from_u16(status)
         .ok()
         .and_then(|s| s.canonical_reason())
@@ -539,7 +548,7 @@ fn html_error_text(e: &ExtractError) -> String {
     format!("html: {e}")
 }
 
-fn invalid_args_text(e: &str) -> String {
+pub(crate) fn invalid_args_text(e: &str) -> String {
     format!("invalid arguments: {e}")
 }
 

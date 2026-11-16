@@ -15,6 +15,10 @@
 //! - [`web_fetch_tool`] — инструмент `web_fetch` (D110): шлюз, тип и кодировка, извлечение
 //!   HTML через `za_core::extract::Extractor`, метка `web`, журнал обращений в
 //!   `ToolOutput::requests` (D112).
+//! - [`search`] — трейт поставщика поиска [`SearchProvider`] и его единственная реализация
+//!   R1-C2 [`Searxng`] (D125); [`web_search_tool`] — инструмент `web_search` (D111). Запросы
+//!   к экземпляру — только [`WebGateway::get_provider`]: исключение фильтра адресов для
+//!   `[web.search] url` глобальной конфигурации (D126).
 //!
 //! Враждебный HTML шлюз не разбирает (D127): это делает `za-extract` в отдельном процессе.
 //! Тестовые подмены резолвера существуют только с признаком сборки `test-hooks` (D128).
@@ -26,16 +30,18 @@ mod gateway;
 mod limit;
 mod rank;
 mod robots;
+pub mod search;
 
 use std::time::Duration;
 
 pub use addr::{Block, IANA_SNAPSHOT, IPV4_SPECIAL, IPV6_SPECIAL, check_ip, parse_url};
 pub use convert::{Converted, HTML_TYPES, META_SCAN_BYTES, TEXT_TYPES, convert};
 pub use fetch::{WEB_FETCH, web_fetch_tool};
-pub use gateway::WebGateway;
+pub use gateway::{PROVIDER_MAX_BYTES, PROVIDER_TIMEOUT, WebGateway};
 pub use limit::RateLimiter;
 pub use rank::rank_passages;
 pub use robots::{ROBOTS_MAX_BYTES, ROBOTS_MAX_RULES, robots_allows};
+pub use search::{SearchHit, SearchProvider, Searxng, WEB_SEARCH, web_search_tool};
 use za_core::NetRequest;
 
 /// Типы резолвера `reqwest` для тестовой подмены внутреннего резолвера (D128).
@@ -62,7 +68,9 @@ pub struct WebConfig {
     pub host_interval: Duration,
     /// Предел установки соединения.
     pub connect_timeout: Duration,
-    /// Экземпляр поставщика поиска из глобальной конфигурации (D126, задача 9).
+    /// Экземпляр поставщика поиска — `[web.search] url` только глобальной конфигурации
+    /// (D122, D126): для его происхождения и только у `WebGateway::get_provider` фильтр
+    /// адресов не действует. `None` — поиска нет (`web_search` не регистрируется, D111).
     pub search_endpoint: Option<url::Url>,
 }
 
@@ -117,6 +125,9 @@ pub enum FetchError {
     /// Редирект на другой хост или на `http` с `https` не исполняется (D107).
     #[error("redirected to {0}; call web_fetch with it if it is the page you need")]
     Redirect(String),
+    /// Ответ поставщика поиска 3xx: клиент поставщика редиректы не исполняет (D126).
+    #[error("search provider redirected; not followed")]
+    ProviderRedirect,
     /// `unavailable` (5xx или сбой) или `disallowed` (правило).
     #[error("blocked by robots.txt: {0}")]
     Robots(&'static str),

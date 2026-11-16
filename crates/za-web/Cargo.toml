@@ -44,6 +44,10 @@ required-features = ["test-hooks"]
 name = "fetch"
 required-features = ["test-hooks"]
 
+[[test]]
+name = "search"
+required-features = ["test-hooks"]
+
 [dev-dependencies]
 axum.workspace = true
 http-body.workspace = true

@@ -19,13 +19,23 @@
 //! **Дедлайн** соблюдается на каждом шаге (`timeout_at`): при истечении шлюз сам
 //! возвращает `Timeout` вместе с записями, собранными до этого, и записью прерванного
 //! запроса (`reason = "timeout"`).
+//!
+//! **Поставщик поиска** (D126) — единственное исключение фильтра адресов: второй клиент
+//! с теми же свойствами (без прокси, cookie и сжатия, `Policy::none`) и резолвером
+//! [`ProviderResolver`], который разрешает только хост `[web.search] url` глобальной
+//! конфигурации (в любые адреса, в том числе частные) и отказывает любому другому имени.
+//! Им пользуется только [`WebGateway::get_provider`]: сверка происхождения (схема,
+//! нормализованный хост, порт) с настроенным, любой 3xx — ошибка без перехода,
+//! `robots.txt` не запрашивается, лимитер общий, ответ до 1 МиБ, не дольше 20 с.
+//! [`WebGateway::get`] (`web_fetch`) на тот же адрес идёт через полный фильтр и получает
+//! отказ `local or private address`: исключение привязано к методу, а не к адресу.
 
 use std::collections::HashMap;
-#[cfg(feature = "test-hooks")]
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use reqwest::dns::{Name, Resolve, Resolving};
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, LOCATION};
 use reqwest::{Client, redirect};
 use tokio::time::{Instant, timeout_at};
@@ -34,7 +44,7 @@ use za_core::NetRequest;
 use za_core::net::normalize_host;
 use za_protocol::net_outcome;
 
-use crate::addr::{FilteredResolver, ResolveFail, check_url};
+use crate::addr::{FilteredResolver, ResolveFail, SystemResolver, check_url};
 use crate::convert::non_identity_coding;
 use crate::limit::RateLimiter;
 use crate::robots::{ROBOTS_MAX_BYTES, Rules};
@@ -48,8 +58,12 @@ const ROBOTS_TTL: Duration = Duration::from_secs(24 * 3600);
 const AGENT: &str = "zero-agent";
 /// Сколько записей держать в кэшах источников и замков хостов без чистки.
 const KEPT: usize = 1024;
-/// Отказ `get_provider` (D126).
+/// Отказ `get_provider` и резолвера поставщика (D126).
 const NOT_PROVIDER: &str = "not the configured search provider";
+/// Предел ответа поставщика поиска, байт (D111, D126).
+pub const PROVIDER_MAX_BYTES: u64 = 1024 * 1024;
+/// Предел времени запроса к поставщику поиска (D111, D126).
+pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Сетевой шлюз: один объект на процесс, в `Arc` (D107). `Send + Sync`.
 pub struct WebGateway {
@@ -58,6 +72,8 @@ pub struct WebGateway {
     /// Резолвер клиента — для тестовых подмен; без признака его держит только клиент.
     #[cfg(feature = "test-hooks")]
     resolver: Arc<FilteredResolver>,
+    /// Экземпляр поставщика поиска (D126); `None` — `[web.search] url` не задан.
+    provider: Option<Provider>,
     limiter: RateLimiter,
     /// `robots.txt` по источнику (`scheme://host:port`): время получения и правила агента,
     /// разобранные один раз (M4 ревью задачи 6: запрос не разбирает текст заново).
@@ -74,6 +90,37 @@ struct Resp {
     content_type: Option<String>,
     bytes: Vec<u8>,
     truncated: bool,
+}
+
+/// Экземпляр поставщика поиска (D126): происхождение `[web.search] url` и свой клиент.
+struct Provider {
+    origin: Origin,
+    client: Client,
+    /// Резолвер клиента поставщика — для тестовой подмены имён.
+    #[cfg(feature = "test-hooks")]
+    resolver: Arc<ProviderResolver>,
+}
+
+/// Происхождение адреса: схема (`http`, `https`), хост после `normalize_host` (D124), порт
+/// (явный или по схеме).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Origin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl Origin {
+    fn of(url: &Url) -> Option<Self> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        Some(Self {
+            scheme: url.scheme().to_string(),
+            host: normalize_host(url.host_str()?)?,
+            port: url.port_or_known_default()?,
+        })
+    }
 }
 
 /// Исход получения `robots.txt`.
@@ -93,30 +140,32 @@ impl WebGateway {
             ));
         }
         let resolver = Arc::new(FilteredResolver::new());
-        let client = Client::builder()
-            .no_proxy()
-            .redirect(redirect::Policy::none())
-            .referer(false)
-            .connect_timeout(cfg.connect_timeout)
-            .user_agent(concat!("zero-agent/", env!("CARGO_PKG_VERSION")))
-            .dns_resolver(resolver.clone())
-            .build()
-            .map_err(|e| WebError::Client(e.to_string()))?;
+        let client = build_client(&cfg, resolver.clone())?;
+        let provider = match &cfg.search_endpoint {
+            Some(ep) => Some(Provider::new(ep, &cfg)?),
+            None => None,
+        };
         Ok(Self {
             limiter: RateLimiter::new(cfg.requests_per_minute, cfg.host_interval),
             cfg,
             client,
             #[cfg(feature = "test-hooks")]
             resolver,
+            provider,
             robots: Mutex::default(),
             hosts: Mutex::default(),
         })
     }
 
     /// Тест (D128): имена списка разрешаются в заданный адрес, фильтр его пропускает;
-    /// прочие имена — через внутренний резолвер под фильтром.
+    /// прочие имена — через внутренний резолвер под фильтром. У клиента поставщика список
+    /// заменяет только поиск адреса настроенного имени: другим именам его резолвер
+    /// отказывает и при подмене (D126).
     #[cfg(feature = "test-hooks")]
     pub fn with_test_resolve(self, map: Vec<(String, SocketAddr)>) -> Self {
+        if let Some(p) = &self.provider {
+            p.resolver.set_test_names(map.clone());
+        }
         self.resolver.set_test_names(map);
         self
     }
@@ -138,14 +187,85 @@ impl WebGateway {
         }
     }
 
-    /// Запрос к экземпляру поставщика поиска (D126): исключение фильтра и клиент
-    /// поставщика — задача 9; до неё отказ `blocked: not the configured search provider`.
-    pub async fn get_provider(&self, url: &Url, _deadline: Instant) -> Fetched {
-        let e = FetchError::Blocked(NOT_PROVIDER.into());
+    /// Экземпляр поставщика поиска из конфигурации (`[web.search] url`, D111): без него
+    /// бинарник не регистрирует `web_search`.
+    pub fn search_endpoint(&self) -> Option<&Url> {
+        self.cfg.search_endpoint.as_ref()
+    }
+
+    /// `GET url` к экземпляру поставщика поиска (D126) до дедлайна вызова, но не дольше
+    /// [`PROVIDER_TIMEOUT`]. Происхождение `url` (схема, нормализованный хост, порт) должно
+    /// совпасть с `[web.search] url`, иначе отказ `blocked: not the configured search
+    /// provider` до соединения; порт вне `[web] ports` допустим (экземпляр обычно слушает
+    /// 8888). Запрос — клиентом поставщика: любой адрес настроенного хоста, в том числе
+    /// частный; редирект (любой 3xx) — ошибка `search provider redirected; not followed`;
+    /// `robots.txt` не запрашивается; лимитер общий; тело до [`PROVIDER_MAX_BYTES`].
+    /// Журнал — запись на запрос или отказ, как у [`WebGateway::get`].
+    pub async fn get_provider(&self, url: &Url, deadline: Instant) -> Fetched {
+        let mut log = Vec::new();
+        let result = self.provide(url, deadline, true, &mut log).await;
         Fetched {
-            requests: vec![refused(&shown(url), &e)],
-            result: Err(e),
+            result,
+            requests: log,
         }
+    }
+
+    /// Тест (D128): запрос клиентом поставщика без сверки происхождения — проверка второго
+    /// слоя D126, резолвера поставщика: другое имя он не разрешает.
+    #[cfg(feature = "test-hooks")]
+    pub async fn provider_client_get_for_tests(&self, url: &Url, deadline: Instant) -> Fetched {
+        let mut log = Vec::new();
+        let result = self.provide(url, deadline, false, &mut log).await;
+        Fetched {
+            result,
+            requests: log,
+        }
+    }
+
+    async fn provide(
+        &self,
+        start: &Url,
+        deadline: Instant,
+        check_origin: bool,
+        log: &mut Vec<NetRequest>,
+    ) -> Result<Body, FetchError> {
+        let refuse = |e: FetchError, log: &mut Vec<NetRequest>| {
+            log.push(refused(&shown(start), &e));
+            Err(e)
+        };
+        let blocked = || FetchError::Blocked(NOT_PROVIDER.into());
+        let (Some(p), Some(origin)) = (&self.provider, Origin::of(start)) else {
+            return refuse(blocked(), log);
+        };
+        if check_origin && origin != p.origin {
+            return refuse(blocked(), log);
+        }
+        if !start.username().is_empty() || start.password().is_some() {
+            return refuse(FetchError::Credentials, log);
+        }
+        // Запрос — на нормализованный хост, без фрагмента (как у `check_url`).
+        let Some(url) = with_host(start, &origin.host) else {
+            return refuse(FetchError::InvalidUrl("invalid host".into()), log);
+        };
+        let deadline = deadline.min(Instant::now() + PROVIDER_TIMEOUT);
+        let mut rec = record(url.as_str());
+        let r = self
+            .request(&p.client, &url, PROVIDER_MAX_BYTES, deadline, &mut rec)
+            .await
+            .and_then(|resp| match resp.status {
+                300..=399 => Err(FetchError::ProviderRedirect),
+                _ => Ok(resp),
+            });
+        finish(&mut rec, &r, &url);
+        log.push(rec);
+        let resp = r?;
+        Ok(Body {
+            final_url: url,
+            status: resp.status,
+            content_type: resp.content_type,
+            bytes: resp.bytes,
+            truncated: resp.truncated,
+        })
     }
 
     async fn fetch(
@@ -168,7 +288,7 @@ impl WebGateway {
             }
             let mut rec = record(url.as_str());
             let r = self
-                .request(&url, self.cfg.max_bytes, deadline, &mut rec)
+                .request(&self.client, &url, self.cfg.max_bytes, deadline, &mut rec)
                 .await;
             finish(&mut rec, &r, &url);
             log.push(rec);
@@ -264,7 +384,13 @@ impl WebGateway {
         for _ in 0..=MAX_REDIRECTS {
             let mut rec = record(url.as_str());
             let r = self
-                .request(&url, ROBOTS_MAX_BYTES as u64, deadline, &mut rec)
+                .request(
+                    &self.client,
+                    &url,
+                    ROBOTS_MAX_BYTES as u64,
+                    deadline,
+                    &mut rec,
+                )
                 .await;
             finish(&mut rec, &r, &url);
             log.push(rec);
@@ -302,10 +428,12 @@ impl WebGateway {
         Ok(Robots::Rules(Arc::default()))
     }
 
-    /// Один `GET`: место в лимитере, запрос, заголовки, тело до `limit`. Запись `rec`
-    /// заполняется по ходу; дедлайн — на каждом шаге.
+    /// Один `GET` клиентом `client` (страниц или поставщика): место в общем лимитере,
+    /// запрос, заголовки, тело до `limit`. Запись `rec` заполняется по ходу; дедлайн — на
+    /// каждом шаге.
     async fn request(
         &self,
+        client: &Client,
         url: &Url,
         limit: u64,
         deadline: Instant,
@@ -315,81 +443,9 @@ impl WebGateway {
             .acquire(url.host_str().unwrap_or_default(), deadline)
             .await?;
         let t0 = Instant::now();
-        let r = self.exchange(url, limit, deadline, rec).await;
+        let r = exchange(client, url, limit, deadline, rec).await;
         rec.ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
         r
-    }
-
-    async fn exchange(
-        &self,
-        url: &Url,
-        limit: u64,
-        deadline: Instant,
-        rec: &mut NetRequest,
-    ) -> Result<Resp, FetchError> {
-        let mut resp = timeout_at(deadline, self.client.get(url.clone()).send())
-            .await
-            .map_err(|_| FetchError::Timeout)?
-            .map_err(|e| send_error(&e))?;
-        let status = resp.status().as_u16();
-        rec.status = Some(status);
-        if matches!(status, 301 | 302 | 303 | 307 | 308)
-            && let Some(loc) = resp.headers().get(LOCATION)
-        {
-            let bad = || FetchError::Network("invalid redirect location".into());
-            let target = url
-                .join(loc.to_str().map_err(|_| bad())?)
-                .map_err(|_| bad())?;
-            // В журнал — без userinfo и фрагмента (M2 ревью задачи 6); цель с userinfo
-            // дальше отвергнет фильтр.
-            rec.final_url = Some(shown(&target));
-            return Ok(Resp {
-                status,
-                location: Some(target),
-                content_type: None,
-                bytes: Vec::new(),
-                truncated: false,
-            });
-        }
-        if let Some(enc) = content_encoding(resp.headers()) {
-            return Err(FetchError::Encoding(enc));
-        }
-        let content_type = resp
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let length = resp.content_length();
-        let (mut bytes, mut truncated) = (Vec::new(), false);
-        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-        loop {
-            let chunk = timeout_at(deadline, resp.chunk())
-                .await
-                .map_err(|_| FetchError::Timeout)?
-                .map_err(|e| FetchError::Network(body_error(&e)))?;
-            let Some(chunk) = chunk else { break };
-            let room = limit - bytes.len();
-            if chunk.len() > room {
-                bytes.extend_from_slice(&chunk[..room]);
-                truncated = true;
-                break;
-            }
-            bytes.extend_from_slice(&chunk);
-            rec.bytes = bytes.len() as u64;
-            // Ровно в предел: обрезано, если сервер не обещал ровно столько.
-            if bytes.len() == limit {
-                truncated = length != Some(limit as u64);
-                break;
-            }
-        }
-        rec.bytes = bytes.len() as u64;
-        Ok(Resp {
-            status,
-            location: None,
-            content_type,
-            bytes,
-            truncated,
-        })
     }
 
     fn host_slot(&self, host: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -417,6 +473,183 @@ impl WebGateway {
         }
         m.insert(origin, (Instant::now(), rules));
     }
+}
+
+impl Provider {
+    /// Экземпляр `[web.search] url`: только `http`, `https` с хостом, без учётных данных.
+    fn new(ep: &Url, cfg: &WebConfig) -> Result<Self, WebError> {
+        let bad = |why: &str| WebError::Config(format!("[web.search] url: {why}"));
+        let origin = Origin::of(ep)
+            .ok_or_else(|| bad("only http and https URLs with a host are allowed"))?;
+        if !ep.username().is_empty() || ep.password().is_some() {
+            return Err(bad("credentials in URL are not allowed"));
+        }
+        let resolver = Arc::new(ProviderResolver::new(origin.host.clone()));
+        Ok(Self {
+            client: build_client(cfg, resolver.clone())?,
+            origin,
+            #[cfg(feature = "test-hooks")]
+            resolver,
+        })
+    }
+}
+
+/// HTTP-клиент шлюза с резолвером `resolver` — одни свойства у клиента страниц и клиента
+/// поставщика (D107, D126): без прокси (`no_proxy()`), редиректы исполняет не `reqwest`
+/// (`Policy::none`), без `Referer`, без cookie и сжатия (функций нет, D129).
+fn build_client<R: Resolve + 'static>(
+    cfg: &WebConfig,
+    resolver: Arc<R>,
+) -> Result<Client, WebError> {
+    Client::builder()
+        .no_proxy()
+        .redirect(redirect::Policy::none())
+        .referer(false)
+        .connect_timeout(cfg.connect_timeout)
+        .user_agent(concat!("zero-agent/", env!("CARGO_PKG_VERSION")))
+        .dns_resolver(resolver)
+        .build()
+        .map_err(|e| WebError::Client(e.to_string()))
+}
+
+/// Резолвер клиента поставщика поиска (D126): разрешает только хост `[web.search] url`
+/// (после `normalize_host`) — системным резолвером, в любые адреса, в том числе частные
+/// (экземпляр обычно на `127.0.0.1` или в локальной сети); любое другое имя — отказ
+/// `not the configured search provider`, до обращения к DNS. IP-литерал из конфигурации
+/// резолвер не видит: `reqwest` подключается к нему как есть.
+struct ProviderResolver {
+    host: String,
+    /// Тестовая подмена (D128): имя → заданный адрес; другим именам отказ остаётся.
+    #[cfg(feature = "test-hooks")]
+    names: std::sync::RwLock<Vec<(String, SocketAddr)>>,
+}
+
+impl ProviderResolver {
+    fn new(host: String) -> Self {
+        Self {
+            host,
+            #[cfg(feature = "test-hooks")]
+            names: std::sync::RwLock::default(),
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn set_test_names(&self, names: Vec<(String, SocketAddr)>) {
+        let names = names
+            .into_iter()
+            .filter_map(|(n, a)| Some((normalize_host(&n)?, a)))
+            .collect();
+        *self.names.write().unwrap_or_else(|e| e.into_inner()) = names;
+    }
+}
+
+impl Resolve for ProviderResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        if normalize_host(name.as_str()).as_deref() != Some(self.host.as_str()) {
+            return Box::pin(async { Err(ResolveFail::Blocked(NOT_PROVIDER).into()) });
+        }
+        #[cfg(feature = "test-hooks")]
+        {
+            let names = self.names.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(a) = names.iter().find(|(n, _)| *n == self.host).map(|(_, a)| *a) {
+                return Box::pin(
+                    async move { Ok(Box::new(std::iter::once(a)) as reqwest::dns::Addrs) },
+                );
+            }
+        }
+        let lookup = SystemResolver.resolve(name);
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = lookup.await.map_err(|_| ResolveFail::NotFound)?.collect();
+            if addrs.is_empty() {
+                return Err(ResolveFail::NotFound.into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Адрес `url` с хостом `host` (нормализованным) и без фрагмента.
+fn with_host(url: &Url, host: &str) -> Option<Url> {
+    let mut out = url.clone();
+    out.set_fragment(None);
+    match host.parse::<IpAddr>() {
+        Ok(ip) => out.set_ip_host(ip).ok()?,
+        Err(_) => out.set_host(Some(host)).ok()?,
+    }
+    Some(out)
+}
+
+/// Один обмен: запрос, заголовки, тело до `limit` (см. `WebGateway::request`).
+async fn exchange(
+    client: &Client,
+    url: &Url,
+    limit: u64,
+    deadline: Instant,
+    rec: &mut NetRequest,
+) -> Result<Resp, FetchError> {
+    let mut resp = timeout_at(deadline, client.get(url.clone()).send())
+        .await
+        .map_err(|_| FetchError::Timeout)?
+        .map_err(|e| send_error(&e))?;
+    let status = resp.status().as_u16();
+    rec.status = Some(status);
+    if matches!(status, 301 | 302 | 303 | 307 | 308)
+        && let Some(loc) = resp.headers().get(LOCATION)
+    {
+        let bad = || FetchError::Network("invalid redirect location".into());
+        let target = url
+            .join(loc.to_str().map_err(|_| bad())?)
+            .map_err(|_| bad())?;
+        // В журнал — без userinfo и фрагмента (M2 ревью задачи 6); цель с userinfo
+        // дальше отвергнет фильтр.
+        rec.final_url = Some(shown(&target));
+        return Ok(Resp {
+            status,
+            location: Some(target),
+            content_type: None,
+            bytes: Vec::new(),
+            truncated: false,
+        });
+    }
+    if let Some(enc) = content_encoding(resp.headers()) {
+        return Err(FetchError::Encoding(enc));
+    }
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let length = resp.content_length();
+    let (mut bytes, mut truncated) = (Vec::new(), false);
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    loop {
+        let chunk = timeout_at(deadline, resp.chunk())
+            .await
+            .map_err(|_| FetchError::Timeout)?
+            .map_err(|e| FetchError::Network(body_error(&e)))?;
+        let Some(chunk) = chunk else { break };
+        let room = limit - bytes.len();
+        if chunk.len() > room {
+            bytes.extend_from_slice(&chunk[..room]);
+            truncated = true;
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+        rec.bytes = bytes.len() as u64;
+        // Ровно в предел: обрезано, если сервер не обещал ровно столько.
+        if bytes.len() == limit {
+            truncated = length != Some(limit as u64);
+            break;
+        }
+    }
+    rec.bytes = bytes.len() as u64;
+    Ok(Resp {
+        status,
+        location: None,
+        content_type,
+        bytes,
+        truncated,
+    })
 }
 
 /// Текст `robots.txt`: UTF-8 с заменой; обрезанный — до последней целой строки.

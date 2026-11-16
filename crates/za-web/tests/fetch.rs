@@ -2,7 +2,8 @@
 //! на `127.0.0.1:0` под именем `site.test` (`with_test_resolve`, признак `test-hooks`) и
 //! заглушки извлекателя (`support::extractor`). Настоящий интернет не используется.
 //!
-//! Golden описаний — `tests/golden/web_tools.json`, пишется только с `ZA_UPDATE_GOLDEN=1`.
+//! Golden описаний `web_fetch` и `web_search` — `tests/golden/web_tools.json`, пишется только
+//! с `ZA_UPDATE_GOLDEN=1`.
 
 mod support;
 
@@ -19,7 +20,7 @@ use za_core::{
     call_deadline,
 };
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier, canonical_json, net_outcome};
-use za_web::{WebConfig, WebGateway, web_fetch_tool};
+use za_web::{Searxng, WebConfig, WebGateway, web_fetch_tool, web_search_tool};
 
 const LONG: Duration = Duration::from_secs(20);
 
@@ -578,7 +579,13 @@ fn golden_descriptions() {
     // Канонический JSON, как `za_llm::render_tools` (массив по имени, объекты
     // `{description, name, parameters}`): `za-web` не зависит от `za-llm` (политика
     // направлений), а замена CRLF не нужна — переводов строк CR в описании нет.
-    let mut tools: Vec<Arc<dyn Tool>> = vec![web_fetch_tool(offline(), StubExtractor::new())];
+    let provider = Arc::new(Searxng::new(
+        url::Url::parse("http://127.0.0.1:8888/").unwrap(),
+    ));
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
+        web_fetch_tool(offline(), StubExtractor::new()),
+        web_search_tool(offline(), provider),
+    ];
     // Порядок — по имени, как у `render_tools` (M6 ревью задачи 8: с `web_search` он важен).
     tools.sort_by(|a, b| a.spec().schema.name.cmp(&b.spec().schema.name));
     let arr: Vec<Value> = tools

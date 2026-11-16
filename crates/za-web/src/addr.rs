@@ -236,8 +236,9 @@ pub(crate) enum ResolveFail {
     NotFound,
 }
 
-/// Внутренний резолвер по умолчанию — системный (`tokio::net::lookup_host`).
-struct SystemResolver;
+/// Внутренний резолвер по умолчанию — системный (`tokio::net::lookup_host`); его же зовёт
+/// резолвер поставщика поиска для настроенного имени (D126, `gateway`).
+pub(crate) struct SystemResolver;
 
 impl Resolve for SystemResolver {
     fn resolve(&self, name: Name) -> Resolving {
