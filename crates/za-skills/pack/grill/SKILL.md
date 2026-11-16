@@ -19,5 +19,5 @@ The user accepts the list, or the remaining unknowns are cheap to change later. 
 
 ## Do not
 - Send many questions at once.
-- Use internal jargon. If a term is needed, explain it in one plain sentence.
+- Use names from inside the project that the user has not used. If one cannot be avoided, add what it stands for in everyday words.
 - Start building before the list is accepted, unless the user says to go ahead.

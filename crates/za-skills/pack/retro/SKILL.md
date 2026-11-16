@@ -4,7 +4,7 @@ description: Use when a task, iteration or incident is over and the user wants t
 ---
 # Retro
 
-Turn finished work into a few lessons that will come back at the moment they are needed.
+Turn finished work into a few lessons, each tied to the situation in which it should come back.
 
 ## Steps
 1. Rebuild the timeline from records, not from memory: the plan, commits, logs, review notes, failed runs, rework.

@@ -1,6 +1,6 @@
 ---
 name: review
-description: Use when asked to review a diff, branch or pull request, or before you merge your own changes.
+description: Use when a finished change needs a search for the inputs and sequences that make it do the wrong thing.
 ---
 # Review
 
@@ -17,7 +17,7 @@ Search a change for situations in which it does the wrong thing, and describe ea
 ## Probe each item
 - Correctness: empty, huge, repeated or malformed input; paths and text on another OS; a failure halfway through; two callers at once; data stored by an older version.
 - Security: can outside data reach a path, a shell, a query or a prompt without a check? Can the change act outside the project, put a secret into a log, or skip a permission check?
-- Tests: which test turns red if this line is wrong? Run the tests that cover the change when you can. Changed behavior that no test would catch is a finding in itself.
+- Tests: which test turns red if this line is wrong? Run those tests when you can. Changed behavior that no test would catch is a finding in itself.
 - Simplicity: code that nothing needs, a second copy of an existing helper, a name that says something else.
 
 Confirm each suspicion in the code or with a run before you write it down.
