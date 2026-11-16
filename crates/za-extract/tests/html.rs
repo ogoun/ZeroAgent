@@ -1040,12 +1040,11 @@ fn two_mib_wide_table_is_bounded() {
     assert!(table_lines(&m.text).len() > 50_000);
 }
 
-/// Бюджет выравнивания общий на страницу: 200 таблиц, у каждой надбавка около 1 МБ
-/// (ширина 3000 × 350 строк, 10 КБ входа), без общего бюджета дали бы 200 МБ. Выровнены
-/// только первые, пока надбавка укладывается в бюджет; остальные — без дополнения.
+/// 200 таблиц, у каждой надбавка около 1 МБ (ширина 3000 × 350 строк, 10 КБ входа): без
+/// пределов дали бы 200 МБ. Надбавка каждой больше четверти её вывода без дополнения (I2
+/// финального ревью), поэтому ни одна не выровнена, и вывод меньше входа.
 #[test]
-fn align_budget_is_per_page() {
-    use za_extract::TABLE_ALIGN_BUDGET;
+fn wide_tables_are_not_padded() {
     let mut html = String::from("<html><body>");
     for i in 0..200 {
         html.push_str(&format!(
@@ -1059,19 +1058,94 @@ fn align_budget_is_per_page() {
     let m = bounded_within("200 tables", html, release_second());
     assert!(!m.simplified);
     assert!(
-        (m.text.len() as u64) < TABLE_ALIGN_BUDGET + input as u64,
+        m.text.len() < input,
         "{} байт при входе {input}",
         m.text.len()
     );
-    // Первая таблица выровнена, последняя — нет.
     let padded = table_lines(&m.text)
         .iter()
-        .filter(|l| l.starts_with("| z ") && l.len() > 3000)
+        .filter(|l| l.starts_with("| z ") && l.len() > 6)
         .count();
-    assert_eq!(padded, 350, "первая таблица не выровнена");
+    assert_eq!(padded, 0, "выровнена таблица с надбавкой больше 25 %");
     assert!(m.text.contains("t199"), "нет последней таблицы");
-    let tail = &m.text[m.text.find("t199").unwrap_or(0)..];
-    assert!(tail.contains("\n| z |\n"), "последняя таблица выровнена");
+}
+
+/// Таблица вида списка государств Википедии (`wiki_states`, I2 финального ревью): столбец
+/// примечаний, где одно примечание в 5700 символов, а остальные короткие. Надбавка (около
+/// 1,1 МБ пробелов) укладывается в бюджет страницы 2 МиБ, но в десятки раз больше самой
+/// таблицы: таблица идёт без дополнения, и модель получает текст, а не пробелы.
+#[test]
+fn wide_note_column_is_not_padded() {
+    let mut html = String::from("<table><tr><th>State</th><th>Notes</th></tr><tr><td>s0</td><td>");
+    html.push_str(&"note ".repeat(1140));
+    html.push_str("</td></tr>");
+    for i in 1..197 {
+        html.push_str(&format!("<tr><td>s{i}</td><td>note {i}</td></tr>"));
+    }
+    html.push_str("</table>");
+    let m = bounded_within("wide note", html, release_half_second());
+    assert!(!m.simplified);
+    let lines = table_lines(&m.text);
+    // Заголовок, разделитель и 197 строк данных.
+    assert_eq!(lines.len(), 199, "{}", &m.text[..200]);
+    assert_eq!(lines.iter().filter(|l| l.len() > 1000).count(), 1);
+    assert!(lines.contains(&"| s196 | note 196 |"), "{}", lines[198]);
+    assert!(m.text.len() < 20_000, "{} байт", m.text.len());
+}
+
+/// Таблица с надбавкой 7 байт при 45 без дополнения (меньше четверти): выравнивается, если
+/// хватает бюджета страницы.
+const NARROW_TABLE: &str =
+    "<table><tr><th>abcdefgh</th></tr><tr><td>abcdefg</td></tr><tr><td>abcdefx</td></tr></table>";
+
+/// Верхняя оценка вывода страницы ([`za_extract::guard::prepare_dom`]), как её считает
+/// `html_to_markdown`.
+fn output_bound(html: &str) -> u64 {
+    let tree = za_extract::guard::guarded_parse(html).expect("разбор под порогами");
+    za_extract::guard::prepare_dom(&tree).expect("оценка в бюджете")
+}
+
+/// Бюджет выравнивания общий на страницу и не больше остатка бюджета вывода после верхней
+/// оценки: в начале страницы таблица из одних `|` (каждый — `&#124;`, 6 байт вывода; её
+/// надбавка больше четверти, она не выравнивается) почти исчерпывает бюджет вывода 4 МиБ, за
+/// ней тысяча одинаковых узких таблиц. Выровнены ровно столько первых, сколько надбавок по 7
+/// байт помещается в остаток; остальные — без дополнения.
+#[test]
+fn align_budget_is_rest_of_output_budget() {
+    use za_extract::{HTML_OUTPUT_BUDGET, TABLE_ALIGN_BUDGET};
+    const TABLES: u64 = 1000;
+    let page = |pipes: usize| {
+        let mut html = format!(
+            "<html><body><table><tr><th>p</th></tr><tr><td>{}</td></tr></table>",
+            "|".repeat(pipes)
+        );
+        html.push_str(&NARROW_TABLE.repeat(TABLES as usize));
+        html.push_str("</body></html>");
+        html
+    };
+    // Остаток бюджета — на половину надбавок узких таблиц.
+    let target = HTML_OUTPUT_BUDGET as u64 - 7 * TABLES / 2;
+    let mut pipes = 600_000usize;
+    for _ in 0..3 {
+        let b = output_bound(&page(pipes));
+        pipes = (pipes as i64 + (target as i64 - b as i64) / 6) as usize;
+    }
+    let html = page(pipes);
+    assert!(html.len() <= HTML_MAX_BYTES, "{}", html.len());
+    let rest = (HTML_OUTPUT_BUDGET as u64).saturating_sub(output_bound(&html));
+    let aligned = TABLE_ALIGN_BUDGET.min(rest) / 7;
+    assert!(aligned > 0 && aligned < TABLES, "{aligned}");
+    let m = bounded_within("rest of budget", html, release_second());
+    assert!(!m.simplified);
+    assert_eq!(
+        m.text.matches("| abcdefg  |").count() as u64,
+        aligned,
+        "остаток {rest}"
+    );
+    assert_eq!(
+        m.text.matches("\n| abcdefg |\n").count() as u64,
+        TABLES - aligned
+    );
 }
 
 /// Недостающие ячейки `htmd` тоже дополняет: одна строка из 40 000 `th` и 40 000 строк по

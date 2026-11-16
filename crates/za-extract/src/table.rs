@@ -63,9 +63,11 @@
 //! - у остальных отрисовывает ячейки теми же обработчиками `htmd` и считает **точный** размер
 //!   выровненной таблицы за O(ячеек), не строя её. Разница с той же таблицей без дополнения —
 //!   надбавка выравнивания;
-//! - пока сумма надбавок страницы не больше бюджета страницы, строит выровненную таблицу из
-//!   уже отрисованных ячеек по правилам `htmd` (`format_row_padded`): вывод байт в байт тот
-//!   же, что у `htmd`, а ячейки отрисованы один раз (m-4 повторного ревью fix-10);
+//! - если надбавка таблицы не больше 25 % её вывода без дополнения
+//!   ([`TABLE_ALIGN_SHARE_DIVISOR`], I2 финального ревью) и сумма надбавок страницы не больше
+//!   бюджета страницы, строит выровненную таблицу из уже отрисованных ячеек по правилам
+//!   `htmd` (`format_row_padded`): вывод байт в байт тот же, что у `htmd`, а ячейки
+//!   отрисованы один раз (m-4 повторного ревью fix-10);
 //! - иначе — та же таблица Markdown без дополнения: те же подписи, строки, ячейки и их
 //!   экранирование, разделитель `---`, строка не длиннее своих ячеек, заголовок — на все
 //!   столбцы (m-1). Размер линеен по ячейкам.
@@ -103,7 +105,19 @@ use markup5ever_rcdom::{Handle, Node, NodeData};
 /// достигают (замер fix-10): надбавка страницы — от 0 до 98 КБ, у списка государств
 /// Википедии (`wiki_states`) — 1,79 МБ, из них 1,71 МБ в одной таблице на 197 строк
 /// Markdown (столбец примечаний шириной 5700 символов); оценка этой страницы — 0,52 МБ.
+///
+/// С пределом доли надбавки таблицы ([`TABLE_ALIGN_SHARE_DIVISOR`]) сумма надбавок страницы
+/// не больше четверти вывода её таблиц без дополнения, а он сам — в бюджете вывода 4 МиБ:
+/// 2 МиБ на странице не достигаются, предел остаётся страховкой.
 pub const TABLE_ALIGN_BUDGET: u64 = 2 * 1024 * 1024;
+
+/// Предел доли надбавки выравнивания одной таблицы — делитель (Ruling прохода fix-10,
+/// сомнение 2; I2 финального ревью): пробелы дополнения стоят токенов модели, поэтому таблица
+/// выравнивается, только если надбавка увеличивает её вывод не больше чем на 25 %
+/// (`надбавка ≤ вывод / 4`; вывод без дополнения — строки заголовка, разделителя и данных,
+/// без подписей). Иначе таблица идёт без дополнения, даже если бюджета страницы хватает. У
+/// `wiki_states` пробелы одной таблицы занимали 85 % текста страницы.
+pub const TABLE_ALIGN_SHARE_DIVISOR: u64 = 4;
 
 /// Элемент HTML с именем `local` (иностранное содержимое SVG и MathML не трогается).
 fn is_html(node: &Node, local: &str) -> bool {
@@ -379,7 +393,7 @@ impl ElementHandler for TableLayout {
         let extra = size.aligned.saturating_sub(size.plain);
         let spent = self.spent.load(Ordering::Relaxed);
         let total = spent.saturating_add(extra);
-        if total <= self.budget {
+        if size.padding_fits() && total <= self.budget {
             self.spent.store(total, Ordering::Relaxed);
             return Some(grid.aligned(handlers, node).into());
         }
@@ -446,6 +460,18 @@ struct GridSize {
     aligned: u64,
     /// Та же таблица без дополнения ([`Grid::plain`]).
     plain: u64,
+}
+
+impl GridSize {
+    /// Надбавка выравнивания не больше 25 % таблицы без дополнения
+    /// ([`TABLE_ALIGN_SHARE_DIVISOR`]): `aligned − plain ≤ plain / 4`, граница включительна
+    /// (точный счёт в целых).
+    fn padding_fits(&self) -> bool {
+        self.aligned
+            .saturating_sub(self.plain)
+            .saturating_mul(TABLE_ALIGN_SHARE_DIVISOR)
+            <= self.plain
+    }
 }
 
 impl Grid {
@@ -1142,37 +1168,58 @@ mod tests {
         }
     }
 
+    /// Таблица, у которой надбавка не больше четверти вывода без дополнения: заголовок в 8
+    /// символов, строки в 7 (по пробелу дополнения в строке и пять тире сверх `---`).
+    const NARROW: &str = "<table><tr><th>abcdefgh</th></tr><tr><td>abcdefg</td></tr><tr><td>abcdefx</td></tr></table>";
+
     /// Вывод страницы: таблица сверх бюджета — та же, что строит [`Grid::plain`], а при
     /// бюджете — та же, что строит `htmd`.
     #[test]
     fn layout_follows_budget() {
-        let html = "<table><caption>Cap</caption><tr><th>head of the column</th></tr><tr><td>a</td></tr></table>";
+        let html = "<table><caption>Cap</caption><tr><th>abcdefgh</th></tr><tr><td>abcdefg</td></tr></table>";
         let aligned = render_with(&tree(html), TableLayout::new());
         let plain = render_with(&tree(html), TableLayout::with_budget(0));
-        assert_eq!(
-            aligned,
-            "Cap\n| head of the column |\n| ------------------ |\n| a                  |"
-        );
-        assert_eq!(plain, "Cap\n| head of the column |\n| --- |\n| a |");
+        assert_eq!(aligned, "Cap\n| abcdefgh |\n| -------- |\n| abcdefg  |");
+        assert_eq!(plain, "Cap\n| abcdefgh |\n| --- |\n| abcdefg |");
     }
 
     /// Бюджет — на страницу и тратится в порядке документа: при бюджете, равном надбавке
     /// одной таблицы, первая из двух одинаковых выровнена, вторая — нет.
     #[test]
     fn budget_is_spent_in_document_order() {
-        let table = "<table><tr><th>head of the column</th></tr><tr><td>a</td></tr><tr><td>b</td></tr></table>";
-        // Надбавка: две строки по 17 пробелов дополнения и разделитель на 15 тире длиннее `---`.
-        let extra = 2 * 17 + 15;
-        let html = format!("{table}<p>mid</p>{table}");
+        // Надбавка: две строки по пробелу дополнения и разделитель на 5 тире длиннее `---`.
+        let extra = 2 + 5;
+        let html = format!("{NARROW}<p>mid</p>{NARROW}");
         let md = render_with(&tree(&html), TableLayout::with_budget(extra));
         let (first, second) = md.split_once("mid").expect("абзац между таблицами");
-        assert!(first.contains(&format!("| a{} |", " ".repeat(17))), "{md}");
+        assert!(first.contains("| abcdefg  |"), "{md}");
         assert!(
-            second.contains("\n| a |\n") && second.contains("| --- |"),
+            second.contains("\n| abcdefg |\n") && second.contains("| --- |"),
             "{md}"
         );
         // На одну таблицу бюджета не хватает — обе без дополнения.
         let md = render_with(&tree(&html), TableLayout::with_budget(extra - 1));
-        assert_eq!(md.matches("\n| a |\n").count(), 2, "{md}");
+        assert_eq!(md.matches("\n| abcdefg |\n").count(), 2, "{md}");
+    }
+
+    /// Надбавка выравнивания таблицы — не больше 25 % её вывода без дополнения (Ruling прохода
+    /// fix-10, сомнение 2; I2 финального ревью): иначе таблица идёт без дополнения, даже если
+    /// бюджета страницы хватает. Граница включительна.
+    #[test]
+    fn padding_share_is_limited_per_table() {
+        let fits = |aligned, plain| GridSize { aligned, plain }.padding_fits();
+        assert!(fits(125, 100) && fits(100, 100) && fits(0, 0));
+        assert!(!fits(126, 100) && !fits(1, 0));
+        // 7 байт надбавки при 45 без дополнения — выровнена.
+        assert_eq!(
+            render_with(&tree(NARROW), TableLayout::new()),
+            "| abcdefgh |\n| -------- |\n| abcdefg  |\n| abcdefx  |"
+        );
+        // Широкий заголовок над короткой строкой: 32 байта надбавки при 36 — без дополнения.
+        let wide = "<table><tr><th>head of the column</th></tr><tr><td>a</td></tr></table>";
+        assert_eq!(
+            render_with(&tree(wide), TableLayout::new()),
+            "| head of the column |\n| --- |\n| a |"
+        );
     }
 }
