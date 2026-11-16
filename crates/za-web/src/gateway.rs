@@ -80,9 +80,12 @@ const PDF_BODY_LIMIT: usize = PDF_MAX_BYTES + 1;
 /// сжатия (D107: распаковки нет), тексты ошибок SearXNG (`unresponsive_engines`) — на
 /// английском. Клиент страниц (`web_fetch`) их не шлёт.
 ///
-/// `limiter` SearXNG (botdetection на `/search`) требует ещё `text/html` в `Accept` и
-/// `gzip` или `deflate` в `Accept-Encoding`: такому экземпляру клиент без сжатия всё равно
-/// получит 429. Подсказка пользователю — ADR 0006, README и `doctor` (задача 14).
+/// С `server.limiter` SearXNG никакие заголовки не помогают: `ip_limit` пропускает не больше
+/// 4 запросов `format=json` в час с адреса (`API_MAX`, `API_WINDOW`), а проверки
+/// botdetection ещё требуют `text/html` в `Accept` и `gzip` или `deflate` в
+/// `Accept-Encoding` (m1 повторного ревью fix-9s). Ответ такого экземпляра — 429. Два пути
+/// для своего экземпляра — выключить `server.limiter` или внести адрес агента в
+/// `botdetection.ip_lists.pass_ip`: ADR 0006, README и `doctor`.
 fn provider_headers() -> HeaderMap {
     [
         (ACCEPT, "application/json"),
