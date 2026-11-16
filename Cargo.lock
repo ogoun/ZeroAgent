@@ -2277,6 +2277,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "za-web"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "http-body",
+ "reqwest",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "za-core",
+ "za-protocol",
+]
+
+[[package]]
 name = "zero-agent"
 version = "0.0.1"
 dependencies = [

@@ -5,6 +5,12 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, задача 6 (сетевой шлюз; D107, D108, D112, D124, D128, D129, ADR 0006):
+  - `za-web` (новый крейт): `WebGateway::get(url, deadline)` — фильтр адресов в резолвере по разрешающему списку (реестры IANA special-purpose, снимок 2025-10-09), порты `80, 443, 8080, 8443`, до пяти редиректов на тот же хост, без прокси, cookie и `Accept-Encoding`, `Content-Encoding` кроме `identity` — ошибка, тело до 5 МиБ, 60 запросов в минуту и 500 мс к хосту, `robots.txt` (RFC 9309, кэш 24 ч), дедлайн вызова внутри шлюза с журналом обращений; `parse_url`, `check_ip`, `robots_allows`, `RateLimiter`; `get_provider` до задачи 9 отказывает;
+  - `za-web`: признак сборки `test-hooks` — `with_test_resolve`, `with_inner_resolver`, `za_web::dns` (только тестам);
+  - `za-core`: `NetRequest` — запись журнала сетевых обращений;
+  - `cargo xtask policy`: направления `za-web`, запрет функций сжатия, cookie, SOCKS, HTTP/2 и корней ОС у `reqwest` в сборке workspace, `reqwest::Client::builder` и подобные — только в `za-web/src/gateway.rs` и `za-llm`;
+  - CI: `clippy` и тесты `za-web` с признаком `test-hooks`.
 - R1-C2, задача 5 (Rule of Two без вопросов, снимок v4; D106, D130, ADR 0006):
   - `za-agent`: `Exposure { untrusted, private, external }` и `Exposure::untrusted_from` (любое происхождение метки, кроме `outside_project`); `ToolEnv.exposure` — снимок на начало пакета; `ToolsOutcome.exposure`, `rule_of_two`, `exposure_calls`. Флаги вызова хранятся в квитанции (`private`, `external`), реплей даёт те же значения. `decide`, `PolicyCx`, `REASON_ORDER` не менялись: сочетание трёх свойств вызов не останавливает (решение заказчика 2026-11-11);
   - `za-agent`: запись аудита `rule_of_two {call_id, tool, exposure}` пишет слот «третьего» вызова при живом исполнении; драйвер после пакета пишет `exposure.changed {untrusted, private, external, calls, rule_of_two}` (после пакета, остановленного на прерывании, — нет: шаг доигрывается при resume);

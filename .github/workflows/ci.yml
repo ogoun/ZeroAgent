@@ -38,6 +38,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # Тесты шлюза с тестовыми подменами резолвера (R1-C2 D128): только с признаком
+      # `test-hooks`, обычная сборка его не содержит. Полная проверка задачи 15 —
+      # `--features za-web/test-hooks,zero-agent/test-hooks` по всему workspace.
+      - run: cargo clippy -p za-web --all-targets --features test-hooks --locked -- -D warnings
+      - run: cargo test -p za-web --features test-hooks --locked
       # Чистые части `za-llm` без функций — так его подключает `za-core`.
       - run: cargo test -p za-llm --no-default-features --locked
       # Ядро отдельно: при --workspace функции объединяются, и za-core видел бы za-llm

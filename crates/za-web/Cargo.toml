@@ -1,0 +1,39 @@
+[package]
+name = "za-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-web"
+
+[lints]
+workspace = true
+
+[dependencies]
+za-protocol = { path = "../za-protocol" }
+# `NetRequest` (D112) и нормализация хоста `net::normalize_host` (D124). `za-llm` приходит
+# транзитивно через `za-core` без функций: HTTP-клиент шлюза — свой (ADR 0006).
+za-core = { path = "../za-core" }
+# Второй держатель HTTP-клиента после `za-llm` (D107, D129): те же функции (`json`,
+# `rustls-tls`), без сжатия, cookie, SOCKS и HTTP/2; клиент строится только в `gateway.rs`.
+reqwest.workspace = true
+# `sync` — замки хостов, лимитера и кэша; `time` — дедлайн вызова; `net` — системный
+# резолвер (`lookup_host`) под фильтром адресов (D108).
+tokio = { workspace = true, features = ["sync", "time", "net"] }
+url.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+# Тестовые подмены резолвера (`with_test_resolve`, `with_inner_resolver`) — только с этим
+# признаком, не под `debug_assertions` (D128): обычная и release-сборка их не содержат.
+test-hooks = []
+
+[[test]]
+name = "gateway"
+required-features = ["test-hooks"]
+
+[dev-dependencies]
+axum.workspace = true
+http-body.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "test-util", "sync"] }

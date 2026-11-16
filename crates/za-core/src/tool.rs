@@ -106,6 +106,34 @@ pub struct Subjects {
     pub hosts_unknown: bool,
 }
 
+/// Одно обращение сетевого шлюза (R1-C2 D112, SEC-045): HTTP-запрос вызова, в том числе
+/// `robots.txt`, отказ фильтра до соединения и запрос, прерванный дедлайном.
+///
+/// Шлюз `za-web` кладёт по записи на каждый запрос; пакет пишет из них события
+/// `web.request` (`url` и `final_url` — через маску секретов).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetRequest {
+    /// Метод: в R1-C2 только `GET`.
+    pub method: String,
+    /// Адрес запроса (после нормализации хоста, без userinfo).
+    pub url: String,
+    /// Куда указал ответ-редирект (`Location`, абсолютный адрес); иначе `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_url: Option<String>,
+    /// Код ответа, если заголовки ответа получены.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Прочитано байт тела.
+    pub bytes: u64,
+    /// Длительность от начала запроса, мс.
+    pub ms: u64,
+    /// Исход: `za_protocol::net_outcome::{OK, BLOCKED, ERROR}`.
+    pub outcome: String,
+    /// Причина отказа или сбоя (`timeout` — дедлайн вызова).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Постусловие результата (TOOL-004, D75): что пакет проверяет после вызова.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

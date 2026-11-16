@@ -8,6 +8,10 @@
 //! `xtask`. R1-C1 (D73): направления `za-jail`, `za-tools`, `za-secrets`; запуск процессов
 //! (`std::process::Command`, `tokio::process::Command`) в `crates/*/src` — только в
 //! `za-jail` (SEC-006); в `Cargo.lock` нет `openssl-sys`, `native-tls`, `libdbus-sys`.
+//! R1-C2 (D107, D129): `za-web` — только от `za-protocol` и `za-core`, от него — только
+//! `zero-agent` и `xtask`; у `reqwest` в сборке workspace (с тестами) нет функций сжатия,
+//! cookie, SOCKS, HTTP/2 и корней ОС; HTTP-клиент `reqwest` строится только в
+//! `crates/za-web/src/gateway.rs` и `crates/za-llm`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -66,6 +70,34 @@ const PROCESS_ALLOWED: &[(&str, &str)] = &[
 ];
 /// Крейты только для `xtask` (R1-B2 D64): счёт токенов промптов в CI, не в продукте.
 const XTASK_ONLY_DEPS: &[&str] = &["tiktoken-rs"];
+/// Крейты `za-*`, от которых может зависеть сетевой шлюз `za-web` (все виды, R1-C2).
+const WEB_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-core"];
+/// Кто может зависеть от `za-web` (все виды): бинарник и `xtask` (бюджеты промптов).
+const WEB_USERS: &[&str] = &["zero-agent", "xtask"];
+/// Функции `reqwest`, которых не должно быть в сборке (D107, D129): распаковка тела
+/// (`Accept-Encoding`), cookie, SOCKS и HTTP/2–3, корни хранилища ОС и системный TLS.
+const REQWEST_FORBIDDEN_FEATURES: &[&str] = &[
+    "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+    "cookies",
+    "socks",
+    "http2",
+    "http3",
+    "rustls-tls-native-roots",
+    "rustls-tls-native-roots-no-provider",
+    "native-tls",
+    "default-tls",
+];
+/// Где можно строить HTTP-клиент `reqwest`, и почему (D129). Путь — от корня, через `/`.
+const HTTP_CLIENT_ALLOWED: &[(&str, &str)] = &[
+    (
+        "crates/za-web/src/gateway.rs",
+        "сетевой шлюз: фильтр адресов в резолвере, без прокси и cookie (D107, D108)",
+    ),
+    ("crates/za-llm/", "транспорт моделей (R1-A)"),
+];
 
 /// Нарушение политики.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +290,24 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     pkg.name
                 )));
             }
+            // Все виды: шлюз — над `za-core`, без цикла и без обходных путей (D107).
+            if pkg.name == "za-web"
+                && is_workspace_crate(&dep.name)
+                && !WEB_ALLOWED_ZA_DEPS.contains(&dep.name.as_str())
+            {
+                out.push(Violation(format!(
+                    "za-web не должен зависеть от {} (допустимы {})",
+                    dep.name,
+                    WEB_ALLOWED_ZA_DEPS.join(", ")
+                )));
+            }
+            if dep.name == "za-web" && !WEB_USERS.contains(&pkg.name.as_str()) {
+                out.push(Violation(format!(
+                    "{} не должен зависеть от za-web (только {})",
+                    pkg.name,
+                    WEB_USERS.join(", ")
+                )));
+            }
             if pkg.name == "za-protocol" && dep.name.starts_with("za-") {
                 out.push(Violation(format!(
                     "za-protocol не должен зависеть от {}",
@@ -300,31 +350,97 @@ pub fn check_resolved_llm_features(pkg: &str, features: &[String]) -> Option<Vio
     })
 }
 
+/// Нарушение, если в сборке workspace у `reqwest` есть функция из
+/// [`REQWEST_FORBIDDEN_FEATURES`] (D129): защита от объединения функций Cargo другим крейтом.
+pub fn check_reqwest_features(features: &[String]) -> Option<Violation> {
+    let bad: Vec<&str> = features
+        .iter()
+        .map(String::as_str)
+        .filter(|f| REQWEST_FORBIDDEN_FEATURES.contains(f))
+        .collect();
+    (!bad.is_empty()).then(|| {
+        Violation(format!(
+            "reqwest: в сборке workspace включены функции {bad:?} (запрещены: сжатие, cookie, SOCKS, HTTP/2, корни ОС; D129)"
+        ))
+    })
+}
+
 /// Итоговые функции `za-llm` в сборке `-p pkg` (обычные зависимости, все цели).
 ///
 /// `resolve` из `cargo metadata` для этого не годится: он объединяет функции по всему
 /// workspace (бинарник `zero-agent` включает `gateway`), а `cargo tree -p` разрешает их
 /// так же, как `cargo build -p` — с собственным `[features]` и транзитивными включениями.
 fn resolved_llm_features(root: &Path, pkg: &str) -> Result<Vec<String>, String> {
+    resolved_features(root, &["-p", pkg, "-e", "normal"], "za-llm")
+}
+
+/// Итоговые функции `reqwest` в сборке всего workspace вместе с тестами (`-e normal,dev`:
+/// функции разрешаются как у `cargo test --workspace`) — надмножество сборки любого крейта.
+fn resolved_reqwest_features(root: &Path) -> Result<Vec<String>, String> {
+    resolved_features(root, &["--workspace", "-e", "normal,dev"], "reqwest")
+}
+
+/// Итоговые функции крейта `krate` в выводе `cargo tree <sel>` (все цели).
+fn resolved_features(root: &Path, sel: &[&str], krate: &str) -> Result<Vec<String>, String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let what = format!("cargo tree {}", sel.join(" "));
     let res = Command::new(cargo)
-        .args([
-            "tree", "--locked", "--color", "never", "-p", pkg, "-e", "normal", "--target", "all",
-            "--prefix", "none", "-f", "{p}|{f}",
-        ])
+        .args(["tree", "--locked", "--color", "never"])
+        .args(sel)
+        .args(["--target", "all", "--prefix", "none", "-f", "{p}|{f}"])
         // CI задаёт CARGO_TERM_COLOR=always: без явного отказа от цвета маркер `(*)` приходит
         // с ANSI-кодами и разбирается как имя функции.
         .env("CARGO_TERM_COLOR", "never")
         .current_dir(root)
         .output()
-        .map_err(|e| format!("cargo tree -p {pkg}: {e}"))?;
+        .map_err(|e| format!("{what}: {e}"))?;
     if !res.status.success() {
-        return Err(format!(
-            "cargo tree -p {pkg}: {}",
-            String::from_utf8_lossy(&res.stderr)
-        ));
+        return Err(format!("{what}: {}", String::from_utf8_lossy(&res.stderr)));
     }
-    Ok(parse_tree_features(&String::from_utf8_lossy(&res.stdout), "za-llm").unwrap_or_default())
+    Ok(parse_tree_features(&String::from_utf8_lossy(&res.stdout), krate).unwrap_or_default())
+}
+
+/// Построение HTTP-клиента `reqwest` в исходнике `rel` вне [`HTTP_CLIENT_ALLOWED`] (D129):
+/// `Client::builder`, `ClientBuilder`, `Client::new(`, `reqwest::get(`, `reqwest::blocking`.
+/// Имя должно начинаться словом: `MemoryClient::new(` — не клиент `reqwest`. Строки-
+/// комментарии не считаются.
+pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
+    const PATTERNS: &[&str] = &[
+        "Client::builder",
+        "ClientBuilder",
+        "Client::new(",
+        "reqwest::get(",
+        "reqwest::blocking",
+    ];
+    if HTTP_CLIENT_ALLOWED
+        .iter()
+        .any(|(prefix, _)| rel.starts_with(prefix))
+    {
+        return Vec::new();
+    }
+    let word_start = |code: &str, at: usize| {
+        code[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+    };
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        let hit = PATTERNS
+            .iter()
+            .any(|p| code.match_indices(p).any(|(at, _)| word_start(code, at)));
+        if hit {
+            out.push(Violation(format!(
+                "{rel}:{}: HTTP-клиент reqwest вне za-web/src/gateway.rs и za-llm (D129: обход фильтра адресов)",
+                i + 1
+            )));
+        }
+    }
+    out
 }
 
 /// Запуск процессов в исходнике `rel` (путь от корня через `/`) вне [`PROCESS_ALLOWED`]:
@@ -473,6 +589,7 @@ fn collect(root: &Path) -> Result<Vec<Violation>, String> {
         let features = resolved_llm_features(root, pkg)?;
         out.extend(check_resolved_llm_features(pkg, &features));
     }
+    out.extend(check_reqwest_features(&resolved_reqwest_features(root)?));
 
     let limit = read_limit(root, "core-size-limit.txt")?;
     let lines =
@@ -484,6 +601,7 @@ fn collect(root: &Path) -> Result<Vec<Violation>, String> {
     out.extend(check_size("za-shell", lines, limit));
     for (rel, text) in crate_sources(root).map_err(|e| format!("crates/*/src: {e}"))? {
         out.extend(check_process_spawn(&rel, &text));
+        out.extend(check_http_client(&rel, &text));
     }
     Ok(out)
 }
@@ -812,6 +930,96 @@ version = \"0.0.1\"
         assert!(
             check_process_spawn("crates/za-core/src/a.rs", "use std::process::Stdio;").is_empty()
         );
+    }
+    #[test]
+    fn r1c2_web_directions() {
+        // za-web — только от za-protocol и za-core, в любом виде.
+        for ok in ["za-protocol", "za-core", "reqwest", "url"] {
+            assert!(check_direction(&meta("za-web", ok)).is_empty(), "{ok}");
+        }
+        for bad in [
+            "za-agent",
+            "za-tools",
+            "za-jail",
+            "za-store",
+            "za-extract",
+            "za-llm",
+            "zero-agent",
+        ] {
+            assert!(!check_direction(&meta("za-web", bad)).is_empty(), "{bad}");
+            let dev = Dependency {
+                kind: Some("dev".into()),
+                ..dep(bad)
+            };
+            assert!(
+                !check_direction(&meta_with("za-web", dev)).is_empty(),
+                "dev {bad}"
+            );
+        }
+        // От za-web — только zero-agent и xtask (случаи бюджета промптов).
+        for ok in ["zero-agent", "xtask"] {
+            assert!(check_direction(&meta(ok, "za-web")).is_empty(), "{ok}");
+        }
+        let to_web = |v: Vec<Violation>| v.iter().any(|x| x.0.contains("зависеть от za-web"));
+        for bad in ["za-agent", "za-tools", "za-core", "za-skills", "za-extract"] {
+            assert!(to_web(check_direction(&meta(bad, "za-web"))), "{bad}");
+            let dev = Dependency {
+                kind: Some("dev".into()),
+                ..dep("za-web")
+            };
+            assert!(to_web(check_direction(&meta_with(bad, dev))), "dev {bad}");
+        }
+    }
+    #[test]
+    fn reqwest_features_are_guarded() {
+        let clean = "reqwest v0.12.28|__rustls,__tls,json,rustls-tls,rustls-tls-webpki-roots\n\
+            reqwest v0.12.28|__rustls,__tls,json,rustls-tls,rustls-tls-webpki-roots (*)\n";
+        let f = parse_tree_features(clean, "reqwest").unwrap();
+        assert_eq!(check_reqwest_features(&f), None);
+        for bad in REQWEST_FORBIDDEN_FEATURES {
+            let tree = format!("reqwest v0.12.28|json,rustls-tls,{bad}\n");
+            let f = parse_tree_features(&tree, "reqwest").unwrap();
+            let v = check_reqwest_features(&f).expect(bad);
+            assert!(v.0.contains(bad), "{v}");
+        }
+        assert_eq!(check_reqwest_features(&[]), None);
+    }
+    #[test]
+    fn http_client_outside_gateway_is_rejected() {
+        for line in [
+            "let c = reqwest::Client::builder().build()?;",
+            "let c = Client::builder()",
+            "let b: reqwest::ClientBuilder = x;",
+            "let c = reqwest::Client::new();",
+            "let r = reqwest::get(url).await?;",
+            "let c = reqwest::blocking::Client::new();",
+        ] {
+            let v = check_http_client("crates/za-tools/src/web.rs", line);
+            assert_eq!(v.len(), 1, "{line}");
+            assert!(v[0].0.contains("crates/za-tools/src/web.rs:1"), "{v:?}");
+            // Остальные файлы za-web — тоже нет: клиент только в gateway.rs.
+            assert_eq!(
+                check_http_client("crates/za-web/src/fetch.rs", line).len(),
+                1,
+                "{line}"
+            );
+        }
+        for rel in ["crates/za-web/src/gateway.rs", "crates/za-llm/src/probe.rs"] {
+            assert!(
+                check_http_client(rel, "Client::builder()").is_empty(),
+                "{rel}"
+            );
+        }
+        for line in [
+            "// reqwest::Client::builder — пример",
+            "let m = MemoryClient::new(cfg);",
+            "let b = HttpClientBuilder::default();",
+        ] {
+            assert!(
+                check_http_client("crates/za-core/src/a.rs", line).is_empty(),
+                "{line}"
+            );
+        }
     }
     #[test]
     fn core_over_limit_is_reported() {
