@@ -31,11 +31,18 @@ pub const SKILL_FILE: &str = "SKILL.md";
 /// Каталоги, в которые обнаружение не заходит (D116).
 pub const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "__pycache__"];
 /// Пределы обхода `user` и `extra` (на хэш доверия проекта не влияют): 1 МиБ на файл, как
-/// у доверия, и 20 000 записей на корень — с запасом над 2000 каталогами по 100 файлов
-/// реального набора скиллов и без многосекундного обхода чужого огромного каталога.
+/// у доверия, и 1000 записей (файлов, каталогов, ссылок) на корень источника. Обход идёт
+/// на каждом старте run, и цель — не дольше ~2 с на корень (ревью задачи 11, m3). Цену
+/// задаёт число файлов, а не размер: на Windows значение файла (разрешение пути и
+/// `open_checked`) стоит ~1,25 мс, хэш 1 МиБ добавляет ~0,3 мс, а чтение `SKILL.md`
+/// скилла в `discover` — ещё ~2,3 мс. Замер (release, NTFS, тёплый кэш, 2026-11-16):
+/// 900 файлов по 1 МиБ — 1,75 с, 500 скиллов из одного `SKILL.md` (1000 записей) — 1,8 с,
+/// 5000 мелких файлов — 7,6 с. Сверх предела — `limit reached: more than 1000 entries`
+/// и остановка источника, без хэшей (перечень записей дешёвый). Следствие: предел D116
+/// «2000 каталогов на источник» у `user` и `extra` не достигается, он действует у проекта.
 pub const LOCAL_TREE_LIMITS: TreeLimits = TreeLimits {
     max_file: 1 << 20,
-    max_entries: 20_000,
+    max_entries: 1000,
 };
 
 /// Пределы обнаружения (D116).
@@ -374,8 +381,15 @@ impl Discovery {
             "changed while reading"
         };
         let abs = join_rel(&root.abs, dir);
-        let bytes = match tree::read_checked(&abs, SKILL_FILE, TRUST_LIMITS.max_file) {
-            Ok(b) => b,
+        // Граница чтения — канонический каталог скилла, как у `load`.
+        let read = tree::skill_roots(&abs).and_then(|roots| {
+            Ok((
+                tree::read_in(&roots, SKILL_FILE, TRUST_LIMITS.max_file)?,
+                roots,
+            ))
+        });
+        let (bytes, skill_roots) = match read {
+            Ok(r) => r,
             Err(ReadFail::Missing | ReadFail::TooLarge) => return self.skip(shown, changed),
             Err(ReadFail::Other(e)) => return self.skip(shown, format!("unreadable: {e}")),
         };
@@ -410,6 +424,15 @@ impl Discovery {
             if v.starts_with(TOO_LARGE_PREFIX) {
                 warnings.push(format!(
                     "file {} is not listed: too large",
+                    inner.escape_debug()
+                ));
+                continue;
+            }
+            // Ссылка внутри корня источника, но за пределы каталога скилла, не загрузится
+            // (`load` читает от канонического каталога скилла): в список она не входит.
+            if v.starts_with(LINK_PREFIX) && !tree::resolves_inside(&skill_roots, inner) {
+                warnings.push(format!(
+                    "file {} is not listed: link outside the skill directory",
                     inner.escape_debug()
                 ));
                 continue;

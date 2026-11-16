@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use za_core::paths::Roots;
 use za_protocol::skill_source;
 use za_skills::{
-    Catalog, DiscoverInput, EXTERNAL_LINK, Limits, LoadError, PROJECT_TREES, Place, ProjectSkills,
-    TRUST_LIMITS, TreeLimits, TreeListing, discover, load, tree_hash, tree_listing,
+    Catalog, DiscoverInput, EXTERNAL_LINK, LOCAL_TREE_LIMITS, Limits, LoadError, PROJECT_TREES,
+    Place, ProjectSkills, TRUST_LIMITS, TreeLimits, TreeListing, discover, load, tree_hash,
+    tree_listing,
 };
 
 /// Свой каталог на процесс и вызов.
@@ -67,6 +68,58 @@ fn reasons(cat: &Catalog) -> Vec<(String, String)> {
 }
 
 static NO_BUNDLED: &[(&str, &str)] = &[];
+
+/// Ссылка на каталог: junction на Windows (`mklink /J` прав не требует), символическая
+/// ссылка на Unix (как в `zero-agent/tests/trust.rs`).
+fn dir_link(link: &Path, target: &Path) {
+    #[cfg(windows)]
+    {
+        // `mklink` понимает только `\`: путь собирается заново по компонентам.
+        let native = |p: &Path| p.components().collect::<PathBuf>();
+        let out = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(native(link))
+            .arg(native(target))
+            .output()
+            .expect("cmd не запустился");
+        assert!(
+            out.status.success(),
+            "mklink /J: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+/// Ссылка на файл. На Windows требует режима разработчика или прав администратора: без
+/// них — `None`, и тест явно пропускает проверку с сообщением.
+#[cfg(unix)]
+fn file_link(link: &Path, target: &Path) -> Option<()> {
+    std::os::unix::fs::symlink(target, link).unwrap();
+    Some(())
+}
+
+/// См. Unix-вариант выше.
+#[cfg(windows)]
+fn file_link(link: &Path, target: &Path) -> Option<()> {
+    match std::os::windows::fs::symlink_file(target, link) {
+        Ok(()) => Some(()),
+        Err(e) => {
+            // `ZA_REQUIRE_LINK_TESTS=1` (CI) — пропуск — падение.
+            let why = format!(
+                "ссылка на файл не создана ({e}); нужен режим разработчика или права администратора"
+            );
+            if std::env::var("ZA_REQUIRE_LINK_TESTS").as_deref() == Ok("1") {
+                panic!("ZA_REQUIRE_LINK_TESTS=1, а проверка пропущена: {why}");
+            }
+            eprintln!("ПРОПУСК: {why}");
+            None
+        }
+    }
+}
 
 #[test]
 fn tree_hash_matches_r1c1_golden() {
@@ -246,7 +299,7 @@ fn order_within_source() {
         bundled: NO_BUNDLED,
         limits: Limits::default(),
     });
-    let x = cat.get("x").unwrap();
+    let x = cat.get("x").unwrap_or_else(|| panic!("{cat:?}"));
     assert_eq!(x.description, "from zero-agent");
     assert_eq!(x.display, ".zero-agent/skills/x");
     assert_eq!(cat.get("y").unwrap().description, "from b");
@@ -284,37 +337,81 @@ fn discover_limits() {
     assert!(cat.get("d6").is_some());
     assert!(cat.get("e7").is_none());
 
-    // 2001 каталог у user (считаются на обходе) — `limit reached`; найденное до предела
-    // остаётся.
+    // Каталогов больше `Limits.dirs` у user (считаются на обходе) — `limit reached`;
+    // найденное до предела остаётся. Предел каталогов — малый: при `LOCAL_TREE_LIMITS`
+    // (1000 записей) 2000 каталогов у `user` и `extra` недостижимы.
+    let few_dirs = Limits {
+        dirs: 20,
+        ..Limits::default()
+    };
     let many = root.join("many");
     skill(&many, "a", "a", "first");
-    for i in 0..2001 {
+    for i in 0..21 {
         write(&many.join(format!("s{i:04}/f.txt")), "f");
     }
     let cat = discover(&DiscoverInput {
         user_dir: Some(many.clone()),
+        limits: few_dirs,
         ..DiscoverInput::default()
     });
     assert!(cat.get("a").is_some());
     assert!(
         cat.skipped
             .iter()
-            .any(|s| s.reason.starts_with("limit reached")),
+            .any(|s| s.reason == "limit reached: more than 20 directories"),
         "{:?}",
         reasons(&cat)
     );
     // Пустые каталоги в счёт не идут.
     let empty = root.join("empty");
     skill(&empty, "a", "a", "first");
-    for i in 0..2001 {
+    for i in 0..21 {
         std::fs::create_dir_all(empty.join(format!("s{i:04}"))).unwrap();
     }
     let cat = discover(&DiscoverInput {
         user_dir: Some(empty),
+        limits: few_dirs,
         ..DiscoverInput::default()
     });
     assert!(cat.get("a").is_some());
     assert!(cat.skipped.is_empty(), "{:?}", reasons(&cat));
+
+    // Предел записей обхода `user` и `extra` (ревью задачи 11, m3): ровно 1000 записей —
+    // скиллы найдены; 1001 — источник не читается, `limit reached: more than 1000
+    // entries`, следующий источник того же вида не обходится.
+    assert_eq!(
+        LOCAL_TREE_LIMITS,
+        TreeLimits {
+            max_file: 1 << 20,
+            max_entries: 1000
+        }
+    );
+    let edge = root.join("entries");
+    skill(&edge, "a", "a", "first");
+    // `a`, `a/SKILL.md` и 998 файлов в корне — 1000 записей.
+    for i in 0..998 {
+        write(&edge.join(format!("f{i:04}")), "");
+    }
+    let cat = discover(&DiscoverInput {
+        user_dir: Some(edge.clone()),
+        ..DiscoverInput::default()
+    });
+    assert!(cat.get("a").is_some(), "{:?}", reasons(&cat));
+    write(&edge.join("f0998"), "");
+    let other = root.join("other");
+    skill(&other, "b", "b", "second extra");
+    let cat = discover(&DiscoverInput {
+        extra_dirs: vec![edge.clone(), other],
+        ..DiscoverInput::default()
+    });
+    assert!(cat.skills.is_empty(), "{:?}", cat.skills);
+    assert_eq!(
+        reasons(&cat),
+        [(
+            edge.display().to_string(),
+            "limit reached: more than 1000 entries".to_owned()
+        )]
+    );
 
     // У project каталоги считаются по путям файлов списка доверия.
     let project = root.join("project");
@@ -551,6 +648,122 @@ fn load_detects_change() {
     // Удалён — тоже `Changed`.
     std::fs::remove_file(user.join("x/SKILL.md")).unwrap();
     assert_eq!(load(meta, None), Err(LoadError::Changed));
+}
+
+/// Ревью задачи 11, m2: каталог-ссылка (junction) внутри каталога скилла не обходится;
+/// у источника `base` (корень `user` или дерево проекта) — каталог-ссылка `x/linked` на
+/// соседний каталог `shared`.
+fn junction_fixture(base: &Path) {
+    skill(base, "x", "x", "skill with links");
+    write(&base.join("x/ref/a.md"), "resource");
+    write(&base.join("shared/ref.md"), "shared resource");
+    dir_link(&base.join("x/linked"), &base.join("shared"));
+}
+
+/// Ссылки на файлы у источника `base`: `x/alias.md` → `x/ref/a.md` (внутри каталога
+/// скилла), `x/shared.md` → `shared/ref.md` (в корне источника, но вне каталога скилла),
+/// `SKILL.md` скилла `y` → `store/y.md` (наружу), `SKILL.md` скилла `z` →
+/// `z/docs/skill.md` (внутрь). `None` — ОС не дала создать ссылку на файл.
+fn file_links_fixture(base: &Path) -> Option<()> {
+    file_link(&base.join("x/alias.md"), &base.join("x/ref/a.md"))?;
+    file_link(&base.join("x/shared.md"), &base.join("shared/ref.md"))?;
+    write(&base.join("store/y.md"), &skill_text("y", "outside target"));
+    std::fs::create_dir_all(base.join("y")).unwrap();
+    file_link(&base.join("y/SKILL.md"), &base.join("store/y.md"))?;
+    write(
+        &base.join("z/docs/skill.md"),
+        &skill_text("z", "inside target"),
+    );
+    file_link(&base.join("z/SKILL.md"), &base.join("z/docs/skill.md"))?;
+    Some(())
+}
+
+/// Проверки каталога и загрузки по фикстурам выше; `links` — есть ли ссылки на файлы.
+fn check_links(cat: &Catalog, shown: impl Fn(&str) -> String, links: bool) {
+    let x = cat.get("x").unwrap_or_else(|| panic!("{cat:?}"));
+    // Каталог-ссылка внутри скилла — запись `external-link`: не ресурс, предупреждение,
+    // загрузка по пути внутри неё — `UnknownFile`.
+    assert!(
+        !x.files.keys().any(|k| k.starts_with("linked")),
+        "{:?}",
+        x.files
+    );
+    assert!(
+        x.warnings
+            .iter()
+            .any(|w| w == "file linked is not listed: external link"),
+        "{:?}",
+        x.warnings
+    );
+    assert_eq!(
+        load(x, Some("linked/ref.md")),
+        Err(LoadError::UnknownFile("linked/ref.md".into()))
+    );
+    assert_eq!(load(x, Some("ref/a.md")).unwrap(), "resource");
+    if !links {
+        return;
+    }
+    // Ссылка на файл внутри каталога скилла — ресурс `link:<hex>`, загружается.
+    assert_eq!(x.files["alias.md"], format!("link:{}", hex(b"resource")));
+    assert_eq!(load(x, Some("alias.md")).unwrap(), "resource");
+    // Ссылка за пределы каталога скилла (в том же корне источника) — не ресурс (m1):
+    // модель не увидит файл, который не загрузится.
+    assert!(!x.files.contains_key("shared.md"), "{:?}", x.files);
+    assert!(
+        x.warnings
+            .iter()
+            .any(|w| w == "file shared.md is not listed: link outside the skill directory"),
+        "{:?}",
+        x.warnings
+    );
+    assert_eq!(
+        load(x, Some("shared.md")),
+        Err(LoadError::UnknownFile("shared.md".into()))
+    );
+    // `SKILL.md`-ссылка наружу — пропуск; внутрь — скилл с хэшем цели.
+    assert!(cat.get("y").is_none());
+    assert!(
+        reasons(cat)
+            .iter()
+            .any(|(path, why)| *path == shown("y")
+                && why == "unreadable: outside the skill directory"),
+        "{:?}",
+        reasons(cat)
+    );
+    let z = cat.get("z").unwrap();
+    assert_eq!(z.hash, hex(skill_text("z", "inside target").as_bytes()));
+    assert_eq!(load(z, None).unwrap(), "Body of z.\n");
+    // Цель внутри каталога скилла — его ресурс, как обычный файл.
+    assert!(z.files.contains_key("docs/skill.md"), "{:?}", z.files);
+}
+
+#[test]
+fn links_inside_skill_dir() {
+    // Источник `user`.
+    let user = dir("links-user");
+    junction_fixture(&user);
+    let links = file_links_fixture(&user).is_some();
+    let cat = discover(&DiscoverInput {
+        user_dir: Some(user.clone()),
+        ..DiscoverInput::default()
+    });
+    check_links(&cat, |d| user.join(d).display().to_string(), links);
+
+    // Проект: те же ссылки внутри доверенного дерева (общие файлы монорепозитория —
+    // `ref.md -> ../shared/ref.md`); значения дал обход доверия.
+    let project = dir("links-project");
+    let tree = project.join(".claude/skills");
+    junction_fixture(&tree);
+    let links = file_links_fixture(&tree).is_some();
+    // Junction на каталог внутри дерева — метка в списке доверия, а не ошибка обхода
+    // (на Windows открытие каталога — `PermissionDenied`).
+    let (_, listing) = tree_listing(&roots(&project), ".claude/skills", &TRUST_LIMITS).unwrap();
+    assert_eq!(listing.unwrap().files["x/linked"], EXTERNAL_LINK);
+    let cat = discover(&DiscoverInput {
+        project: Some(project_skills(&project)),
+        ..DiscoverInput::default()
+    });
+    check_links(&cat, |d| format!(".claude/skills/{d}"), links);
 }
 
 #[test]

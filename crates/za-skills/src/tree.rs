@@ -210,6 +210,13 @@ fn entry_value(
     if !resolved.inside {
         return Ok(Some(EXTERNAL_LINK.to_owned()));
     }
+    // Ссылка (junction) на каталог внутри корня не обходится — метка. Проверка до открытия:
+    // на Windows открытие каталога даёт `PermissionDenied`, а не «не обычный файл», и
+    // одна такая ссылка делала нечитаемым всё дерево (ревью задачи 11, m2). Путь
+    // канонический, ссылок в нём нет; подмену после проверки ловит `open_checked`.
+    if link && std::fs::symlink_metadata(&resolved.path).is_ok_and(|m| m.is_dir()) {
+        return Ok(Some(EXTERNAL_LINK.to_owned()));
+    }
     let file = match paths::open_checked(&resolved, false) {
         Ok(f) => f,
         // Висячая ссылка — метка; исчезнувший обычный файл — нет файла.
@@ -345,6 +352,9 @@ pub(crate) fn is_missing(e: &io::Error) -> bool {
     )
 }
 
+/// Причина отказа чтения файла, разрешённого за пределы каталога скилла.
+pub(crate) const OUTSIDE_SKILL_DIR: &str = "outside the skill directory";
+
 /// Почему файл скилла не прочитан.
 #[derive(Debug)]
 pub(crate) enum ReadFail {
@@ -356,23 +366,44 @@ pub(crate) enum ReadFail {
     Other(String),
 }
 
-/// Байты файла `rel` каталога скилла `dir` (не больше `max`). Путь разрешается от
-/// канонического каталога скилла: ссылка за его пределы — отказ; файл открывается
-/// `open_checked` (без следования ссылке на последнем компоненте, со сверкой
-/// дескриптора). Блокирующая.
-pub(crate) fn read_checked(dir: &Path, rel: &str, max: u64) -> Result<Vec<u8>, ReadFail> {
-    let roots = Roots::canonical(dir, dir).map_err(|e| {
+/// Корни чтения каталога скилла `dir`: канонический каталог скилла — граница
+/// ([`read_in`], [`resolves_inside`]). Блокирующая.
+pub(crate) fn skill_roots(dir: &Path) -> Result<Roots, ReadFail> {
+    Roots::canonical(dir, dir).map_err(|e| {
         if is_missing(&e) {
             ReadFail::Missing
         } else {
             ReadFail::Other(e.to_string())
         }
-    })?;
+    })
+}
+
+/// Путь `rel` каталога скилла разрешается внутрь канонического каталога скилла — так, как
+/// его разрешит [`read_in`]. Ссылка из каталога скилла на файл рядом с ним (в том же
+/// корне источника, но вне каталога скилла) — `false`: такой файл не загрузится, и в
+/// список ресурсов он не входит (ревью задачи 11, m1). Блокирующая.
+pub(crate) fn resolves_inside(roots: &Roots, rel: &str) -> bool {
+    paths::classify(&roots.project, rel)
+        .and_then(|lex| paths::resolve(roots, &lex, Access::Read))
+        .is_ok_and(|r| r.inside)
+}
+
+/// Байты файла `rel` каталога скилла `dir` (не больше `max`): [`skill_roots`] и
+/// [`read_in`]. Блокирующая.
+pub(crate) fn read_checked(dir: &Path, rel: &str, max: u64) -> Result<Vec<u8>, ReadFail> {
+    read_in(&skill_roots(dir)?, rel, max)
+}
+
+/// Байты файла `rel` каталога скилла с корнями `roots` ([`skill_roots`]), не больше
+/// `max`. Путь разрешается от канонического каталога скилла: ссылка за его пределы —
+/// отказ; файл открывается `open_checked` (без следования ссылке на последнем компоненте,
+/// со сверкой дескриптора). Блокирующая.
+pub(crate) fn read_in(roots: &Roots, rel: &str, max: u64) -> Result<Vec<u8>, ReadFail> {
     let lex = paths::classify(&roots.project, rel).map_err(|e| ReadFail::Other(e.to_string()))?;
     let resolved =
-        paths::resolve(&roots, &lex, Access::Read).map_err(|e| ReadFail::Other(e.to_string()))?;
+        paths::resolve(roots, &lex, Access::Read).map_err(|e| ReadFail::Other(e.to_string()))?;
     if !resolved.inside {
-        return Err(ReadFail::Other("outside the skill directory".into()));
+        return Err(ReadFail::Other(OUTSIDE_SKILL_DIR.into()));
     }
     let file = paths::open_checked(&resolved, false).map_err(|e| {
         if is_missing(&e) {
