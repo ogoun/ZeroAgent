@@ -2903,6 +2903,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "za-agent",
  "za-core",

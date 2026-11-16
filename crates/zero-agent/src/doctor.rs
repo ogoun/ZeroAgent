@@ -9,16 +9,25 @@
 //! памяти — с клиентом ZeroAIMemory. Строки `git` и `shell` (R1-C1 D96): `git` в `PATH` и
 //! его версия (без git чекпоинты — копиями файлов, D89), оболочка инструмента `bash`
 //! (D85); их нет — `Warn`. Проверка памяти ZeroAIMemory появится вместе с её клиентом.
+//!
+//! R1-C2 (D122, задача 14): строки `web` (`[web]` включён ли и его пределы), `search`
+//! (поставщик поиска: не настроен, или пробный запрос к своему экземпляру SearXNG через
+//! `WebGateway::get_provider` с подсказками на 403 и 429), `extract` (проба подпроцесса
+//! `zero-agent extract html`), `skills` (число скиллов по источникам вне проекта, пропуски и
+//! корни, не прочитанные пределом `[skills] max_entries`) и `window` (тир standard или full
+//! на окне меньше 32k, D169). Всё это — `Warn`, не `Fail`: run без них работает.
 
 use std::path::Path;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use za_core::extract::{Extractor, HtmlRequest};
 use za_jail::{CommandSpec, DirectRunner, EnvMode, Exit, Runner};
 use za_llm::EndpointView;
+use za_protocol::Tier;
 use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query_nvidia_smi};
 
 use crate::config::{AgentConfig, AppConfigError, LLAMA_URL_ENDPOINT, load_config};
@@ -77,6 +86,16 @@ pub struct DoctorReport {
     pub git: Check,
     /// Оболочка инструмента `bash` (D85, D96); нет — `Warn`.
     pub shell: Check,
+    /// `[web]` (D122): включён ли веб и его пределы.
+    pub web: Check,
+    /// Поставщик поиска (D111, D122): не настроен или итог пробного запроса.
+    pub search: Check,
+    /// Извлекатель в подпроцессе (D113, D127): проба `extract html`.
+    pub extractor: Check,
+    /// Скиллы вне проекта (D114, D122): по источникам, пропуски, пределы корней.
+    pub skills: Check,
+    /// Тир и окно моделей (D169).
+    pub window: Check,
     /// Модели по id эндпоинта; `config` — ошибка или предупреждение конфигурации.
     pub models: Vec<(String, Check)>,
     /// Компилятор сборки и MSRV.
@@ -84,32 +103,36 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
-    /// Есть ли отказ: `doctor` завершается с кодом 1.
-    pub fn has_failure(&self) -> bool {
+    /// Проверки строками отчёта: имя и итог.
+    fn rows(&self) -> [(&'static str, &Check); 11] {
         [
-            &self.sqlite,
-            &self.llama,
-            &self.gpu,
-            &self.secrets,
-            &self.git,
-            &self.shell,
-        ]
-        .into_iter()
-        .chain(self.models.iter().map(|(_, c)| c))
-        .any(|c| matches!(c, Check::Fail(_)))
-    }
-
-    /// Человекочитаемый вывод.
-    pub fn render(&self) -> String {
-        let mut out = String::from("zero-agent doctor\n");
-        for (name, c) in [
             ("sqlite", &self.sqlite),
             ("llama", &self.llama),
             ("gpu", &self.gpu),
             ("secrets", &self.secrets),
             ("git", &self.git),
             ("shell", &self.shell),
-        ] {
+            ("web", &self.web),
+            ("search", &self.search),
+            ("extract", &self.extractor),
+            ("skills", &self.skills),
+            ("window", &self.window),
+        ]
+    }
+
+    /// Есть ли отказ: `doctor` завершается с кодом 1.
+    pub fn has_failure(&self) -> bool {
+        self.rows()
+            .into_iter()
+            .map(|(_, c)| c)
+            .chain(self.models.iter().map(|(_, c)| c))
+            .any(|c| matches!(c, Check::Fail(_)))
+    }
+
+    /// Человекочитаемый вывод.
+    pub fn render(&self) -> String {
+        let mut out = String::from("zero-agent doctor\n");
+        for (name, c) in self.rows() {
             out.push_str(&format!("  {name:<7} {:<5} {}\n", c.label(), c.detail()));
         }
         out.push_str(&format!("  {:<7} {:<5} {}\n", "rust", "", self.rust));
@@ -133,6 +156,7 @@ impl DoctorReport {
 pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
     let cfg = home.map(load_config);
     let covered = matches!(&cfg, Some(Ok(c)) if c.llama_url_fallback);
+    let read: Option<AgentConfig> = cfg.as_ref().and_then(|r| r.as_ref().ok()).cloned();
     let llama = async {
         if covered {
             None
@@ -140,7 +164,15 @@ pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
             Some(check_llama(llama_url).await)
         }
     };
-    let (llama, (gpu, models), git) = tokio::join!(llama, check_home(home, cfg), check_git());
+    let (llama, (gpu, models, windows), git, (web, search), extractor, skills) = tokio::join!(
+        llama,
+        check_home(home, cfg),
+        check_git(),
+        check_web_search(read.as_ref()),
+        check_extractor(home),
+        check_skills(home, read.as_ref()),
+    );
+    let window = check_window(read.as_ref().and_then(|c| c.context.tier), &windows);
     let llama = llama.unwrap_or_else(|| {
         let shown = llama_url.map(display_url).unwrap_or_default();
         match models.iter().find(|(id, _)| id == LLAMA_URL_ENDPOINT) {
@@ -163,8 +195,143 @@ pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
         secrets: check_secrets(&StoreSecrets::from_env().short_names()),
         git,
         shell: check_shell(),
+        web,
+        search,
+        extractor,
+        skills,
+        window,
         models,
         rust: rust_version(),
+    }
+}
+
+/// Конфигурация не прочитана — веб, поиск и скиллы не проверяются.
+fn no_config() -> Check {
+    Check::Warn("не проверено: конфигурация не прочитана (строка config ниже)".to_owned())
+}
+
+/// Строки `web` и `search` (D111, D122).
+async fn check_web_search(cfg: Option<&AgentConfig>) -> (Check, Check) {
+    match cfg {
+        Some(c) => (
+            crate::web::check_web(&c.web),
+            crate::web::check_search(&c.web).await,
+        ),
+        None => (no_config(), no_config()),
+    }
+}
+
+/// HTML пробы извлекателя.
+const PROBE_HTML: &str =
+    "<html><head><title>doctor</title></head><body><p>zero-agent doctor probe</p></body></html>";
+
+/// Подпроцесс извлечения (D113, D127): `zero-agent extract html` этого же бинарника через
+/// `za_jail::Runner` с каталогом `ZA_HOME/work/tmp/doctor`; ответ должен содержать текст
+/// страницы. Нет — `Warn`: PDF в `read` и страницы `web_fetch` не читаются.
+async fn check_extractor(home: Option<&Path>) -> Check {
+    const LOST: &str = "PDF в read и страницы web_fetch не читаются";
+    let Some(home) = home else {
+        return Check::Warn("не проверено: каталог данных не определён (ZA_HOME)".to_owned());
+    };
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return Check::Warn(format!("путь бинарника не определён ({e}): {LOST}")),
+    };
+    let tmp = home.join("work").join("tmp").join("doctor");
+    if let Err(e) = std::fs::create_dir_all(&tmp) {
+        return Check::Warn(format!("каталог {} не создан ({e}): {LOST}", tmp.display()));
+    }
+    let ex = crate::extract::ProcessExtractor::new(Arc::new(DirectRunner), exe.clone(), tmp);
+    let started = Instant::now();
+    let r = ex
+        .html(HtmlRequest {
+            html: PROBE_HTML.to_owned(),
+            base_url: "http://doctor.invalid/".to_owned(),
+        })
+        .await;
+    match r {
+        Ok(md) if md.text.contains("zero-agent doctor probe") => Check::Ok(format!(
+            "подпроцесс extract отвечает: HTML за {} мс ({})",
+            started.elapsed().as_millis(),
+            exe.display()
+        )),
+        Ok(_) => Check::Warn(format!("подпроцесс extract вернул не тот текст: {LOST}")),
+        Err(e) => Check::Warn(format!("подпроцесс extract не отвечает ({e}): {LOST}")),
+    }
+}
+
+/// Скиллы вне проекта (D114, D122): по источникам, пропущенные и корни, не прочитанные
+/// пределом `[skills] max_entries` (перенос задачи 12); скиллы проекта — `skills list
+/// --project`.
+async fn check_skills(home: Option<&Path>, cfg: Option<&AgentConfig>) -> Check {
+    let (Some(home), Some(cfg)) = (home, cfg) else {
+        return no_config();
+    };
+    if !cfg.skills.enabled {
+        return Check::Ok("скиллы выключены ([skills] enabled = false)".to_owned());
+    }
+    let cat = match crate::skills::catalog(home, &cfg.skills, None).await {
+        Ok(c) => c,
+        Err(e) => return Check::Warn(format!("каталог не прочитан: {e}")),
+    };
+    let mut text = format!("скиллы: {}", crate::skills::summary(&cat));
+    let limits = crate::skills::limit_lines(&cat, &cfg.skills);
+    if cat.skipped.is_empty() {
+        return Check::Ok(format!(
+            "{text}; скиллы проекта — zero-agent skills list --project"
+        ));
+    }
+    text.push_str(&format!(
+        "; пропущено {} (zero-agent skills list)",
+        cat.skipped.len()
+    ));
+    for l in limits {
+        text.push_str(&format!("; {l}"));
+    }
+    Check::Warn(text)
+}
+
+/// Предупреждение D169: тир standard или full на окне меньше 32k (у standard окна по
+/// умолчанию от 32k, `Tier::for_context`): набор инструментов standard превышает слот окна
+/// 16k, рабочая часть окна мала. `None` — тир small, окно 32k и больше или неизвестно.
+pub fn tier_window_warning(tier: Option<Tier>, n_ctx: Option<u32>) -> Option<String> {
+    let (Some(t), Some(n)) = (tier, n_ctx) else {
+        return None;
+    };
+    if t == Tier::Small || n >= za_agent::STANDARD_MIN_WINDOW {
+        return None;
+    }
+    Some(format!(
+        "тир {} выбран на окне {n} токенов, меньше {}: описания инструментов тира не помещаются в слот окна, а на модель остаётся мало места (D169); на таком окне — тир small или модель с окном от 32k",
+        t.as_str(),
+        za_agent::STANDARD_MIN_WINDOW
+    ))
+}
+
+/// Строка `window` (D169): `[context] tier` против окна каждой модели с известным окном
+/// (без `[context] tier` тир берётся по окну и предупреждения нет; флаг `--tier` `run`
+/// проверяет при старте сам).
+fn check_window(tier: Option<Tier>, windows: &[(String, Option<u32>)]) -> Check {
+    let known: Vec<(&str, u32)> = windows
+        .iter()
+        .filter_map(|(id, n)| n.map(|n| (id.as_str(), n)))
+        .collect();
+    if known.is_empty() {
+        return Check::Ok("окно моделей неизвестно: тир — по окну при старте run".to_owned());
+    }
+    let mut warn = Vec::new();
+    let mut ok = Vec::new();
+    for (id, n) in known {
+        let t = tier.unwrap_or_else(|| Tier::for_context(n));
+        match tier_window_warning(Some(t), Some(n)) {
+            Some(w) => warn.push(format!("{id}: {w}")),
+            None => ok.push(format!("{id}: окно {n}, тир {}", t.as_str())),
+        }
+    }
+    if warn.is_empty() {
+        Check::Ok(ok.join("; "))
+    } else {
+        Check::Warn(warn.join("; "))
     }
 }
 
@@ -228,26 +395,33 @@ fn check_shell() -> Check {
     }
 }
 
-/// GPU и модели по конфигурации `home`.
+/// Модели по id и окна готовых моделей (`context_tokens`, D169).
+type Models = (Vec<(String, Check)>, Vec<(String, Option<u32>)>);
+
+/// GPU, модели и их окна по конфигурации `home`.
 async fn check_home(
     home: Option<&Path>,
     cfg: Option<Result<AgentConfig, AppConfigError>>,
-) -> (Check, Vec<(String, Check)>) {
+) -> (Check, Vec<(String, Check)>, Vec<(String, Option<u32>)>) {
     let (Some(home), Some(cfg)) = (home, cfg) else {
         let w = || Check::Warn("каталог данных не определён (ZA_HOME)".to_owned());
-        return (w(), vec![("config".to_owned(), w())]);
+        return (w(), vec![("config".to_owned(), w())], Vec::new());
     };
     let cfg = match cfg {
         Ok(c) => c,
         Err(e) => {
             // Конфигурация не прочитана: GPU — по `nvidia-smi` из PATH.
             let gpu = gpu_check(home, &ResourcesConfig::default()).await;
-            return (gpu, vec![("config".to_owned(), Check::Fail(e.to_string()))]);
+            return (
+                gpu,
+                vec![("config".to_owned(), Check::Fail(e.to_string()))],
+                Vec::new(),
+            );
         }
     };
     let models = async {
         if cfg.models.as_ref().is_none_or(|m| m.endpoints.is_empty()) {
-            return Vec::new();
+            return Models::default();
         }
         match start_gateway(home, &cfg, false).await {
             Ok(s) => {
@@ -257,16 +431,27 @@ async fn check_home(
                     .warnings
                     .into_iter()
                     .map(|w| ("config".to_owned(), Check::Warn(w)));
-                view.endpoints
+                let windows = view
+                    .endpoints
+                    .iter()
+                    .map(|v| (v.id.0.clone(), v.context_tokens))
+                    .collect();
+                let checks = view
+                    .endpoints
                     .iter()
                     .map(|v| (v.id.0.clone(), check_endpoint(v)))
                     .chain(warnings)
-                    .collect()
+                    .collect();
+                (checks, windows)
             }
-            Err(e) => vec![("config".to_owned(), Check::Fail(e.to_string()))],
+            Err(e) => (
+                vec![("config".to_owned(), Check::Fail(e.to_string()))],
+                Vec::new(),
+            ),
         }
     };
-    tokio::join!(gpu_check(home, &cfg.resources), models)
+    let (gpu, (models, windows)) = tokio::join!(gpu_check(home, &cfg.resources), models);
+    (gpu, models, windows)
 }
 
 /// Один вызов `nvidia-smi` (D6) с очищенным окружением и временным каталогом
@@ -467,6 +652,11 @@ mod tests {
             secrets: check_secrets(&[]),
             git: Check::Warn("нет".to_owned()),
             shell: Check::Ok("bash".to_owned()),
+            web: Check::Ok("веб".to_owned()),
+            search: Check::Warn("поиск не настроен".to_owned()),
+            extractor: Check::Ok("extract".to_owned()),
+            skills: Check::Ok("скиллы".to_owned()),
+            window: Check::Ok("окно".to_owned()),
             models: vec![("local".to_owned(), Check::Warn("inactive".to_owned()))],
             rust: rust_version(),
         };
@@ -479,6 +669,26 @@ mod tests {
         assert!(r.has_failure());
     }
 
+    /// D169: standard (и full) на окне меньше 32k — предупреждение; small и окна от 32k —
+    /// нет; без `[context] tier` тир берётся по окну.
+    #[test]
+    fn standard_below_32k_warns() {
+        assert!(tier_window_warning(Some(Tier::Standard), Some(16_384)).is_some());
+        assert!(tier_window_warning(Some(Tier::Full), Some(16_384)).is_some());
+        assert!(tier_window_warning(Some(Tier::Standard), Some(32_768)).is_none());
+        assert!(tier_window_warning(Some(Tier::Small), Some(8192)).is_none());
+        assert!(tier_window_warning(None, Some(8192)).is_none());
+        assert!(tier_window_warning(Some(Tier::Standard), None).is_none());
+        let w = vec![("local".to_owned(), Some(16_384))];
+        let c = check_window(Some(Tier::Standard), &w);
+        assert!(
+            matches!(&c, Check::Warn(d) if d.starts_with("local: тир standard") && d.contains("16384")),
+            "{c:?}"
+        );
+        assert!(matches!(check_window(None, &w), Check::Ok(d) if d.contains("тир small")));
+        assert!(matches!(check_window(None, &[]), Check::Ok(_)));
+    }
+
     #[test]
     fn json_shape() {
         let r = DoctorReport {
@@ -488,6 +698,11 @@ mod tests {
             secrets: check_secrets(&[]),
             git: Check::Ok("git version 2.47.0".to_owned()),
             shell: Check::Warn("нет".to_owned()),
+            web: Check::Ok("веб включён".to_owned()),
+            search: Check::Warn("поиск не настроен".to_owned()),
+            extractor: Check::Ok("extract".to_owned()),
+            skills: Check::Ok("скиллы".to_owned()),
+            window: Check::Warn("окно".to_owned()),
             models: vec![("local".to_owned(), Check::Ok("ready".to_owned()))],
             rust: "rustc 1.99.1".to_owned(),
         };
@@ -501,6 +716,11 @@ mod tests {
                 "secrets": {"status": "ok", "detail": "источник секретов: переменные ZA_SECRET_* (Vault памяти — с клиентом ZeroAIMemory)"},
                 "git": {"status": "ok", "detail": "git version 2.47.0"},
                 "shell": {"status": "warn", "detail": "нет"},
+                "web": {"status": "ok", "detail": "веб включён"},
+                "search": {"status": "warn", "detail": "поиск не настроен"},
+                "extractor": {"status": "ok", "detail": "extract"},
+                "skills": {"status": "ok", "detail": "скиллы"},
+                "window": {"status": "warn", "detail": "окно"},
                 "models": [["local", {"status": "ok", "detail": "ready"}]],
                 "rust": "rustc 1.99.1",
             })

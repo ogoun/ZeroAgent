@@ -1,11 +1,14 @@
 //! Конфигурация агента: `ZA_HOME/config.toml`, разделы `[models]`, `[resources]` (D23),
 //! `[budgets.run]` (бюджет run по умолчанию, R1-B1 D19), `[context]` (пороги контекста,
-//! R1-B2 D65) и `[policy]` с `[[policy.rules]]` и `[[policy.grants]]` (политика, R1-C1
-//! D78, D80; правила по домену — R1-C2 D105). Проектная конфигурация — `[policy]` и
-//! `[web] enabled = false` ([`parse_project_config`]).
+//! R1-B2 D65), `[policy]` с `[[policy.rules]]` и `[[policy.grants]]` (политика, R1-C1
+//! D78, D80; правила по домену — R1-C2 D105), `[web]` с `[web.search]` (сетевой шлюз и
+//! поставщик поиска, R1-C2 D107, D122, D125) и `[skills]` (источники скиллов, D114, D122).
+//! Проектная конфигурация — `[policy]` и `[web] enabled = false`
+//! ([`parse_project_config`]): адрес поставщика поиска проект не задаёт (D126).
 //!
-//! `[policy]` разбирается вторым проходом по уже прочитанной таблице: ошибка называет
-//! путь поля (`policy.rules[0]`), а не только строку.
+//! `[policy]`, `[web]` и `[skills]` разбираются вторым проходом по уже прочитанной
+//! таблице: ошибка называет путь поля (`policy.rules[0]`, `web.search.url`), а не только
+//! строку.
 //!
 //! Текст ошибки разбора наружу — только [`ConfigParseError`] (белый список: место,
 //! категория, имя известного поля). `Display` ошибки `toml` печатает строку исходника,
@@ -44,11 +47,84 @@ pub struct AgentConfig {
     pub context: ContextConfig,
     /// `[policy]`: `allow_bypass`, правила и гранты глобальной конфигурации (D78, D80).
     pub policy: PolicyConfig,
+    /// `[web]` и `[web.search]` (D107, D122): шлюз, лимиты, поставщик поиска.
+    pub web: WebSettings,
+    /// `[skills]` (D114, D122): источники скиллов вне проекта.
+    pub skills: SkillsSettings,
     /// `models` — запасной эндпоинт `local` из `LLAMA_URL`, а не раздел файла.
     pub llama_url_fallback: bool,
 }
 
-/// Файл как его читает `toml`: `[policy]` — таблицей, её разбирает [`parse_policy`].
+/// Раздел `[web]` глобальной конфигурации (D107, D122). Значения по умолчанию — D107:
+/// веб включён, `robots.txt` соблюдается, 5 МиБ тела, 60 запросов в минуту, порты 80, 443,
+/// 8080, 8443; поиска нет.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSettings {
+    /// `false` — `web_fetch` и `web_search` не регистрируются ни в одном run.
+    pub enabled: bool,
+    pub robots: bool,
+    /// Предел тела ответа, байт (у PDF — свой, 32 МиБ, D113).
+    pub max_bytes: u64,
+    /// Запросов в минуту на процесс, не меньше 1.
+    pub requests_per_minute: u32,
+    /// Разрешённые порты `web_fetch`, непустой список.
+    pub ports: Vec<u16>,
+    /// `[web.search]` с `url`; без `url` поиска нет (D111).
+    pub search: Option<SearchSettings>,
+}
+
+impl Default for WebSettings {
+    fn default() -> Self {
+        let d = za_web::WebConfig::default();
+        Self {
+            enabled: true,
+            robots: d.robots,
+            max_bytes: d.max_bytes,
+            requests_per_minute: d.requests_per_minute,
+            ports: d.ports,
+            search: None,
+        }
+    }
+}
+
+/// `[web.search]` (D122, D125): `provider` — только [`SEARXNG`] (по умолчанию), `url` —
+/// базовый адрес своего экземпляра (`http`/`https` с хостом, без учётных данных).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchSettings {
+    pub provider: String,
+    pub url: url::Url,
+}
+
+/// Единственный поставщик поиска R1-C2 (D125).
+pub const SEARXNG: &str = "searxng";
+
+/// Раздел `[skills]` (D114, D122): `enabled = false` — каталога нет (ни `activate_skill`,
+/// ни `/имя`, ни роутера); `dirs` — каталоги источника `extra` по порядку (абсолютные
+/// пути); `max_entries` — предел записей обхода на корень `user` и `extra` (перенос задачи
+/// 12; по умолчанию [`za_skills::LOCAL_TREE_LIMITS`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillsSettings {
+    pub enabled: bool,
+    pub dirs: Vec<PathBuf>,
+    pub max_entries: usize,
+}
+
+impl Default for SkillsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dirs: Vec::new(),
+            max_entries: za_skills::LOCAL_TREE_LIMITS.max_entries,
+        }
+    }
+}
+
+/// Наибольшее `[skills] max_entries`: обход стоит около 1,25 мс на файл (замер задачи 12),
+/// так что 100 000 записей — около двух минут старта run на корень.
+pub const MAX_SKILL_ENTRIES: usize = 100_000;
+
+/// Файл как его читает `toml`: `[policy]`, `[web]` и `[skills]` — таблицами, их разбирают
+/// [`parse_policy`], [`parse_web`] и [`parse_skills`].
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -61,6 +137,10 @@ struct RawConfig {
     context: ContextConfig,
     #[serde(default)]
     policy: Option<toml::Value>,
+    #[serde(default)]
+    web: Option<toml::Value>,
+    #[serde(default)]
+    skills: Option<toml::Value>,
 }
 
 /// Раздел `[budgets]`. Незнакомый ключ — ошибка разбора: `deny_unknown_fields`
@@ -102,6 +182,10 @@ pub enum AppConfigError {
     /// Правило `[[policy.rules]]` без полей или с неверным шаблоном (D80).
     #[error("{file}: {0}", file = CONFIG_FILE)]
     PolicyRules(PolicyError),
+    /// Неверное поле `[web]` или `[skills]` (D122): `at` — путь поля (`web.search.url`),
+    /// значение в текст не попадает.
+    #[error("{file}: {at}: {reason}", file = CONFIG_FILE)]
+    Section { at: String, reason: String },
     /// Ошибка проектной конфигурации `.zero-agent/config.toml` (D80, D83): текст — как у
     /// ошибок глобальной (место, категория, путь поля), без фрагментов исходника.
     #[error("{file} проекта: {0}", file = PROJECT_CONFIG)]
@@ -290,8 +374,229 @@ pub fn parse_config(src: &str) -> Result<AgentConfig, AppConfigError> {
             .map(parse_policy)
             .transpose()?
             .unwrap_or_default(),
+        web: raw.web.map(parse_web).transpose()?.unwrap_or_default(),
+        skills: raw
+            .skills
+            .map(parse_skills)
+            .transpose()?
+            .unwrap_or_default(),
         llama_url_fallback: false,
     })
+}
+
+fn section_error(at: impl Into<String>, reason: impl Into<String>) -> AppConfigError {
+    AppConfigError::Section {
+        at: at.into(),
+        reason: reason.into(),
+    }
+}
+
+/// Имя незнакомого ключа, которое можно показать: строчные латинские буквы, цифры и `_`,
+/// с буквы, не длиннее 24 символов. Ключи и токены известных форматов (`sk-…`, `ghp_…`
+/// длиной 40, `AKIA…`, JWT) под это не подходят, и их имя не печатается (SEC-044).
+fn shown_key(k: &str) -> Option<&str> {
+    let ok = k.len() <= 24
+        && k.starts_with(|c: char| c.is_ascii_lowercase())
+        && k.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    ok.then_some(k)
+}
+
+/// Ошибка незнакомого ключа раздела `section`: путь — `section.<ключ>`, если имя можно
+/// показать ([`shown_key`]), иначе только раздел.
+fn unknown_key(section: &str, key: &str, expected: &str) -> AppConfigError {
+    let at = match shown_key(key) {
+        Some(k) => format!("{section}.{k}"),
+        None => section.to_owned(),
+    };
+    section_error(at, format!("неизвестное поле; ожидается {expected}"))
+}
+
+fn table_at(at: &str, v: toml::Value) -> Result<toml::Table, AppConfigError> {
+    match v {
+        toml::Value::Table(t) => Ok(t),
+        _ => Err(section_error(at, format!("ожидается таблица [{at}]"))),
+    }
+}
+
+fn bool_at(at: &str, v: &toml::Value) -> Result<bool, AppConfigError> {
+    v.as_bool()
+        .ok_or_else(|| section_error(at, "ожидается true или false"))
+}
+
+/// Целое в `min..=max`.
+fn int_at(at: &str, v: &toml::Value, min: i64, max: i64) -> Result<i64, AppConfigError> {
+    match v.as_integer() {
+        Some(n) if (min..=max).contains(&n) => Ok(n),
+        Some(_) => Err(section_error(
+            at,
+            format!("ожидается целое от {min} до {max}"),
+        )),
+        None => Err(section_error(at, "ожидается целое число")),
+    }
+}
+
+/// Раздел `[web]` (D107, D122): значения по умолчанию у отсутствующих ключей; незнакомый
+/// ключ и неверный тип — ошибка с путём поля.
+fn parse_web(v: toml::Value) -> Result<WebSettings, AppConfigError> {
+    let mut out = WebSettings::default();
+    for (key, value) in table_at("web", v)? {
+        let at = format!("web.{key}");
+        match key.as_str() {
+            "enabled" => out.enabled = bool_at(&at, &value)?,
+            "robots" => out.robots = bool_at(&at, &value)?,
+            "max_bytes" => out.max_bytes = int_at(&at, &value, 1, i64::MAX)?.unsigned_abs(),
+            "requests_per_minute" => {
+                out.requests_per_minute =
+                    u32::try_from(int_at(&at, &value, 1, i64::from(u32::MAX))?).unwrap_or(u32::MAX);
+            }
+            "ports" => out.ports = parse_ports(value)?,
+            "search" => out.search = parse_search(value)?,
+            other => {
+                return Err(unknown_key(
+                    "web",
+                    other,
+                    "enabled, robots, max_bytes, requests_per_minute, ports или [web.search]",
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `[web] ports`: непустой список портов 1–65535.
+fn parse_ports(v: toml::Value) -> Result<Vec<u16>, AppConfigError> {
+    let toml::Value::Array(items) = v else {
+        return Err(section_error("web.ports", "ожидается список портов"));
+    };
+    if items.is_empty() {
+        return Err(section_error(
+            "web.ports",
+            "пустой список: web_fetch не открыл бы ни одной страницы",
+        ));
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let n = int_at(&format!("web.ports[{i}]"), p, 1, i64::from(u16::MAX))?;
+            Ok(u16::try_from(n).unwrap_or(u16::MAX))
+        })
+        .collect()
+}
+
+/// `[web.search]` (D111, D122, D125): `provider` — только `searxng`; `url` — `http` или
+/// `https` с хостом, без учётных данных. Без `url` — поиска нет и предупреждение.
+fn parse_search(v: toml::Value) -> Result<Option<SearchSettings>, AppConfigError> {
+    let mut provider = SEARXNG.to_owned();
+    let mut url = None;
+    for (key, value) in table_at("web.search", v)? {
+        match key.as_str() {
+            "provider" => {
+                let Some(p) = value.as_str() else {
+                    return Err(section_error("web.search.provider", "ожидается строка"));
+                };
+                if p != SEARXNG {
+                    let shown = shown_key(p).unwrap_or("(имя не показано)");
+                    return Err(section_error(
+                        "web.search.provider",
+                        format!("unknown search provider {shown}; поддерживается только {SEARXNG}"),
+                    ));
+                }
+                provider = p.to_owned();
+            }
+            "url" => url = Some(parse_search_url(&value)?),
+            other => return Err(unknown_key("web.search", other, "provider или url")),
+        }
+    }
+    let Some(url) = url else {
+        tracing::warn!(
+            key = "web.search.url",
+            "[web.search] url is required: поиск не настроен, web_search не регистрируется"
+        );
+        return Ok(None);
+    };
+    Ok(Some(SearchSettings { provider, url }))
+}
+
+/// Адрес экземпляра поставщика: значение в текст ошибки не попадает (в нём могут быть
+/// учётные данные).
+fn parse_search_url(v: &toml::Value) -> Result<url::Url, AppConfigError> {
+    const AT: &str = "web.search.url";
+    let Some(s) = v.as_str() else {
+        return Err(section_error(AT, "ожидается строка с адресом"));
+    };
+    let u = url::Url::parse(s.trim())
+        .map_err(|_| section_error(AT, "адрес не разбирается; пример: http://127.0.0.1:8888"))?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return Err(section_error(AT, "только http или https"));
+    }
+    if u.host_str().is_none_or(str::is_empty) {
+        return Err(section_error(AT, "в адресе нет хоста"));
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err(section_error(
+            AT,
+            "учётные данные в адресе не допускаются (у SearXNG ключа нет)",
+        ));
+    }
+    Ok(u)
+}
+
+/// Раздел `[skills]` (D114, D122): `enabled`, `dirs` (абсолютные пути, `~` и переменные
+/// не раскрываются), `max_entries` (1–[`MAX_SKILL_ENTRIES`]).
+fn parse_skills(v: toml::Value) -> Result<SkillsSettings, AppConfigError> {
+    let mut out = SkillsSettings::default();
+    for (key, value) in table_at("skills", v)? {
+        let at = format!("skills.{key}");
+        match key.as_str() {
+            "enabled" => out.enabled = bool_at(&at, &value)?,
+            "dirs" => out.dirs = parse_skill_dirs(value)?,
+            "max_entries" => {
+                let n = int_at(&at, &value, 1, MAX_SKILL_ENTRIES as i64)?;
+                out.max_entries = usize::try_from(n).unwrap_or(MAX_SKILL_ENTRIES);
+            }
+            other => {
+                return Err(unknown_key(
+                    "skills",
+                    other,
+                    "enabled, dirs или max_entries",
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `[skills] dirs`: абсолютные пути каталогов `extra` (как пути грантов, D78).
+fn parse_skill_dirs(v: toml::Value) -> Result<Vec<PathBuf>, AppConfigError> {
+    let toml::Value::Array(items) = v else {
+        return Err(section_error("skills.dirs", "ожидается список путей"));
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let at = format!("skills.dirs[{i}]");
+            let Some(s) = item.as_str() else {
+                return Err(section_error(at, "ожидается строка с путём"));
+            };
+            if s.trim().is_empty() {
+                return Err(section_error(at, "пустой путь"));
+            }
+            if s.starts_with(['~', '$', '%']) {
+                return Err(section_error(
+                    at,
+                    "`~` и переменные окружения не раскрываются: укажите полный путь",
+                ));
+            }
+            let p = PathBuf::from(s);
+            if !p.is_absolute() {
+                return Err(section_error(at, "нужен абсолютный путь"));
+            }
+            Ok(p)
+        })
+        .collect()
 }
 
 /// Поля `[policy]`, `[[policy.rules]]` и `[[policy.grants]]`: только эти имена ошибка

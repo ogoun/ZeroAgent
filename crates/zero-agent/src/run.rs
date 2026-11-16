@@ -25,8 +25,19 @@
 //! у доверенного проекта — `AGENTS.md` или `CLAUDE.md`. Resume сверяет якорь аудита из
 //! снимка и передаёт отличия доверия, политики и грантов через `ResumeChange`. Пауза
 //! `needs_trust` — код 3.
+//!
+//! R1-C2 (задача 14): `run` строит сетевой шлюз один раз на процесс и регистрирует
+//! `web_fetch` и `web_search` ([`crate::web`]; веб не выключен глобально или проектом,
+//! поиск — только при `[web.search] url`), подключает извлекатель в подпроцессе
+//! ([`crate::extract::RunExtractor`]: PDF в `read` и `web_fetch`, HTML у `web_fetch`) и
+//! каталог скиллов ([`crate::skills::catalog`] после проверки доверия; пустой каталог —
+//! без capability `skills` и `activate_skill`, m7 ревью задачи 13). Resume регистрирует
+//! веб-инструменты, только если они есть в замороженном префиксе run (новых инструментов
+//! посреди run нет, а выключенный сейчас веб не включается). `policy.loaded` получает
+//! `web_disabled` и `search_host`. Печать: строки `web.request` (D112), `skill.activated`
+//! (D122) и предупреждение о тире standard на окне меньше 32k (D169).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -38,11 +49,12 @@ use tokio::sync::broadcast::error::RecvError;
 use za_agent::{
     AuditHead, EnvInfo, Grant, GrantMode, GrantSource, LoopDeps, LoopError, LoopOutcome,
     PolicyError, PolicySnapshot, ResumeChange, RuleOfTwoNotice, RunSpec, TrustSetFn, WorkMode,
-    builtin_tools, control_channel, git_branch, resume_run, start_run,
+    builtin_tools, control_channel, git_branch, resume_run, skills_capability, start_run,
 };
+use za_core::extract::Extractor;
 use za_core::paths::{self, Roots};
 use za_core::{
-    Access, AgentEvent, EventBus, InterruptKind, Journal, ToolRegistry, UnknownDecision,
+    Access, AgentEvent, EventBus, InterruptKind, Journal, Tool, ToolRegistry, UnknownDecision,
     resolve_unknown,
 };
 use za_jail::DirectRunner;
@@ -57,7 +69,10 @@ use za_tools::{
     AgentHome, GitCheckpointer, NativeDeps, ReadTracker, SecretFilter, Shell, native_capability,
 };
 
-use crate::config::{AgentConfig, PROJECT_CONFIG, load_config, parse_project_config};
+use crate::config::{
+    AgentConfig, PROJECT_CONFIG, ProjectConfig, load_config, parse_project_config,
+};
+use crate::extract::RunExtractor;
 use crate::home;
 use crate::journal::open_retrying;
 use crate::models::{CommandError, PROBE_WAIT, start_gateway, state_text, wait_endpoint};
@@ -131,6 +146,9 @@ pub enum RunError {
         "журнал аудита проекта изменён: записи {seq}, сохранённой при прошлом запуске run, нет в цепочке; проверка: zero-agent audit --verify"
     )]
     AuditAnchor { seq: u64 },
+    /// Сетевой шлюз не построен (D107): неверные настройки `[web]`.
+    #[error("веб: {0}")]
+    Web(#[from] za_web::WebError),
 }
 
 /// Точка аварийного завершения `--crash-at` (D33; только для тестов).
@@ -212,6 +230,31 @@ pub struct RunArgs {
     /// Предел чекпоинта git при вызове инструмента вместо `CHECKPOINT_TIMEOUT` (скрытый
     /// `--checkpoint-timeout`, только для тестов под нагрузкой: × `ZA_TEST_TIME_SCALE`).
     pub checkpoint_timeout: Option<Duration>,
+    /// Тестовые подмены (D128); без признака `test-hooks` — пусто.
+    pub hooks: RunHooks,
+}
+
+/// Тестовые подмены `run` (D128): поля существуют только с признаком `test-hooks`, обычная
+/// и release-сборка флага `--web-resolve` не знают.
+#[derive(Debug, Clone, Default)]
+pub struct RunHooks {
+    /// `--web-resolve host=addr`: имя разрешается шлюзом в заданный адрес мимо фильтра
+    /// (`WebGateway::with_test_resolve`).
+    #[cfg(feature = "test-hooks")]
+    pub web_resolve: Vec<(String, std::net::SocketAddr)>,
+}
+
+/// Разбор `--web-resolve host=addr` (D128): `addr` — `ip:port`.
+#[cfg(feature = "test-hooks")]
+pub fn parse_web_resolve(s: &str) -> Result<(String, std::net::SocketAddr), String> {
+    let (host, addr) = s
+        .split_once('=')
+        .ok_or_else(|| format!("ожидается host=ip:port, получено {s:?}"))?;
+    let addr = addr
+        .trim()
+        .parse()
+        .map_err(|e| format!("адрес {addr:?}: {e}"))?;
+    Ok((host.trim().to_owned(), addr))
 }
 
 /// Флаги бюджета `run`: каждый задаёт своё поле поверх базового бюджета.
@@ -421,6 +464,8 @@ struct Prepared {
     grants: Vec<Grant>,
     roots: Roots,
     project_id: String,
+    /// Проектная конфигурация доверенного проекта (`[web] enabled = false`, D105).
+    project_cfg: Option<ProjectConfig>,
 }
 
 /// Подготовка run (новый и resume). Порядок: доверие (D83: набор сейчас против
@@ -469,6 +514,14 @@ async fn prepare(
         None
     };
     let policy = PolicySnapshot::build(&cfg.policy, project_cfg.as_ref().map(|c| &c.policy))?;
+    if project_cfg
+        .as_ref()
+        .is_some_and(|c| c.web_enabled == Some(false))
+    {
+        eprintln!(
+            "zero-agent: {PROJECT_CONFIG}: веб выключен проектом ([web] enabled = false): web_fetch и web_search в run нет"
+        );
+    }
     for _ in &policy.ignored {
         eprintln!(
             "zero-agent: {PROJECT_CONFIG}: правило allow проекта не действует (только ask и deny, ARC-041)"
@@ -498,6 +551,122 @@ async fn prepare(
         grants,
         roots,
         project_id,
+        project_cfg,
+    })
+}
+
+/// Подключения run R1-C2 (задача 14): веб-инструменты, извлекатель, каталог скиллов и
+/// что из этого пишется в `policy.loaded`.
+struct Wiring {
+    web: Vec<Arc<dyn Tool>>,
+    extractor: Option<Arc<dyn Extractor>>,
+    /// `None` — `[skills] enabled = false`.
+    catalog: Option<Arc<za_skills::Catalog>>,
+    /// Кто выключил веб (`crate::web::DISABLED_BY_*`); `None` — включён.
+    web_disabled: Option<&'static str>,
+    /// Хост поставщика поиска, если `web_search` зарегистрирован (D105).
+    search_host: Option<String>,
+}
+
+/// Имена инструментов замороженного префикса из снимка run (`frozen.tools[].name`).
+fn frozen_tools(snap: &Value) -> BTreeSet<String> {
+    snap.get("frozen")
+        .and_then(|f| f.get("tools"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Сетевой шлюз процесса (D107) из `[web]` глобальной конфигурации; с признаком
+/// `test-hooks` — подмена имён `--web-resolve` (D128).
+fn gateway(
+    cfg: &AgentConfig,
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] hooks: &RunHooks,
+) -> Result<za_web::WebGateway, RunError> {
+    let gw = za_web::WebGateway::new(crate::web::web_config(&cfg.web))?;
+    #[cfg(feature = "test-hooks")]
+    if !hooks.web_resolve.is_empty() {
+        return Ok(gw.with_test_resolve(hooks.web_resolve.clone()));
+    }
+    Ok(gw)
+}
+
+/// Подключения run: извлекатель в подпроцессе (`current_exe`, каталог
+/// `work_dir("tmp/<run>")` по первому вызову), шлюз и веб-инструменты, если веб не выключен
+/// (`allowed` — имена из замороженного префикса при resume: только они), каталог скиллов
+/// после проверки доверия (проектные — у доверенного проекта по сверенному обходу, D116).
+async fn wire(
+    home: &Path,
+    project: &Path,
+    run: RunId,
+    cfg: &AgentConfig,
+    prep: &Prepared,
+    hooks: &RunHooks,
+    allowed: Option<&BTreeSet<String>>,
+) -> Result<Wiring, RunError> {
+    let extractor: Option<Arc<dyn Extractor>> = match std::env::current_exe() {
+        Ok(exe) => Some(Arc::new(RunExtractor::new(
+            Arc::new(DirectRunner),
+            exe,
+            project.to_path_buf(),
+            run,
+        ))),
+        Err(e) => {
+            tracing::warn!(error = %e, "путь бинарника не определён: PDF и HTML не извлекаются");
+            eprintln!(
+                "zero-agent: путь бинарника не определён ({e}): PDF и веб-страницы не читаются"
+            );
+            None
+        }
+    };
+    let web_disabled = crate::web::web_disabled(cfg, prep.project_cfg.as_ref());
+    let mut web = Vec::new();
+    if let (None, Some(ex)) = (web_disabled, &extractor) {
+        web = crate::web::web_tools(&Arc::new(gateway(cfg, hooks)?), Arc::clone(ex));
+        if let Some(names) = allowed {
+            web.retain(|t| names.contains(&t.spec().schema.name));
+        }
+    }
+    let search_host = web
+        .iter()
+        .any(|t| t.spec().schema.name == za_web::WEB_SEARCH)
+        .then(|| crate::web::search_host(&cfg.web))
+        .flatten();
+    let catalog = if cfg.skills.enabled {
+        let trusted = prep.trusted.then_some((project, &prep.set));
+        let cat = crate::skills::catalog(home, &cfg.skills, trusted)
+            .await
+            .map_err(|source| RunError::Io {
+                what: "каталог скиллов",
+                path: project.to_path_buf(),
+                source,
+            })?;
+        for k in cat
+            .skipped
+            .iter()
+            .filter(|k| k.reason == crate::skills::TREE_CHANGED)
+        {
+            eprintln!(
+                "zero-agent: дерево скиллов {} изменилось после проверки доверия: его скиллы в run не читаются",
+                k.path
+            );
+        }
+        for line in crate::skills::limit_lines(&cat, &cfg.skills) {
+            tracing::warn!("{line}");
+        }
+        Some(Arc::new(cat))
+    } else {
+        None
+    };
+    Ok(Wiring {
+        web,
+        extractor,
+        catalog,
+        web_disabled,
+        search_host,
     })
 }
 
@@ -510,10 +679,11 @@ async fn record_start(
     project: &Path,
     run: RunId,
     policy: Option<&PolicySnapshot>,
+    web: &Wiring,
     grants: &[Grant],
 ) -> Result<Option<AuditHead>, RunError> {
     if let Some(p) = policy {
-        policy_loaded(store, project, p).await?;
+        policy_loaded(store, project, p, web).await?;
     }
     grants_audit(store, run, grants).await?;
     Ok(store
@@ -623,13 +793,16 @@ async fn cleanup_run_tmp(project: &Path, run: RunId) {
     }
 }
 
-/// `policy.loaded` (D91): пишется, только если хэш снимка политики отличается от
-/// последней такой записи аудита. Цепочка аудита не сходится — запись не пишется (`warn`):
-/// её сверит `audit --verify`.
+/// `policy.loaded` (D91): пишется, только если хэш снимка политики, `web_disabled` (кто
+/// выключил веб: `config`, `project` или `null`, D105) или `search_host` (хост поставщика
+/// поиска, если `web_search` зарегистрирован: правила по домену к поиску не применяются)
+/// отличаются от последней такой записи аудита. Цепочка аудита не сходится — запись не
+/// пишется (`warn`): её сверит `audit --verify`.
 async fn policy_loaded(
     store: &ProjectStore,
     project: &Path,
     policy: &PolicySnapshot,
+    web: &Wiring,
 ) -> Result<(), RunError> {
     let last = match store.last_audit(audit_action::POLICY_LOADED).await {
         Ok(l) => l,
@@ -639,12 +812,13 @@ async fn policy_loaded(
         }
         Err(e) => return Err(e.into()),
     };
-    if last
-        .as_ref()
-        .and_then(|e| e.payload.get("hash"))
-        .and_then(Value::as_str)
-        == Some(policy.hash.as_str())
-    {
+    let same = last.as_ref().is_some_and(|e| {
+        let p = &e.payload;
+        p.get("hash").and_then(Value::as_str) == Some(policy.hash.as_str())
+            && p.get("web_disabled").and_then(Value::as_str) == web.web_disabled
+            && p.get("search_host").and_then(Value::as_str) == web.search_host.as_deref()
+    });
+    if same {
         return Ok(());
     }
     let project_rules = policy
@@ -663,6 +837,8 @@ async fn policy_loaded(
                 "rules": policy.rules.len(),
                 "project_rules": project_rules,
                 "ignored": policy.ignored,
+                "web_disabled": web.web_disabled,
+                "search_host": web.search_host,
             }),
         })
         .await?;
@@ -904,9 +1080,17 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 );
                 return Ok(ExitCode::from(EXIT_ERROR));
             }
+            // D169: тир standard (и full) на окне меньше 32k — только явно, с предупреждением.
+            if let Some(line) =
+                crate::doctor::tier_window_warning(n.tier.or(cfg.context.tier), view.context_tokens)
+            {
+                eprintln!("zero-agent: {line}");
+            }
             let dir = journal_dir(home, &project)?;
             let store = ProjectStore::open(&dir)?;
             let prep = prepare(home, &project, &store, &cfg, &args.grants).await?;
+            let wiring = wire(home, &project, run, &cfg, &prep, &args.hooks, None).await?;
+            register(&mut tools, &wiring.web);
             // Бюджет нового run: `[budgets.run]`, поверх него флаги.
             let budget = run_budget(&cfg.budgets.run, &args.budget);
             // D83, CAP-084: инструкции — только у доверенного проекта.
@@ -956,11 +1140,19 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 &masker,
                 secret_filter.clone(),
                 &prep,
+                &wiring,
                 args.checkpoint_timeout,
             );
             deps.crash = crash_hook(args.crash);
-            deps.audit_head =
-                record_start(&store, &project, run, Some(&prep.policy), &prep.grants).await?;
+            deps.audit_head = record_start(
+                &store,
+                &project,
+                run,
+                Some(&prep.policy),
+                &wiring,
+                &prep.grants,
+            )
+            .await?;
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
             let outcome = drive(&store, &bus, fut, &ctl, args.crash, masker.clone()).await;
@@ -980,6 +1172,19 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             check_audit_anchor(&store, &snap).await?;
             let prep = prepare(home, &project, &store, &cfg, &args.grants).await?;
             let mut change = resume_changes(&prep, &cfg, &snap)?;
+            // Веб-инструменты — только из замороженного префикса run: новых посреди run нет.
+            let frozen = frozen_tools(&snap);
+            let wiring = wire(
+                home,
+                &project,
+                r.run,
+                &cfg,
+                &prep,
+                &args.hooks,
+                Some(&frozen),
+            )
+            .await?;
+            register(&mut tools, &wiring.web);
             let endpoint = match r.model {
                 Some(m) => Some(select(Some(m)).map_err(CommandError::from)?),
                 None => None,
@@ -1003,6 +1208,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 &masker,
                 secret_filter.clone(),
                 &prep,
+                &wiring,
                 args.checkpoint_timeout,
             );
             deps.crash = crash_hook(args.crash);
@@ -1011,6 +1217,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 &project,
                 r.run,
                 change.policy.as_ref(),
+                &wiring,
                 &change.grants_add,
             )
             .await?;
@@ -1056,6 +1263,22 @@ async fn grants_audit(store: &ProjectStore, run: RunId, grants: &[Grant]) -> Res
     Ok(())
 }
 
+/// Capability `skills` (`activate_skill` с каталогом, D117) — только у непустого каталога
+/// (m7 ревью задачи 13): описание `activate_skill` ссылается на каталог ниже, а без скиллов
+/// звать его незачем. Пустой каталог run по-прежнему получает: `skill.catalog` с пропусками.
+fn skills_capability_of(cat: &Arc<za_skills::Catalog>) -> Option<za_core::Capability> {
+    (!cat.skills.is_empty()).then(|| skills_capability(Arc::clone(cat)))
+}
+
+/// Инструменты в реестр run (повтор имени — `warn`, как у встроенных).
+fn register(reg: &mut ToolRegistry, tools: &[Arc<dyn Tool>]) {
+    for t in tools {
+        if let Err(e) = reg.register(Arc::clone(t)) {
+            tracing::warn!(error = %e, "инструмент уже зарегистрирован");
+        }
+    }
+}
+
 /// Первая строка stderr: `run <id>` — по нему продолжают после сбоя.
 fn announce(run: RunId) {
     eprintln!("run {run}");
@@ -1063,8 +1286,11 @@ fn announce(run: RunId) {
 }
 
 /// Зависимости цикла и шина его событий (`EventBus::DEFAULT_CAPACITY`, D35): нативные
-/// инструменты (D74), чекпоинты (D89), политика, корни, маска, набор доверия и голова
-/// аудита (задача 13).
+/// инструменты (D74) с извлекателем PDF (D113), чекпоинты (D89), политика, корни, маска,
+/// набор доверия и голова аудита (задача 13 R1-C1), каталог скиллов (D114–D119): capability
+/// `skills` — только у непустого каталога (m7 ревью задачи 13: описание `activate_skill`
+/// ссылается на каталог ниже), сам каталог — у любого (событие `skill.catalog` с пропусками).
+#[allow(clippy::too_many_arguments)]
 fn deps(
     store: &ProjectStore,
     gateway: &Arc<za_llm::Gateway>,
@@ -1072,6 +1298,7 @@ fn deps(
     masker: &SecretMasker,
     secret_filter: SecretFilter,
     prep: &Prepared,
+    wiring: &Wiring,
     checkpoint_timeout: Option<Duration>,
 ) -> (LoopDeps, EventBus) {
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
@@ -1095,10 +1322,14 @@ fn deps(
             let m = masker.clone();
             Arc::new(move |s: &str| m.mask(s).into_owned())
         }),
-        // Извлекатель PDF в подпроцессе (`ProcessExtractor`, D113) подключается в задаче 14
-        // вместе с `web_fetch`; до неё `read` отвечает на PDF `binary file …`.
-        extractor: None,
+        // Извлекатель PDF в подпроцессе (D113): без него `read` отвечает на PDF
+        // `binary file …`.
+        extractor: wiring.extractor.clone(),
     })];
+    if let Some(cat) = &wiring.catalog {
+        deps.capabilities.extend(skills_capability_of(cat));
+        deps.skills = Some(Arc::clone(cat));
+    }
     // D103: секретные файлы (имя, известные значения, PEM) в чекпоинты не входят.
     let mut checkpointer =
         GitCheckpointer::new(runner, agent_home).with_secret_filter(secret_filter);
@@ -1197,6 +1428,18 @@ impl Printer {
                 if self.rule_of_two.on_event(&ev.event.kind, p) {
                     eprintln!("{RULE_OF_TWO_LINE}");
                 }
+            }
+            // D112: сетевое обращение нативного инструмента — строка на запрос.
+            EventKind::WebRequest => eprintln!("{}", crate::web::request_line(p)),
+            // D122: загруженный скилл.
+            EventKind::SkillActivated => {
+                let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("?");
+                let by = if s("by") == za_protocol::skill_by::ROUTER {
+                    ", карточка роутера"
+                } else {
+                    ""
+                };
+                eprintln!("zero-agent: скилл {} ({}){by}", s("name"), s("source"));
             }
             // D96: исполненный вызов с путями вне проекта — строка на путь.
             EventKind::BoundaryOutside => {
@@ -1813,6 +2056,31 @@ mod tests {
         let mut resumed = RuleOfTwoNotice::new(true);
         assert!(!resumed.on_event(&EventKind::ToolStarted, &marked("w3")));
         assert!(RULE_OF_TWO_LINE.contains("SEC-052"));
+    }
+
+    /// m7 ревью задачи 13: пустой каталог — без capability `skills` и `activate_skill`.
+    #[test]
+    fn empty_catalog_has_no_skills_capability() {
+        assert!(skills_capability_of(&Arc::new(za_skills::Catalog::default())).is_none());
+        let full = za_skills::discover(&za_skills::DiscoverInput {
+            bundled: za_skills::bundled(),
+            ..za_skills::DiscoverInput::default()
+        });
+        let cap = skills_capability_of(&Arc::new(full)).expect("capability у поставки");
+        assert_eq!(cap.tools.len(), 1);
+        assert_eq!(
+            cap.tools[0].spec().schema.name,
+            za_agent::ACTIVATE_SKILL_TOOL
+        );
+    }
+
+    /// Имена инструментов замороженного префикса из снимка (resume, задача 14).
+    #[test]
+    fn frozen_tool_names() {
+        let snap = json!({"frozen": {"tools": [{"name": "read"}, {"name": "web_fetch"}]}});
+        let names = frozen_tools(&snap);
+        assert!(names.contains("web_fetch") && names.contains("read"));
+        assert!(frozen_tools(&json!({})).is_empty());
     }
 
     #[test]

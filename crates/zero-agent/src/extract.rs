@@ -138,6 +138,68 @@ impl Extractor for ProcessExtractor {
     }
 }
 
+/// Извлекатель run (D113, D127; m-5 повторного ревью fix-10): [`ProcessExtractor`] с
+/// каталогом `work_dir(project, "tmp/<run>")`, который создаётся при каждом вызове (если его
+/// ещё нет) проверкой `za_core::paths::work_dir` — без перехода по ссылкам и только внутри
+/// проекта. Без каталога HTML-подпроцесс не запустился бы (`cannot start the process`):
+/// копию PDF `read` и `web_fetch` кладут туда сами, а у HTML копии нет. В недоверенном
+/// проекте каталог появляется только при первом извлечении, а не на старте run; после run
+/// его убирает бинарник.
+pub struct RunExtractor {
+    runner: Arc<dyn Runner>,
+    exe: PathBuf,
+    project: PathBuf,
+    run: za_protocol::RunId,
+}
+
+impl RunExtractor {
+    pub fn new(
+        runner: Arc<dyn Runner>,
+        exe: PathBuf,
+        project: PathBuf,
+        run: za_protocol::RunId,
+    ) -> Self {
+        Self {
+            runner,
+            exe,
+            project,
+            run,
+        }
+    }
+
+    /// Каталог подпроцесса и извлекатель с ним; каталог не создан — `Failed` (подпроцесс не
+    /// запускается).
+    fn extractor(&self) -> impl Future<Output = Result<ProcessExtractor, ExtractError>> + use<> {
+        let (runner, exe) = (Arc::clone(&self.runner), self.exe.clone());
+        let (project, sub) = (self.project.clone(), format!("tmp/{}", self.run));
+        async move {
+            let dir = tokio::task::spawn_blocking(move || za_core::paths::work_dir(&project, &sub))
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|r| r);
+            match dir {
+                Ok(dir) => Ok(ProcessExtractor::new(runner, exe, dir)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "каталог подпроцесса извлечения не создан");
+                    Err(ExtractError::Failed(FAILED_START.into()))
+                }
+            }
+        }
+    }
+}
+
+impl Extractor for RunExtractor {
+    fn html(&self, req: HtmlRequest) -> BoxFuture<'static, Result<Markdown, ExtractError>> {
+        let ex = self.extractor();
+        Box::pin(async move { ex.await?.html(req).await })
+    }
+
+    fn pdf(&self, req: PdfRequest) -> BoxFuture<'static, Result<PdfText, ExtractError>> {
+        let ex = self.extractor();
+        Box::pin(async move { ex.await?.pdf(req).await })
+    }
+}
+
 /// Исход подпроцесса → результат извлечения.
 fn reply<T: DeserializeOwned>(r: Result<Output, RunnerError>) -> Result<T, ExtractError> {
     let out = r.map_err(|e| {

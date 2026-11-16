@@ -1085,7 +1085,7 @@ git commit -m "feat(agent): activate_skill, /имя, карточки роуте
 ```rust
 pub struct WebSettings { pub enabled: bool, pub robots: bool, pub max_bytes: u64, pub requests_per_minute: u32, pub ports: Vec<u16>, pub search: Option<SearchSettings> }
 pub struct SearchSettings { pub provider: String, pub url: url::Url }      // provider: только "searxng" (D125); url обязателен
-pub struct SkillsSettings { pub enabled: bool, pub dirs: Vec<PathBuf> }
+pub struct SkillsSettings { pub enabled: bool, pub dirs: Vec<PathBuf>, pub max_entries: usize } // max_entries — перенос задачи 12, по умолчанию 1000
 pub struct AgentConfig { /* ... */ pub web: WebSettings, pub skills: SkillsSettings }
 // CLI: `skills list [--project P]`; run: скрытый `--web-resolve host=addr` (cfg(feature = "test-hooks"), D128)
 ```
@@ -1115,8 +1115,11 @@ pub struct AgentConfig { /* ... */ pub web: WebSettings, pub skills: SkillsSetti
 }
 #[tokio::test] async fn standard_tools_fit_slot_with_web_and_catalog() {
     // настоящий набор top standard (native_capability, встроенные, веб, каталог core pack) при n_ctx 16k и 32k:
-    // render_tools ≤ слота ContextBudget::tools; каталог ≤ ContextBudget::catalog (za-agent от za-tools не зависит — тест здесь)
+    // render_tools ≤ предела D169, как у `standard_tools_cases`: слот `for_context(max(n_ctx, STANDARD_MIN_WINDOW)).tools`
+    // плюс `catalog` окна — 1800 на 16k и 2100 на 32k (поправка по I2 ревью fix-13: слот 16k (800) рассчитан на small);
+    // каталог ≤ ContextBudget::catalog (za-agent от za-tools не зависит — тест здесь)
 }
+// m7 ревью задачи 13 (перенос): пустой каталог скиллов — без capability `skills` и инструмента `activate_skill`.
 ```
 
 - [ ] **Step 2: Запустить** — `cargo test -p zero-agent --test config web`, `cargo test -p zero-agent --features test-hooks --test skills`. Expected: FAIL.

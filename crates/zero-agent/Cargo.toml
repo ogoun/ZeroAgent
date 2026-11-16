@@ -29,10 +29,13 @@ za-skills = { path = "../za-skills" }
 # Разборщики враждебного HTML и PDF (R1-C2 D113, D127): работают только в скрытой подкоманде
 # `zero-agent extract` — подпроцессе, который запускает `extract::ProcessExtractor`.
 za-extract = { path = "../za-extract" }
-# Сетевой шлюз (D107): инструменты `web_fetch` и `web_search` подключает задача 14; здесь —
-# цель признака `test-hooks` (D128: подмены резолвера шлюза включаются вместе с крюками
-# бинарника).
+# Сетевой шлюз (D107): инструменты `web_fetch` и `web_search` run, проба поставщика поиска
+# в `doctor`; признак `test-hooks` (D128) включает подмены резолвера шлюза вместе с крюками
+# бинарника (`run --web-resolve`).
 za-web = { path = "../za-web" }
+# Адрес поставщика поиска `[web.search] url` (D122): разбор и проверка при чтении
+# конфигурации; уже в `Cargo.lock` через `za-web` и `reqwest`.
+url.workspace = true
 clap.workspace = true
 # `macros` — `join!` проверок doctor и `select!` команды `run`, `time` — ожидание зондов и
 # `resources --watch`, `signal` — Ctrl+C команды `run` (пауза, второй — выход).
@@ -59,6 +62,12 @@ test-hooks = ["za-web/test-hooks"]
 # крюками; обычный `cargo test` его пропускает, не ломаясь.
 [[test]]
 name = "extract"
+required-features = ["test-hooks"]
+
+# Веб и скиллы в бинарнике (задача 14): `skills list`, `doctor` с поддельным SearXNG на
+# 127.0.0.1, набор инструментов run — с крюками (`run --web-resolve`).
+[[test]]
+name = "skills"
 required-features = ["test-hooks"]
 
 [dev-dependencies]

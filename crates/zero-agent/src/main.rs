@@ -1,6 +1,7 @@
 //! Бинарник `zero-agent`: `doctor`, `demo-run`, `replay` (R0), `models`, `ask`,
 //! `resources` (R1-A), `run`, `answer` (R1-B1), `inspect`, `stats` (R1-B2), `audit`,
-//! `journal export`, `checkpoints`, `secret list`, `trust` (R1-C1).
+//! `journal export`, `checkpoints`, `secret list`, `trust` (R1-C1), `skills list` и скрытая
+//! `extract` (R1-C2).
 //!
 //! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы, ошибка
 //! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя;
@@ -36,9 +37,10 @@ use zero_agent::models::{self, AskArgs, CommandError};
 use zero_agent::resources;
 use zero_agent::run::{
     self as agent_run, Answer, BudgetFlags, EXIT_NEEDS_DECISION, JOURNAL_FILE, NewRunArgs,
-    ResumeArgs, RunAction, RunArgs, RunCrash, RunError, parse_run_crash, parse_usd,
+    ResumeArgs, RunAction, RunArgs, RunCrash, RunError, RunHooks, parse_run_crash, parse_usd,
 };
 use zero_agent::secret::{StoreSecrets, cmd_secret_list};
+use zero_agent::skills::{SkillsCmdError, cmd_skills_list};
 use zero_agent::trust::{TrustCmdError, cmd_trust};
 /// Переменная окружения с фильтром логов; без неё читается `RUST_LOG`.
 const LOG_ENV: &str = "ZA_LOG";
@@ -195,6 +197,11 @@ enum Cmd {
         #[command(subcommand)]
         action: SecretCmd,
     },
+    /// Скиллы: каталог по источникам (user, bundled, extra, project) и пропущенные.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsCmd,
+    },
     /// Запрос хода к модели по журналу: блоки с байтами, токенами и хэшем, расход,
     /// предсказание следующего хода; `--raw` — тело запроса провайдеру.
     Inspect(InspectCli),
@@ -347,6 +354,11 @@ struct RunCli {
     /// 20 с).
     #[arg(long, hide = true, value_name = "СЕК")]
     checkpoint_timeout: Option<u64>,
+    /// Тест (D128): `host=ip:port` — шлюз разрешает имя в этот адрес мимо фильтра; можно
+    /// повторять. Флага нет без признака `test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    #[arg(long = "web-resolve", hide = true, value_parser = agent_run::parse_web_resolve)]
+    web_resolve: Vec<(String, std::net::SocketAddr)>,
     /// Текст задачи.
     #[arg(required_unless_present = "resume", conflicts_with = "resume")]
     task: Option<String>,
@@ -445,6 +457,10 @@ fn run_args(r: RunCli) -> RunArgs {
         grants: r.grants,
         crash: r.crash_at,
         checkpoint_timeout: r.checkpoint_timeout.map(Duration::from_secs),
+        hooks: RunHooks {
+            #[cfg(feature = "test-hooks")]
+            web_resolve: r.web_resolve,
+        },
     }
 }
 
@@ -459,6 +475,18 @@ enum JournalCmd {
         /// id run.
         #[arg(long, value_parser = parse_run)]
         run: RunId,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsCmd {
+    /// Скиллы каталога: имя, источник, путь, предупреждения; затем пропущенные с причинами.
+    /// Скиллы проекта — только у доверенного проекта (`zero-agent trust`).
+    List {
+        /// Каталог проекта: с ним — и скиллы проекта (`.zero-agent/skills`,
+        /// `.agents/skills`, `.claude/skills`).
+        #[arg(long)]
+        project: Option<PathBuf>,
     },
 }
 
@@ -559,6 +587,8 @@ enum AppError {
     Checkpoints(#[from] CheckpointsCmdError),
     #[error(transparent)]
     Trust(#[from] TrustCmdError),
+    #[error(transparent)]
+    Skills(#[from] SkillsCmdError),
 }
 
 fn parse_run(s: &str) -> Result<RunId, String> {
@@ -770,6 +800,12 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
         } => {
             let home = home::za_home()?;
             Ok(cmd_secret_list(&home))
+        }
+        Cmd::Skills {
+            action: SkillsCmd::List { project },
+        } => {
+            let home = home::za_home()?;
+            Ok(cmd_skills_list(&home, project.as_deref()).await?)
         }
     }
 }
