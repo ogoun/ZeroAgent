@@ -1156,6 +1156,42 @@ fn align_budget_is_rest_of_output_budget() {
     assert!(counts[0] - counts[1] >= 1000 / 7, "{counts:?}");
 }
 
+/// Заголовок входит в бюджет вывода (m1 финального ревью извлечения; m-A3 повторного ревью
+/// финального прохода): верхняя оценка текста лежит в окне (бюджет − заголовок, бюджет] — без
+/// заголовка страница строится полностью, с заголовком в 1000 байт сумма больше бюджета, и
+/// страница извлекается линейно. Окно подбирается таблицей из одних `|` (6 байт вывода на
+/// символ), как в [`align_budget_is_rest_of_output_budget`].
+#[test]
+fn title_over_rest_of_budget_is_simplified() {
+    use za_extract::HTML_OUTPUT_BUDGET;
+    const TITLE: usize = 1000;
+    let page = |title: usize, pipes: usize| {
+        format!(
+            "<html><head><title>{}</title></head><body><table><tr><th>p</th></tr><tr><td>{}</td></tr></table></body></html>",
+            "T".repeat(title),
+            "|".repeat(pipes)
+        )
+    };
+    // Оценка — посередине окна, на расстоянии от его краёв больше шага в 6 байт.
+    let target = (HTML_OUTPUT_BUDGET - TITLE / 2) as u64;
+    let mut pipes = 690_000usize;
+    for _ in 0..3 {
+        let b = output_bound(&page(0, pipes));
+        pipes = (pipes as i64 + (target as i64 - b as i64) / 6) as usize;
+    }
+    let bound = output_bound(&page(TITLE, pipes));
+    let budget = HTML_OUTPUT_BUDGET as u64;
+    assert!(
+        bound <= budget && bound + TITLE as u64 > budget,
+        "оценка {bound} вне окна"
+    );
+    let m = bounded_within("without title", page(0, pipes), release_second());
+    assert!(!m.simplified, "без заголовка оценка в бюджете");
+    let m = bounded_within("with title", page(TITLE, pipes), release_second());
+    assert!(m.simplified, "оценка с заголовком больше бюджета");
+    assert_eq!(m.title.as_deref().map_or(0, str::len), TITLE);
+}
+
 /// Заголовок страницы режется до [`za_extract::TITLE_MAX_BYTES`] по границе символа на обоих
 /// путях (m1 финального ревью извлечения): прежде заголовок в 0,9 МБ при тексте в бюджете
 /// давал ответ подпроцесса больше предела вывода, и `web_fetch` падал с ошибкой. Потребитель

@@ -1109,10 +1109,14 @@ mod tests {
     /// Таблицы, которые `htmd` выводит обходом детей (без заголовков, внутри ячейки, с
     /// признаком заголовка без ячеек, пустые), [`TableLayout`] выводит сам — байт в байт как
     /// встроенный обработчик (I1 финального ревью извлечения), в том числе неглубокие формы
-    /// с таблицей в подписи.
+    /// с таблицей в подписи. Формы со строчным текстом вокруг таблицы без ячеек (m-A2
+    /// повторного ревью финального прохода): между `x` и `y` блочных элементов нет, поэтому
+    /// пустой обход (`None`) и обёртка `\n\n` различимы — `xy` у `htmd`, а не `x\n\ny`.
     #[test]
     fn walked_tables_match_htmd() {
         for html in [
+            "x<table><thead></thead><caption></caption></table>y",
+            "x<table><thead></thead><caption>c</caption></table>y",
             "<p>a</p><table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table><p>z</p>",
             "<table><tr><td>x<table><tr><th>i</th></tr><tr><td>j</td></tr></table>y</td></tr></table>",
             "<table><thead></thead><caption>c <b>bold</b></caption></table><p>after</p>",
