@@ -35,6 +35,7 @@ use za_core::net::normalize_host;
 use za_protocol::net_outcome;
 
 use crate::addr::{FilteredResolver, ResolveFail, check_url};
+use crate::convert::non_identity_coding;
 use crate::limit::RateLimiter;
 use crate::robots::{ROBOTS_MAX_BYTES, Rules};
 use crate::{Body, FetchError, Fetched, WebConfig, WebError};
@@ -497,24 +498,12 @@ fn finish(rec: &mut NetRequest, r: &Result<Resp, FetchError>, url: &Url) {
     );
 }
 
-/// Первое кодирование `Content-Encoding`, кроме `identity` (только `[a-z0-9.+_-]`, до 40
-/// символов: значение уходит модели).
+/// Первое кодирование `Content-Encoding`, кроме `identity`, по всем строкам заголовка — то же
+/// правило, что у `convert` (D107, D109).
 fn content_encoding(h: &HeaderMap) -> Option<String> {
-    for v in h.get_all(CONTENT_ENCODING) {
-        let v = String::from_utf8_lossy(v.as_bytes()).to_ascii_lowercase();
-        for t in v.split(',').map(str::trim) {
-            if t.is_empty() || t == "identity" {
-                continue;
-            }
-            let t: String = t
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '_' | '-'))
-                .take(40)
-                .collect();
-            return Some(if t.is_empty() { "unknown".into() } else { t });
-        }
-    }
-    None
+    h.get_all(CONTENT_ENCODING)
+        .iter()
+        .find_map(|v| non_identity_coding(&String::from_utf8_lossy(v.as_bytes())))
 }
 
 /// Ошибка отправки: отказ фильтра — `Blocked`, прочее — `Network` с английским текстом

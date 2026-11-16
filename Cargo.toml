@@ -118,3 +118,18 @@ similar = { version = "=2.7.0", default-features = false, features = ["text"] }
 # шлюза `za-web`. Крейт уже в Cargo.lock через `reqwest`, новых крейтов нет; только `std`.
 # Лицензия MIT OR Apache-2.0.
 url = { version = "=2.5.8", default-features = false, features = ["std"] }
+# Кодировка ответа `web_fetch` (R1-C2 D109, `za_web::convert`): `charset` заголовка или
+# `<meta>`, BOM, декодирование с заменой. Версия — та, что уже в Cargo.lock (через
+# `grep-searcher`), новых крейтов нет. Лицензия (Apache-2.0 OR MIT) AND BSD-3-Clause
+# (таблицы WHATWG; BSD-3-Clause разрешена в `deny.toml`).
+encoding_rs = "=0.8.44"
+# HTML в Markdown (R1-C2 D109, D127, CAP-002) — только у `za-extract`, который работает
+# лишь в подпроцессе `zero-agent extract html`: обход DOM у `htmd` рекурсивный, глубокая
+# вложенность переполняет стек. Последняя версия старше двух недель (0.5.6 от 2026-10-15);
+# лицензия Apache-2.0. Тянет `html5ever`/`markup5ever_rcdom` 0.38 и `phf` 0.13 (MIT OR
+# Apache-2.0); прирост `Cargo.lock` — в журнале.
+htmd = "=0.5.6"
+# Тип узла DOM (`NodeData`) для заголовка `<title>` отдельным полем: `htmd` отдаёт дерево
+# (`html_to_tree`), но не тип его узлов. Та же версия, что у `htmd`, новых крейтов нет.
+# Только у `za-extract`. Лицензия MIT OR Apache-2.0.
+markup5ever_rcdom = "=0.38.0"

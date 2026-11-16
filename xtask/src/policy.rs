@@ -12,7 +12,8 @@
 //! `zero-agent` и `xtask`; от `reqwest` напрямую (любой вид) — только `za-llm` и `za-web`;
 //! у `reqwest` в сборке workspace (с тестами) нет функций сжатия, cookie, SOCKS, HTTP/2 и
 //! корней ОС; HTTP-клиент `reqwest` строится только в `crates/za-web/src/gateway.rs` и
-//! `crates/za-llm`.
+//! `crates/za-llm`. R1-C2 (D113, D127): `za-extract` — без крейтов workspace, от него —
+//! только `zero-agent`; `htmd`, `html5ever`, `markup5ever_rcdom` — только у `za-extract`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -73,6 +74,12 @@ const XTASK_ONLY_DEPS: &[&str] = &["tiktoken-rs"];
 const WEB_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-core"];
 /// Кто может зависеть от `za-web` (все виды): бинарник и `xtask` (бюджеты промптов).
 const WEB_USERS: &[&str] = &["zero-agent", "xtask"];
+/// Кто может зависеть от `za-extract` (все виды, D113, D127): только бинарник — его скрытая
+/// подкоманда `extract` и есть подпроцесс разбора.
+const EXTRACT_USERS: &[&str] = &["zero-agent"];
+/// Разборщики враждебного HTML — прямая зависимость (все виды) только у `za-extract` (D127):
+/// в процессе агента рекурсивный обход DOM переполнил бы стек на глубокой вложенности.
+const EXTRACT_ONLY_DEPS: &[&str] = &["htmd", "html5ever", "markup5ever_rcdom"];
 /// Функции `reqwest`, которых не должно быть в сборке (D107, D129): распаковка тела
 /// (`Accept-Encoding`), cookie, SOCKS и HTTP/2–3, корни хранилища ОС и системный TLS.
 const REQWEST_FORBIDDEN_FEATURES: &[&str] = &[
@@ -310,6 +317,27 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     "{} не должен зависеть от za-web (только {})",
                     pkg.name,
                     WEB_USERS.join(", ")
+                )));
+            }
+            // Все виды (D113, D127): извлекатель — лист без крейтов workspace, его зовёт
+            // только бинарник в подпроцессе.
+            if pkg.name == "za-extract" && is_workspace_crate(&dep.name) {
+                out.push(Violation(format!(
+                    "za-extract не должен зависеть от {} (без крейтов workspace)",
+                    dep.name
+                )));
+            }
+            if dep.name == "za-extract" && !EXTRACT_USERS.contains(&pkg.name.as_str()) {
+                out.push(Violation(format!(
+                    "{} не должен зависеть от za-extract (только {}: разбор — в подпроцессе, D127)",
+                    pkg.name,
+                    EXTRACT_USERS.join(", ")
+                )));
+            }
+            if pkg.name != "za-extract" && EXTRACT_ONLY_DEPS.contains(&dep.name.as_str()) {
+                out.push(Violation(format!(
+                    "{} не должен зависеть от {} (только za-extract, в подпроцессе: D127)",
+                    pkg.name, dep.name
                 )));
             }
             if pkg.name == "za-protocol" && dep.name.starts_with("za-") {
@@ -975,6 +1003,60 @@ version = \"0.0.1\"
                 ..dep("za-web")
             };
             assert!(to_web(check_direction(&meta_with(bad, dev))), "dev {bad}");
+        }
+    }
+    /// D113, D127: `za-extract` — без крейтов workspace в любом виде, от него — только
+    /// `zero-agent`; `htmd` и его разборщики — прямой зависимостью только у `za-extract`.
+    #[test]
+    fn r1c2_extract_directions() {
+        let dev = |name: &str| Dependency {
+            kind: Some("dev".into()),
+            ..dep(name)
+        };
+        for ok in ["htmd", "markup5ever_rcdom", "serde"] {
+            assert!(check_direction(&meta("za-extract", ok)).is_empty(), "{ok}");
+        }
+        for bad in ["za-core", "za-protocol", "za-jail", "za-web", "zero-agent"] {
+            assert!(
+                !check_direction(&meta("za-extract", bad)).is_empty(),
+                "{bad}"
+            );
+            assert!(
+                !check_direction(&meta_with("za-extract", dev(bad))).is_empty(),
+                "dev {bad}"
+            );
+        }
+        assert!(check_direction(&meta("zero-agent", "za-extract")).is_empty());
+        let to_extract =
+            |v: Vec<Violation>| v.iter().any(|x| x.0.contains("зависеть от za-extract"));
+        for bad in [
+            "za-web",
+            "za-agent",
+            "za-tools",
+            "za-core",
+            "za-skills",
+            "xtask",
+        ] {
+            assert!(
+                to_extract(check_direction(&meta(bad, "za-extract"))),
+                "{bad}"
+            );
+            assert!(
+                to_extract(check_direction(&meta_with(bad, dev("za-extract")))),
+                "dev {bad}"
+            );
+        }
+        for parser in EXTRACT_ONLY_DEPS {
+            for bad in ["za-web", "za-agent", "zero-agent"] {
+                assert!(
+                    !check_direction(&meta(bad, parser)).is_empty(),
+                    "{bad} → {parser}"
+                );
+                assert!(
+                    !check_direction(&meta_with(bad, dev(parser))).is_empty(),
+                    "dev {bad} → {parser}"
+                );
+            }
         }
     }
     /// Ruling I2 ревью задачи 6: прямая зависимость от `reqwest` любого вида (обычная, dev,

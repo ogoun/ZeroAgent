@@ -1,0 +1,21 @@
+[package]
+name = "za-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-extract"
+
+[lints]
+workspace = true
+
+# Разборщики враждебного содержимого (R1-C2 D113, D127): вызываются только в подпроцессе
+# `zero-agent extract` через `za_jail::Runner`. Крейтов workspace здесь нет ни в каком виде,
+# от `za-extract` зависит только `zero-agent` (`cargo xtask policy`).
+[dependencies]
+# HTML в Markdown (D109): только здесь, `za-web` его не подключает (D127).
+htmd.workspace = true
+# Тип узлов дерева `htmd` — заголовок `<title>` отдельным полем.
+markup5ever_rcdom.workspace = true
+# `Markdown` уходит из подпроцесса JSON-ом той же формы, что `za_core::extract::Markdown`.
+serde.workspace = true

@@ -21,6 +21,9 @@ reqwest.workspace = true
 # резолвер (`lookup_host`) под фильтром адресов (D108).
 tokio = { workspace = true, features = ["sync", "time", "net"] }
 url.workspace = true
+# Кодировка ответа (D109, `convert`): BOM, `charset` заголовка или `<meta>`, замена битых
+# байт. Разборщика HTML (`htmd`) здесь нет: он только в `za-extract`, в подпроцессе (D127).
+encoding_rs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

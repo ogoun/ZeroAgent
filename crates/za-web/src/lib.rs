@@ -9,20 +9,27 @@
 //!   `za_core::net::normalize_host` (D124), IP-литерал и `localhost` — сразу.
 //! - [`RateLimiter`] — окно в минуту на процесс и интервал по хосту.
 //! - [`robots_allows`] — свой разбор `robots.txt` (RFC 9309).
+//! - [`convert`] — тип и кодировка ответа (D109): строго по `Content-Type`, сигнатуры только
+//!   в начале тела; HTML и текст — в UTF-8.
+//! - [`rank_passages`] — отрывки длинной страницы по запросу `prompt` (D110).
 //!
-//! Враждебный HTML шлюз не разбирает (D127). Тестовые подмены резолвера существуют только
-//! с признаком сборки `test-hooks` (D128).
+//! Враждебный HTML шлюз не разбирает (D127): это делает `za-extract` в отдельном процессе.
+//! Тестовые подмены резолвера существуют только с признаком сборки `test-hooks` (D128).
 
 mod addr;
+mod convert;
 mod gateway;
 mod limit;
+mod rank;
 mod robots;
 
 use std::time::Duration;
 
 pub use addr::{Block, IANA_SNAPSHOT, IPV4_SPECIAL, IPV6_SPECIAL, check_ip, parse_url};
+pub use convert::{Converted, HTML_TYPES, META_SCAN_BYTES, TEXT_TYPES, convert};
 pub use gateway::WebGateway;
 pub use limit::RateLimiter;
+pub use rank::rank_passages;
 pub use robots::{ROBOTS_MAX_BYTES, ROBOTS_MAX_RULES, robots_allows};
 use za_core::NetRequest;
 
