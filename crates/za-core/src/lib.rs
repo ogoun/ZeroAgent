@@ -44,7 +44,7 @@ pub mod text;
 mod tool;
 
 pub use bus::{AgentEvent, EventBus, Journal};
-pub use capability::{BoundaryInfo, Capability, Hook};
+pub use capability::{BoundaryInfo, Capability, Hook, InstructionsTarget};
 pub use checkpoint::{Checkpoint, CheckpointRequest, Checkpointer};
 pub use demo::{CrashPoint, DemoConfig, DemoOutcome, replay_hash, run_demo};
 pub use graph::{BoxFuture, Exit, Graph, GraphError, Node, NodeId, Transition};

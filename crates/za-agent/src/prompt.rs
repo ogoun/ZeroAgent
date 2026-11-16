@@ -162,6 +162,7 @@ pub fn runtime_texts() -> Vec<(&'static str, String)> {
         .map(|(n, t)| (*n, (*t).to_owned()))
         .chain(crate::context::compact_text_samples())
         .chain(crate::policy::text_samples())
+        .chain(crate::skills::text_samples())
         .chain(crate::tools::text_samples())
         .chain(crate::turn::text_samples())
         .chain(pack_texts().map(|(n, t)| (n, t.to_owned())))
@@ -699,6 +700,86 @@ pub fn small_prefix_cases(tools: &[std::sync::Arc<dyn za_core::Tool>]) -> Vec<Bu
             name: format!("top/small/prefix/{name}"),
             text: format!("{}\n\n{tools}", system_of(RunRole::Top, Some(m))),
             limit: SMALL_PREFIX_LIMIT,
+        });
+    }
+    out
+}
+
+/// Окна случаев CI-лимита описаний инструментов top standard (R1-C2 D117): `(n_ctx, имя)`.
+const STANDARD_WINDOWS: [(u32, &str); 2] = [(16_384, "16k"), (32_768, "32k")];
+/// Наименьшее окно тира standard по умолчанию (`Tier::for_context`): на окне меньше standard
+/// бывает только по `--tier`.
+pub const STANDARD_MIN_WINDOW: u32 = 32_768;
+
+/// Случаи CI-лимита описаний инструментов top standard (R1-C2 D117, preflight 3.7, 5.10):
+/// `top/standard/tools@16k` и `top/standard/tools@32k` — `render_tools` префикса run с тиром
+/// standard на окне 16k и 32k: встроенные инструменты ([`crate::builtin_tools`],
+/// [`crate::request_grant_tool`]), `tools` (нативные и веб — их собирает `xtask`) и
+/// инструменты capability `caps` (скиллы с каталогом поставки) так, как их видит run: через
+/// [`crate::freeze`], с каталогом в описании `activate_skill` в его колонке
+/// (`ContextBudget::catalog`).
+///
+/// Лимит — слот Tools тира и колонка каталога окна: каталог — своя колонка, а не остаток
+/// слота (D117). Слот Tools берётся по окну, но не меньше окна [`STANDARD_MIN_WINDOW`]:
+/// набор standard на окне 16k бывает только по `--tier`, а слот 16k (800) рассчитан на набор
+/// small и превышен нативными, встроенными и вебом уже без каталога (preflight 3.7). Колонка
+/// каталога — по самому окну, как её берёт `freeze`.
+pub fn standard_tools_cases(
+    tools: &[std::sync::Arc<dyn za_core::Tool>],
+    caps: &[za_core::Capability],
+) -> Vec<BudgetCase> {
+    let mut reg = za_core::ToolRegistry::default();
+    let all = crate::tools::builtin_tools()
+        .into_iter()
+        .chain([crate::tools::request_grant_tool()])
+        .chain(tools.iter().cloned())
+        .chain(caps.iter().flat_map(|c| c.tools.iter().cloned()));
+    for t in all {
+        if let Err(e) = reg.register(t) {
+            tracing::debug!(tool = %e.0, "инструмент уже в наборе");
+        }
+    }
+    let schemas: Vec<za_llm::ToolSchema> = reg
+        .for_run(RunRole::Top, Tier::Standard)
+        .iter()
+        .map(|t| t.spec().schema.clone())
+        .collect();
+    let mut out = Vec::new();
+    for (n_ctx, window) in STANDARD_WINDOWS {
+        let setup = crate::request::RunSetup {
+            role: RunRole::Top,
+            tier: Tier::Standard,
+            work_mode: None,
+            run_mode: za_protocol::RunMode::Ask,
+            endpoint: za_llm::EndpointId("budget".into()),
+            n_ctx,
+            reasoning: reasoning_for(Tier::Standard),
+            priority: za_protocol::Priority::Top,
+            max_wait: None,
+            project_id: "budget".into(),
+            project_dir: std::path::PathBuf::from("."),
+            context: crate::context::ContextConfig::default(),
+        };
+        let budget = crate::context::ContextBudget::for_context(n_ctx);
+        let slot = crate::context::ContextBudget::for_context(n_ctx.max(STANDARD_MIN_WINDOW))
+            .tools
+            .unwrap_or(u32::MAX);
+        let text = match crate::request::freeze(&setup, &schemas, caps, None) {
+            Ok(f) => za_llm::render_tools(&za_llm::PromptBlocks {
+                tools: f.tools,
+                ..Default::default()
+            }),
+            // Повтор имени отсеян реестром выше; ошибка префикса — пустой случай с
+            // предупреждением, CI его увидит по нулю.
+            Err(e) => {
+                tracing::warn!(error = %e, "префикс случая бюджета не собран");
+                String::new()
+            }
+        };
+        out.push(BudgetCase {
+            name: format!("top/standard/tools@{window}"),
+            text,
+            limit: slot.saturating_add(budget.catalog),
         });
     }
     out

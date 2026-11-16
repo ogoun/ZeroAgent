@@ -28,7 +28,8 @@ pub enum LoadError {
 ///
 /// Скилл поставки (`dir = None`) берётся из [`crate::bundled`] по хэшу каталога: текст
 /// заглушки `DiscoverInput::bundled` отсюда не виден, и такой скилл даёт
-/// [`LoadError::Changed`].
+/// [`LoadError::Changed`]. Заглушка `Catalog::bundled_for_tests` (признак `test-hooks`)
+/// несёт свой текст и сверяется с хэшем так же.
 pub fn load(meta: &SkillMeta, file: Option<&str>) -> Result<String, LoadError> {
     let Some(file) = file else {
         return load_body(meta);
@@ -51,9 +52,13 @@ pub fn load(meta: &SkillMeta, file: Option<&str>) -> Result<String, LoadError> {
 fn load_body(meta: &SkillMeta) -> Result<String, LoadError> {
     let (text, dir_name) = match &meta.dir {
         None => {
-            let text = crate::bundled()
-                .iter()
-                .map(|(_, t)| *t)
+            #[cfg(feature = "test-hooks")]
+            let stub = meta.stub.as_deref();
+            #[cfg(not(feature = "test-hooks"))]
+            let stub: Option<&str> = None;
+            let text = stub
+                .into_iter()
+                .chain(crate::bundled().iter().map(|(_, t)| *t))
                 .find(|t| blake3::hash(t.as_bytes()).to_hex().as_str() == meta.hash)
                 .ok_or(LoadError::Changed)?;
             (text.to_owned(), meta.name.clone())

@@ -4,6 +4,7 @@
 
 mod support;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -364,7 +365,7 @@ fn prune_replaces_old_large_results() {
     results[5] = big.clone();
     let conv = history(&results);
     let before = conv.clone();
-    let (out, n) = prune(&conv, run, &d, 4, 1024).unwrap();
+    let (out, n) = prune(&conv, run, &d, 4, 1024, &BTreeSet::new()).unwrap();
     assert_eq!(n, 1);
     assert_eq!(result_of(&out, "c1"), removed(run, &big));
     assert_eq!(result_of(&out, "c6"), big);
@@ -376,11 +377,42 @@ fn prune_replaces_old_large_results() {
         big
     );
     // Повтор (реплей границы): та же история, файл тот же, удалённое не удаляется снова.
-    let (again, _) = prune(&conv, run, &d, 4, 1024).unwrap();
+    let (again, _) = prune(&conv, run, &d, 4, 1024, &BTreeSet::new()).unwrap();
     assert_eq!(again.messages(), out.messages());
-    let (second, n2) = prune(&out, run, &d, 4, 1024).unwrap();
+    let (second, n2) = prune(&out, run, &d, 4, 1024, &BTreeSet::new()).unwrap();
     assert_eq!(n2, 0);
     assert_eq!(second.messages(), out.messages());
+}
+
+/// R1-C2 D118: результат вызова активного скилла (`keep`) не удаляется, как бы стар и
+/// велик он ни был; без `keep` тот же результат удаляется.
+#[test]
+fn prune_keeps_active_skill_result() {
+    let d = dir("prune_keep_skill");
+    let run = RunId::new();
+    let skill = format!(
+        "<skill_content name=\"tdd\" source=\"bundled\" hash=\"0123456789abcdef\">\n{}\n</skill_content>",
+        "s".repeat(4096)
+    );
+    let big = "x".repeat(4096);
+    // c1 — активация скилла пять ходов назад (4 КиБ), c2 — обычный большой результат.
+    let mut results = vec!["ok".to_owned(); 7];
+    results[0] = skill.clone();
+    results[1] = big.clone();
+    let conv = history(&results);
+    let keep = BTreeSet::from(["c1".to_owned()]);
+    let (out, n) = prune(&conv, run, &d, 4, 1024, &keep).unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(
+        result_of(&out, "c1"),
+        skill,
+        "результат активного скилла заменён"
+    );
+    assert_eq!(result_of(&out, "c2"), removed(run, &big));
+    // Скилл снят (компакцией) — его результат удаляется по общему правилу.
+    let (out, n) = prune(&conv, run, &d, 4, 1024, &BTreeSet::new()).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(result_of(&out, "c1"), removed(run, &skill));
 }
 
 #[test]
@@ -398,7 +430,7 @@ fn prune_ignores_pointer_in_untrusted_text() {
     let mut results = vec!["ok".to_owned(); 6];
     results[0] = quoted.clone();
     results[1] = spilled.content.clone();
-    let (out, n) = prune(&history(&results), run, &d, 4, 1024).unwrap();
+    let (out, n) = prune(&history(&results), run, &d, 4, 1024, &BTreeSet::new()).unwrap();
     assert_eq!(n, 2);
     assert_eq!(result_of(&out, "c1"), removed(run, &quoted));
     assert_eq!(result_of(&out, "c2"), removed(run, &spilled.content));
@@ -434,7 +466,7 @@ fn prune_names_do_not_collide() {
         c.push_results(vec![result_part(id, text.clone())]).unwrap();
         texts.push(text);
     }
-    let (out, n) = prune(&c, run, &d, 1, 1024).unwrap();
+    let (out, n) = prune(&c, run, &d, 1, 1024, &BTreeSet::new()).unwrap();
     assert_eq!(n, 5);
     assert_eq!(out.validate(), Ok(()));
     let mut names = Vec::new();
@@ -457,12 +489,12 @@ fn prune_same_text_same_file() {
     let mut results = vec!["ok".to_owned(); 6];
     results[0] = big.clone();
     results[1] = big.clone();
-    let (out, n) = prune(&history(&results), run, &d, 4, 1024).unwrap();
+    let (out, n) = prune(&history(&results), run, &d, 4, 1024, &BTreeSet::new()).unwrap();
     assert_eq!(n, 2);
     assert_eq!(result_of(&out, "c1"), result_of(&out, "c2"));
     let file = spill_file(&d, &content_name(run, &big));
     let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
-    prune(&history(&results), run, &d, 4, 1024).unwrap();
+    prune(&history(&results), run, &d, 4, 1024, &BTreeSet::new()).unwrap();
     assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), mtime);
     let spill_dir = d.join(SPILL_DIR);
     let left: Vec<_> = std::fs::read_dir(&spill_dir)
@@ -482,7 +514,7 @@ fn prune_write_failure_leaves_no_tmp() {
     std::fs::create_dir_all(spill_file(&d, &content_name(run, &big))).unwrap();
     let mut results = vec!["ok".to_owned(); 6];
     results[0] = big;
-    assert!(prune(&history(&results), run, &d, 4, 1024).is_err());
+    assert!(prune(&history(&results), run, &d, 4, 1024, &BTreeSet::new()).is_err());
     let left: Vec<_> = std::fs::read_dir(d.join(SPILL_DIR))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -803,7 +835,7 @@ fn spill_refuses_linked_work_dir() {
     let run = RunId::new();
     let mut results = vec!["ok".to_owned(); 6];
     results[0] = "x".repeat(5000);
-    assert!(prune(&history(&results), run, &project, 4, 1024).is_err());
+    assert!(prune(&history(&results), run, &project, 4, 1024, &BTreeSet::new()).is_err());
     assert!(is_empty_dir(&outside), "запись вне проекта");
 }
 

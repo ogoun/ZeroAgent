@@ -1,0 +1,119 @@
+[
+  {
+    "description": "Load a skill: step-by-step guidance for one kind of task. Call it with the exact name from the catalog below when a skill fits the current step; the text comes back inside <skill_content>. Pass file to load one of the files the skill lists.",
+    "name": "activate_skill",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "description": "One of the files the skill lists, relative to the skill directory",
+          "type": "string"
+        },
+        "name": {
+          "description": "Skill name from the catalog",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Ask the user a question and wait for the answer. Use it only when the task cannot continue without the user's decision.",
+    "name": "ask_user",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "options": {
+          "description": "Suggested answers, if any",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "question": {
+          "description": "The question for the user",
+          "type": "string"
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Finish the task and report the outcome. Call it once, when the work is done, partly done or blocked.",
+    "name": "finish",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence": {
+          "description": "Checks that confirm the result: commands, file paths, test names",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "open_issues": {
+          "description": "What remains unresolved",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "result": {
+          "description": "What was done and the answer",
+          "type": "string"
+        },
+        "status": {
+          "description": "done: the goal is reached; partial: only part of it; blocked: cannot continue",
+          "enum": [
+            "done",
+            "partial",
+            "blocked"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Ask the user for access to a path outside the project. Use it before reading or writing there; the user approves or denies.",
+    "name": "request_grant",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "description": "ro: read only; rw: read and write",
+          "enum": [
+            "ro",
+            "rw"
+          ],
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path outside the project",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why access is needed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "mode",
+        "reason"
+      ],
+      "type": "object"
+    }
+  }
+]

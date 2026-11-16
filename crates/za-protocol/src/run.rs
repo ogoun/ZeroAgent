@@ -170,6 +170,19 @@ pub mod skill_source {
     pub const PROJECT: &str = "project";
 }
 
+/// Кто загрузил скилл (R1-C2 D118, D119): поле `by` события `skill.activated` и
+/// `ActiveSkill` снимка run.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod skill_by {
+    /// Модель вызовом `activate_skill`.
+    pub const MODEL: &str = "model";
+    /// Пользователь командой `/имя` в задаче или вводе.
+    pub const USER: &str = "user";
+    /// Роутер карточек tier small (D119).
+    pub const ROUTER: &str = "router";
+}
+
 /// Источник очищенного ввода (R1-C2 D102): поле `source` события `input.cleaned`.
 ///
 /// Значения — часть протокола, менять строки нельзя.

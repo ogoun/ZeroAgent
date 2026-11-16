@@ -22,14 +22,30 @@ pub trait Hook: Send + Sync {
     fn at_boundary(&self, b: &BoundaryInfo) -> Option<String>;
 }
 
+/// Куда префикс run кладёт инструкции capability (R1-C2 D117).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InstructionsTarget {
+    /// Блок 2 system после Core (D21); на top small — описание первого инструмента
+    /// capability (R1-C1 D93).
+    #[default]
+    System,
+    /// Описание первого по имени инструмента capability на любом тире, в своём бюджете
+    /// окна, а не в system: так идёт каталог скиллов — недоверенные описания из файлов
+    /// скиллов (MCP-007). Инструмента в наборе run нет (например, на tier small) —
+    /// инструкции молча опускаются.
+    FirstTool,
+}
+
 /// Набор возможностей, подключаемый к run.
 #[derive(Clone, Default)]
 pub struct Capability {
     pub name: String,
     pub tools: Vec<Arc<dyn Tool>>,
-    /// Инструкции; входят в блок 2 промпта после Core (D21).
+    /// Инструкции; куда они идут — [`Capability::instructions_target`].
     pub instructions: Option<String>,
     pub hooks: Vec<Arc<dyn Hook>>,
     /// Настройки capability как есть.
     pub settings: Value,
+    /// Место инструкций в префиксе; по умолчанию — system (D21).
+    pub instructions_target: InstructionsTarget,
 }

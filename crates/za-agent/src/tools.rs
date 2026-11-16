@@ -37,6 +37,13 @@
 //!
 //! Квитанция эффекта — [`ToolOutput`] с признаками пакета ([`Receipt`]); в результат для
 //! модели текст идёт через [`escape_untrusted`] (D23, D94).
+//!
+//! **`activate_skill`** (R1-C2 D118) — встроенный, как `request_grant`: решение и
+//! дедупликация — `crate::skills::plan_activation`, исполнение — эффект `skill.load`
+//! (`ReadOnly`) мимо `tool_action`, выгрузки и шагов (2)–(12) слота; события `tool.*` и
+//! `skill.activated` пишет слот. Результат собран рантаймом (тело экранировано внутри
+//! обёртки `<skill_content>`) и повторно не экранируется. Записанный под ключом вызова
+//! `skill.load` реплеится с его аргументами (D92).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -76,6 +83,8 @@ use crate::policy::{
     subject_paths,
 };
 use crate::prompt::escape_untrusted;
+use crate::skills::{ACTIVATE_SKILL_TOOL, Activation, LoadJob, SkillRef, plan_activation};
+use crate::state::ActiveSkill;
 use crate::turn::{CallVerdict, PlannedCall, Signal, Signals};
 
 /// Имя встроенного инструмента завершения (D17).
@@ -160,6 +169,9 @@ pub struct ToolsOutcome {
     /// `call_id` исполненных вызовов, поставивших флаг, которого в снимке начала пакета не
     /// было (`calls` события `exposure.changed`).
     pub exposure_calls: Vec<String>,
+    /// Скиллы, загруженные в пакете вызовами `activate_skill` (R1-C2 D118; вживую и по
+    /// квитанции): драйвер дописывает их в `LoopState.skills`.
+    pub skills: Vec<ActiveSkill>,
 }
 
 /// Набор доверенных файлов проекта для payload прерывания `Trust` (D83): по корню
@@ -206,6 +218,10 @@ pub struct ToolEnv {
     /// если их дают она и вклад самого вызова, — аргументы вызовов пакета выбраны до их
     /// результатов. Запись `rule_of_two` — только у вызова с внешней связью.
     pub exposure: Exposure,
+    /// Каталог скиллов run для `activate_skill` (R1-C2 D118); `None` — скиллов нет.
+    pub skills: Option<Arc<za_skills::Catalog>>,
+    /// Имена активных скиллов run на начало пакета: повтор без `file` — без эффекта.
+    pub active_skills: BTreeSet<String>,
 }
 
 impl fmt::Debug for ToolEnv {
@@ -225,6 +241,8 @@ impl fmt::Debug for ToolEnv {
             .field("masker", &self.masker.is_some())
             .field("step", &self.step)
             .field("exposure", &self.exposure)
+            .field("skills", &self.skills.as_ref().map(|c| c.skills.len()))
+            .field("active_skills", &self.active_skills)
             .finish_non_exhaustive()
     }
 }
@@ -263,6 +281,8 @@ impl ToolEnv {
             step: 0,
             trust_set: None,
             exposure: Exposure::default(),
+            skills: None,
+            active_skills: BTreeSet::new(),
         }
     }
 }
@@ -285,6 +305,8 @@ struct BatchState {
     taint: BTreeSet<String>,
     grants: Vec<Grant>,
     exposure: Exposure,
+    /// Активные скиллы: начала пакета и загруженные в нём (дедупликация D118).
+    skills: BTreeSet<String>,
 }
 
 /// Квитанция вызова: результат инструмента и признаки пакета. Поля пакета
@@ -311,6 +333,10 @@ struct Receipt {
     /// `ToolsOutcome.rule_of_two` без повторной записи.
     #[serde(default, skip_serializing_if = "is_false")]
     rule_of_two: bool,
+    /// Скилл, загруженный `activate_skill` (R1-C2 D118): реплей квитанции восстанавливает
+    /// его в списке активных без файла скилла и каталога.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skill: Option<SkillRef>,
 }
 
 impl Receipt {
@@ -435,6 +461,8 @@ enum Action {
     Finish,
     /// Одобренный `request_grant` (D78).
     Grant(Grant),
+    /// `activate_skill`: эффект `skill.load` (R1-C2 D118), мимо `tool_action` и выгрузки.
+    Skill(Box<LoadJob>),
 }
 
 /// Подготовленный к запуску слот.
@@ -442,6 +470,8 @@ struct Job {
     slot: EffectSlot,
     spec: EffectSpec,
     call_id: String,
+    /// Имя инструмента для событий `tool.*` (у `activate_skill` имя эффекта другое).
+    tool: String,
     action: Action,
     journal: Journal,
     run: RunId,
@@ -506,6 +536,7 @@ pub async fn run_tools(
         taint: env.taint.clone(),
         grants: env.grants.as_ref().clone(),
         exposure: env.exposure,
+        skills: env.active_skills.clone(),
     };
     let mut out = ToolsOutcome::default();
     batch(ctx, j, reg, env, calls, sig, &mut slots, &mut st, &mut out).await?;
@@ -677,7 +708,10 @@ fn is_read(reg: &ToolRegistry, pc: &PlannedCall) -> bool {
 
 /// Встроенные инструменты, которые исполняет сам пакет.
 fn is_runtime_tool(name: &str) -> bool {
-    matches!(name, FINISH_TOOL | ASK_USER_TOOL | REQUEST_GRANT_TOOL)
+    matches!(
+        name,
+        FINISH_TOOL | ASK_USER_TOOL | REQUEST_GRANT_TOOL | ACTIVATE_SKILL_TOOL
+    )
 }
 
 /// Подготовка вызова `i`: записанное решение, иначе политика (D92, D98).
@@ -737,6 +771,26 @@ async fn prepare(
             };
         }
         REQUEST_GRANT_TOOL => return prepare_grant(ctx, env, call, &key, slots, i, j).await,
+        ACTIVATE_SKILL_TOOL => {
+            if let Gate::Deny(reason) = gate(env.mode, tool.spec()) {
+                return Ok(Prep::Done(result(call, denied_text(reason), true)));
+            }
+            // Записанный `skill.load` под ключом вызова реплеится (D92), что бы ни стало с
+            // каталогом с тех пор.
+            let row = ctx.store().effect(ctx.run_id(), &key).await;
+            let recorded = observe_store(ctx, row)?
+                .filter(|r| r.name == crate::skills::SKILL_LOAD_EFFECT)
+                .map(|r| r.args);
+            return match plan_activation(
+                env.skills.as_deref(),
+                &st.skills,
+                &call.arguments,
+                recorded.as_ref(),
+            ) {
+                Activation::Done { text, is_error } => Ok(Prep::Done(result(call, text, is_error))),
+                Activation::Load(job) => run(slots, Action::Skill(job), None),
+            };
+        }
         _ => {}
     }
 
@@ -1447,18 +1501,24 @@ fn job(
     env: &ToolEnv,
     finish: Option<FinishArgs>,
 ) -> Job {
-    let class = match &action {
-        Action::Tool(t) => t.tool.spec().class,
-        Action::Answer(_) | Action::Finish | Action::Grant(_) => EffectClass::Pure,
-    };
-    Job {
-        slot,
-        spec: EffectSpec {
-            class,
+    let spec = match &action {
+        Action::Skill(l) => l.spec(),
+        Action::Tool(t) => EffectSpec {
+            class: t.tool.spec().class,
             name: call.name.clone(),
             args: call.arguments.clone(),
         },
+        Action::Answer(_) | Action::Finish | Action::Grant(_) => EffectSpec {
+            class: EffectClass::Pure,
+            name: call.name.clone(),
+            args: call.arguments.clone(),
+        },
+    };
+    Job {
+        slot,
+        spec,
         call_id: call.id.clone(),
+        tool: call.name.clone(),
         action,
         journal: j.clone(),
         run: env.run,
@@ -1542,7 +1602,19 @@ fn finish_part(
                     st.grants.push(g.clone());
                     out.grants.push(g);
                 }
-                result(call, escape_untrusted(&r.out.content), r.out.is_error)
+                if let Some(s) = r.skill {
+                    st.skills.insert(s.name.clone());
+                    out.skills
+                        .push(s.active(Some(call.id.clone()), za_protocol::skill_by::MODEL));
+                }
+                // Результат `activate_skill` собран рантаймом: тело и атрибуты в нём уже
+                // экранированы, а обёртка `<skill_content>` — разметка рантайма (D118).
+                let content = if call.name == ACTIVATE_SKILL_TOOL {
+                    r.out.content
+                } else {
+                    escape_untrusted(&r.out.content)
+                };
+                result(call, content, r.out.is_error)
             }
             // Значение другой формы — решение `unknown_outcome` (D16).
             Err(_) => result(call, escape_untrusted(&canonical_json(&v)), false),
@@ -1658,6 +1730,7 @@ async fn execute(jb: Job) -> Executed {
         slot,
         spec,
         call_id,
+        tool,
         action,
         journal,
         run,
@@ -1668,7 +1741,7 @@ async fn execute(jb: Job) -> Executed {
         exposure,
     } = jb;
     let key = slot.key().0.clone();
-    let name = spec.name.clone();
+    let name = tool;
     let (halt_tx, mut halt_rx) = oneshot::channel::<()>();
     let mut failure: Option<StoreError> = None;
     let fref = &mut failure;
@@ -1823,6 +1896,7 @@ impl Live {
                 ..Receipt::default()
             },
             Action::Grant(g) => self.grant(g, fref).await?,
+            Action::Skill(l) => self.skill(*l, fref).await,
         };
         // Третье свойство дала только метка результата (до инструмента её не знать) —
         // запись после вызова, отметка в `tool.finished`. Без записи результат не
@@ -1902,6 +1976,39 @@ impl Live {
                 }
                 false
             }
+        }
+    }
+
+    /// `activate_skill` (R1-C2 D118): загрузка [`crate::skills::load`] и событие
+    /// `skill.activated {by: "model"}`. Ошибка хранилища — квитанция-отказ без текста
+    /// скилла, run встаёт на паузу `store`.
+    async fn skill(&self, job: LoadJob, fref: &mut Option<StoreError>) -> Receipt {
+        let loaded = match crate::skills::load(job, self.journal.store()).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(key = %self.key, error = %e, "скилл не загружен: ошибка хранилища");
+                if fref.is_none() {
+                    *fref = Some(e);
+                }
+                return Receipt {
+                    out: ToolOutput::error(JOURNAL_FAILED),
+                    ..Receipt::default()
+                };
+            }
+        };
+        if let Some(s) = &loaded.skill {
+            let e = crate::skills::activated_event(self.run, s, za_protocol::skill_by::MODEL);
+            self.append(e.kind, e.actor, e.payload, false, fref).await;
+        }
+        let out = if loaded.is_error {
+            ToolOutput::error(loaded.content)
+        } else {
+            ToolOutput::ok(loaded.content)
+        };
+        Receipt {
+            out,
+            skill: loaded.skill,
+            ..Receipt::default()
         }
     }
 
@@ -2363,6 +2470,12 @@ impl Tool for Builtin {
         let name = self.spec.schema.name.clone();
         Box::pin(async move { ToolOutput::error(runtime_only_text(&name)) })
     }
+}
+
+/// Встроенный инструмент со своей спецификацией (`activate_skill`, R1-C2 D118): исполняет
+/// пакет, прямой вызов — ошибка.
+pub(crate) fn runtime_tool(spec: ToolSpec) -> Arc<dyn Tool> {
+    Arc::new(Builtin { spec })
 }
 
 fn builtin(schema: ToolSchema, roles: Vec<RunRole>, min_tier: Tier) -> Arc<dyn Tool> {

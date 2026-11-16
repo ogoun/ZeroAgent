@@ -18,3 +18,8 @@ za-core = { path = "../za-core" }
 blake3.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[features]
+# Заглушки поставки для тестов (`Catalog::bundled_for_tests`) — только с этим признаком, не
+# под `debug_assertions` (D128): обычная и release-сборка их не содержат.
+test-hooks = []

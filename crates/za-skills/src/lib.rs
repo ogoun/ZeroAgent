@@ -2,7 +2,7 @@
 //! ([`parse_skill_md`]), обход доверенных деревьев ([`tree_listing`] — один код для набора
 //! доверия проекта и для чтения скиллов), обнаружение и каталог ([`discover`]), загрузка с
 //! проверкой хэша ([`load`]), поставка — core pack из 14 скиллов своими текстами
-//! ([`bundled`], [`PACK`], D120).
+//! ([`bundled`], [`PACK`], D120), роутер карточек tier small ([`route`], D119).
 //!
 //! Зависит только от `za-protocol` и `za-core` (`cargo xtask policy`); `za-agent` может
 //! зависеть от него, обратного нет ни в каком виде. Весь ввод-вывод блокирующий: из
@@ -12,6 +12,7 @@ mod discover;
 mod load;
 mod pack;
 mod parse;
+mod route;
 mod tree;
 mod yaml;
 
@@ -25,6 +26,7 @@ pub use parse::{
     COMPATIBILITY_MAX_CHARS, DESCRIPTION_MAX_CHARS, MAX_FILE_BYTES, MAX_FRONTMATTER_BYTES,
     NAME_MAX_CHARS, ParseError, Parsed, allowed_tools, parse_skill_md, valid_name,
 };
+pub use route::{ROUTE_MIN_WORDS, route};
 pub use tree::{
     EXTERNAL_LINK, LINK_PREFIX, PROJECT_TREES, Place, TOO_LARGE_PREFIX, TRUST_LIMITS, TreeLimits,
     TreeListing, file_value, tree_hash, tree_listing,

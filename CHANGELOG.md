@@ -5,6 +5,16 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, задача 13 (скиллы в цикле агента, D117–D119):
+  - `za-agent`: встроенный `activate_skill(name, file?)` — эффект `skill.load` со сверкой хэша каталога, блок `<skill_content name source hash>` с экранированным телом и списком ресурсов, без выгрузки D44 (до 64 КиБ, длиннее — `[skill truncated; load parts with file]`), повтор активного скилла — `already loaded above` без эффекта, изменённый после старта файл — ошибка `changed since the run started`, событие `skill.activated`;
+  - `za-agent`: `skills_capability(catalog)` — каталог скиллов в описании `activate_skill` (ограждение `<skill_catalog>`, своя колонка окна `ContextBudget::catalog`: 300 / 600 / 1500, запасной вид — имена через запятую), в system описаний нет; `LoopDeps::skills`;
+  - `za-agent`: `/имя` в задаче или вводе (любой тир, после очистки невидимых символов) — блок скилла к сообщению пользователя; роутер карточек top small (`<skill_card>` ≤ 150 токенов верхней оценки);
+  - `za-agent`: активные скиллы (`LoopState.skills`, снимок v4) не удаляются при удалении старых результатов (`prune` получил параметр `keep`, `CompactInput` и `Compacted` — поле `skills`) и возвращаются после компакции в пределах `min(3000, n_ctx / 8)` токенов, не поместившиеся снимаются строкой `unloaded by compaction`;
+  - `za-skills`: роутер `route(catalog, text)` (idf, не меньше двух общих слов, ничья — без кандидата); `Catalog::bundled_for_tests` — заглушки поставки только с признаком `test-hooks`;
+  - `za-core`: `InstructionsTarget::{System, FirstTool}` и поле `Capability::instructions_target`; общий разбор слов `text::words` (вынесен из `za-web`);
+  - `za-protocol`: `skill_by::{MODEL, USER, ROUTER}`;
+  - `cargo xtask prompt-budget`: случаи `top/standard/tools@16k` и `@32k` — набор standard с вебом и каталогом поставки;
+  - golden: `za-agent/tests/golden/builtin_tools.json`, `za-agent/tests/golden/r1c2_v4/snapshot.json`, новый `prompts.hash` при `r1c2.1`.
 - R1-C2, проход fix-12 (ревью задачи 12, core pack):
   - `za-skills`: тексты `review` и `doubt` написаны заново со своей структурой (N-13). `review` строит карту изменения (результаты, эффекты, контракты, вход внешних данных), пробует каждый пункт по осям корректность, безопасность, тесты, простота и пишет находки сценариями воспроизведения по обратимости вреда. `doubt` ищет, чем вывод может оказаться ложным (не тот код, вход, окружение, частичное покрытие, побочное изменение), и проверяет каждую причину;
   - `za-skills`: после сверки с первоисточниками переписаны и `tdd`, `diagnose`, `tickets`, `domain-model`, `source-driven`, `retro`, поправлены `grill` и `handoff`. `tdd` больше не советует коммитить без просьбы пользователя;

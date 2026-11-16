@@ -1490,3 +1490,174 @@ async fn snapshot_v3_untrusted_label_resumes_untrusted() {
         evs.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>()
     );
 }
+
+// ---- R1-C2, задача 13: скиллы и снимок v4 (D118, D130) ----
+
+/// Скилл источника `user` в каталоге теста: (каталог скиллов, каталог).
+fn user_skill_catalog(name: &str, body: &str) -> (PathBuf, za_skills::Catalog) {
+    let root = dir(name).join("home-skills");
+    let p = root.join("tdd/SKILL.md");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(
+        &p,
+        format!("---\nname: tdd\ndescription: Use when testing.\n---\n{body}\n"),
+    )
+    .unwrap();
+    let cat = za_skills::discover(&za_skills::DiscoverInput {
+        user_dir: Some(root.clone()),
+        ..za_skills::DiscoverInput::default()
+    });
+    assert_eq!(cat.skills.len(), 1, "{:?}", cat.skipped);
+    (root, cat)
+}
+
+fn with_skills(deps: &mut LoopDeps, cat: za_skills::Catalog) {
+    let cat = Arc::new(cat);
+    deps.capabilities = vec![za_agent::skills_capability(Arc::clone(&cat))];
+    deps.skills = Some(cat);
+}
+
+fn activate_call(id: &str) -> Vec<Result<StreamEvent, ModelError>> {
+    vec![Ok(StreamEvent::Finished {
+        message: Message {
+            role: Role::Assistant,
+            parts: vec![Part::ToolCall(ToolCall {
+                id: id.into(),
+                name: za_agent::ACTIVATE_SKILL_TOOL.into(),
+                arguments: json!({"name": "tdd"}),
+                raw_arguments: None,
+            })],
+        },
+        finish: FinishReason::ToolCalls,
+        usage: Usage::default(),
+    })]
+}
+
+/// D118, D92: сбой после квитанции `skill.load` (граница следующего шага записана, снимка
+/// `Model` нет); файл скилла удалён; resume реплеит шаг: тот же текст из квитанции, без
+/// второго эффекта и второго `skill.activated`.
+#[tokio::test]
+async fn resume_replays_skill_load_from_receipt() {
+    let (root, cat) = user_skill_catalog("skill_replay", "Original method.");
+    let mut f = fx("skill_replay");
+    with_skills(&mut f.deps, cat);
+    f.deps.crash = crash_at(CrashPoint::AfterBoundary { step: 2 });
+    let spec = RunSpec {
+        tier: Some(Tier::Standard),
+        ..ask()
+    };
+    f.model.push(activate_call("c1"));
+    f.model.push(answer("ок"));
+    assert!(matches!(start(&f, spec).await, Err(LoopError::Halted)));
+    let evs = events(&f.store, f.run).await;
+    let loads: Vec<&Event> = evs
+        .iter()
+        .filter(|e| e.kind == EventKind::EffectIntent && e.payload["name"] == "skill.load")
+        .collect();
+    assert_eq!(loads.len(), 1);
+    // Текст первой попытки — квитанция эффекта (ход 2 до сбоя не начат).
+    let receipt = evs
+        .iter()
+        .find(|e| e.kind == EventKind::EffectReceipt && e.payload["key"] == loads[0].payload["key"])
+        .expect("нет квитанции skill.load");
+    let value = &receipt.payload["result"]["value"];
+    let first = (
+        value["content"].as_str().unwrap().to_owned(),
+        value["is_error"].as_bool().unwrap(),
+    );
+    assert!(!first.1);
+    assert!(first.0.contains("Original method."), "{}", first.0);
+    // Скилл удалён с диска: перечитать его нельзя, а каталог нового процесса (бинарник
+    // обнаруживает скиллы заново) его уже не содержит — решает записанный эффект (D92).
+    std::fs::remove_dir_all(root.join("tdd")).unwrap();
+    let fresh = za_skills::discover(&za_skills::DiscoverInput {
+        user_dir: Some(root.clone()),
+        ..za_skills::DiscoverInput::default()
+    });
+    assert!(fresh.skills.is_empty());
+    let mut deps = f.deps.clone();
+    deps.crash = None;
+    deps.skills = Some(Arc::new(fresh));
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume_with(&f, &deps, ResumeChange::default())
+            .await
+            .unwrap(),
+        done("ок")
+    );
+    let again = result_of(&f.model.calls().last().unwrap().request.messages, "c1").unwrap();
+    assert_eq!(again, first, "реплей дал другой текст скилла");
+    let evs = events(&f.store, f.run).await;
+    assert_eq!(
+        evs.iter()
+            .filter(|e| e.kind == EventKind::EffectIntent && e.payload["name"] == "skill.load")
+            .count(),
+        1,
+        "эффект skill.load повторён"
+    );
+    assert_eq!(of_kind(&evs, EventKind::SkillActivated).len(), 1);
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.skills.len(), 1);
+    assert_eq!(snap.skills[0].call_id.as_deref(), Some("c1"));
+}
+
+/// Каталог golden снимка v4 (D130): снимок живого run R1-C2 с активным скиллом и
+/// экспозицией (`snapshot.json`).
+fn golden_v4_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/r1c2_v4/snapshot.json")
+}
+
+/// Снимок для golden v4: недоверенный проект (`untrusted` с шага 0), скилл поставки-
+/// заглушки активирован моделью, run завершён.
+async fn write_golden_v4() {
+    let mut f = fx("golden_v4_write");
+    let cat = za_skills::Catalog::bundled_for_tests(&[(
+        "tdd",
+        "---\nname: tdd\ndescription: Use when testing.\n---\nWrite the test first.\n",
+    )]);
+    with_skills(&mut f.deps, cat);
+    let spec = RunSpec {
+        tier: Some(Tier::Standard),
+        trusted: false,
+        ..ask()
+    };
+    f.model.push(activate_call("c1"));
+    f.model.push(answer("ок"));
+    assert_eq!(start(&f, spec).await.unwrap(), done("ок"));
+    let (_, v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    let mut text = serde_json::to_string_pretty(&v).unwrap();
+    text.push('\n');
+    std::fs::create_dir_all(golden_v4_path().parent().unwrap()).unwrap();
+    std::fs::write(golden_v4_path(), text).unwrap();
+}
+
+/// D130: golden снимка v4 с активным скиллом и экспозицией читается без потерь полей;
+/// `ZA_UPDATE_GOLDEN=1` переписывает его живым run.
+#[tokio::test]
+async fn snapshot_v4_golden() {
+    if std::env::var("ZA_UPDATE_GOLDEN").as_deref() == Ok("1") {
+        write_golden_v4().await;
+    }
+    let text = std::fs::read_to_string(golden_v4_path()).unwrap_or_else(|e| {
+        panic!(
+            "нет {}: {e}; эталон пишется командой ZA_UPDATE_GOLDEN=1 cargo test -p za-agent --test resume snapshot_v4_golden",
+            golden_v4_path().display()
+        )
+    });
+    let golden: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(golden["v"], 4);
+    let snap: Snapshot = serde_json::from_value(golden.clone()).unwrap();
+    assert_eq!(snap.v, za_agent::SNAPSHOT_V);
+    assert_eq!(snap.skills.len(), 1);
+    let s = &snap.skills[0];
+    assert_eq!(s.name, "tdd");
+    assert_eq!(s.source, "bundled");
+    assert_eq!(s.hash.len(), 64);
+    assert_eq!(s.call_id.as_deref(), Some("c1"));
+    assert_eq!(s.by, "model");
+    assert_eq!(s.content.0.len(), 64);
+    assert!(snap.exposure.untrusted);
+    assert_eq!(snap.taint.iter().collect::<Vec<_>>(), ["untrusted_project"]);
+    // Без потерь: разбор и запись дают тот же JSON.
+    assert_eq!(serde_json::to_value(&snap).unwrap(), golden);
+}

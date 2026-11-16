@@ -12,14 +12,21 @@
 //! считаются по настоящему набору run `for_run(Top, Small)`: встроенные инструменты и
 //! `za_tools::native_capability()` ([`all_cases`]). Случаи `skills/<name>` — тексты
 //! core pack целиком, не больше 700 токенов каждый (R1-C2 D120): их даёт
-//! `za_agent::budget_cases()` с теми же текстами, что входят в хэш промптов.
+//! `za_agent::budget_cases()` с теми же текстами, что входят в хэш промптов. Случаи
+//! `top/standard/tools@{16k,32k}` (R1-C2 D117) — описания инструментов run с тиром standard:
+//! встроенные, нативные, `web_fetch`, `web_search` и `activate_skill` с каталогом 14 скиллов
+//! поставки ([`standard_cases`]); инструменты веба только строятся, к сети команда не идёт.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use za_agent::{budget_cases, small_prefix_cases};
+use std::sync::Arc;
+
+use za_agent::{budget_cases, small_prefix_cases, standard_tools_cases};
+use za_core::BoxFuture;
+use za_core::extract::{ExtractError, Extractor, HtmlRequest, Markdown, PdfRequest, PdfText};
 use za_tools::{AgentHome, NativeDeps, ReadTracker, Shell, native_capability};
 
 /// Предел подключения и каждой операции записи и чтения `/tokenize`.
@@ -224,9 +231,48 @@ fn dechunk(mut rest: &[u8]) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
-/// Все случаи CI-лимита: фиксированные тексты ([`budget_cases`]) и префикс top small с
-/// нативными инструментами ([`small_prefix_cases`]). Инструменты только описываются:
-/// оболочка и `ZA_HOME` — заглушки (описания от них не зависят, D97).
+/// Извлекатель для описания `web_fetch`: не вызывается (описание от него не зависит).
+struct NoExtractor;
+
+impl Extractor for NoExtractor {
+    fn html(&self, _req: HtmlRequest) -> BoxFuture<'static, Result<Markdown, ExtractError>> {
+        Box::pin(async { Err(ExtractError::Failed("not used".into())) })
+    }
+
+    fn pdf(&self, _req: PdfRequest) -> BoxFuture<'static, Result<PdfText, ExtractError>> {
+        Box::pin(async { Err(ExtractError::Failed("not used".into())) })
+    }
+}
+
+/// Случаи `top/standard/tools@{16k,32k}` (R1-C2 D117): нативные инструменты `native`,
+/// `web_fetch` и `web_search` поверх шлюза без обращений (адрес поставщика — только для
+/// построения) и capability скиллов с каталогом поставки. Шлюз не строится — случаев нет и
+/// ошибка в выводе (CI увидит пропажу случаев в тесте).
+fn standard_cases(native: &[Arc<dyn za_core::Tool>]) -> Result<Vec<za_agent::BudgetCase>, String> {
+    let gw =
+        Arc::new(za_web::WebGateway::new(za_web::WebConfig::default()).map_err(|e| e.to_string())?);
+    let base = url::Url::parse("http://127.0.0.1:8888/").map_err(|e| e.to_string())?;
+    let mut tools = native.to_vec();
+    tools.push(za_web::web_fetch_tool(
+        Arc::clone(&gw),
+        Arc::new(NoExtractor),
+    ));
+    tools.push(za_web::web_search_tool(
+        gw,
+        Arc::new(za_web::Searxng::new(base)),
+    ));
+    let catalog = za_skills::discover(&za_skills::DiscoverInput {
+        bundled: za_skills::bundled(),
+        ..za_skills::DiscoverInput::default()
+    });
+    let caps = [za_agent::skills_capability(Arc::new(catalog))];
+    Ok(standard_tools_cases(&tools, &caps))
+}
+
+/// Все случаи CI-лимита: фиксированные тексты ([`budget_cases`]), префикс top small с
+/// нативными инструментами ([`small_prefix_cases`]) и описания top standard с вебом и
+/// каталогом ([`standard_cases`]). Инструменты только описываются: оболочка и `ZA_HOME` —
+/// заглушки (описания от них не зависят, D97).
 pub fn all_cases() -> Vec<za_agent::BudgetCase> {
     let deps = NativeDeps {
         runner: std::sync::Arc::new(za_jail::DirectRunner),
@@ -243,8 +289,13 @@ pub fn all_cases() -> Vec<za_agent::BudgetCase> {
         // Описание `read` от извлекателя не зависит (D113).
         extractor: None,
     };
+    let native = native_capability(&deps).tools;
     let mut cases = budget_cases();
-    cases.extend(small_prefix_cases(&native_capability(&deps).tools));
+    cases.extend(small_prefix_cases(&native));
+    match standard_cases(&native) {
+        Ok(c) => cases.extend(c),
+        Err(e) => eprintln!("prompt-budget: случаи top/standard/tools не собраны: {e}"),
+    }
     cases
 }
 
@@ -415,6 +466,58 @@ mod tests {
         assert_eq!(skills, hashed);
         for c in cases.iter().filter(|c| c.name.starts_with("skills/")) {
             assert_eq!(c.limit, 700, "{}", c.name);
+        }
+    }
+
+    /// R1-C2 D117 (preflight 3.7, 5.10): случаи `top/standard/tools@{16k,32k}` — настоящий
+    /// набор run с тиром standard: нативные, встроенные, веб и `activate_skill` с каталогом
+    /// 14 скиллов поставки в ограждении; лимит — слот Tools тира (не меньше окна 32k) и
+    /// колонка каталога окна (300 и 600).
+    #[test]
+    fn prompt_budget_has_standard_cases() {
+        use za_protocol::Tier;
+        assert_eq!(
+            Tier::for_context(za_agent::STANDARD_MIN_WINDOW),
+            Tier::Standard
+        );
+        assert_eq!(
+            Tier::for_context(za_agent::STANDARD_MIN_WINDOW - 1),
+            Tier::Small
+        );
+        let cases = all_cases();
+        for (window, n_ctx, limit) in [("16k", 16_384, 1500 + 300), ("32k", 32_768, 1500 + 600)] {
+            let c = cases
+                .iter()
+                .find(|c| c.name == format!("top/standard/tools@{window}"))
+                .unwrap_or_else(|| panic!("нет случая {window}"));
+            assert_eq!(c.limit, limit, "{window}");
+            let b = za_agent::ContextBudget::for_context(n_ctx);
+            assert_eq!(c.limit, 1500 + b.catalog, "{window}");
+            for name in [
+                "read",
+                "search",
+                "glob",
+                "edit",
+                "multi_edit",
+                "bash",
+                "ask_user",
+                "request_grant",
+                "web_fetch",
+                "web_search",
+                "activate_skill",
+            ] {
+                assert!(
+                    c.text.contains(&format!("\"name\":\"{name}\"")),
+                    "{window}: {name}"
+                );
+            }
+            assert!(!c.text.contains("\"name\":\"finish\""), "{window}");
+            assert!(c.text.contains("<skill_catalog>"), "{window}");
+            for skill in za_skills::PACK {
+                assert!(c.text.contains(skill), "{window}: {skill}");
+            }
+            let n = count(&c.text);
+            assert!(!over_limit(&n, c.limit), "{window}: {n:?} при {}", c.limit);
         }
     }
 

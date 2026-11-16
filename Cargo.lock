@@ -2656,11 +2656,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tiktoken-rs",
+ "url",
  "za-agent",
  "za-core",
  "za-jail",
  "za-protocol",
+ "za-skills",
  "za-tools",
+ "za-web",
 ]
 
 [[package]]
@@ -2698,6 +2701,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "za-core",
  "za-llm",

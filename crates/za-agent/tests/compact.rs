@@ -883,6 +883,7 @@ async fn emergency_input_fits_window() {
                 emergency: true,
                 grants: None,
                 masker: None,
+                skills: &[],
             },
             0,
             &mut sig,
@@ -1404,6 +1405,7 @@ async fn direct_compact(
                 emergency,
                 grants: None,
                 masker: None,
+                skills: &[],
             },
             0,
             &mut sig,
@@ -1679,4 +1681,128 @@ async fn step1_fault_after_inbox_resumes() {
         done("готово")
     );
     assert_eq!(compactions(&f.model), 1);
+}
+
+// ---- R1-C2, задача 13: активные скиллы переживают компакцию (D118) ----
+
+/// D118: предел recall — `min(3000, n_ctx / 8)`.
+#[test]
+fn recall_limit_scales_with_window() {
+    assert_eq!(za_agent::skill_recall_limit(16_384), 2048);
+    assert_eq!(za_agent::skill_recall_limit(131_072), 3000);
+    assert_eq!(za_agent::skill_recall_limit(24_000), 3000);
+}
+
+/// Заглушка поставки с телом около `tokens` токенов оценки (байты / 4).
+fn sized_skill(name: &str, tokens: usize) -> String {
+    let line = format!("{name}: one more careful step of the method.\n");
+    let body = line.repeat(tokens * 4 / line.len());
+    format!("---\nname: {name}\ndescription: Use when {name} is needed.\n---\n{body}")
+}
+
+/// D118: после компакции первое сообщение новой эпохи получает блоки активных скиллов
+/// из их блобов, новые первыми, в пределах `skill_recall_limit(n_ctx)`; не поместившийся
+/// старший снимается со списка активных строкой `[skill "…" unloaded by compaction; …]`.
+#[tokio::test]
+async fn compaction_recalls_active_skills() {
+    let texts = [sized_skill("review", 1980), sized_skill("tdd", 1980)];
+    let catalog = Arc::new(za_skills::Catalog::bundled_for_tests(&[
+        ("review", texts[0].as_str()),
+        ("tdd", texts[1].as_str()),
+    ]));
+    assert_eq!(catalog.skills.len(), 2);
+    let with_skills = |f: &mut Fx| {
+        f.deps.capabilities = vec![za_agent::skills_capability(Arc::clone(&catalog))];
+        f.deps.skills = Some(Arc::clone(&catalog));
+    };
+    let standard = || RunSpec {
+        tier: Some(Tier::Standard),
+        ..spec()
+    };
+    let n_ctx = 24_000;
+    assert_eq!(za_agent::skill_recall_limit(n_ctx), 3000);
+    // Оценка первого запроса run с тем же набором (байты / 4).
+    let mut p = fx("recall_probe", scripted(n_ctx));
+    with_skills(&mut p);
+    p.model.push(answer("ok"));
+    let (_ctl, rx) = control_channel(p.store.clone(), p.run);
+    within("start_run", start_run(&p.deps, p.run, standard(), rx))
+        .await
+        .unwrap();
+    let base = ContextMeter::default()
+        .estimate(
+            &p.model.calls()[0].request,
+            p.model.as_ref(),
+            &EndpointId("a".into()),
+        )
+        .await
+        .tokens;
+    // Порог компакции на окне 24000 и тире standard: оценка + резерв ≥ 0,75 × 24000.
+    let reserve = za_agent::output_plan(
+        &za_agent::ContextBudget::for_context(n_ctx),
+        &reasoning_for(Tier::Standard),
+    )
+    .max_output_tokens;
+    let threshold = 18_000 - reserve;
+    let window = n_ctx - reserve;
+    // Две активации (~4000) и запись `note`: оценка шага 4 — между порогом и окном.
+    let target = (threshold + window) / 2;
+    let note_tokens = target - base - 4100;
+    assert!(
+        base + 4100 < 15_600 - reserve,
+        "удаление результатов до записи"
+    );
+
+    let mut f = fx("recall", scripted(n_ctx));
+    with_skills(&mut f);
+    f.model.push(finished(
+        vec![Part::ToolCall(ToolCall {
+            id: "s1".into(),
+            name: "activate_skill".into(),
+            arguments: json!({"name": "review"}),
+            raw_arguments: None,
+        })],
+        FinishReason::ToolCalls,
+        Usage::default(),
+    ));
+    f.model.push(finished(
+        vec![Part::ToolCall(ToolCall {
+            id: "s2".into(),
+            name: "activate_skill".into(),
+            arguments: json!({"name": "tdd"}),
+            raw_arguments: None,
+        })],
+        FinishReason::ToolCalls,
+        Usage::default(),
+    ));
+    f.model.push(note("n1", note_tokens));
+    f.model.push(summary("finish"));
+    f.model.push(answer("готово"));
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let out = within("start_run", start_run(&f.deps, f.run, standard(), rx))
+        .await
+        .unwrap();
+    assert_eq!(out, done("готово"));
+    assert_eq!(compactions(&f.model), 1);
+    let last = turn_requests(&f.model).pop().unwrap();
+    let first = text_of(&last.messages[0]);
+    let summary_end = first.find("</summary>").expect("нет сводки");
+    let tdd = first
+        .find("<skill_content name=\"tdd\" source=\"bundled\"")
+        .expect("блока tdd нет после компакции");
+    assert!(tdd > summary_end, "блок скилла — после сводки");
+    assert!(!first.contains("<skill_content name=\"review\""), "{first}");
+    assert!(
+        first.ends_with(
+            "\n\n[skill \"review\" unloaded by compaction; activate it again if needed]"
+        ),
+        "{}",
+        &first[first.len().saturating_sub(200)..]
+    );
+    let evs = events(&f.store, f.run).await;
+    assert_eq!(of_kind(&evs, EventKind::ContextCompacted).len(), 1);
+    let (_, snap) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    let snap: Snapshot = serde_json::from_value(snap).unwrap();
+    assert_eq!(snap.skills.len(), 1);
+    assert_eq!(snap.skills[0].name, "tdd");
 }

@@ -81,6 +81,7 @@ use crate::request::{
     FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message_with, freeze_for,
 };
 use crate::resume::state_block;
+use crate::skills::user_skill;
 use crate::state::{AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools};
 use crate::turn::{
@@ -176,6 +177,10 @@ pub struct LoopDeps {
     /// Голова цепочки аудита на момент старта или продолжения (D91): пишется в снимок,
     /// бинарник сверяет её при resume; `None` — без якоря.
     pub audit_head: Option<AuditHead>,
+    /// Каталог скиллов run (R1-C2 D114–D119): `activate_skill`, `/имя` и роутер small.
+    /// Каталог для модели — инструкции capability `za_agent::skills_capability` того же
+    /// каталога; `None` — скиллов нет.
+    pub skills: Option<Arc<za_skills::Catalog>>,
 }
 
 impl LoopDeps {
@@ -199,6 +204,7 @@ impl LoopDeps {
             masker: None,
             trust_set: None,
             audit_head: None,
+            skills: None,
         }
     }
 
@@ -475,6 +481,19 @@ async fn step_zero(
         .await
         .map_err(effect_err)?;
     let memory_text = v.get("text").and_then(Value::as_str).map(str::to_owned);
+    // D119: `/имя` в задаче (любой тир) или карточка роутера (top small) — эффект
+    // `skill.load` сразу после снимка памяти; блок дописывается к задаче в первом
+    // сообщении, сама задача (цель сводки и рецитации) — без него.
+    let task_skill = user_skill(
+        &mut ctx,
+        &deps.journal,
+        deps.skills.as_deref(),
+        &[],
+        &spec.task,
+        router_on(spec.role, tier),
+    )
+    .await
+    .map_err(effect_err)?;
     // Ревью задачи 1, m1: события шага 0 — после квитанции памяти, снимок шага 0 стоит
     // на последнем событии run (D4).
     for (source, removed) in cleaned {
@@ -522,11 +541,19 @@ async fn step_zero(
     // D78: top получает `<grants>` после `<env>`; субагент — в слоте своего `<task>`.
     let grants = (spec.role == RunRole::Top).then(|| grants_text(&spec.grants, &roots.project));
     let mut conv = Conversation::default();
+    let mut skills = Vec::new();
+    let task_text = match task_skill {
+        Some((block, active)) => {
+            skills.extend(active);
+            format!("{}\n\n{block}", spec.task)
+        }
+        None => spec.task.clone(),
+    };
     conv.push_user(first_message_with(
         &env,
         grants.as_deref(),
         memory_text.as_deref(),
-        &spec.task,
+        &task_text,
     ))?;
     let refs = conv.persist(&store).await?.refs;
 
@@ -585,10 +612,15 @@ async fn step_zero(
         // D82, Ruling 7.20: недоверенный проект помечен с шага 0.
         taint,
         audit_head: deps.audit_head.clone(),
-        skills: Vec::new(),
+        skills,
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
+}
+
+/// Роутер карточек — только у top small (D119).
+fn router_on(role: RunRole, tier: Tier) -> bool {
+    role == RunRole::Top && tier == Tier::Small
 }
 
 /// Реестр run: `deps.tools` и инструменты capability. Повтор имени — ошибка префикса.
@@ -1114,10 +1146,30 @@ async fn push_inbox(
                     );
                     continue;
                 }
+                // D119: `/имя` (любой тир) или карточка роутера (top small) — после
+                // очистки, до истории; блок дописывается к сообщению, а в `user_inputs`
+                // (сводка компакции) идёт только текст пользователя.
+                let skill = user_skill(
+                    &mut st.ctx,
+                    &deps.journal,
+                    deps.skills.as_deref(),
+                    &st.skills,
+                    &text,
+                    router_on(st.setup.role, st.setup.tier),
+                )
+                .await
+                .map_err(effect_err)?;
                 // Текст пользователя — как есть, только управляющий тег экранируется:
                 // ввод не выдаёт себя за голос рантайма (D23).
                 let text = escape_untrusted(&text);
-                st.conv.push_user(text.clone())?;
+                let message = match skill {
+                    Some((block, active)) => {
+                        st.skills.extend(active);
+                        format!("{text}\n\n{block}")
+                    }
+                    None => text.clone(),
+                };
+                st.conv.push_user(message)?;
                 push_input(&store_of(deps), st, &text, false).await?;
                 // Ввод пользователя сбрасывает окно повтора (Ruling I-3 ревью задачи 6).
                 st.detectors.on_user_input();
@@ -1623,6 +1675,7 @@ async fn run_compaction(
             emergency,
             grants: recite_grants.as_deref(),
             masker: deps.masker.as_deref(),
+            skills: &st.skills,
         },
         st.turn,
         &mut st.sig,
@@ -1638,6 +1691,7 @@ async fn run_compaction(
             st.conv = c.conv;
             st.user_inputs = c.user_inputs;
             st.last_next_step = c.next_step;
+            st.skills = c.skills;
             st.epoch += 1;
             st.meter.reset();
             st.meter.compact_pending = false;
@@ -1728,8 +1782,10 @@ async fn prune_results(
     before: Estimate,
 ) -> Result<Estimate, LoopError> {
     let (conv, run, dir) = (st.conv.clone(), st.run, st.setup.project_dir.clone());
+    // Результаты активных скиллов не удаляются (R1-C2 D118).
+    let keep: BTreeSet<String> = st.skills.iter().filter_map(|s| s.call_id.clone()).collect();
     let pruned = match tokio::task::spawn_blocking(move || {
-        prune(&conv, run, &dir, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES)
+        prune(&conv, run, &dir, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES, &keep)
     })
     .await
     {
@@ -2286,6 +2342,8 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         step: st.ctx.step(),
         trust_set: deps.trust_set.clone(),
         exposure: st.exposure_now(),
+        skills: deps.skills.clone(),
+        active_skills: st.skills.iter().map(|s| s.name.clone()).collect(),
     };
     // Флаги наблюдаются рядом с пакетом (D26): `pausing`/`cancelling` пишутся сразу,
     // не дожидаясь конца идущего инструмента. На сигналы пакет реагирует сам.
@@ -2344,9 +2402,11 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
     if out.halted {
         return Err(LoopError::Halted);
     }
-    // Состояние пакета (D78, D82, D83, D106): метки, гранты, доверие, экспозиция.
+    // Состояние пакета (D78, D82, D83, D106, D118): метки, гранты, доверие, экспозиция,
+    // загруженные скиллы.
     st.taint.append(&mut out.taint);
     st.grants.append(&mut out.grants);
+    st.skills.append(&mut out.skills);
     match out.trusted {
         Some(true) => st.trust_granted(),
         Some(false) => st.trust_refused = true,

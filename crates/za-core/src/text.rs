@@ -69,6 +69,24 @@ pub fn clean_invisible(s: &str, level: Clean) -> (Cow<'_, str>, usize) {
     }
 }
 
+/// 40 английских стоп-слов [`words`] (короче трёх символов слова и так не считаются).
+pub const STOP_WORDS: [&str; 40] = [
+    "the", "and", "for", "are", "but", "not", "you", "your", "with", "this", "that", "these",
+    "from", "into", "about", "there", "their", "they", "them", "then", "than", "was", "were",
+    "been", "have", "has", "had", "does", "did", "can", "will", "would", "should", "how", "what",
+    "when", "where", "which", "who", "why",
+];
+
+/// Слова текста для сопоставления по совпадению слов (R1-C2 D110, D119): серии букв и
+/// цифр в нижнем регистре длиной от трёх символов, без [`STOP_WORDS`]. Один разбор у
+/// ранжирования абзацев `web_fetch` и у роутера карточек скиллов.
+pub fn words(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().nth(2).is_some())
+        .map(str::to_lowercase)
+        .filter(|w| !STOP_WORDS.contains(&w.as_str()))
+}
+
 /// Символы, похожие на `<`: ASCII, одиночная кавычка-уголок, угловые скобки
 /// (технические, математические, CJK, орнаментальные), малая и полноширинная формы,
 /// гомоглифы (канадское слоговое PA, модификаторы-стрелки ˂ и ˱, «не меньше» ≮) и

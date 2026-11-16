@@ -86,6 +86,10 @@ pub struct SkillMeta {
     pub warnings: Vec<String>,
     /// `allowed-tools` (SKL-007: прав не меняют).
     pub allowed_tools: Vec<String>,
+    /// Текст `SKILL.md` заглушки поставки ([`Catalog::bundled_for_tests`], D128): `load`
+    /// берёт тело из него, сверяя хэш. Поля нет без признака `test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) stub: Option<std::sync::Arc<str>>,
 }
 
 /// Пропущенный скилл или источник.
@@ -106,6 +110,23 @@ pub struct Catalog {
 impl Catalog {
     pub fn get(&self, name: &str) -> Option<&SkillMeta> {
         self.skills.iter().find(|s| s.name == name)
+    }
+
+    /// Каталог из скиллов поставки-заглушек — только тесты (признак `test-hooks`, D128):
+    /// пары (имя каталога, текст `SKILL.md`) разбираются и упорядочиваются как поставка
+    /// в [`discover`], хэш — настоящий BLAKE3 текста заглушки, а [`crate::load`] берёт
+    /// тело из неё (со сверкой хэша), а не из [`crate::bundled`]. В обычной и
+    /// release-сборке конструктора нет.
+    #[cfg(feature = "test-hooks")]
+    pub fn bundled_for_tests(pairs: &[(&str, &str)]) -> Catalog {
+        let mut d = Discovery::default();
+        for (name, text) in pairs {
+            d.bundled(name, text, Some(std::sync::Arc::from(*text)));
+        }
+        d.cat
+            .skills
+            .sort_by(|a, b| (rank(a.source), &a.name).cmp(&(rank(b.source), &b.name)));
+        d.cat
     }
 }
 
@@ -138,7 +159,7 @@ pub fn discover(input: &DiscoverInput) -> Catalog {
         d.local(skill_source::USER, dir, &input.limits);
     }
     for (name, text) in input.bundled {
-        d.bundled(name, text);
+        d.bundled(name, text, None);
     }
     for dir in &input.extra_dirs {
         d.local(skill_source::EXTRA, dir, &input.limits);
@@ -268,8 +289,8 @@ impl Discovery {
         self.scan(&root, &listing.files, limits);
     }
 
-    /// Скилл поставки.
-    fn bundled(&mut self, dir_name: &str, text: &'static str) {
+    /// Скилл поставки; `stub` — текст заглушки теста ([`Catalog::bundled_for_tests`]).
+    fn bundled(&mut self, dir_name: &str, text: &str, stub: Option<Stub>) {
         let shown = format!("{}:{dir_name}", skill_source::BUNDLED);
         let parsed = match parse_skill_md(text, dir_name) {
             Ok(p) => p,
@@ -280,10 +301,22 @@ impl Discovery {
             skill_source::BUNDLED,
             None,
             shown,
-            hash,
+            hash.clone(),
             parsed,
             BTreeMap::new(),
         );
+        // Скилл принят, если он последний в каталоге с этим хэшем (дубль имени — пропуск).
+        #[cfg(feature = "test-hooks")]
+        if let Some(m) = self
+            .cat
+            .skills
+            .last_mut()
+            .filter(|m| m.dir.is_none() && m.hash == hash)
+        {
+            m.stub = stub;
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        let _: Option<Stub> = stub;
     }
 
     /// Скиллы корня по списку файлов `files` (пути от корня).
@@ -491,6 +524,15 @@ impl Discovery {
             allowed_tools: parse::allowed_tools(&parsed.fields),
             files,
             warnings: parsed.warnings,
+            #[cfg(feature = "test-hooks")]
+            stub: None,
         });
     }
 }
+
+/// Текст заглушки поставки (признак `test-hooks`); без признака — пустой тип: в
+/// продукт заглушка не попадает.
+#[cfg(feature = "test-hooks")]
+type Stub = std::sync::Arc<str>;
+#[cfg(not(feature = "test-hooks"))]
+type Stub = std::convert::Infallible;

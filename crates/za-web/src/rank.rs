@@ -1,7 +1,8 @@
 //! Ранжирование абзацев длинной страницы по запросу `web_fetch(url, prompt)` (R1-C2 D110,
 //! preflight 5.3). Без модели (MDL-014 — R4): совпадение слов.
 //!
-//! - **Слова:** нижний регистр, буквы и цифры, длина от 3 символов, без [`STOP_WORDS`].
+//! - **Слова:** `za_core::text::words` — нижний регистр, буквы и цифры, длина от 3 символов,
+//!   без 40 стоп-слов (тот же разбор у роутера карточек скиллов, D119).
 //! - **Отрывки:** абзацы (серии непустых строк); абзац больше доли совпадений режется по
 //!   строкам, строка больше неё — по границе символа.
 //! - **Выборка по совпадениям:** отрывки с общими словами по убыванию их числа (при равенстве —
@@ -17,7 +18,7 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-use za_core::text::{escaped_char_len, escaped_len};
+use za_core::text::{escaped_char_len, escaped_len, words};
 
 /// Голова страницы — столько первых строк (D110).
 const HEAD_LINES: usize = 20;
@@ -25,14 +26,6 @@ const HEAD_LINES: usize = 20;
 const MATCH_SHARE_PERCENT: usize = 60;
 /// Разделитель отрывков в итоге.
 const SEP: &str = "\n\n";
-
-/// 40 английских стоп-слов (короче трёх символов слова и так не считаются).
-const STOP_WORDS: [&str; 40] = [
-    "the", "and", "for", "are", "but", "not", "you", "your", "with", "this", "that", "these",
-    "from", "into", "about", "there", "their", "they", "them", "then", "than", "was", "were",
-    "been", "have", "has", "had", "does", "did", "can", "will", "would", "should", "how", "what",
-    "when", "where", "which", "who", "why",
-];
 
 /// Отрывки `text`, близкие к `prompt`, в пределах `budget_bytes` байт после экранирования
 /// (D110). Текст не длиннее бюджета возвращается как есть.
@@ -92,14 +85,6 @@ pub fn rank_passages(text: &str, prompt: &str, budget_bytes: usize) -> String {
         .map(|r| &text[r.clone()])
         .collect::<Vec<_>>()
         .join(SEP)
-}
-
-/// Слова для сравнения: нижний регистр, буквы и цифры, от 3 символов, без стоп-слов.
-fn words(s: &str) -> impl Iterator<Item = String> + '_ {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.chars().nth(2).is_some())
-        .map(str::to_lowercase)
-        .filter(|w| !STOP_WORDS.contains(&w.as_str()))
 }
 
 /// Число разных слов запроса в отрывке.

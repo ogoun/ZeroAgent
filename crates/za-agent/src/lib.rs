@@ -22,7 +22,9 @@
 //! рассуждения в стриме [`StreamWatch`] (D58, D59), обещания без действия
 //! [`promise_without_action`], ошибок инструмента, порчи JSON и падения кэша (D57,
 //! D60–D62), движок политики [`decide`] (правила, гранты [`Grant`], защищённые пути,
-//! доверие и метка `tainted`, R1-C1 D77–D83). Модель
+//! доверие и метка `tainted`, R1-C1 D77–D83), скиллы (`activate_skill`
+//! [`skills_capability`], `/имя`, роутер карточек tier small, защита активных скиллов от
+//! удаления результатов и компакции, R1-C2 D117–D119). Модель
 //! вызывается только через `za_llm::ModelPort`: `za-llm` подключён без HTTP и `Gateway`.
 
 mod budget;
@@ -39,6 +41,7 @@ mod policy;
 mod prompt;
 mod request;
 mod resume;
+mod skills;
 mod state;
 mod tools;
 mod turn;
@@ -50,10 +53,10 @@ mod test_unique_dir;
 
 pub use budget::{Spent, check_budget};
 pub use context::{
-    ANSWER_RESERVE, COMPACT_RUBRIC, CompactInput, Compacted, ContextBudget, ContextConfig,
-    ContextConfigError, ContextMeter, Estimate, OutputPlan, SPILL_DIR, SpillCfg, SpillResult,
-    UserInput, compact, output_plan, prune, spill, spill_limit_bytes, spill_name, summary_block,
-    thinking_budget, truncation_suspected,
+    ANSWER_RESERVE, CATALOG_LIMIT, COMPACT_RUBRIC, CompactInput, Compacted, ContextBudget,
+    ContextConfig, ContextConfigError, ContextMeter, Estimate, OutputPlan, SPILL_DIR, SpillCfg,
+    SpillResult, UserInput, compact, output_plan, prune, spill, spill_limit_bytes, spill_name,
+    summary_block, thinking_budget, truncation_suspected,
 };
 pub use control::{ControlRx, InputMode, RunControl, control_channel, submit_input};
 pub use conversation::{Conversation, HistoryError, LoadError, Persisted, cut_points, split_tail};
@@ -78,11 +81,11 @@ pub use policy::{
 pub use prompt::{
     AGENTS_MD_LIMIT, BRANCH_MAX_CHARS, BudgetCase, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo,
     LEFT_ANGLES, MODE_LIMIT, PROMPT_VERSION, RIGHT_ANGLES, SMALL_PREFIX_LIMIT, SMALL_TOOLS_SLOT,
-    TaskBlock, WorkMode, agents_md_budget, approx_tokens, budget_cases, env_in_role_limit,
-    escape_untrusted, fit_agents_md, git_branch, max_env, mode_overlay, prompt_files,
-    prompt_texts_hash, prompt_texts_hash_for, reasoning_for, render_control, render_env,
-    render_task, role_core, role_limit, runtime_texts, runtime_texts_with, small_prefix_cases,
-    upper_tokens, utility_rules,
+    STANDARD_MIN_WINDOW, TaskBlock, WorkMode, agents_md_budget, approx_tokens, budget_cases,
+    env_in_role_limit, escape_untrusted, fit_agents_md, git_branch, max_env, mode_overlay,
+    prompt_files, prompt_texts_hash, prompt_texts_hash_for, reasoning_for, render_control,
+    render_env, render_task, role_core, role_limit, runtime_texts, runtime_texts_with,
+    small_prefix_cases, standard_tools_cases, upper_tokens, utility_rules,
 };
 pub use request::{
     BlockHashes, BlockSizes, CAPABILITY_LIMIT, FrozenPrefix, PrefixError, RunSetup, TurnOptions,
@@ -90,6 +93,10 @@ pub use request::{
     request_hash,
 };
 pub use resume::{ResumeChange, resume_run, state_block};
+pub use skills::{
+    ACTIVATE_SKILL_TOOL, CARD_LIMIT, SKILL_OUTPUT_LIMIT, SKILLS_CAPABILITY, activate_skill_tool,
+    skill_recall_limit, skills_capability,
+};
 pub use state::{
     ActiveSkill, AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit, SNAPSHOT_V,
     Snapshot,
