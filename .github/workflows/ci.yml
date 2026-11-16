@@ -66,12 +66,16 @@ jobs:
         run: cargo clippy -p za-extract --all-targets --features test-hooks --locked -- -D warnings
       - if: ${{ !cancelled() }}
         run: cargo test -p za-extract --features test-hooks --locked --no-fail-fast
-      # Извлекатель в отдельном процессе (D113, D127, задача 10): крюки бинарника
-      # `extract --hang` и `extract --crash` есть только с признаком `test-hooks`.
+      # Бинарник с тестовыми крюками (D128): `extract --hang`/`--crash` (D113, D127,
+      # задача 10), `run --web-resolve` — цели `extract`, `skills` (задача 14) и
+      # `r1c2_web_skills` (приёмка R1-C2) есть только с признаком `test-hooks`. Запускается
+      # весь пакет, а не одна цель (I1 ревью задачи 15): иначе приёмка этапа не шла бы ни на
+      # одной платформе. Страж обычной сборки (`tests/hooks_absent.rs`) идёт в шаге
+      # `cargo test --workspace` выше.
       - if: ${{ !cancelled() }}
         run: cargo clippy -p zero-agent --all-targets --features test-hooks --locked -- -D warnings
       - if: ${{ !cancelled() }}
-        run: cargo test -p zero-agent --features test-hooks --test extract --locked --no-fail-fast
+        run: cargo test -p zero-agent --features test-hooks --locked --no-fail-fast
       # Чистые части `za-llm` без функций — так его подключает `za-core`.
       - if: ${{ !cancelled() }}
         run: cargo test -p za-llm --no-default-features --locked --no-fail-fast
