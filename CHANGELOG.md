@@ -5,6 +5,13 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, проход fix-7 (ревью задачи 7 — онлайн-страж разбора HTML, элементы управления, `simplified`):
+  - `za-extract`: из списка пропуска убран `form` (страница ASP.NET WebForms целиком в `<form>` теряла текст), добавлены элементы управления `input`, `select`, `option`, `button`, `textarea` (I1);
+  - `za-extract`: онлайн-страж разбора (`guard.rs`) — `TreeSink` поверх `RcDom` считает события разборщика кусками по 16 КиБ (глубина 256, сумма глубин 2·10^7, элементов 600 000) и точная проверка DOM до `htmd` (цена слияния соседей 2·10^9); при превышении — линейное извлечение токенизатором без дерева (`linear.rs`) с признаком `simplified`. Классы вложенности, реконструкции форматирования, «Noah's Ark» и слияния соседей дают упрощённый текст за ≤ 0,4 с в release вместо тайм-аута;
+  - `za-core`/`za-extract`: поле `Markdown.simplified` (`#[serde(default)]`);
+  - `za-web`: `web_fetch` ставит в шапку результата строку `[simplified extraction: …]`, когда разбор упрощён (D127);
+  - новая прямая зависимость `html5ever =0.38.0` у `za-extract` (уже в `Cargo.lock` через `htmd`, новых крейтов нет);
+  - тест `deep_nesting_kills_only_child` перенесён в `za-extract/tests/crash.rs` под признаком `test-hooks`: глубокая вложенность теперь даёт `simplified`, падение подпроцесса проверяется намеренным сбоем (D128).
 - R1-C2, задача 8 (трейт извлечения, `web_fetch`, журнал сетевых обращений):
   - `za-core`: модуль `extract` — трейт `Extractor` (`html`, `pdf`) и типы `HtmlRequest`, `Markdown`, `PdfRequest`, `PdfText`, `ExtractError` (D113); реализация — подпроцесс, задача 10;
   - `za-core`: `ToolOutput.requests` (`#[serde(skip)]`, в квитанцию эффекта не попадает), `ToolCx.deadline`, `call_deadline` и `DEADLINE_GRACE` (дедлайн вызова — тайм-аут минус 1 с);

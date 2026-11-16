@@ -104,6 +104,36 @@ async fn fetch_html_page() {
 }
 
 #[tokio::test]
+async fn simplified_extraction_is_marked_in_result() {
+    // Извлекатель вернул упрощённый разбор (D127, ревью задачи 7): шапка несёт пометку.
+    let s = site(|_| {
+        typed(
+            200,
+            "text/html",
+            b"<html><body><p>deep</p></body></html>".to_vec(),
+        )
+    })
+    .await;
+    let tool = web_fetch_tool(gateway(&s), StubExtractor::simplifying());
+    let out = fetch(&tool, json!({"url": page_url(&s, "/a")})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("[simplified extraction:"),
+        "нет пометки упрощения: {}",
+        out.content
+    );
+    // Пометка — в шапке, до текста страницы.
+    let marker = out.content.find("[simplified extraction:").unwrap();
+    let body = out.content.find("deep").unwrap();
+    assert!(
+        marker < body,
+        "пометка должна быть в шапке: {}",
+        out.content
+    );
+    assert_eq!(out.taint.as_deref(), Some("web"));
+}
+
+#[tokio::test]
 async fn extractor_failure_is_tool_error() {
     let s = site(|_| typed(200, "text/html", b"<p>x</p>".to_vec())).await;
     let ex = StubExtractor::failing(ExtractError::Failed("crashed".into()));

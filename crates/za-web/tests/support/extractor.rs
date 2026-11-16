@@ -13,6 +13,8 @@ use za_core::extract::{ExtractError, Extractor, HtmlRequest, Markdown, PdfReques
 pub struct StubExtractor {
     pub html_seen: Mutex<Vec<HtmlRequest>>,
     pub html_error: Option<ExtractError>,
+    /// Разбор HTML возвращает `simplified = true` (страница слишком сложная, D127).
+    pub html_simplified: bool,
     pub pdf_seen: Mutex<Vec<PdfRequest>>,
     pub pdf_pages: PdfText,
 }
@@ -30,6 +32,14 @@ impl StubExtractor {
         })
     }
 
+    /// Разбор HTML всегда помечает результат упрощённым (`simplified = true`).
+    pub fn simplifying() -> Arc<Self> {
+        Arc::new(Self {
+            html_simplified: true,
+            ..Self::default()
+        })
+    }
+
     /// Принятые запросы HTML.
     pub fn html_requests(&self) -> Vec<HtmlRequest> {
         self.html_seen.lock().unwrap().clone()
@@ -40,7 +50,10 @@ impl Extractor for StubExtractor {
     fn html(&self, req: HtmlRequest) -> BoxFuture<'static, Result<Markdown, ExtractError>> {
         let r = match &self.html_error {
             Some(e) => Err(e.clone()),
-            None => Ok(strip_tags(&req.html)),
+            None => Ok(Markdown {
+                simplified: self.html_simplified,
+                ..strip_tags(&req.html)
+            }),
         };
         self.html_seen.lock().unwrap().push(req);
         Box::pin(async move { r })
@@ -78,5 +91,6 @@ pub fn strip_tags(html: &str) -> Markdown {
     Markdown {
         title,
         text: text.trim().to_string(),
+        ..Markdown::default()
     }
 }

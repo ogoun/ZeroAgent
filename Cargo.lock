@@ -2388,6 +2388,7 @@ name = "za-extract"
 version = "0.0.1"
 dependencies = [
  "htmd",
+ "html5ever",
  "markup5ever_rcdom",
  "serde",
 ]

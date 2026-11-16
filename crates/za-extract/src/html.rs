@@ -1,13 +1,18 @@
 //! HTML в Markdown (R1-C2 D109, D127).
 //!
-//! [`html_to_markdown`] — `htmd` с пропуском служебных и встраиваемых элементов
-//! ([`SKIPPED_TAGS`]), заголовок — текст `<title>` отдельным полем. Вход длиннее
+//! [`html_to_markdown`] — `htmd` с пропуском служебных, встраиваемых элементов и элементов
+//! управления ([`SKIPPED_TAGS`]), заголовок — текст `<title>` отдельным полем. Вход длиннее
 //! [`HTML_MAX_BYTES`] обрезается до разбора. После преобразования картинки `data:`
 //! отсутствуют, серии пустых строк сжаты в одну.
 //!
+//! Разбор идёт под онлайн-стражем ([`crate::guard`]): квадратичные классы `html5ever` и
+//! `htmd` (глубокая вложенность, реконструкция активных элементов форматирования, «Noah's
+//! Ark», слияние соседей) прерываются до их разрастания. При превышении порога текст
+//! извлекается линейно без DOM ([`crate::linear`]) и результат несёт признак
+//! [`Markdown::simplified`].
+//!
 //! Вызывается только в подпроцессе (D127, задача 10): обход DOM у `htmd` рекурсивный, и
-//! глубокая вложенность переполняет стек, а внутри `html5ever` и `htmd` есть проходы,
-//! квадратичные на враждебной разметке. Свой обход здесь — без рекурсии.
+//! даже под стражем остаётся жёсткая граница — тайм-аут и предел вывода подпроцесса.
 
 use std::rc::Rc;
 
@@ -16,14 +21,22 @@ use htmd::{Element, HtmlToMarkdown};
 use markup5ever_rcdom::{Node, NodeData};
 use serde::{Deserialize, Serialize};
 
+use crate::{guard, linear};
+
 /// Предел входа: дальше HTML обрезается до разбора (D109).
 pub const HTML_MAX_BYTES: usize = 2 * 1024 * 1024;
 
-/// Элементы, содержимое которых в текст не попадает (D109). `head` и `title` — чтобы текст
-/// заголовка не попал в тело: он возвращается отдельным полем.
+/// Элементы, содержимое которых в текст не попадает (D109, I1 ревью задачи 7).
+/// - служебные и встраиваемые: `head`, `title`, `script`, `style`, `noscript`, `template`,
+///   `svg`, `canvas`, `iframe`, `object`, `embed` (`head` и `title` — чтобы текст заголовка
+///   не попал в тело: он возвращается отдельным полем);
+/// - элементы управления формы: `input`, `select`, `option`, `button`, `textarea`.
+///
+/// `form` в списке нет: страница ASP.NET WebForms целиком обёрнута в один `<form>`, и её
+/// пропуск стёр бы весь текст. Пропускаются только сами элементы управления.
 pub const SKIPPED_TAGS: &[&str] = &[
     "head", "title", "script", "style", "noscript", "template", "svg", "canvas", "iframe",
-    "object", "embed", "form",
+    "object", "embed", "input", "select", "option", "button", "textarea",
 ];
 
 /// Пространство имён элементов HTML: `<title>` внутри SVG заголовком страницы не считается.
@@ -35,24 +48,36 @@ pub struct Markdown {
     /// Текст первого `<title>` документа (пробелы схлопнуты); пустой — `None`.
     pub title: Option<String>,
     pub text: String,
+    /// `true`, если текст получен линейным извлечением без DOM: страница оказалась слишком
+    /// сложной для полного разбора (D127, ревью задачи 7).
+    #[serde(default)]
+    pub simplified: bool,
 }
 
 /// HTML (UTF-8) в Markdown. Вход длиннее [`HTML_MAX_BYTES`] обрезается по границе символа
-/// до разбора. Только для подпроцесса (D127).
+/// до разбора. Разбор под стражем ([`crate::guard`]); при превышении порога — линейное
+/// извлечение с признаком [`Markdown::simplified`]. Только для подпроцесса (D127).
 pub fn html_to_markdown(html: &str) -> Markdown {
     let html = &html[..html.floor_char_boundary(HTML_MAX_BYTES)];
+    // Страж прерывает квадратичный разбор на первых килобайтах; `dom_check` ловит глубину
+    // (рекурсия `htmd`) и цену слияния соседей до вызова `htmd`.
+    let Ok(tree) = guard::guarded_parse(html) else {
+        return linear::linear_extract(html);
+    };
+    if guard::dom_check(&tree).is_err() {
+        return linear::linear_extract(html);
+    }
     let converter = HtmlToMarkdown::builder()
         .skip_tags(SKIPPED_TAGS.to_vec())
         .add_handler(vec!["img"], drop_data_image)
         .build();
-    // `html_to_tree` ошибки не возвращает (разбор строки целиком); на случай смены API —
-    // пустой результат, инструмент ответит «нет читаемого текста».
-    let Ok(tree) = converter.html_to_tree(html) else {
-        return Markdown::default();
-    };
     let title = document_title(&tree);
     let text = collapse_blank_lines(&converter.tree_to_markdown(&tree));
-    Markdown { title, text }
+    Markdown {
+        title,
+        text,
+        simplified: false,
+    }
 }
 
 /// Картинка с адресом `data:` (`src` или `href`, как их читает `htmd`) в текст не попадает:
@@ -100,7 +125,7 @@ fn document_title(root: &Rc<Node>) -> Option<String> {
 /// Серии из двух и более пустых (или пробельных) строк — то есть три и более переводов
 /// строки подряд — сжимаются в одну пустую строку; пустые строки в начале и в конце
 /// снимаются (D109).
-fn collapse_blank_lines(md: &str) -> String {
+pub(crate) fn collapse_blank_lines(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
     let mut blank_run = 0usize;
     for line in md.split('\n') {

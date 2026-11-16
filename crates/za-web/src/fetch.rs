@@ -54,6 +54,10 @@ const GARBAGE_PERCENT_MAX: usize = 10;
 
 /// Пустой или нечитаемый текст страницы (D110).
 const NO_TEXT: &str = "no readable text on the page";
+/// Страница оказалась слишком сложной для полного разбора: текст получен линейным
+/// извлечением без ссылок и разметки (D127, ревью задачи 7). Строка уходит модели.
+const SIMPLIFIED: &str =
+    "[simplified extraction: page too complex to fully parse; links and formatting dropped]";
 /// Сбой задачи `spawn_blocking` (паника или остановка рантайма).
 const INTERNAL: &str = "internal error: page processing failed";
 
@@ -171,6 +175,7 @@ impl Tool for WebFetch {
                 invalid_args_text("missing field `url`"),
             ),
             ("runtime/web.fetch.no_text", NO_TEXT.to_owned()),
+            ("runtime/web.fetch.simplified", SIMPLIFIED.to_owned()),
             (
                 "runtime/web.fetch.timeout",
                 timeout_text(Duration::from_secs(59)),
@@ -286,38 +291,35 @@ async fn page(body: Body, prompt: Option<String>, extractor: Arc<dyn Extractor>)
         Err(e) => return e,
     };
     let ok = (200..300).contains(&status);
-    let (kind, text, title) = match prepared {
+    let (kind, text, title, simplified) = match prepared {
         Prepared::Error(text) if ok => return ToolOutput::error(text),
         // Тело не 2xx без читаемого текста — только строка статуса.
-        Prepared::Error(_) => (None, None, None),
-        Prepared::NoText(kind) => (Some(kind), None, None),
-        Prepared::Text(kind, text) => (Some(kind), Some(text), None),
+        Prepared::Error(_) => (None, None, None, false),
+        Prepared::NoText(kind) => (Some(kind), None, None, false),
+        Prepared::Text(kind, text) => (Some(kind), Some(text), None, false),
         Prepared::Html(kind, html) => {
             let req = HtmlRequest {
                 html,
                 base_url: final_url.to_string(),
             };
             match extractor.html(req).await {
-                Ok(md) => (Some(kind), Some(md.text), md.title),
+                // `md.simplified` — страница разобрана упрощённо (D127, ревью задачи 7).
+                Ok(md) => (Some(kind), Some(md.text), md.title, md.simplified),
                 Err(e) if ok => return ToolOutput::error(html_error_text(&e)),
-                Err(_) => (Some(kind), None, None),
+                Err(_) => (Some(kind), None, None, false),
             }
         }
     };
-    let url = final_url.to_string();
-    match blocking(move || {
-        assemble(
-            &url,
-            status,
-            kind,
-            title,
-            text,
-            truncated.then_some(shown),
-            prompt,
-        )
-    })
-    .await
-    {
+    let rendered = Rendered {
+        url: final_url.to_string(),
+        status,
+        kind,
+        title,
+        text,
+        truncated: truncated.then_some(shown),
+        simplified,
+    };
+    match blocking(move || assemble(rendered, prompt)).await {
         Ok(o) | Err(o) => o,
     }
 }
@@ -349,20 +351,24 @@ fn prepare(content_type: Option<&str>, bytes: &[u8]) -> Prepared {
     }
 }
 
-/// Сборка результата. `kind` — `None`, когда тело ответа не показывается (код не 2xx без
-/// текста); `truncated` — длина тела, если оно оборвано на `max_bytes`.
-fn assemble(
-    url: &str,
+/// Разобранный ответ для сборки результата (D110). `kind` — `None`, когда тело не
+/// показывается (код не 2xx без текста); `truncated` — длина тела, если оно оборвано на
+/// `max_bytes`; `simplified` — страница разобрана упрощённо (D127, строка-пометка в шапке).
+struct Rendered {
+    url: String,
     status: u16,
     kind: Option<&'static str>,
     title: Option<String>,
     text: Option<String>,
     truncated: Option<usize>,
-    prompt: Option<String>,
-) -> ToolOutput {
-    let text = text.filter(|t| readable(t));
-    if !(200..300).contains(&status) {
-        let mut content = status_line(status);
+    simplified: bool,
+}
+
+/// Сборка результата из [`Rendered`]; `prompt` задаёт `digest` (D110).
+fn assemble(r: Rendered, prompt: Option<String>) -> ToolOutput {
+    let text = r.text.filter(|t| readable(t));
+    if !(200..300).contains(&r.status) {
+        let mut content = status_line(r.status);
         if let Some(t) = &text {
             let t = t.trim();
             content.push_str("\n\n");
@@ -370,9 +376,20 @@ fn assemble(
         }
         return ToolOutput::error(content);
     }
-    let title = title.as_deref().and_then(clean_title);
-    let head = header(url, status, kind.unwrap_or("text/plain"), title.as_deref());
-    let marker = truncated
+    let title = r.title.as_deref().and_then(clean_title);
+    let mut head = header(
+        &r.url,
+        r.status,
+        r.kind.unwrap_or("text/plain"),
+        title.as_deref(),
+    );
+    // Пометка упрощённого разбора — строкой в шапке, рядом с `title` (D127, ревью задачи 7).
+    if r.simplified {
+        head.push_str(SIMPLIFIED);
+        head.push('\n');
+    }
+    let marker = r
+        .truncated
         .map(|n| format!("\n{}", truncated_text(n)))
         .unwrap_or_default();
     let Some(text) = text else {
