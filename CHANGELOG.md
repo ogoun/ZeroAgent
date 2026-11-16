@@ -5,6 +5,13 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, задача 11 (крейт `za-skills`, D114–D116, D118):
+  - `za-skills`: разбор `SKILL.md` своим строгим подмножеством YAML (`parse_skill_md`, модуль `yaml`) — всё строки, корректный YAML вне подмножества (якоря, алиасы, теги, flow-карты, второй документ, директивы) — `unsupported YAML feature: …`, ошибки синтаксиса (табуляция в отступе, повтор ключа) — `unparseable frontmatter: …`; файл до 256 КиБ, frontmatter до 64 КиБ; описание очищается уровнем `Untrusted`; недопустимое имя заменяется именем каталога; `hooks`, `commands`, `scripts` — предупреждение, ничего не исполняется;
+  - `za-skills`: обход доверенных деревьев `tree_listing` и `tree_hash` (вынос из `zero-agent/src/trust.rs`, итеративный, сначала перечень записей) с пределами `TreeLimits`;
+  - `za-skills`: обнаружение `discover` — источники `user` > `bundled` > `extra` > `project`, внутри проекта `.zero-agent` > `.agents` > `.claude`, причины пропуска `shadows <source> skill <name>`, `duplicate skill <name>`, `changed since trust`, `external link`, `limit reached`; проект читается только по списку доверенного обхода со сверкой BLAKE3 каждого `SKILL.md`; пределы: глубина 6, 2000 каталогов на источник, 100 ресурсов на скилл, без `.git`, `node_modules`, `target`, `__pycache__`;
+  - `za-skills`: загрузка `load` с проверкой хэша (`LoadError::Changed`), ресурсы только из списка каталога (`..`, абсолютные пути — `UnknownFile`); `bundled()` — пустой срез до задачи 12;
+  - `cargo xtask policy`: `za-skills` — только от `za-protocol` и `za-core` в любом виде; `za-agent` может зависеть от `za-skills`;
+  - ADR 0006 — раздел «Скиллы».
 - R1-C2, задача 9 (`web_search`, D111, D125, D126):
   - `za-web`: трейт поставщика поиска `search::SearchProvider` и единственная реализация `Searxng` — свой экземпляр SearXNG, `GET {base}/search?q=…&format=json`, без ключа (решение заказчика 2026-11-11: поиск бесплатный; Brave и платные поставщики не входят);
   - `za-web`: инструмент `web_search(query, count?)` — `query` до 400 символов, `count` от 1, по умолчанию 8, больше 20 обрезается инструментом (в схеме нет `maximum`); выдача `N. <title>` / `   <url>` / `   <snippet>` (теги сняты, сущности раскрыты, поля в одну строку, описание до 300 символов), пусто — `no results`; метка `web`; правила по домену к поиску не применяются;
@@ -164,6 +171,7 @@
 - `za-protocol`: `checkpoint_reason` — причины пропуска чекпоинта.
 
 ### Изменено
+- **Миграция доверия** (R1-C2, задача 11, D116): у обхода доверенных деревьев скиллов (`.zero-agent/skills`, `.agents/skills`, `.claude/skills`) появились пределы. Файл дерева больше 1 МиБ входит в набор как `too-large:<size>` без чтения содержимого, дерево больше 10 000 записей — значением `external-link` (его скиллы не читаются). У проектов с такими деревьями набор доверия меняется, и следующий `run` спросит доверие заново (отличие «изменены: <дерево>»). У остальных проектов хэши прежние, доверие действует. Обход — `za_skills::tree_listing`; `zero_agent::trust::{EXTERNAL_LINK, LINK_PREFIX}` — реэкспорт из `za-skills`, `TRUSTED_TREES` — `za_skills::PROJECT_TREES`.
 - `zero-agent run`: флаг `--agents-md` удалён — `AGENTS.md` читается у доверенного проекта; флаг печатает подсказку `zero-agent trust` и выходит с кодом 2. Недоверенный проект — строка «проект не доверен» в stderr (после `run <id>`).
 - `zero-agent run --resume`: пересчитывает доверие, политику и гранты и передаёт отличия от снимка (`ResumeChange`); сверяет запись аудита из снимка run — удалённый или изменённый хвост цепочки даёт код 1 с подсказкой `audit --verify`; доверие run снимается только явным `trust --revoke`.
 - `zero-agent checkpoints`: проверка доверия перед git — общая с `run` (`trust::trust_state`).

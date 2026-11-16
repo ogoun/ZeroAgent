@@ -23,6 +23,9 @@ za-jail = { path = "../za-jail" }
 # Секреты (R1-C1 D90): `EnvStore` (`ZA_SECRET_*`) под кэшем `StoreSecrets`, маскировка
 # выгрузки журнала, аудита и печати `run`; команда `secret list`.
 za-secrets = { path = "../za-secrets" }
+# Обход доверенных деревьев (`trust_set` — через `za_skills::tree_listing`, R1-C2 D116) и,
+# с задачи 14, каталог скиллов.
+za-skills = { path = "../za-skills" }
 clap.workspace = true
 # `macros` — `join!` проверок doctor и `select!` команды `run`, `time` — ожидание зондов и
 # `resources --watch`, `signal` — Ctrl+C команды `run` (пауза, второй — выход).

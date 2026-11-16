@@ -14,6 +14,8 @@
 //! корней ОС; HTTP-клиент `reqwest` строится только в `crates/za-web/src/gateway.rs` и
 //! `crates/za-llm`. R1-C2 (D113, D127): `za-extract` — без крейтов workspace, от него —
 //! только `zero-agent`; `htmd`, `html5ever`, `markup5ever_rcdom` — только у `za-extract`.
+//! R1-C2 (D114): `za-skills` — только от `za-protocol` и `za-core` (все виды); `za-agent`
+//! может зависеть от него, а он от `za-agent` — нет.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -42,6 +44,7 @@ const CORE_FORBIDDEN_DEPS: &[&str] = &[
 ];
 /// Крейты workspace, от которых может зависеть `za-agent` (ADR 0004).
 /// R1-C1 D73: `za-secrets` — да; `za-tools` и `za-jail` — нет ни в каком виде.
+/// R1-C2 D114: `za-skills` — да (каталог и активация скиллов).
 const AGENT_ALLOWED_ZA_DEPS: &[&str] = &[
     "za-protocol",
     "za-store",
@@ -49,6 +52,7 @@ const AGENT_ALLOWED_ZA_DEPS: &[&str] = &[
     "za-llm",
     "za-res",
     "za-secrets",
+    "za-skills",
 ];
 /// Крейты, подключающие `za-llm` только без функций: без HTTP и `Gateway`.
 const PURE_LLM_USERS: &[&str] = &["za-core", "za-agent"];
@@ -70,6 +74,9 @@ const PROCESS_ALLOWED: &[(&str, &str)] = &[
 ];
 /// Крейты только для `xtask` (R1-B2 D64): счёт токенов промптов в CI, не в продукте.
 const XTASK_ONLY_DEPS: &[&str] = &["tiktoken-rs"];
+/// Крейты workspace, от которых может зависеть `za-skills` (все виды, R1-C2 D114): разбор,
+/// обход и загрузка — над `za-core`, без цикла с `za-agent` даже в тестах.
+const SKILLS_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-core"];
 /// Крейты `za-*`, от которых может зависеть сетевой шлюз `za-web` (все виды, R1-C2).
 const WEB_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-core"];
 /// Кто может зависеть от `za-web` (все виды): бинарник и `xtask` (бюджеты промптов).
@@ -317,6 +324,17 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     "{} не должен зависеть от za-web (только {})",
                     pkg.name,
                     WEB_USERS.join(", ")
+                )));
+            }
+            // Все виды (D114): скиллы — над `za-core`; от `za-agent` — ни в каком виде.
+            if pkg.name == "za-skills"
+                && is_workspace_crate(&dep.name)
+                && !SKILLS_ALLOWED_ZA_DEPS.contains(&dep.name.as_str())
+            {
+                out.push(Violation(format!(
+                    "za-skills не должен зависеть от {} (допустимы {})",
+                    dep.name,
+                    SKILLS_ALLOWED_ZA_DEPS.join(", ")
                 )));
             }
             // Все виды (D113, D127): извлекатель — лист без крейтов workspace, его зовёт
@@ -1003,6 +1021,43 @@ version = \"0.0.1\"
                 ..dep("za-web")
             };
             assert!(to_web(check_direction(&meta_with(bad, dev))), "dev {bad}");
+        }
+    }
+    /// D114: `za-skills` — только от `za-protocol` и `za-core` в любом виде; `za-agent` и
+    /// бинарник могут зависеть от него.
+    #[test]
+    fn r1c2_skills_directions() {
+        let dev = |name: &str| Dependency {
+            kind: Some("dev".into()),
+            ..dep(name)
+        };
+        for ok in ["za-protocol", "za-core", "blake3", "serde_json"] {
+            assert!(check_direction(&meta("za-skills", ok)).is_empty(), "{ok}");
+            assert!(
+                check_direction(&meta_with("za-skills", dev(ok))).is_empty(),
+                "dev {ok}"
+            );
+        }
+        for bad in [
+            "za-agent",
+            "za-tools",
+            "za-jail",
+            "za-store",
+            "za-web",
+            "za-llm",
+            "zero-agent",
+        ] {
+            assert!(
+                !check_direction(&meta("za-skills", bad)).is_empty(),
+                "{bad}"
+            );
+            assert!(
+                !check_direction(&meta_with("za-skills", dev(bad))).is_empty(),
+                "dev {bad}"
+            );
+        }
+        for ok in ["za-agent", "zero-agent", "xtask"] {
+            assert!(check_direction(&meta(ok, "za-skills")).is_empty(), "{ok}");
         }
     }
     /// D113, D127: `za-extract` — без крейтов workspace в любом виде, от него — только

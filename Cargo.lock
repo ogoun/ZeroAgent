@@ -2466,6 +2466,17 @@ name = "za-shell"
 version = "0.0.1"
 
 [[package]]
+name = "za-skills"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "serde_json",
+ "thiserror",
+ "za-core",
+ "za-protocol",
+]
+
+[[package]]
 name = "za-store"
 version = "0.0.1"
 dependencies = [
@@ -2548,6 +2559,7 @@ dependencies = [
  "za-protocol",
  "za-res",
  "za-secrets",
+ "za-skills",
  "za-store",
  "za-tools",
 ]

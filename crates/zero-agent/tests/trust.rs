@@ -180,6 +180,41 @@ fn directory_links_are_not_walked() {
     assert_ne!(trust_set(&p).unwrap().files[".agents/skills"], own_tree);
 }
 
+/// R1-C2 D116 (миграция): пределы обхода доверия меняют значение только у деревьев сверх
+/// них. Файл дерева больше 1 МиБ входит в хэш дерева как `too-large:<size>`, без чтения
+/// содержимого (его правка того же размера набор не меняет: рантайм такой файл не читает);
+/// больше 10 000 записей — дереву значение `external-link`. Доверенные файлы в корне
+/// хэшируются целиком, как в R1-C1.
+#[test]
+fn tree_limits_change_only_big_trees() {
+    let (p, _) = fixture("tree-limits");
+    std::fs::create_dir_all(p.join(".claude/skills/x")).unwrap();
+    std::fs::write(p.join(".claude/skills/x/SKILL.md"), "s").unwrap();
+    std::fs::write(p.join(".claude/skills/x/big.bin"), vec![1u8; 2 << 20]).unwrap();
+    std::fs::write(p.join("CLAUDE.md"), vec![b'c'; 2 << 20]).unwrap();
+    let list = serde_json::json!([
+        ["x/SKILL.md", hex(b"s")],
+        ["x/big.bin", "too-large:2097152"]
+    ]);
+    let tree = hex(za_protocol::canonical_json(&list).as_bytes());
+    let first = trust_set(&p).unwrap();
+    assert_eq!(first.files[".claude/skills"], tree);
+    assert_eq!(first.files["CLAUDE.md"], hex(&vec![b'c'; 2 << 20]));
+    std::fs::write(p.join(".claude/skills/x/big.bin"), vec![2u8; 2 << 20]).unwrap();
+    assert_eq!(trust_set(&p).unwrap(), first);
+    // Больше 10 000 записей в дереве.
+    let t = p.join(".agents/skills");
+    std::fs::create_dir_all(&t).unwrap();
+    for i in 0..10_001 {
+        std::fs::write(t.join(format!("f{i:05}")), "").unwrap();
+    }
+    assert_eq!(
+        trust_set(&p).unwrap().files[".agents/skills"],
+        EXTERNAL_LINK
+    );
+    std::fs::remove_dir_all(&t).unwrap();
+}
+
 /// I2, Ruling 7.4: `.claude` и `AGENTS.md` — ссылки на `\\host\share`. Набор строится без
 /// обращения к цели: число вызовов `canonicalize` то же, что у проекта без ссылок (только
 /// корень проекта), значения — метка.

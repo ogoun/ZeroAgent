@@ -20,17 +20,24 @@
 //!   `za_core::paths::classify`, — значение [`EXTERNAL_LINK`]. Загрузчик такой файл не
 //!   читает, как отсутствующий; само появление метки меняет набор.
 //!
-//! Обход не заходит в каталоги-ссылки и junction ни на каком уровне: у промежуточных
-//! компонентов читаются только локальные метаданные самой записи (`symlink_metadata`),
-//! без перехода по ссылке. Цель файла-ссылки разрешается `za_core::paths::resolve`:
-//! цепочка ссылок проверяется лексически до любой канонизации, сетевая цель — отказ без
-//! SMB-запроса (Ruling 7.4, C1 задачи 2). Файл открывается `open_checked` (без следования
-//! ссылке и со сверкой дескриптора). Компонента нет или он не каталог (`ENOTDIR`) —
-//! файла нет, а не ошибка.
+//! Обход — один код с чтением скиллов: `za_skills::tree_listing` и `za_skills::file_value`
+//! (R1-C2 D116, вынос из этого файла без изменения значений обычных деревьев). Обход не
+//! заходит в каталоги-ссылки и junction ни на каком уровне: у промежуточных компонентов
+//! читаются только локальные метаданные самой записи (`symlink_metadata`), без перехода
+//! по ссылке. Цель файла-ссылки разрешается `za_core::paths::resolve`: цепочка ссылок
+//! проверяется лексически до любой канонизации, сетевая цель — отказ без SMB-запроса
+//! (Ruling 7.4, C1 задачи 2). Файл открывается `open_checked` (без следования ссылке и со
+//! сверкой дескриптора). Компонента нет или он не каталог (`ENOTDIR`) — файла нет, а не
+//! ошибка.
+//!
+//! Пределы обхода деревьев (D116, `za_skills::TRUST_LIMITS`): файл дерева больше 1 МиБ —
+//! значение `too-large:<size>` без чтения; больше 10 000 записей в дереве — дереву
+//! значение [`EXTERNAL_LINK`], его скиллы не читаются. Доверенные файлы в корне
+//! ([`TRUSTED_FILES`]) хэшируются целиком, как в R1-C1.
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -40,24 +47,22 @@ use serde_json::json;
 use za_core::Access;
 use za_core::paths::{self, Roots};
 use za_protocol::{audit_action, canonical_json};
+use za_skills::Place;
 use za_store::{AuditNew, ProjectStore, StoreError};
 
 use crate::run::{RunError, canonical_project, display_path};
 
+pub use za_skills::{EXTERNAL_LINK, LINK_PREFIX};
+
 /// Доверенные файлы в корне проекта.
 pub const TRUSTED_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".zero-agent/config.toml"];
-/// Доверенные деревья (скиллы).
-pub const TRUSTED_TREES: &[&str] = &[".zero-agent/skills", ".agents/skills", ".claude/skills"];
-/// Значение набора у файла, который рантайм не читает: ссылка наружу, на сетевой или
-/// device-путь, висячая ссылка, ссылка в пути, неразбираемое имя.
-pub const EXTERNAL_LINK: &str = "external-link";
-/// Префикс значения у ссылки на файл внутри проекта.
-pub const LINK_PREFIX: &str = "link:";
+/// Доверенные деревья (скиллы): деревья скиллов проекта по старшинству (D114).
+pub const TRUSTED_TREES: &[&str] = za_skills::PROJECT_TREES;
 
 /// Набор доверенных файлов: путь относительно проекта (через `/`) → значение (hex BLAKE3
-/// содержимого, `link:<hex>` или [`EXTERNAL_LINK`]). У дерева один элемент — BLAKE3
-/// канонического JSON отсортированного списка пар (путь в дереве, значение). Отсутствующие
-/// файлы и пустые деревья в набор не входят.
+/// содержимого, `link:<hex>` или [`EXTERNAL_LINK`]). У дерева один элемент — хэш списка
+/// `za_skills::tree_hash` (BLAKE3 канонического JSON отсортированного списка пар (путь в
+/// дереве, значение)). Отсутствующие файлы и пустые деревья в набор не входят.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustSet {
     pub files: BTreeMap<String, String>,
@@ -81,31 +86,20 @@ pub fn trust_set(project: &Path) -> io::Result<TrustSet> {
     let roots = Roots::canonical(project, project)?;
     let mut files = BTreeMap::new();
     for rel in TRUSTED_FILES {
-        if let Some(v) = file_value(&roots, rel)? {
+        if let Some(v) = za_skills::file_value(&roots, rel)? {
             files.insert((*rel).to_owned(), v);
         }
     }
     for rel in TRUSTED_TREES {
-        match locate(&roots.project, rel)? {
-            Place::Missing => {}
-            Place::Link => {
+        match za_skills::tree_listing(&roots, rel, &za_skills::TRUST_LIMITS)? {
+            // Ссылка в пути или больше 10 000 записей: дерево не читается.
+            (Place::Link, _) => {
                 files.insert((*rel).to_owned(), EXTERNAL_LINK.to_owned());
             }
-            Place::Found(dir, meta) => {
-                if !meta.is_dir() {
-                    continue;
-                }
-                let mut list = Vec::new();
-                walk(&roots, &dir, rel, "", &mut list)?;
-                if !list.is_empty() {
-                    list.sort();
-                    let text = canonical_json(&serde_json::json!(list));
-                    files.insert(
-                        (*rel).to_owned(),
-                        blake3::hash(text.as_bytes()).to_hex().to_string(),
-                    );
-                }
+            (_, Some(list)) if !list.files.is_empty() => {
+                files.insert((*rel).to_owned(), za_skills::tree_hash(&list));
             }
+            _ => {}
         }
     }
     Ok(TrustSet { files })
@@ -399,141 +393,6 @@ pub async fn cmd_trust(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Где лежит доверенный путь `rel`.
-enum Place {
-    /// Компонента нет или промежуточный компонент не каталог.
-    Missing,
-    /// Промежуточный компонент — ссылка или junction: дальше не идём.
-    Link,
-    /// Путь и локальные метаданные последнего компонента (без перехода по ссылке).
-    Found(PathBuf, std::fs::Metadata),
-}
-
-/// Проходит `rel` по компонентам от корня проекта, читая только метаданные самих записей.
-fn locate(project: &Path, rel: &str) -> io::Result<Place> {
-    let parts: Vec<&str> = rel.split('/').collect();
-    let mut p = project.to_path_buf();
-    for (i, part) in parts.iter().enumerate() {
-        p.push(part);
-        let meta = match std::fs::symlink_metadata(&p) {
-            Ok(m) => m,
-            Err(e) if is_missing(&e) => return Ok(Place::Missing),
-            Err(e) => return Err(e),
-        };
-        if i + 1 == parts.len() {
-            return Ok(Place::Found(p, meta));
-        }
-        if meta.file_type().is_symlink() {
-            return Ok(Place::Link);
-        }
-        if !meta.is_dir() {
-            return Ok(Place::Missing);
-        }
-    }
-    Ok(Place::Missing)
-}
-
-/// Значение доверенного файла `rel`; `None` — файла нет (или это каталог).
-fn file_value(roots: &Roots, rel: &str) -> io::Result<Option<String>> {
-    match locate(&roots.project, rel)? {
-        Place::Missing => Ok(None),
-        Place::Link => Ok(Some(EXTERNAL_LINK.to_owned())),
-        Place::Found(_, meta) => entry_value(roots, rel, &meta),
-    }
-}
-
-/// Значение записи с относительным путём `rel` и локальными метаданными `meta`.
-fn entry_value(roots: &Roots, rel: &str, meta: &std::fs::Metadata) -> io::Result<Option<String>> {
-    let link = meta.file_type().is_symlink();
-    if !link && !meta.is_file() {
-        return Ok(None);
-    }
-    let Ok(lex) = paths::classify(&roots.project, rel) else {
-        return Ok(Some(EXTERNAL_LINK.to_owned()));
-    };
-    // Цепочка ссылок проверяется лексически до канонизации: сетевая цель — отказ без SMB.
-    let Ok(resolved) = paths::resolve(roots, &lex, Access::Read) else {
-        return Ok(Some(EXTERNAL_LINK.to_owned()));
-    };
-    if !resolved.inside {
-        return Ok(Some(EXTERNAL_LINK.to_owned()));
-    }
-    let file = match paths::open_checked(&resolved, false) {
-        Ok(f) => f,
-        // Висячая ссылка — метка; исчезнувший обычный файл — нет файла.
-        Err(e) if is_missing(&e) => {
-            return Ok(link.then(|| EXTERNAL_LINK.to_owned()));
-        }
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
-        // Не обычный файл, ссылка, подмена между разрешением и открытием: не читается.
-        Err(_) => {
-            return Ok(link.then(|| EXTERNAL_LINK.to_owned()));
-        }
-    };
-    let mut h = blake3::Hasher::new();
-    h.update_reader(file)?;
-    let hex = h.finalize().to_hex().to_string();
-    Ok(Some(if link {
-        format!("{LINK_PREFIX}{hex}")
-    } else {
-        hex
-    }))
-}
-
-/// Пары (путь в дереве, значение) записей каталога `dir` (путь `rel` от проекта).
-/// Каталоги-ссылки и junction не обходятся: у них значение [`EXTERNAL_LINK`].
-fn walk(
-    roots: &Roots,
-    dir: &Path,
-    rel: &str,
-    prefix: &str,
-    out: &mut Vec<(String, String)>,
-) -> io::Result<()> {
-    let items = match std::fs::read_dir(dir) {
-        Ok(it) => it,
-        Err(e) if is_missing(&e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    for item in items {
-        let item = item?;
-        let name = item.file_name();
-        let Some(name) = name.to_str().map(str::to_owned) else {
-            // Имя не в UTF-8: рантайм его не прочтёт.
-            out.push((
-                join(prefix, &item.file_name().to_string_lossy()),
-                EXTERNAL_LINK.to_owned(),
-            ));
-            continue;
-        };
-        let in_tree = join(prefix, &name);
-        let path = item.path();
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(e) if is_missing(&e) => continue,
-            Err(e) => return Err(e),
-        };
-        if meta.file_type().is_symlink() {
-            // Ссылка на файл внутри проекта хэшируется по цели; на каталог — не обходится.
-            let v = entry_value(roots, &format!("{rel}/{in_tree}"), &meta)?
-                .unwrap_or_else(|| EXTERNAL_LINK.to_owned());
-            out.push((in_tree, v));
-        } else if meta.is_dir() {
-            walk(roots, &path, rel, &in_tree, out)?;
-        } else if let Some(v) = entry_value(roots, &format!("{rel}/{in_tree}"), &meta)? {
-            out.push((in_tree, v));
-        }
-    }
-    Ok(())
-}
-
-fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{prefix}/{name}")
-    }
-}
-
 /// Компонента нет: `NotFound` или «не каталог» (`ENOTDIR`).
 fn is_missing(e: &io::Error) -> bool {
     matches!(
@@ -544,6 +403,8 @@ fn is_missing(e: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     /// Свой каталог на процесс и вызов `.tmp/zero-agent-unit/<name>-<pid>-<n>`.
