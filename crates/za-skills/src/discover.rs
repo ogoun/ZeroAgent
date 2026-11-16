@@ -18,7 +18,7 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use za_core::paths::Roots;
-use za_core::text::{Clean, clean_invisible};
+use za_core::text::hidden_char;
 use za_protocol::skill_source;
 
 use crate::parse::{self, Parsed, parse_skill_md};
@@ -500,9 +500,10 @@ impl Discovery {
             }
             // Имя ресурса уходит модели (строка `Files:`, атрибут `file`): невидимые символы
             // уровня `Untrusted` (D102) и управляющие — не ресурс (Minor 8 финального ревью
-            // скиллов). Очищать имя нельзя: модель позвала бы файл, которого нет.
-            if clean_invisible(inner, Clean::Untrusted).1 > 0 || inner.chars().any(char::is_control)
-            {
+            // скиллов). Очищать имя нельзя: модель позвала бы файл, которого нет. Проверка —
+            // по символу (`hidden_char`): U+FEFF первым символом `clean_invisible` считает BOM
+            // и оставляет (Minor 1 повторного ревью финального прохода).
+            if inner.chars().any(hidden_char) {
                 warnings.push(format!(
                     "file {} is not listed: invisible or control characters in the name",
                     inner.escape_debug()

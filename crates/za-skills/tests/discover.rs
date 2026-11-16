@@ -666,7 +666,9 @@ fn skill_meta_fields() {
 /// Minor 8 финального ревью скиллов (m7 ревью задачи 11): скиллы — недоверенные данные
 /// (D102), и имя ресурса с невидимыми символами (bidi, нулевая ширина) в список ресурсов
 /// не входит: модель увидела бы одно имя, а файл назывался бы другим. Предупреждение
-/// называет имя с экранированием.
+/// называет имя с экранированием. U+FEFF — в любой позиции имени, в том числе первым
+/// символом (Minor 1 повторного ревью финального прохода): `clean_invisible` считает его там
+/// меткой BOM и оставляет, а модель увидела бы `notes.md`.
 #[test]
 fn resource_names_with_invisible_chars_not_listed() {
     let user = dir("invisible-names");
@@ -674,6 +676,8 @@ fn resource_names_with_invisible_chars_not_listed() {
     write(&user.join("x/ok.md"), "fine");
     write(&user.join("x/evil\u{202E}dm.md"), "bidi");
     write(&user.join("x/zero\u{200B}width.md"), "zero width");
+    write(&user.join("x/\u{FEFF}notes.md"), "bom first");
+    write(&user.join("x/mid\u{FEFF}dle.md"), "bom inside");
     let cat = discover(&DiscoverInput {
         user_dir: Some(user),
         ..DiscoverInput::default()
@@ -683,7 +687,12 @@ fn resource_names_with_invisible_chars_not_listed() {
         x.files.keys().cloned().collect::<Vec<_>>(),
         ["ok.md".to_owned()]
     );
-    for shown in ["evil\\u{202e}dm.md", "zero\\u{200b}width.md"] {
+    for shown in [
+        "evil\\u{202e}dm.md",
+        "zero\\u{200b}width.md",
+        "\\u{feff}notes.md",
+        "mid\\u{feff}dle.md",
+    ] {
         let want =
             format!("file {shown} is not listed: invisible or control characters in the name");
         assert!(x.warnings.contains(&want), "{:?}", x.warnings);

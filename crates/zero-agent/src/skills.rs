@@ -289,19 +289,11 @@ pub fn render_list(cat: &Catalog, s: &SkillsSettings, notes: &[String]) -> Strin
 /// Строка для терминала (Minor 8 финального ревью скиллов): управляющие символы и
 /// невидимые символы уровня `Untrusted` (D102: bidi, нулевая ширина, теги) — в виде
 /// `\u{…}`, остальное как есть (обратная косая путей Windows не удваивается). Иначе имя
-/// каталога с U+202E переставляло бы текст строки `skills list`.
+/// каталога с U+202E переставляло бы текст строки `skills list`. Признак символа — общий с
+/// проверкой имён ресурсов в `za-skills` (`za_core::text::hidden_char`, U+FEFF в любой
+/// позиции).
 fn printable(s: &str) -> std::borrow::Cow<'_, str> {
-    let hidden = |c: char| {
-        let mut buf = [0u8; 4];
-        // Отдельный символ: U+FEFF в начале строки `clean_invisible` считает BOM.
-        c.is_control()
-            || c == '\u{feff}'
-            || za_core::text::clean_invisible(
-                c.encode_utf8(&mut buf),
-                za_core::text::Clean::Untrusted,
-            )
-            .1 > 0
-    };
+    let hidden = za_core::text::hidden_char;
     if !s.chars().any(hidden) {
         return std::borrow::Cow::Borrowed(s);
     }

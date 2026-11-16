@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use za_core::text::{Clean, clean_invisible};
+use za_core::text::{Clean, clean_invisible, hidden_char};
 
 #[test]
 fn tags_level_keeps_prior_untagged_behaviour() {
@@ -93,5 +93,27 @@ fn range_bounds_exact() {
     ] {
         let s = format!("a{c}b");
         assert_eq!(clean_invisible(&s, Clean::Untrusted).1, 1, "{:X}", c as u32);
+    }
+}
+
+/// Символ имени (Minor 1 повторного ревью финального прохода): управляющие и невидимые
+/// уровня `Untrusted` — в любой позиции, U+FEFF тоже (первым символом `clean_invisible`
+/// оставляет его как BOM), ZWJ тоже (уровень `Untrusted`); обычные символы, обратная косая
+/// и соседи диапазонов — нет.
+#[test]
+fn hidden_char_in_any_position() {
+    for c in [
+        '\u{FEFF}',
+        '\u{202E}',
+        '\u{200B}',
+        '\u{200D}',
+        '\u{E0041}',
+        '\u{1}',
+        '\n',
+    ] {
+        assert!(hidden_char(c), "{:X}", c as u32);
+    }
+    for c in ['a', 'ж', '\\', ' ', '\u{2010}', '\u{1F468}'] {
+        assert!(!hidden_char(c), "{:X}", c as u32);
     }
 }

@@ -69,6 +69,15 @@ pub fn clean_invisible(s: &str, level: Clean) -> (Cow<'_, str>, usize) {
     }
 }
 
+/// Символ, который в имени нельзя ни показать как есть, ни молча убрать (имя ресурса скилла
+/// уходит модели, имя каталога — в строку терминала): управляющий (категория Cc) или
+/// невидимый уровня [`Clean::Untrusted`] в любой позиции строки — в том числе U+FEFF,
+/// который [`clean_invisible`] первым символом оставляет как BOM (Minor 8 финального ревью
+/// скиллов, Minor 1 повторного ревью финального прохода).
+pub fn hidden_char(c: char) -> bool {
+    c.is_control() || c == '\u{FEFF}' || Clean::Untrusted.drops(0, c)
+}
+
 /// 40 английских стоп-слов [`words`] (короче трёх символов слова и так не считаются).
 pub const STOP_WORDS: [&str; 40] = [
     "the", "and", "for", "are", "but", "not", "you", "your", "with", "this", "that", "these",
