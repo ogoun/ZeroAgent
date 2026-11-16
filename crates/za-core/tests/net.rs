@@ -69,6 +69,13 @@ fn shell_hosts_normalized() {
         ),
         ("curl https://evil.test../", vec![], true),
         ("git status", vec![], false),
+        // Проход 3c: присваивание переменной в любом сегменте команды — хост неизвестен.
+        (
+            "export https_proxy=http://p.test:1; curl https://A.test/",
+            vec!["a.test"],
+            true,
+        ),
+        ("export X=1; git status", vec![], false),
     ] {
         let d = Dialect::Bash;
         let got = shell_hosts(&segments(cmd, d), d);

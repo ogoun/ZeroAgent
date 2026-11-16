@@ -6,8 +6,8 @@
 //! молчат). Каждый случай — строка таблицы с текстом команды в сообщении о падении.
 
 use za_shell::{
-    Dialect, NetHosts, Segment, argv0, command_args, irreversible, is_network, is_simple,
-    network_hosts, path_words, reads_network, segments,
+    Dialect, NetHosts, Segment, argv0, command_args, command_hosts, irreversible, is_network,
+    is_simple, path_words, reads_network, segments,
 };
 
 const B: Dialect = Dialect::Bash;
@@ -1129,18 +1129,9 @@ fn strict_n4_nested_code_is_not_rewritten() {
 
 /// Хосты всех сегментов команды без повторов и признак неопределённого хоста — как их
 /// собирает `bash::subjects_in` (D105).
+/// Хосты команды целиком — так их собирает `za_core::net::shell_hosts`.
 fn hosts_of(c: &str, d: Dialect) -> NetHosts {
-    let mut out = NetHosts::default();
-    for s in segments(c, d) {
-        let h = network_hosts(&s, d);
-        out.unknown |= h.unknown;
-        for x in h.hosts {
-            if !out.hosts.contains(&x) {
-                out.hosts.push(x);
-            }
-        }
-    }
-    out
+    command_hosts(&segments(c, d), d)
 }
 
 #[test]
@@ -1203,7 +1194,9 @@ fn hosts_table_extended() {
         ("curl --url=https://a.test/", B, &["a.test"], false),
         ("timeout 5 curl https://a.test/", B, &["a.test"], false),
         ("bash -c 'curl https://a.test/'", B, &["a.test"], false),
-        ("x=$(curl https://a.test/)", B, &["a.test"], false),
+        // Проход 3c: любое присваивание в команде — `unknown` (Ruling прохода 3b, без
+        // разбора, влияет ли переменная на сетевую команду).
+        ("x=$(curl https://a.test/)", B, &["a.test"], true),
         ("scp me@[::1]:a b", B, &["[::1]"], false),
         ("rsync -a x host.test:/y", B, &["host.test"], false),
         ("rsync -a x rsync://r.test/m", B, &["r.test"], false),
@@ -1512,6 +1505,211 @@ fn hosts_table_strict() {
         ),
     ];
     check_hosts(t);
+}
+
+/// Проход 3c (Ruling прохода 3b, сомнения 2–3): присваивание переменной в любом сегменте
+/// команды и мультиплексирование ssh (`-S`, `-o Control*`) — хост сетевой команды неизвестен.
+#[test]
+fn hosts_table_assignments_and_ssh_mux() {
+    let t: &[(&str, Dialect, &[&str], bool)] = &[
+        // 3c-1: присваивание в любом сегменте — до, после, перед командой, в обёртке.
+        (
+            "export https_proxy=http://p.test:1; curl https://a.test/",
+            B,
+            &["a.test"],
+            true,
+        ),
+        ("export X; curl https://a.test/", B, &["a.test"], true),
+        ("X=1; curl https://a.test/", B, &["a.test"], true),
+        ("X=1 curl https://a.test/", B, &["a.test"], true),
+        ("curl https://a.test/; export X=1", B, &["a.test"], true),
+        ("env X=1 curl https://a.test/", B, &["a.test"], true),
+        ("env -u NO_PROXY curl https://a.test/", B, &["a.test"], true),
+        ("sudo X=1 curl https://a.test/", B, &["a.test"], true),
+        ("set -a; curl https://a.test/", B, &["a.test"], true),
+        ("unset NO_PROXY; curl https://a.test/", B, &["a.test"], true),
+        ("declare -x X=1; curl https://a.test/", B, &["a.test"], true),
+        ("read X; curl https://a.test/", B, &["a.test"], true),
+        (
+            "for X in a; do curl https://a.test/; done",
+            B,
+            &["a.test"],
+            true,
+        ),
+        ("source x.sh; curl https://a.test/", B, &["a.test"], true),
+        (". x.sh; curl https://a.test/", B, &["a.test"], true),
+        (
+            "printf -v X %s y; curl https://a.test/",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "bash -c 'export X=1; curl https://a.test/'",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "$env:HTTPS_PROXY = 'http://p.test:1'; iwr https://a.test/",
+            P,
+            &["a.test"],
+            true,
+        ),
+        ("$s = 1; iwr https://a.test/", P, &["a.test"], true),
+        (
+            "Set-Variable x 1; iwr https://a.test/",
+            P,
+            &["a.test"],
+            true,
+        ),
+        (
+            "Set-Item env:X 1; iwr https://a.test/",
+            P,
+            &["a.test"],
+            true,
+        ),
+        (
+            "[Environment]::SetEnvironmentVariable('X', '1'); iwr https://a.test/",
+            P,
+            &["a.test"],
+            true,
+        ),
+        (
+            "cmd /c \"set X=1 && curl https://a.test/\"",
+            P,
+            &["a.test"],
+            true,
+        ),
+        // Не присваивание: аргумент `a=b`, слово `echo`; без сетевой команды хоста нет.
+        ("curl -d a=b https://a.test/", B, &["a.test"], false),
+        ("echo X=1; curl https://a.test/", B, &["a.test"], false),
+        ("export X=1; git status", B, &[], false),
+        // 3c-2: мастер-соединение ssh идёт к своему хосту, а не к записанному.
+        ("ssh -S ctl me@a.test", B, &["a.test"], true),
+        ("ssh -Sctl a.test", B, &["a.test"], true),
+        ("ssh -o ControlPath=ctl me@a.test", B, &["a.test"], true),
+        ("ssh -o ControlMaster=no a.test", B, &["a.test"], true),
+        ("ssh -oControlPersist=yes a.test", B, &["a.test"], true),
+        ("scp -o ControlPath=ctl x b.test:y", B, &["b.test"], true),
+        ("sftp -o ControlMaster=auto me@b.test", B, &["b.test"], true),
+    ];
+    check_hosts(t);
+}
+
+/// Проход 3d (третье ревью задачи 3): транспорт git с цифрой, глобальные опции git и ключи
+/// `-c` — по таблице, ключи `-o` у ssh, scp, sftp — по белому списку.
+#[test]
+fn hosts_table_git_globals_and_ssh_keys() {
+    let t: &[(&str, Dialect, &[&str], bool)] = &[
+        // I1: имя транспорта git — `[A-Za-z0-9][A-Za-z0-9+.-]*`.
+        ("git clone 9x::b.test", B, &[], true),
+        ("git clone 9x://b.test/r", B, &[], true),
+        // m1: схема вне встроенных и стандартных помощников — адрес толкует помощник.
+        ("git clone foo://b.test/r", B, &["b.test"], true),
+        ("git clone git+ssh://a.test/r", B, &["a.test"], false),
+        // I2: глобальные опции — по таблице; незнакомая — `unknown`.
+        (
+            "git --attr-source HEAD clone https://a.test/r",
+            B,
+            &["a.test"],
+            false,
+        ),
+        (
+            "git --shallow-file x fetch https://a.test/r",
+            B,
+            &["a.test"],
+            false,
+        ),
+        (
+            "git --no-pager -C x --git-dir=y clone https://a.test/r",
+            B,
+            &["a.test"],
+            false,
+        ),
+        ("git --frobnicate x clone https://a.test/r", B, &[], true),
+        // Ключи `-c` и `--config-env` — белый список; прочие меняют адрес или могут менять.
+        (
+            "git -c http.curloptResolve=a.test:443:b.test clone https://a.test/r",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "git --config-env=http.extraHeader=H clone https://a.test/r",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "git -c remote.origin.url=https://b.test/r fetch https://a.test/r",
+            B,
+            &["a.test"],
+            true,
+        ),
+        (
+            "git -c user.name=x -c core.autocrlf=false -c advice.detachedHead=false clone https://a.test/r",
+            B,
+            &["a.test"],
+            false,
+        ),
+        // m2: ключи `-o` — белый список.
+        ("ssh -o LocalCommand=x a.test", B, &["a.test"], true),
+        ("ssh -o Frobnicate=1 a.test", B, &["a.test"], true),
+        ("ssh -o ProxyJump=b.test a.test", B, &["a.test"], true),
+        (
+            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=k -o BatchMode=yes me@a.test",
+            B,
+            &["a.test"],
+            false,
+        ),
+        ("ssh -o 'Port 22' -oUser=me a.test", B, &["a.test"], false),
+        ("scp -o ConnectTimeout=5 x b.test:y", B, &["b.test"], false),
+        // `-o` у rsync — флаг (owner), у git clone — имя удалённого репозитория.
+        ("rsync -rlptgoD x h.test:/y", B, &["h.test"], false),
+        ("git clone -o up https://a.test/r", B, &["a.test"], false),
+        // m5: известный флаг с приклеенным значением; m6: `-WebSession` несёт прокси.
+        ("curl --silent=1 https://a.test/", B, &["a.test"], true),
+        (
+            "iwr https://a.test/ -UseBasicParsing:$false",
+            P,
+            &["a.test"],
+            true,
+        ),
+        ("iwr https://a.test/ -WebSession $s", P, &["a.test"], true),
+    ];
+    check_hosts(t);
+}
+
+/// I2 третьего ревью задачи 3: глобальные опции git со значением (`--attr-source`,
+/// `--shallow-file`) не прячут подкоманду — сетевой признак и метка необратимости
+/// остаются; незнакомая глобальная опция — подкоманда неизвестна: сеть и `unparsed`.
+#[test]
+fn git_global_options_keep_network_and_irreversible() {
+    for (c, label) in [
+        (
+            "git --attr-source HEAD push --force origin main",
+            "git_force_push",
+        ),
+        ("git --shallow-file x push -f", "git_force_push"),
+        ("git -c a=b push -f", "git_force_push"),
+        ("git --frobnicate x push", "unparsed"),
+        ("git --exec-path=x status", "unparsed"),
+    ] {
+        assert!(is_network(&seg0(c, B), B), "{c}");
+        assert_eq!(labels(c, B), vec![label], "{c}");
+    }
+    let s = seg0("git --attr-source HEAD clone https://a.test/r", B);
+    assert!(is_network(&s, B) && reads_network(&s, B));
+    for c in [
+        "git --no-pager log",
+        "git -P diff",
+        "git --git-dir=.git --work-tree . status",
+        "git --literal-pathspecs --no-optional-locks status",
+    ] {
+        assert!(labels(c, B).is_empty(), "{c}");
+        assert!(!is_network(&seg0(c, B), B), "{c}");
+    }
 }
 
 #[test]

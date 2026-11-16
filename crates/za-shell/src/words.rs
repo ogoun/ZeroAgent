@@ -141,7 +141,7 @@ pub(crate) fn words_of(seg: &Segment, lang: Lang, out: &mut Vec<String>) {
                 }
                 i += 1;
             }
-            let (sub, _) = git_split(a);
+            let (sub, ..) = git_split(a);
             if a.get(sub).is_some_and(|s| s == "config") {
                 let rest = &a[sub + 1..];
                 if git_config_key(rest).is_some() {

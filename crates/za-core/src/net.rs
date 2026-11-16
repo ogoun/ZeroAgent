@@ -1,6 +1,6 @@
 //! Нормализация хоста — одна функция для всех сравнений хостов (R1-C2 D124).
 //!
-//! Потребители: хосты команд `bash` (`za_shell::network_hosts` отдаёт сырой хост, D104;
+//! Потребители: хосты команд `bash` (`za_shell::command_hosts` отдаёт сырые хосты, D104;
 //! сбор — [`shell_hosts`]), `web_fetch`, разбор URL шлюза, шаблоны `domain` политики (D105),
 //! лексический запрет `localhost`. Расхождение нормализации между ними было бы обходом
 //! правила по домену.
@@ -10,7 +10,7 @@
 //! отказ). Иначе запись вроде `1.2.3.4.5` или `evil.test..` обходила бы правило по домену.
 
 use url::Host;
-use za_shell::{Dialect, Segment, network_hosts};
+use za_shell::{Dialect, Segment, command_hosts};
 
 /// Нормализованный хост: снята одна последняя точка, нижний регистр, IDN — в punycode,
 /// IP-литерал — в каноническую запись `url::Host` без скобок (WHATWG: `0x7f.1` →
@@ -37,21 +37,19 @@ pub fn normalize_host(raw: &str) -> Option<String> {
 }
 
 /// Хосты команды для правил по домену (D104, D105, D124) — сбор для всех потребителей
-/// (`bash::subjects_in`): нормализованные хосты всех сегментов без повторов и признак
-/// неопределённого хоста. Сырой хост, для которого [`normalize_host`] даёт `None`, ставит
-/// признак, а не пропадает.
+/// (`bash::subjects_in`): нормализованные хосты команды целиком (`za_shell::command_hosts`:
+/// все сегменты, присваивание переменной в любом из них — хост неизвестен) без повторов и
+/// признак неопределённого хоста. Сырой хост, для которого [`normalize_host`] даёт `None`,
+/// ставит признак, а не пропадает.
 pub fn shell_hosts(segs: &[Segment], d: Dialect) -> (Vec<String>, bool) {
+    let raw = command_hosts(segs, d);
     let mut hosts: Vec<String> = Vec::new();
-    let mut unknown = false;
-    for s in segs {
-        let h = network_hosts(s, d);
-        unknown |= h.unknown;
-        for raw in &h.hosts {
-            match normalize_host(raw) {
-                Some(n) if !hosts.contains(&n) => hosts.push(n),
-                Some(_) => {}
-                None => unknown = true,
-            }
+    let mut unknown = raw.unknown;
+    for h in &raw.hosts {
+        match normalize_host(h) {
+            Some(n) if !hosts.contains(&n) => hosts.push(n),
+            Some(_) => {}
+            None => unknown = true,
         }
     }
     (hosts, unknown)

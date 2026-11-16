@@ -270,7 +270,7 @@ fn env_skip(w: &[String], mut i: usize) -> Result<usize, String> {
 }
 
 /// `NAME=…` или `NAME+=…` перед командой.
-fn is_assignment(w: &str) -> bool {
+pub(crate) fn is_assignment(w: &str) -> bool {
     let Some(pos) = w.find('=') else { return false };
     let name = w[..pos].strip_suffix('+').unwrap_or(&w[..pos]);
     let mut cs = name.chars();

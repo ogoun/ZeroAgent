@@ -599,6 +599,11 @@ fn unknown_host_asks_only_with_domain_rules() {
         "curl --resolve ok.test:443:1.2.3.4 https://ok.test/",
         // Сырой хост, который нормализация не принимает, — неизвестен (I1 ревью задачи 3).
         "curl https://1.2.3.4.5/",
+        // Проходы 3c и 3d: присваивание в команде, мастер-соединение ssh, ключ `git -c` вне
+        // белого списка.
+        "export https_proxy=http://p.test:1; curl https://ok.test/",
+        "ssh -S ctl me@ok.test",
+        "git -c http.curloptResolve=ok.test:443:b.test fetch https://ok.test/r",
     ] {
         let sp = bash(&r, cmd);
         assert!(sp.0.hosts_unknown, "{cmd}");

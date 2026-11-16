@@ -11,19 +11,22 @@
 //! утилиты ([`Spec`]): опция не точно из таблицы — незнакомая буква или имя, сокращение
 //! имени, значение у флага — даёт `unknown`. Слово, которое нельзя однозначно отнести к
 //! хосту, — `unknown`, а не хост: хост не найден; имя удалённого репозитория git или адрес
-//! git `<транспорт>::…`; у команд загрузки (`curl`, `wget`, `iwr`…) — позиционное слово без
-//! схемы; адрес не URL (`nc`, `socat`, `telnet`…: хосты из URL только добавляются); хост
-//! записан не буквально (`$`, `%`, `{…}`, текст после `]`); сокет `/dev/tcp`, `/dev/udp` в
-//! слове или перенаправлении; сегмент с подстановкой или вложенной интерпретацией
-//! (`has_subst`, в том числе `ssh host команда`) или неразобран; ключ подмены адреса —
-//! `ssh -J`, `-o ProxyJump|ProxyCommand|HostName|Canonical*|Include` (и в связке `-vo`),
-//! `-F`, `sftp|scp -S|-D`, `curl -x`, `--proxy`, `--connect-to`, `--resolve`, `-K`,
-//! `wget -e|-i|--config`, `rsync -e`, `git -c` с прокси, `sshCommand` или `insteadOf`,
-//! переменные `*_proxy`, `GIT_SSH*`, `POSIXLY_CORRECT`. Без правил по домену ни хосты, ни
-//! `unknown` ни на что не влияют (D105).
+//! git `<транспорт>::…` и `<схема>://…` вне схем самого git; у команд загрузки (`curl`,
+//! `wget`, `iwr`…) — позиционное слово без схемы; адрес не URL (`nc`, `socat`, `telnet`…:
+//! хосты из URL только добавляются); хост записан не буквально (`$`, `%`, `{…}`, текст
+//! после `]`); сокет `/dev/tcp`, `/dev/udp` в слове или перенаправлении; сегмент с
+//! подстановкой или вложенной интерпретацией (`has_subst`, в том числе `ssh host команда`)
+//! или неразобран; ключ подмены адреса — `ssh -J|-S|-F`, `sftp|scp -S|-D`, `curl -x`,
+//! `--proxy`, `--connect-to`, `--resolve`, `-K`, `wget -e|-i|--config`, `rsync -e`,
+//! `iwr -Proxy|-WebSession`, переменные `*_proxy`, `GIT_SSH*`, `POSIXLY_CORRECT`. Белые
+//! списки (третье ревью задачи 3): ключ `-o` у `ssh`, `scp`, `sftp` и ключ `git -c` вне
+//! списка — `unknown`; глобальная опция git вне таблицы — подкоманда и хост неизвестны.
+//! Присваивание переменной в любом сегменте команды — хост сетевой команды неизвестен
+//! ([`command_hosts`], проход 3c). Без правил по домену ни хосты, ни `unknown` ни на что не
+//! влияют (D105).
 
-use crate::classify::{git_split, net_cmd, uses_dev_net};
-use crate::command::{Inner, analyze};
+use crate::classify::{git_cfg, git_split, net_cmd, uses_dev_net};
+use crate::command::{Inner, analyze, is_assignment, norm};
 use crate::lex::lex_code;
 use crate::{Dialect, Lang, Segment};
 
@@ -55,14 +58,17 @@ struct Spec {
     bad_long: &'static [&'static str],
     /// Имена без учёта регистра (PowerShell; в таблице — нижний регистр).
     ci: bool,
-    /// Опции только до первого позиционного слова (getopt OpenSSH у `scp`).
+    /// Опции только до первого позиционного слова (getopt OpenSSH у `scp`, глобальные
+    /// опции git до подкоманды).
     posix: bool,
+    /// Белый список ключей `-o` (`ssh`, `scp`, `sftp`): ключ вне него — `unknown`.
+    o_keys: &'static [&'static str],
 }
 
 /// Опции неизвестны (`http`, `xh`, `aria2c`): любая опция — `unknown`.
 #[rustfmt::skip]
 const NONE: Spec = Spec { urls: &[], flags: "", vals: "", flags_long: &[], vals_long: &[],
-    bad_short: "", bad_long: &[], ci: false, posix: false };
+    bad_short: "", bad_long: &[], ci: false, posix: false, o_keys: &[] };
 
 /// curl 8.x: длинные имена — только точные (сокращений curl не принимает).
 #[rustfmt::skip]
@@ -132,26 +138,42 @@ const PWSH_WEB: Spec = Spec {
         "-retryintervalsec", "-certificate", "-certificatethumbprint", "-transferencoding",
         "-form", "-proxycredential", "-sslprotocol", "-httpversion", "-destination",
         "-displayname", "-description", "-priority", "-transfertype", "-erroraction", "-ea"],
-    bad_long: &["-proxy"],
+    // `-WebSession` — объект сеанса со свойством `Proxy` (m6 третьего ревью задачи 3).
+    bad_long: &["-proxy", "-websession"],
     ci: true,
     ..NONE
 };
 
-/// `ssh` (OpenSSH 9.x; со значением — как у вложенной интерпретации `ssh host команда`).
+/// Ключи `-o` у `ssh`, `scp`, `sftp`, которые не меняют адрес и способ соединения (белый
+/// список, m2 третьего ревью задачи 3). Прочие — `ProxyJump`, `ProxyCommand`, `HostName`,
+/// `Control*` (мастер-соединение идёт к своему хосту), `LocalCommand`, `Include`, `Match`,
+/// незнакомые — `unknown`.
 #[rustfmt::skip]
-const SSH: Spec = Spec { flags: "1246afgknqstvxyACGKMNTVXY", vals: "bceilmopBDEILOPQRSwW",
-    bad_short: "FJ", ..NONE };
+const SSH_KEYS: &[&str] = &["port", "user", "identityfile", "identitiesonly", "certificatefile",
+    "stricthostkeychecking", "userknownhostsfile", "globalknownhostsfile", "checkhostip",
+    "hashknownhosts", "updatehostkeys", "batchmode", "connecttimeout", "connectionattempts",
+    "serveraliveinterval", "serveralivecountmax", "tcpkeepalive", "compression", "loglevel",
+    "addressfamily", "passwordauthentication", "pubkeyauthentication",
+    "kbdinteractiveauthentication", "preferredauthentications", "numberofpasswordprompts",
+    "ciphers", "macs", "kexalgorithms", "hostkeyalgorithms", "pubkeyacceptedalgorithms",
+    "requesttty", "forwardagent", "addkeystoagent", "visualhostkey", "escapechar"];
+
+/// `ssh` (OpenSSH 9.x; со значением — как у вложенной интерпретации `ssh host команда`);
+/// `-S` — сокет мастер-соединения: соединение идёт к хосту мастера (проход 3c).
+#[rustfmt::skip]
+const SSH: Spec = Spec { flags: "1246afgknqstvxyACGKMNTVXY", vals: "bceilmopBDEILOPQRwW",
+    bad_short: "FJS", o_keys: SSH_KEYS, ..NONE };
 
 /// `sftp` — свои опции (`-P port`, `-s subsystem`); `-S`, `-D` — программа вместо ssh.
 #[rustfmt::skip]
 const SFTP: Spec = Spec { flags: "1246AafhNpqrvC", vals: "bBcilosPRX", bad_short: "DFJS",
-    ..NONE };
+    o_keys: SSH_KEYS, ..NONE };
 
 /// `scp`: как `sftp`; getopt OpenSSH не переставляет опции — после первого позиционного
 /// слова все слова позиционные (`scp b:y -P a:x` копирует и на `a`).
 #[rustfmt::skip]
 const SCP: Spec = Spec { flags: "346ABCOpqRrsTv", vals: "ciloPX", bad_short: "DFJS",
-    posix: true, ..NONE };
+    posix: true, o_keys: SSH_KEYS, ..NONE };
 
 /// rsync 3.x (popt).
 #[rustfmt::skip]
@@ -199,6 +221,98 @@ const GIT: Spec = Spec {
         "--sort", "-X", "--strategy", "--strategy-option"],
     ..NONE
 };
+
+/// Глобальные опции git до подкоманды (`git.c`, `handle_options`; I2 третьего ревью задачи
+/// 3). Опция вне таблицы могла взять значение — подкоманда неизвестна.
+#[rustfmt::skip]
+const GIT_GLOBAL: Spec = Spec {
+    flags_long: &["-p", "--paginate", "-P", "--no-pager", "--bare", "--no-replace-objects",
+        "--no-lazy-fetch", "--no-optional-locks", "--no-advice", "--literal-pathspecs",
+        "--no-literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs",
+        "--exec-path", "--html-path", "--man-path", "--info-path", "-v", "--version", "-h",
+        "--help"],
+    vals_long: &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix",
+        "--config-env", "--list-cmds", "--attr-source", "--shallow-file"],
+    posix: true,
+    ..NONE
+};
+
+/// Ключи `git -c`, `--config-env`, которые не меняют адрес соединения (белый список,
+/// третье ревью задачи 3); с точкой в конце — раздел целиком. Прочие (`http.*`, `url.*`,
+/// `remote.*`, `core.sshCommand`…) — `unknown`.
+#[rustfmt::skip]
+const GIT_KEYS: &[&str] = &["user.name", "user.email", "core.autocrlf", "core.safecrlf",
+    "core.quotepath", "core.longpaths", "core.filemode", "core.ignorecase", "core.eol",
+    "init.defaultbranch", "pull.rebase", "pull.ff", "fetch.prune", "rebase.autostash",
+    "merge.ff", "commit.gpgsign", "tag.gpgsign", "gc.auto", "maintenance.auto",
+    "safe.directory", "protocol.version", "advice.", "color."];
+
+/// Схемы URL, которые git обслуживает сам или помощниками своей поставки (m1 третьего ревью
+/// задачи 3); у прочих адрес толкует сторонний `git remote-<схема>`.
+const GIT_SCHEMES: [&str; 9] = [
+    "file", "git", "ssh", "git+ssh", "ssh+git", "http", "https", "ftp", "ftps",
+];
+
+/// Индекс подкоманды git после глобальных опций ([`GIT_GLOBAL`]) и признак опции не из
+/// таблицы.
+pub(crate) fn git_global(a: &[String]) -> (usize, bool) {
+    let (pos, bad) = walk(a, &GIT_GLOBAL);
+    (a.len() - pos.len(), bad)
+}
+
+/// Хосты команды целиком (D104): хосты всех сегментов без повторов и признак `unknown`.
+/// `segs` — сегменты [`crate::segments`] (с телами подстановок и вложенным кодом).
+/// Присваивание переменной в любом сегменте (проход 3c) делает хост сетевой команды
+/// неизвестным: переменная окружения меняет адрес (`https_proxy`, `POSIXLY_CORRECT`,
+/// `GIT_SSH_COMMAND`, `$PSDefaultParameterValues`).
+pub fn command_hosts(segs: &[Segment], d: Dialect) -> NetHosts {
+    let mut out = NetHosts::default();
+    for s in segs {
+        let h = network_hosts(s, d);
+        out.unknown |= h.unknown;
+        for x in h.hosts {
+            if !out.hosts.contains(&x) {
+                out.hosts.push(x);
+            }
+        }
+    }
+    // Сетевой сегмент всегда даёт хост или `unknown`: хосты есть — сетевая команда есть.
+    out.unknown |= !out.hosts.is_empty() && segs.iter().any(|s| assigns(s, Lang::from(d)));
+    out
+}
+
+/// Сегмент присваивает или меняет переменную (Ruling прохода 3b, сомнение 2): `VAR=…`
+/// отдельно, перед командой или после обёртки; `env`, `export`, `set`, `unset`, `read`,
+/// `for X in`, `source`, `.`; PowerShell — выражение `$…` или `[…]` (`$env:X = …`,
+/// `$x = …`, `[Environment]::…`), `Set-Variable`, диски `env:`, `variable:`.
+fn assigns(seg: &Segment, lang: Lang) -> bool {
+    #[rustfmt::skip]
+    const NAMES: &[&str] = &["export", "declare", "typeset", "local", "readonly", "set", "unset",
+        "setenv", "env", "read", "mapfile", "readarray", "getopts", "let", "source", "select",
+        "set-variable", "sv", "new-variable", "nv", "clear-variable", "clv", "remove-variable",
+        "rv"];
+    let (w, pwsh) = (&seg.argv, lang == Lang::Pwsh);
+    if w.first()
+        .is_some_and(|x| x == "." || (pwsh && x.starts_with(['$', '['])))
+        || (pwsh
+            && w.iter()
+                .map(|x| x.to_lowercase())
+                .any(|l| l.starts_with("env:") || l.starts_with("variable:")))
+    {
+        return true;
+    }
+    let named = |x: &String| is_assignment(x) || NAMES.contains(&norm(x).as_str());
+    match analyze(w, lang) {
+        // Команды нет: одни присваивания (`X=1`) или обёртка без команды (`env`).
+        None => w.iter().any(named),
+        Some(c) => {
+            let prefix = &w[..w.len().saturating_sub(c.args.len() + 1)];
+            prefix.iter().any(|x| named(x) || x == "for")
+                || NAMES.contains(&c.name.as_str())
+                || (c.name == "printf" && c.args.first().is_some_and(|a| a.starts_with("-v")))
+        }
+    }
+}
 
 /// Хосты сегмента и сегментов его строки вложенной интерпретации (D104).
 pub fn network_hosts(seg: &Segment, d: Dialect) -> NetHosts {
@@ -264,14 +378,15 @@ fn seg_hosts(seg: &Segment, lang: Lang, out: &mut NetHosts) {
         }
         "ssh" | "sftp" => {
             let (pos, bad) = walk(a, if name == "ssh" { &SSH } else { &SFTP });
-            out.unknown |= bad || ssh_opts(a);
+            out.unknown |= bad;
             if let Some(d) = pos.first() {
                 add(out, url_word(d).or_else(|| dest_host(d)));
             }
         }
+        // У `rsync` `-o` — флаг (owner): ключи ssh — только в `-e`, а он подмена адреса.
         "scp" | "rsync" => {
             let (pos, bad) = walk(a, if name == "scp" { &SCP } else { &RSYNC });
-            out.unknown |= bad || ssh_opts(a);
+            out.unknown |= bad;
             for p in pos {
                 if let Some(h) = url_word(p).or_else(|| scp_host(p)) {
                     add(out, Some(h));
@@ -280,14 +395,32 @@ fn seg_hosts(seg: &Segment, lang: Lang, out: &mut NetHosts) {
         }
         // Адрес — только слово-репозиторий; имя удалённого репозитория — `unknown`.
         "git" => {
-            let (i, _) = git_split(a);
-            out.unknown |= git_opts(a.get(..i).unwrap_or(a)) || ssh_opts(a);
+            let (i, _, bad) = git_split(a);
+            out.unknown |= bad || git_opts(&a[..i]);
             let r = git_repo(a, i).unwrap_or_default();
-            // `<транспорт>::<адрес>` — адрес толкует помощник `git remote-<транспорт>`: хост
-            // неизвестен (`found` не ставится), хост адреса-URL только добавляется.
-            match r.split_once("::").filter(|(t, _)| scheme(t)) {
-                Some((_, x)) => url_word(x).into_iter().for_each(|h| push(out, Some(h))),
-                None => add(out, url_word(r).or_else(|| scp_host(r))),
+            // Транспорт git — `[A-Za-z0-9][A-Za-z0-9+.-]*` (`transport_get`, `is_url` в
+            // `url.c`): у `<транспорт>::<адрес>` и у схемы вне [`GIT_SCHEMES`] (`9x://…`)
+            // адрес толкует помощник `git remote-<транспорт>` — хост неизвестен (`found` не
+            // ставится), хост адреса-URL только добавляется.
+            let transport = |t: &str| {
+                t.starts_with(|c: char| c.is_ascii_alphanumeric()) && t.chars().all(scheme_char)
+            };
+            let helper = match (r.split_once("::"), r.split_once("://")) {
+                (Some((t, x)), _) if transport(t) => Some(x),
+                (_, Some((t, _)))
+                    if transport(t) && !GIT_SCHEMES.contains(&t.to_ascii_lowercase().as_str()) =>
+                {
+                    Some(r)
+                }
+                _ => None,
+            };
+            match helper {
+                Some(x) => url_word(x).into_iter().for_each(|h| push(out, Some(h))),
+                // Слово с `://`, которое не URL, — не scp-форма: хост неизвестен.
+                None => add(
+                    out,
+                    url_word(r).or_else(|| scp_host(r).filter(|_| !r.contains("://"))),
+                ),
             }
         }
         // Прочие сетевые команды и выражения: адрес не URL (`nc`, `socat`…) или не
@@ -305,19 +438,21 @@ fn seg_hosts(seg: &Segment, lang: Lang, out: &mut NetHosts) {
     }
 }
 
-/// Позиционные слова и признак `unknown` по таблице утилиты: ключ подмены адреса или опция
-/// не точно из таблицы. Опции — в любом месте (GNU getopt, popt, git, PowerShell), у
-/// `posix` — до первого позиционного слова.
+/// Позиционные слова и признак `unknown` по таблице утилиты: ключ подмены адреса, опция
+/// не точно из таблицы или ключ `-o` вне [`Spec::o_keys`]. Опции — в любом месте (GNU
+/// getopt, popt, git, PowerShell), у `posix` — до первого позиционного слова (после него и
+/// `--` — позиционное слово).
 fn walk<'a>(args: &'a [String], s: &Spec) -> (Vec<&'a str>, bool) {
     let (mut pos, mut bad, mut i) = (Vec::new(), false, 0);
     let letters = !(s.flags.is_empty() && s.vals.is_empty());
     while let Some(a) = args.get(i).map(String::as_str) {
         i += 1;
-        if a == "--" {
+        let rest = s.posix && !pos.is_empty();
+        if a == "--" && !rest {
             pos.extend(args[i..].iter().map(String::as_str));
             break;
         }
-        if a.len() < 2 || !a.starts_with('-') || (s.posix && !pos.is_empty()) {
+        if rest || a.len() < 2 || !a.starts_with('-') {
             pos.push(a);
             continue;
         }
@@ -343,12 +478,27 @@ fn walk<'a>(args: &'a [String], s: &Spec) -> (Vec<&'a str>, bool) {
             continue;
         }
         // Связка букв: буква со значением забирает остаток слова или следующее слово,
-        // незнакомая буква — `unknown`, остаток слова не разбирается.
+        // незнакомая буква — `unknown`, остаток слова не разбирается. Ключ `-o` (`Key=…`,
+        // `Key …`) — из белого списка.
         for (k, ch) in a[1..].char_indices() {
             let takes = s.vals.contains(ch) || s.bad_short.contains(ch);
             bad |= s.bad_short.contains(ch) || !(takes || s.flags.contains(ch));
             if !s.flags.contains(ch) {
-                i += usize::from(takes && k + ch.len_utf8() == a.len() - 1);
+                let v = match &a[1 + k + ch.len_utf8()..] {
+                    "" if takes => args.get(i).map(String::as_str).inspect(|_| i += 1),
+                    v => Some(v),
+                };
+                if ch == 'o' && !s.o_keys.is_empty() {
+                    let key = |v: &str| {
+                        v.trim_start()
+                            .split(['=', ' ', '\t'])
+                            .next()
+                            .map(str::to_lowercase)
+                    };
+                    bad |= !v
+                        .and_then(key)
+                        .is_some_and(|k| s.o_keys.contains(&k.as_str()));
+                }
                 break;
             }
         }
@@ -381,34 +531,6 @@ fn redirecting_word(w: &str) -> bool {
             || matches!(name, "git_ssh" | "posixly_correct"))
 }
 
-/// `-o` с ключом, меняющим адрес (`ProxyJump`, `ProxyCommand`, `HostName`, `Canonical*`,
-/// `Include`), у `ssh`, `scp`, `sftp`, `rsync`, git — и в связке коротких опций (`-vo`,
-/// `-qoKey=…`). Буква `o` внутри значения другой опции даёт лишний `unknown`, не пропуск.
-fn ssh_opts(a: &[String]) -> bool {
-    const KEYS: [&str; 5] = [
-        "proxyjump",
-        "proxycommand",
-        "hostname",
-        "canonical",
-        "include",
-    ];
-    a.iter().enumerate().any(|(i, x)| {
-        let Some(k) = x
-            .strip_prefix('-')
-            .filter(|b| !b.starts_with('-'))
-            .and_then(|b| b.find('o'))
-        else {
-            return false;
-        };
-        let v = match &x[k + 2..] {
-            "" => a.get(i + 1).map_or("", String::as_str),
-            v => v,
-        };
-        let v = v.trim_start().to_lowercase();
-        KEYS.iter().any(|p| v.starts_with(p))
-    })
-}
-
 /// Слово-репозиторий подкоманды git `a[i]` (D104, C1 ревью задачи 3): первое позиционное
 /// слово, у `remote add` — второе (после имени); refspec и каталог назначения не
 /// разбираются. `None` — слова нет или опция не из таблицы [`GIT`] (до или после адреса: git
@@ -425,16 +547,13 @@ fn git_repo(a: &[String], i: usize) -> Option<&str> {
     pos.get(skip).copied().filter(|_| !bad)
 }
 
-/// Глобальные опции git до подкоманды: `-c` и `--config-env` с прокси, `sshCommand`,
-/// `insteadOf`.
-fn git_opts(a: &[String]) -> bool {
-    let bad = |kv: &str| {
+/// Глобальный `-c` или `--config-env` git с ключом вне белого списка [`GIT_KEYS`].
+fn git_opts(head: &[String]) -> bool {
+    git_cfg(head).any(|kv| {
         let k = kv.split('=').next().unwrap_or("").to_lowercase();
-        k.contains("proxy") || k.contains("sshcommand") || k.contains("insteadof")
-    };
-    a.iter().enumerate().any(|(i, x)| match x.as_str() {
-        "-c" | "--config-env" => a.get(i + 1).is_some_and(|kv| bad(kv)),
-        s => s.strip_prefix("--config-env=").is_some_and(bad),
+        !GIT_KEYS
+            .iter()
+            .any(|s| k == *s || (s.ends_with('.') && k.starts_with(s)))
     })
 }
 
@@ -463,7 +582,8 @@ fn url_word(w: &str) -> Option<&str> {
         .then(|| url_host(w))?
 }
 
-/// Схема URL и имя транспорта git: буква, затем буквы, цифры, `+`, `.`, `-`.
+/// Схема URL (RFC 3986): буква, затем буквы, цифры, `+`, `.`, `-`. Имя транспорта git шире:
+/// первой может быть и цифра (ветка git в [`seg_hosts`]).
 fn scheme(s: &str) -> bool {
     s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(scheme_char)
 }
