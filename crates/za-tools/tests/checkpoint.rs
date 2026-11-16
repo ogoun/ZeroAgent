@@ -2045,7 +2045,37 @@ async fn content_scan_cached_by_stat_and_fingerprint() {
     assert_eq!(count(b"plain\n"), 2);
 }
 
+/// Чекпоинт «до» восстановления `cp` под пределом теста.
+#[cfg(feature = "test-hooks")]
+async fn backup_ok(ck: &GitCheckpointer, c: &Case, cp: &Checkpoint, git: bool) {
+    within(
+        Duration::from_secs(60),
+        "чекпоинт перед восстановлением",
+        backup_before_restore(ck, &c.root(), cp, false, git),
+    )
+    .await
+    .expect("чекпоинт «до»");
+}
+
+/// Восстановление `cp` под пределом теста.
+#[cfg(feature = "test-hooks")]
+async fn restore_ok(
+    ck: &GitCheckpointer,
+    c: &Case,
+    cp: &Checkpoint,
+    git: bool,
+) -> za_tools::Restored {
+    within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(ck, &c.root(), cp, false, git),
+    )
+    .await
+    .expect("восстановление")
+}
+
 /// Время изменения файла `rel` проекта — `at`.
+#[cfg(feature = "test-hooks")]
 fn set_mtime(c: &Case, rel: &str, at: std::time::SystemTime) {
     std::fs::File::options()
         .write(true)
@@ -2058,6 +2088,15 @@ fn set_mtime(c: &Case, rel: &str, at: std::time::SystemTime) {
 /// Повторное ревью задач 1–2, Minor 1: восстановление проверяет содержимое заново, без
 /// кэша итогов. На Windows у файла нет `ctime` и `ino` в ключе, и файл, ставший секретом
 /// с прежними размером и `mtime`, иначе прошёл бы по записи кэша «не секрет».
+///
+/// На Unix свежий `ctime` (его ставит и `set_modified`) не даёт записи кэша годиться, и
+/// без подмены часов тест проходил бы, ничего не проверяя (отчёт исправления CI Linux,
+/// fix-8). Поэтому часы проверки сдвинуты на 10 минут вперёд (`test-hooks`, D128), а
+/// фильтр считает прочитанное:
+/// 1. предусловие (git): повторный чекпоинт берёт итог о файле из кэша, не читая его;
+/// 2. восстановление при том же stat всё равно читает файл фильтром — на обеих ОС;
+/// 3. файл, ставший секретом с прежними размером и `mtime`, восстановлением не тронут.
+#[cfg(feature = "test-hooks")]
 #[tokio::test]
 async fn restore_rescans_content_without_cache() {
     for git in [true, false] {
@@ -2072,35 +2111,64 @@ async fn restore_rescans_content_without_cache() {
         let value = secret_value();
         let secret = format!("token = {value}\n");
         let plain = format!("{}\n", "p".repeat(secret.len() - 1));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let filter = {
+            let (seen, value) = (seen.clone(), value.clone());
+            let fp = *blake3::hash(value.as_bytes()).as_bytes();
+            SecretFilter::new(fp, move |b: &[u8]| {
+                seen.lock().unwrap().push(b.to_vec());
+                has(b, value.as_bytes())
+            })
+        };
+        let reads = |what: &[u8]| seen.lock().unwrap().iter().filter(|b| *b == what).count();
         c.write("config.txt", "level = 1\n");
         c.write("a.txt", "one\n");
-        let ck = c.ck().with_secret_filter(value_filter(value.clone()));
-        let cp = create(&ck, c.req_edit(&["config.txt", "a.txt"], git, RunId::new())).await;
-        // Файл не секрет и «старый» (кэш не доверяет файлам моложе 2 с): чекпоинт «до»
-        // запоминает итог «не секрет» по stat.
+        let ck = c
+            .ck()
+            .with_secret_clock_for_tests(ten_minutes_ahead)
+            .with_secret_filter(filter);
+        let paths = ["config.txt", "a.txt"];
+        let cp = create(&ck, c.req_edit(&paths, git, RunId::new())).await;
         let old = std::time::SystemTime::now() - Duration::from_secs(600);
+
+        // 1. Файл не секрет; чекпоинт «до» запоминает итог «не секрет» по stat.
         c.write("config.txt", &plain);
         set_mtime(&c, "config.txt", old);
         c.write("a.txt", "two\n");
-        within(
-            Duration::from_secs(60),
-            "чекпоинт перед восстановлением",
-            backup_before_restore(&ck, &c.root(), &cp, false, git),
-        )
-        .await
-        .expect("чекпоинт «до»");
-        // Файл стал секретом с тем же размером и тем же `mtime`.
+        backup_ok(&ck, &c, &cp, git).await;
+        let before = reads(plain.as_bytes());
+        if git {
+            assert_eq!(before, 1, "чекпоинт «до» прочитал файл");
+            create(&ck, c.req_edit(&paths, git, RunId::new())).await;
+            assert_eq!(
+                reads(plain.as_bytes()),
+                before,
+                "предусловие: запись кэша доверена, повторный чекпоинт файл не читает"
+            );
+        }
+        // 2. Тот же stat, запись кэша годна — восстановление всё равно читает файл.
+        let r = restore_ok(&ck, &c, &cp, git).await;
+        assert_eq!(
+            reads(plain.as_bytes()),
+            before + 1,
+            "git={git}: восстановление взяло итог из кэша"
+        );
+        assert_eq!(c.read("config.txt"), b"level = 1\n", "git={git}: {r:?}");
+
+        // 3. Файл стал секретом с тем же размером и тем же `mtime`.
+        c.write("config.txt", &plain);
+        set_mtime(&c, "config.txt", old);
+        c.write("a.txt", "two\n");
+        backup_ok(&ck, &c, &cp, git).await;
         c.write("config.txt", &secret);
         set_mtime(&c, "config.txt", old);
-        let r = within(
-            Duration::from_secs(60),
-            "восстановление",
-            restore(&ck, &c.root(), &cp, false, git),
-        )
-        .await
-        .expect("восстановление");
+        let r = restore_ok(&ck, &c, &cp, git).await;
         assert_eq!(c.read("config.txt"), secret.as_bytes(), "git={git}");
         assert_eq!(c.read("a.txt"), b"one\n", "git={git}");
         assert_eq!(r.secret_untouched, ["config.txt"], "git={git}: {r:?}");
+        assert!(
+            reads(secret.as_bytes()) >= 1,
+            "git={git}: секрет не прочитан"
+        );
     }
 }

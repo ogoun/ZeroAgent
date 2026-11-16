@@ -635,8 +635,10 @@ async fn gateway_and_calls_are_send() {
 const CHILD_SITE: &str = "ZA_WEB_TEST_PROXY_CHILD_SITE";
 
 /// `HTTP_PROXY` и другие переменные прокси не действуют (`no_proxy()`, D107): прокси
-/// разрешал бы имена мимо фильтра адресов. Без `std::env::set_var` (`unsafe_code =
-/// "forbid"`): тест перезапускает свой исполняемый файл с окружением через
+/// разрешал бы имена мимо фильтра адресов. Заданы и строчные `http_proxy`, `https_proxy`,
+/// `all_proxy`: `reqwest` на Unix читает и их (подозрение 3 отчёта исправления CI Linux,
+/// fix-8); на Windows имена переменных без учёта регистра. Без `std::env::set_var`
+/// (`unsafe_code = "forbid"`): тест перезапускает свой исполняемый файл с окружением через
 /// `Command::env`; дочерний запуск делает запрос и проверяет, что ответила страница.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_env_is_ignored() {
@@ -670,6 +672,9 @@ async fn proxy_env_is_ignored() {
                 .env("HTTP_PROXY", &proxy_url)
                 .env("HTTPS_PROXY", &proxy_url)
                 .env("ALL_PROXY", &proxy_url)
+                .env("http_proxy", &proxy_url)
+                .env("https_proxy", &proxy_url)
+                .env("all_proxy", &proxy_url)
                 .env_remove("NO_PROXY")
                 .env_remove("no_proxy")
                 .output()

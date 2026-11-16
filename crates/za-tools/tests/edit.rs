@@ -20,6 +20,9 @@ use za_tools::{
 #[path = "../../../test-support/unique_dir.rs"]
 mod shared_dir;
 
+#[path = "../../../test-support/file_perms.rs"]
+mod file_perms;
+
 /// Корень проекта теста `CARGO_TARGET_TMPDIR/za-tools-edit/<name>-<pid>-<n>/p`; рядом —
 /// `ZA_HOME` теста `../h` (маркеры правок, m11).
 fn unique_dir(name: &str) -> PathBuf {
@@ -1089,6 +1092,11 @@ async fn overlapping_old_is_refused_by_tool() {
 async fn read_only_file_is_refused() {
     // I2: rename обошёл бы `chmod a-w` (Unix) и упал бы на Windows; отказ на обеих ОС.
     let root = unique_dir("read_only");
+    // Под root запрет записи не действует: отказа не будет, проверять нечего (fix-8).
+    if !file_perms::write_denial_enforced(&root) {
+        eprintln!("read_only_file_is_refused: {}", file_perms::NOT_ENFORCED);
+        return;
+    }
     write(&root, "ro.txt", "1\n");
     let p = root.join("ro.txt");
     let mut perms = std::fs::metadata(&p).unwrap().permissions();
@@ -1167,15 +1175,20 @@ async fn unix_modes_of_new_and_owner_only_files() {
             gid
         );
     }
-    // Без права записи владельца (0555) — отказ.
-    write(&root, "rx.sh", "a\n");
-    std::fs::set_permissions(root.join("rx.sh"), std::fs::Permissions::from_mode(0o555)).unwrap();
-    k.read("rx.sh").await;
-    let o = k
-        .edit(json!({"path": "rx.sh", "old": "a", "new": "b"}))
-        .await;
-    assert_eq!(o.content, "cannot write rx.sh: permission denied");
-    assert_eq!(bytes(&root, "rx.sh"), b"a\n");
+    // Без права записи владельца (0555) — отказ; под root запрет не действует (fix-8).
+    if file_perms::write_denial_enforced(&root) {
+        write(&root, "rx.sh", "a\n");
+        std::fs::set_permissions(root.join("rx.sh"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        k.read("rx.sh").await;
+        let o = k
+            .edit(json!({"path": "rx.sh", "old": "a", "new": "b"}))
+            .await;
+        assert_eq!(o.content, "cannot write rx.sh: permission denied");
+        assert_eq!(bytes(&root, "rx.sh"), b"a\n");
+    } else {
+        eprintln!("unix_modes (0555): {}", file_perms::NOT_ENFORCED);
+    }
     // Каталог маркеров — 0700 (ревью задачи 8).
     let m = std::fs::metadata(markers(&root))
         .unwrap()
