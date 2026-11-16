@@ -17,8 +17,8 @@ mod tree;
 mod yaml;
 
 pub use discover::{
-    Catalog, DiscoverInput, LOCAL_TREE_LIMITS, Limits, ProjectSkills, SKILL_FILE, SKIP_DIRS,
-    SkillMeta, Skipped, discover,
+    Catalog, DiscoverInput, LINKED_SKILL_DIR, LOCAL_TREE_LIMITS, Limits, ProjectSkills, SKILL_FILE,
+    SKIP_DIRS, SkillMeta, Skipped, discover,
 };
 pub use load::{LoadError, load};
 pub use pack::{PACK, PACK_TEXT_NAMES, PACK_TOKEN_LIMIT};

@@ -163,6 +163,44 @@ fn skills_list_shows_sources_and_skipped() {
     );
 }
 
+/// I1 финального ревью скиллов: каталог скилла, подключённый ссылкой (junction на
+/// Windows), не читается (D116), но виден — в `skills list` среди пропущенных с причиной и
+/// подсказкой, в `doctor` — подсказкой.
+#[test]
+fn linked_skill_dir_shown_in_list_and_doctor() {
+    let e = env_in(GROUP, "linked", "");
+    let target = support::process::unique_dir(GROUP, "linked-target").join("ext");
+    write(
+        &target.join("SKILL.md"),
+        &skill_md("ext", "Use when linked."),
+    );
+    write(
+        &e.home.join("skills/my/SKILL.md"),
+        &skill_md("my", "Use when checking my own skill."),
+    );
+    let link = e.home.join("skills").join("linked");
+    support::process::dir_link(&link, &target);
+    let hint = format!("каталог скилла {} подключён ссылкой", link.display());
+    let o = e.run(&["skills", "list"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert!(o.stdout.contains("my  user"), "{}", o.stdout);
+    assert!(!o.stdout.contains("ext  user"), "{}", o.stdout);
+    assert!(
+        o.stdout
+            .contains(&format!("{}: linked skill directory", link.display())),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains(&format!("предупреждение: {hint}")),
+        "{}",
+        o.stdout
+    );
+    let o = e.run(&["doctor"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert!(o.stdout.contains(&hint), "{}", o.stdout);
+}
+
 // ---- doctor (D111, D122) ----
 
 /// Поддельный SearXNG: `/search` — выдача; `/limited/search` — 429 (`server.limiter`);

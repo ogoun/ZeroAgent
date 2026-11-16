@@ -12,6 +12,10 @@
 //! `user` и `extra` отдельно: переполненный корень пропускается целиком с причиной
 //! `limit reached: more than <N> entries`, следующие корни обходятся. `skills list` и
 //! `doctor` называют такой корень и предел ([`limit_lines`]).
+//!
+//! **Каталог скилла по ссылке** (junction, символическая ссылка) не читается: ссылки не
+//! разворачиваются (D116). Он среди пропущенных с причиной `za_skills::LINKED_SKILL_DIR`, а
+//! `skills list` и `doctor` дают подсказку ([`linked_lines`], I1 финального ревью скиллов).
 
 use std::io;
 use std::path::Path;
@@ -20,8 +24,8 @@ use std::process::ExitCode;
 use za_core::paths::Roots;
 use za_protocol::skill_source;
 use za_skills::{
-    Catalog, DiscoverInput, EXTERNAL_LINK, Limits, Place, ProjectSkills, Skipped, TRUST_LIMITS,
-    discover, tree_hash, tree_listing,
+    Catalog, DiscoverInput, EXTERNAL_LINK, LINKED_SKILL_DIR, Limits, Place, ProjectSkills, Skipped,
+    TRUST_LIMITS, discover, tree_hash, tree_listing,
 };
 
 use crate::config::{SkillsSettings, load_config};
@@ -136,6 +140,21 @@ pub fn limit_lines(cat: &Catalog, s: &SkillsSettings) -> Vec<String> {
         .collect()
 }
 
+/// Строки о каталогах скиллов, подключённых ссылкой или junction (I1 финального ревью
+/// скиллов): ссылки не разворачиваются (D116), и такой скилл не читается.
+pub fn linked_lines(cat: &Catalog) -> Vec<String> {
+    cat.skipped
+        .iter()
+        .filter(|k| k.reason == LINKED_SKILL_DIR)
+        .map(|k| {
+            format!(
+                "каталог скилла {} подключён ссылкой и не читается: ссылки не разворачиваются; скопируйте каталог скилла на место ссылки или перечислите каталог, где он лежит, в [skills] dirs",
+                k.path
+            )
+        })
+        .collect()
+}
+
 /// Число скиллов источника.
 pub fn count_of(cat: &Catalog, source: &str) -> usize {
     cat.skills.iter().filter(|s| s.source == source).count()
@@ -227,8 +246,8 @@ pub async fn cmd_skills_list(
 }
 
 /// Текст `skills list`: строки `name  source  путь` (по старшинству источника, затем
-/// имени) с предупреждениями, затем заметки о проекте, пропущенные и корни, не прочитанные
-/// пределом записей.
+/// имени) с предупреждениями, затем заметки о проекте, пропущенные, корни, не прочитанные
+/// пределом записей, и каталоги скиллов по ссылке ([`linked_lines`]).
 pub fn render_list(cat: &Catalog, s: &SkillsSettings, notes: &[String]) -> String {
     let mut out = String::new();
     for k in &cat.skills {
@@ -250,7 +269,7 @@ pub fn render_list(cat: &Catalog, s: &SkillsSettings, notes: &[String]) -> Strin
             out.push_str(&format!("  {}: {}\n", k.path, k.reason));
         }
     }
-    for l in limit_lines(cat, s) {
+    for l in limit_lines(cat, s).into_iter().chain(linked_lines(cat)) {
         out.push_str(&format!("предупреждение: {l}\n"));
     }
     out

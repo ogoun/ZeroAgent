@@ -275,7 +275,8 @@ async fn check_skills(home: Option<&Path>, cfg: Option<&AgentConfig>) -> Check {
         Err(e) => return Check::Warn(format!("каталог не прочитан: {e}")),
     };
     let mut text = format!("скиллы: {}", crate::skills::summary(&cat));
-    let limits = crate::skills::limit_lines(&cat, &cfg.skills);
+    let mut limits = crate::skills::limit_lines(&cat, &cfg.skills);
+    limits.extend(crate::skills::linked_lines(&cat));
     if cat.skipped.is_empty() {
         return Check::Ok(format!(
             "{text}; скиллы проекта — zero-agent skills list --project"

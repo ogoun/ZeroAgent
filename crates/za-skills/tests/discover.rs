@@ -802,6 +802,63 @@ fn links_inside_skill_dir() {
     check_links(&cat, |d| format!(".claude/skills/{d}"), links);
 }
 
+/// I1 финального ревью скиллов: каталог скилла, подключённый ссылкой (junction на Windows,
+/// символическая ссылка на Unix), не обходится (D116), но и не пропадает молча — он среди
+/// пропущенных с причиной `linked skill directory` у `user`, `extra` и в дереве проекта,
+/// на любой глубине в пределах обнаружения. Каталог-ссылка внутри каталога скилла —
+/// по-прежнему предупреждение этого скилла, а не пропуск.
+#[test]
+fn linked_skill_dir_is_skipped_with_reason() {
+    use za_skills::LINKED_SKILL_DIR;
+    let base = dir("linked-dir");
+    let target = base.join("outside").join("ext");
+    skill(&base, "outside/ext", "ext", "skill outside the source");
+    let has = |cat: &Catalog, path: String| {
+        let r = reasons(cat);
+        assert!(r.contains(&(path, LINKED_SKILL_DIR.to_owned())), "{r:?}");
+    };
+    let (user, extra) = (base.join("user"), base.join("extra"));
+    skill(&user, "real", "real", "a regular skill");
+    dir_link(&user.join("linked"), &target);
+    std::fs::create_dir_all(user.join("group")).unwrap();
+    dir_link(&user.join("group").join("deep"), &target);
+    std::fs::create_dir_all(&extra).unwrap();
+    dir_link(&extra.join("linked"), &target);
+    // Каталог-ссылка внутри скилла — предупреждение скилла `x`, не пропуск.
+    junction_fixture(&user);
+    let cat = discover(&DiscoverInput {
+        user_dir: Some(user.clone()),
+        extra_dirs: vec![extra.clone()],
+        ..DiscoverInput::default()
+    });
+    assert!(cat.get("real").is_some() && cat.get("x").is_some());
+    assert!(cat.get("ext").is_none(), "{cat:?}");
+    has(&cat, user.join("linked").display().to_string());
+    has(&cat, user.join("group").join("deep").display().to_string());
+    has(&cat, extra.join("linked").display().to_string());
+    assert_eq!(
+        cat.skipped
+            .iter()
+            .filter(|s| s.reason == LINKED_SKILL_DIR)
+            .count(),
+        3,
+        "{:?}",
+        reasons(&cat)
+    );
+
+    // Проект: каталог-ссылка в доверенном дереве (ссылка наружу — значение
+    // `external-link` обхода доверия).
+    let project = base.join("project");
+    skill(&project, ".claude/skills/real", "real", "a regular skill");
+    dir_link(&project.join(".claude/skills/linked"), &target);
+    let cat = discover(&DiscoverInput {
+        project: Some(project_skills(&project)),
+        ..DiscoverInput::default()
+    });
+    assert!(cat.get("real").is_some() && cat.get("ext").is_none());
+    has(&cat, ".claude/skills/linked".to_owned());
+}
+
 /// Ревью задачи 12, m8: доверенный файл корня проекта (`AGENTS.md`, `CLAUDE.md`,
 /// `.zero-agent/config.toml` R1-C1) в виде ссылки (junction) на каталог внутри проекта —
 /// значение `external-link`, а не ошибка. Это та же ветка `entry_value`, что у обхода

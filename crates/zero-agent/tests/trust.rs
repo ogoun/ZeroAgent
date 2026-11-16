@@ -19,7 +19,7 @@ use zero_agent::trust::{EXTERNAL_LINK, LINK_PREFIX, TrustDiff, TrustSet, trust_s
 
 mod support;
 use support::fake_llama::{Fake, call_reply, llama_config, text_reply};
-use support::process::{Env, env_in, interrupt_id, run_id, unique_dir};
+use support::process::{Env, dir_link, env_in, interrupt_id, run_id, unique_dir};
 
 /// Каталог проекта и внешний каталог теста.
 fn fixture(name: &str) -> (PathBuf, PathBuf) {
@@ -33,31 +33,6 @@ fn fixture(name: &str) -> (PathBuf, PathBuf) {
 
 fn hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
-}
-
-/// Ссылка на каталог: junction на Windows (`mklink /J` прав не требует), символическая
-/// ссылка на Unix.
-fn dir_link(link: &Path, target: &Path) {
-    #[cfg(windows)]
-    {
-        // `mklink` понимает только `\`: путь собирается заново по компонентам.
-        let native = |p: &Path| p.components().collect::<PathBuf>();
-        let out = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(native(link))
-            .arg(native(target))
-            .output()
-            .expect("cmd не запустился");
-        assert!(
-            out.status.success(),
-            "mklink /J: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
 }
 
 /// Ссылка на файл. На Windows требует прав администратора или режима разработчика:

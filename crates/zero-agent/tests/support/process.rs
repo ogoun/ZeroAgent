@@ -276,3 +276,28 @@ pub fn is_subsequence(hay: &[&str], needle: &[&str]) -> bool {
 pub fn journal_exists(e: &Env) -> bool {
     Path::new(&e.journal_dir()).exists()
 }
+
+/// Ссылка на каталог: junction на Windows (`mklink /J` прав не требует), символическая
+/// ссылка на Unix.
+pub fn dir_link(link: &Path, target: &Path) {
+    #[cfg(windows)]
+    {
+        // `mklink` понимает только `\`: путь собирается заново по компонентам.
+        let native = |p: &Path| p.components().collect::<PathBuf>();
+        let out = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(native(link))
+            .arg(native(target))
+            .output()
+            .expect("cmd не запустился");
+        assert!(
+            out.status.success(),
+            "mklink /J: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}

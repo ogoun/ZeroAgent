@@ -734,7 +734,10 @@ async fn wire(
                 k.path
             );
         }
-        for line in crate::skills::limit_lines(&cat, &cfg.skills) {
+        for line in crate::skills::limit_lines(&cat, &cfg.skills)
+            .into_iter()
+            .chain(crate::skills::linked_lines(&cat))
+        {
             tracing::warn!("{line}");
         }
         Some(Arc::new(cat))

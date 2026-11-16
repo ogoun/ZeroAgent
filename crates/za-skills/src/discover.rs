@@ -30,6 +30,10 @@ use crate::tree::{
 pub const SKILL_FILE: &str = "SKILL.md";
 /// Каталоги, в которые обнаружение не заходит (D116).
 pub const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "__pycache__"];
+/// Причина пропуска каталога, подключённого ссылкой или junction (I1 финального ревью
+/// скиллов): ссылки не разворачиваются (D116), поэтому его скилл не читается, но и не
+/// пропадает молча — `skills list` и `doctor` его называют.
+pub const LINKED_SKILL_DIR: &str = "linked skill directory";
 /// Пределы обхода `user` и `extra` по умолчанию (на хэш доверия проекта не влияют): 1 МиБ
 /// на файл, как у доверия, и 1000 записей (файлов, каталогов, ссылок) на корень источника;
 /// число записей задаёт [`Limits::entries`] (`[skills] max_entries` глобальной
@@ -364,6 +368,40 @@ impl Discovery {
             }
             self.skill(root, dir, &accepted, limits);
         }
+        self.linked_dirs(root, &accepted, &candidates, limits);
+    }
+
+    /// Каталоги-ссылки корня вне каталогов скиллов (I1 финального ревью скиллов): запись
+    /// `external-link` без `SKILL.md` под собой, в пределах глубины обнаружения, — ссылка или
+    /// junction на каталог. Обход по ней не идёт (D116), а запись идёт в пропущенные с
+    /// причиной [`LINKED_SKILL_DIR`]. Ссылка внутри каталога скилла — предупреждение
+    /// самого скилла ([`Discovery::skill`]).
+    fn linked_dirs(
+        &mut self,
+        root: &Root,
+        accepted: &BTreeMap<&str, &str>,
+        candidates: &BTreeSet<&str>,
+        limits: &Limits,
+    ) {
+        for (path, value) in accepted {
+            if *value != EXTERNAL_LINK {
+                continue;
+            }
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let in_skill = path
+                .match_indices('/')
+                .any(|(i, _)| candidates.contains(&path[..i]));
+            if in_skill
+                || name == SKILL_FILE
+                || SKIP_DIRS.contains(&name)
+                || path.split('/').count() > limits.depth
+            {
+                continue;
+            }
+            if is_dir_link(&join_rel(&root.abs, path)) {
+                self.skip(root.show(path), LINKED_SKILL_DIR);
+            }
+        }
     }
 
     /// Файлы корня в пределах числа каталогов источника (пути по порядку байтов); каталоги
@@ -540,6 +578,23 @@ impl Discovery {
             stub: None,
         });
     }
+}
+
+/// Запись — ссылка или junction на каталог. На Windows — по метаданным самой ссылки, без
+/// перехода по ней: цель может быть сетевой (D116, обращение к SMB). На Unix у ссылки нет
+/// признака каталога, и проверяется цель (`stat`, содержимое не читается); висячая ссылка —
+/// не каталог.
+#[cfg(windows)]
+fn is_dir_link(path: &Path) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink_dir())
+}
+
+/// См. Windows-вариант выше.
+#[cfg(not(windows))]
+fn is_dir_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+        && std::fs::metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 /// Текст заглушки поставки (признак `test-hooks`); без признака — пустой тип: в
