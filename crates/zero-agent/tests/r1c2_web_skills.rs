@@ -1137,6 +1137,84 @@ fn resume_keeps_frozen_web_tools() {
     );
 }
 
+/// Находка 1 приёмки (Ruling «Задача 15»): веб-инструмент остался в замороженном префиксе
+/// (префикс не меняется — кэш), а конфигурация его выключила во время паузы. Вызов после
+/// resume не исполняется (ни `tool.started`, ни сети) и отвечает модели понятным текстом
+/// с именем инструмента, а не `unknown tool`; в stderr resume — строка о выключенном вебе:
+/// - `[web] enabled = false` — `web_fetch: web tools are disabled by configuration since
+///   this run started`;
+/// - `[web.search] url` убран — `web_search: web search is not configured since this run
+///   started`.
+#[test]
+fn disabled_web_tool_explains_after_resume() {
+    let site = FakeHttp::start(docs_site);
+    let names = resolve(&[("docs.test", site.port)]);
+    let url = format!("http://docs.test:{}/spawn", site.port);
+    let srv = Fake::start(N_CTX, true, fetch_pause_fetch);
+    let e = env_in(
+        GROUP,
+        "disabled-web-text",
+        &web_cfg(&srv.base, &[site.port], None),
+    );
+    let first = e.run(&run_args(&e, &names, &[&format!("Открой URL=|{url}|")]));
+    let run = run_id(&first);
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!("{}\n[web]\nenabled = false\n", llama_config(&srv.base)),
+    )
+    .unwrap();
+    let r = pause_answer_resume(&e, &names, &first);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    let f2 = result_of(&srv.bodies(), "f2");
+    assert_eq!(
+        f2,
+        "web_fetch: web tools are disabled by configuration since this run started"
+    );
+    assert!(
+        r.stderr.contains(
+            "zero-agent: веб выключен после старта run ([web] enabled = false): вызовы web_fetch этого run не исполняются"
+        ),
+        "{r:?}"
+    );
+    assert_eq!(site.requests(), ["/robots.txt", "/spawn"]);
+    let events = e.events(run);
+    assert!(
+        of_call(&events, EventKind::ToolStarted, "f2").is_empty(),
+        "{events:?}"
+    );
+
+    // Поиск убран из конфигурации во время паузы: `web_fetch` работает, `web_search` — нет.
+    let sx = searx(vec![(
+        "Spawning | Tokio".into(),
+        "https://docs.example/spawn".into(),
+    )]);
+    let srv = Fake::start(N_CTX, true, search_pause_search);
+    let e = env_in(
+        GROUP,
+        "search-removed-text",
+        &web_cfg(&srv.base, &[site.port], Some(&sx.base)),
+    );
+    let first = e.run(&run_args(&e, &names, &["Найди про tokio"]));
+    std::fs::write(
+        e.home.join("config.toml"),
+        web_cfg(&srv.base, &[site.port], None),
+    )
+    .unwrap();
+    let r = pause_answer_resume(&e, &names, &first);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert_eq!(
+        result_of(&srv.bodies(), "s2"),
+        "web_search: web search is not configured since this run started"
+    );
+    assert!(
+        r.stderr.contains(
+            "zero-agent: поиск не настроен после старта run ([web.search] url): вызовы web_search этого run не исполняются"
+        ),
+        "{r:?}"
+    );
+    assert_eq!(sx.requests().len(), 1, "{:?}", sx.requests());
+}
+
 // ---- Секрет в URL ----
 
 /// Значение `ZA_SECRET_DEMO`: собирается из частей во время выполнения (сканеры

@@ -300,6 +300,11 @@ impl Tool for WebFetch {
         ] {
             t.push((name, e.text()));
         }
+        // Вызов после resume, если веб выключили во время паузы (текст отдаёт бинарник).
+        t.push((
+            "runtime/web.fetch.withdrawn",
+            crate::withdrawn_text(WEB_FETCH, crate::WEB_DISABLED),
+        ));
         t
     }
 }

@@ -355,6 +355,16 @@ impl Tool for WebSearch {
             ),
             ("runtime/web.search.too_large", too_large_text()),
             ("runtime/web.search.internal", INTERNAL.to_owned()),
+            // Вызов после resume, если веб или поиск выключили во время паузы (текст отдаёт
+            // бинарник).
+            (
+                "runtime/web.search.withdrawn",
+                crate::withdrawn_text(WEB_SEARCH, crate::WEB_DISABLED),
+            ),
+            (
+                "runtime/web.search.unconfigured",
+                crate::withdrawn_text(WEB_SEARCH, crate::SEARCH_UNCONFIGURED),
+            ),
         ]
     }
 }

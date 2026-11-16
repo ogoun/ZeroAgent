@@ -33,7 +33,10 @@
 //! каталог скиллов ([`crate::skills::catalog`] после проверки доверия; пустой каталог —
 //! без capability `skills` и `activate_skill`, m7 ревью задачи 13). Resume регистрирует
 //! веб-инструменты, только если они есть в замороженном префиксе run (новых инструментов
-//! посреди run нет, а выключенный сейчас веб не включается). `policy.loaded` получает
+//! посреди run нет, а выключенный сейчас веб не включается); веб-инструмент префикса,
+//! выключенный конфигурацией после старта, снимается с исполнения: вызов отвечает модели
+//! `<имя>: web tools are disabled by configuration since this run started` (Ruling «Задача
+//! 15»), в stderr — строка о выключенном вебе. `policy.loaded` получает
 //! `web_disabled` и `search_host` и сверяется с действующим снимком у нового run и у
 //! каждого resume (I1 ревью задачи 14). Печать: строки `web.request` (D112), `skill.activated`
 //! (D122) и предупреждение о тире standard на окне меньше 32k (D169).
@@ -576,6 +579,52 @@ struct Wiring {
     web_disabled: Option<&'static str>,
     /// Хост поставщика поиска, если `web_search` зарегистрирован (D105).
     search_host: Option<String>,
+    /// Resume: веб-инструменты замороженного префикса, которые конфигурация выключила после
+    /// старта run, — имя и текст вызова (`ToolRegistry::withdraw`, Ruling «Задача 15»).
+    withdrawn: Vec<(String, String)>,
+}
+
+/// Веб-инструменты замороженного префикса `frozen`, которых нет среди зарегистрированных
+/// `web`, с текстом вызова (Ruling «Задача 15», находка 1): веб выключен —
+/// [`za_web::WEB_DISABLED`], убран `[web.search] url` — [`za_web::SEARCH_UNCONFIGURED`].
+/// Префикс не меняется (кэш), поэтому модель видит описание и может позвать инструмент.
+fn withdrawn_web(
+    frozen: &BTreeSet<String>,
+    web: &[Arc<dyn Tool>],
+    web_disabled: Option<&str>,
+) -> Vec<(String, String)> {
+    [za_web::WEB_FETCH, za_web::WEB_SEARCH]
+        .into_iter()
+        .filter(|n| frozen.contains(*n) && !web.iter().any(|t| t.spec().schema.name == *n))
+        .filter_map(|n| {
+            let reason = match (web_disabled, n) {
+                (Some(_), _) => za_web::WEB_DISABLED,
+                (None, za_web::WEB_SEARCH) => za_web::SEARCH_UNCONFIGURED,
+                // `web_fetch` при включённом вебе регистрируется всегда.
+                _ => return None,
+            };
+            Some((n.to_owned(), za_web::withdrawn_text(n, reason)))
+        })
+        .collect()
+}
+
+/// Строка stderr resume о снятых веб-инструментах (`withdrawn` из [`withdrawn_web`]).
+fn withdrawn_line(withdrawn: &[(String, String)], web_disabled: Option<&str>) -> Option<String> {
+    if withdrawn.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = withdrawn.iter().map(|(n, _)| n.as_str()).collect();
+    let why = match web_disabled {
+        Some(crate::web::DISABLED_BY_PROJECT) => {
+            format!("веб выключен после старта run ({PROJECT_CONFIG}: [web] enabled = false)")
+        }
+        Some(_) => "веб выключен после старта run ([web] enabled = false)".to_owned(),
+        None => "поиск не настроен после старта run ([web.search] url)".to_owned(),
+    };
+    Some(format!(
+        "zero-agent: {why}: вызовы {} этого run не исполняются",
+        names.join(", ")
+    ))
 }
 
 /// Имена инструментов замороженного префикса из снимка run (`frozen.tools[].name`).
@@ -640,6 +689,10 @@ async fn wire(
             web.retain(|t| names.contains(&t.spec().schema.name));
         }
     }
+    let withdrawn = allowed.map_or_else(Vec::new, |names| withdrawn_web(names, &web, web_disabled));
+    if let Some(line) = withdrawn_line(&withdrawn, web_disabled) {
+        eprintln!("{line}");
+    }
     let search_host = web
         .iter()
         .any(|t| t.spec().schema.name == za_web::WEB_SEARCH)
@@ -677,6 +730,7 @@ async fn wire(
         catalog,
         web_disabled,
         search_host,
+        withdrawn,
     })
 }
 
@@ -1110,7 +1164,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             let store = ProjectStore::open(&dir)?;
             let prep = prepare(home, &project, &store, &cfg, &args.grants).await?;
             let wiring = wire(home, &project, run, &cfg, &prep, &args.hooks, None).await?;
-            register(&mut tools, &wiring.web);
+            register(&mut tools, &wiring);
             // Бюджет нового run: `[budgets.run]`, поверх него флаги.
             let budget = run_budget(&cfg.budgets.run, &args.budget);
             // D83, CAP-084: инструкции — только у доверенного проекта.
@@ -1197,7 +1251,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 Some(&frozen),
             )
             .await?;
-            register(&mut tools, &wiring.web);
+            register(&mut tools, &wiring);
             let endpoint = match r.model {
                 Some(m) => Some(select(Some(m)).map_err(CommandError::from)?),
                 None => None,
@@ -1284,12 +1338,16 @@ fn skills_capability_of(cat: &Arc<za_skills::Catalog>) -> Option<za_core::Capabi
     (!cat.skills.is_empty()).then(|| skills_capability(Arc::clone(cat)))
 }
 
-/// Инструменты в реестр run (повтор имени — `warn`, как у встроенных).
-fn register(reg: &mut ToolRegistry, tools: &[Arc<dyn Tool>]) {
-    for t in tools {
+/// Веб-инструменты подключений в реестр run (повтор имени — `warn`, как у встроенных) и
+/// снятые с исполнения имена замороженного префикса (`Wiring::withdrawn`).
+fn register(reg: &mut ToolRegistry, wiring: &Wiring) {
+    for t in &wiring.web {
         if let Err(e) = reg.register(Arc::clone(t)) {
             tracing::warn!(error = %e, "инструмент уже зарегистрирован");
         }
+    }
+    for (name, text) in &wiring.withdrawn {
+        reg.withdraw(name.as_str(), text.as_str());
     }
 }
 
@@ -2095,6 +2153,46 @@ mod tests {
         let names = frozen_tools(&snap);
         assert!(names.contains("web_fetch") && names.contains("read"));
         assert!(frozen_tools(&json!({})).is_empty());
+    }
+
+    /// Ruling «Задача 15», находка 1: веб-инструменты префикса, которых нет в реестре resume,
+    /// снимаются с исполнения с текстом причины; строка stderr называет, кто выключил.
+    #[test]
+    fn withdrawn_web_tools_of_frozen_prefix() {
+        let frozen: BTreeSet<String> = ["read", "web_fetch", "web_search"]
+            .map(str::to_owned)
+            .into();
+        let off = withdrawn_web(&frozen, &[], Some(crate::web::DISABLED_BY_PROJECT));
+        assert_eq!(
+            off,
+            [
+                (
+                    "web_fetch".to_owned(),
+                    "web_fetch: web tools are disabled by configuration since this run started"
+                        .to_owned()
+                ),
+                (
+                    "web_search".to_owned(),
+                    "web_search: web tools are disabled by configuration since this run started"
+                        .to_owned()
+                ),
+            ]
+        );
+        let line = withdrawn_line(&off, Some(crate::web::DISABLED_BY_PROJECT)).unwrap();
+        assert!(line.contains(PROJECT_CONFIG), "{line}");
+        assert!(line.ends_with("вызовы web_fetch, web_search этого run не исполняются"));
+        // Веб включён, поиска нет: снят только `web_search`.
+        let only: BTreeSet<String> = ["web_search"].map(str::to_owned).into();
+        let search = withdrawn_web(&only, &[], None);
+        assert_eq!(search.len(), 1);
+        assert_eq!(
+            search[0].1,
+            "web_search: web search is not configured since this run started"
+        );
+        // Префикс без веба — ничего не снято, строки нет.
+        let none: BTreeSet<String> = ["read"].map(str::to_owned).into();
+        assert!(withdrawn_web(&none, &[], Some("config")).is_empty());
+        assert!(withdrawn_line(&[], Some("config")).is_none());
     }
 
     #[test]

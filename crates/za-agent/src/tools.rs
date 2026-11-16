@@ -736,11 +736,12 @@ async fn prepare(
         CallVerdict::Run => {}
     }
     let Some(tool) = reg.get(&call.name) else {
-        return Ok(Prep::Done(result(
-            call,
-            unknown_tool_text(&call.name),
-            true,
-        )));
+        // Снятый с исполнения инструмент замороженного префикса (выключен конфигурацией
+        // после старта run) — текст причины от того, кто его снял; иначе `unknown tool`.
+        let text = reg
+            .withdrawn(&call.name)
+            .map_or_else(|| unknown_tool_text(&call.name), str::to_owned);
+        return Ok(Prep::Done(result(call, text, true)));
     };
     let key = slot_ref(slots, i)?.key().clone();
     let run = |slots: &mut [Option<EffectSlot>], action, finish| -> Result<Prep, EffectError> {

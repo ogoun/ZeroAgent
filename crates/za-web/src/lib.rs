@@ -53,6 +53,22 @@ pub mod dns {
 /// Причина отказа фильтра адресов (D108); текст для модели — `blocked: <причина>`.
 pub const LOCAL_ADDRESS: &str = "local or private address";
 
+/// Веб выключен конфигурацией (глобальной или проекта) после старта run, а описание
+/// инструмента осталось в замороженном префиксе (Ruling «Задача 15», находка 1): вызов не
+/// исполняется, модель получает [`withdrawn_text`] с этой причиной.
+pub const WEB_DISABLED: &str = "web tools are disabled by configuration since this run started";
+/// `[web.search] url` убран из конфигурации после старта run: `web_search` префикса не
+/// исполняется ([`withdrawn_text`]).
+pub const SEARCH_UNCONFIGURED: &str = "web search is not configured since this run started";
+
+/// Результат вызова веб-инструмента `name`, снятого с исполнения после старта run
+/// (`ToolRegistry::withdraw`): `<имя>: <причина>` — модель видит, какой инструмент и почему.
+/// Образцы — в `Tool::texts` самих инструментов (D94): у run с вебом они входят в
+/// `texts_hash` префикса.
+pub fn withdrawn_text(name: &str, reason: &str) -> String {
+    format!("{name}: {reason}")
+}
+
 /// Настройки шлюза: раздел `[web]` глобальной конфигурации (D107, D122).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebConfig {

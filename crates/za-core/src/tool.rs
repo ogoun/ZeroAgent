@@ -337,9 +337,17 @@ pub fn gate(mode: RunMode, spec: &ToolSpec) -> Gate {
 pub struct DuplicateTool(pub String);
 
 /// Реестр инструментов по имени.
+///
+/// Кроме инструментов, реестр знает имена, снятые с исполнения ([`ToolRegistry::withdraw`]):
+/// инструмент есть в замороженном префиксе run (модель его видит, префикс не меняется ради
+/// кэша), но этот процесс его не исполняет — например, веб выключен конфигурацией между
+/// паузой и resume (находка 1 приёмки R1-C2). Вызов такого имени получает текст причины
+/// вместо `unknown tool`.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Имя, снятое с исполнения → текст результата-ошибки для модели (английский, D23).
+    withdrawn: BTreeMap<String, String>,
 }
 
 impl ToolRegistry {
@@ -357,6 +365,22 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// Снимает имя `name` с исполнения: вызов отвечает `text` (результат-ошибка). На
+    /// зарегистрированный инструмент не действует — [`ToolRegistry::get`] важнее; повтор
+    /// заменяет текст.
+    pub fn withdraw(&mut self, name: impl Into<String>, text: impl Into<String>) {
+        self.withdrawn.insert(name.into(), text.into());
+    }
+
+    /// Текст вызова имени, снятого с исполнения ([`ToolRegistry::withdraw`]); `None` —
+    /// имя не снималось или инструмент зарегистрирован.
+    pub fn withdrawn(&self, name: &str) -> Option<&str> {
+        if self.tools.contains_key(name) {
+            return None;
+        }
+        self.withdrawn.get(name).map(String::as_str)
     }
 
     /// Инструменты роли с `min_tier <= tier`, по имени.

@@ -138,6 +138,25 @@ fn registry_filters_role_and_tier() {
     assert_eq!(r.get("a").unwrap().spec().roles, [RunRole::Top]);
 }
 
+/// Имя, снятое с исполнения (находка 1 приёмки R1-C2): не инструмент набора, вызов отвечает
+/// текстом причины; зарегистрированный инструмент важнее; текст переживает копию реестра
+/// (`run_registry` копирует `deps.tools`).
+#[test]
+fn registry_withdrawn_names() {
+    let mut r = ToolRegistry::default();
+    r.register(echo("a", vec![RunRole::Top], Tier::Small))
+        .unwrap();
+    r.withdraw("w", "w: off");
+    r.withdraw("a", "a: off");
+    assert!(r.get("w").is_none());
+    assert_eq!(r.withdrawn("w"), Some("w: off"));
+    assert_eq!(r.withdrawn("a"), None, "зарегистрированный важнее");
+    assert_eq!(r.withdrawn("zzz"), None);
+    assert_eq!(names(&r.for_run(RunRole::Top, Tier::Full)), ["a"]);
+    r.withdraw("w", "w: again");
+    assert_eq!(r.clone().withdrawn("w"), Some("w: again"));
+}
+
 #[test]
 fn tool_output_round_trips() {
     let o = ToolOutput::error("x");
