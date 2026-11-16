@@ -463,6 +463,13 @@ fn resolved_features(root: &Path, sel: &[&str], krate: &str) -> Result<Vec<Strin
 /// `reqwest::Client`, `reqwest::get(`, `reqwest::blocking`. Имя должно начинаться словом:
 /// `MemoryClient::new(` — не клиент `reqwest`. Строки-комментарии не считаются. Главный
 /// страж — зависимость (`REQWEST_USERS`): этот проверяет файлы внутри `za-web`.
+///
+/// Внутри `za-web` вне `gateway.rs` действует ещё строгое подмножество (Minor 1
+/// финального ревью безопасности, m1 ревью fix-5/6): из `reqwest` допустимы только пути
+/// [`WEB_REQWEST_PATHS`]. Импорт `use reqwest::{Client}` с `Default::default()` образцы
+/// выше не видят, а клиент по умолчанию — системный резолвер и прокси из окружения, обход
+/// фильтра D108. Перечня обходов здесь нет: любое другое упоминание крейта (группа импорта,
+/// псевдоним, `extern crate`, иной тип) — нарушение.
 pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
     const PATTERNS: &[&str] = &[
         "Client::builder",
@@ -479,12 +486,10 @@ pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
     {
         return Vec::new();
     }
-    let word_start = |code: &str, at: usize| {
-        code[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
-    };
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let word_start =
+        |code: &str, at: usize| code[..at].chars().next_back().is_none_or(|c| !ident(c));
+    let in_web = rel.starts_with("crates/za-web/");
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let code = line.trim_start();
@@ -499,10 +504,29 @@ pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
                 "{rel}:{}: HTTP-клиент reqwest вне za-web/src/gateway.rs и za-llm (D129: обход фильтра адресов)",
                 i + 1
             )));
+            continue;
+        }
+        let other_path = in_web
+            && code.match_indices("reqwest").any(|(at, w)| {
+                let rest = &code[at + w.len()..];
+                word_start(code, at)
+                    && !rest.chars().next().is_some_and(ident)
+                    && !WEB_REQWEST_PATHS.iter().any(|p| rest.starts_with(p))
+            });
+        if other_path {
+            out.push(Violation(format!(
+                "{rel}:{}: в za-web вне gateway.rs из reqwest допустимы только reqwest::dns:: и reqwest::StatusCode (D129: клиент — только в шлюзе)",
+                i + 1
+            )));
         }
     }
     out
 }
+
+/// Пути `reqwest`, допустимые в `za-web` вне `gateway.rs` (D129): типы резолвера
+/// (`addr.rs`, тестовая подмена `lib.rs`) и код статуса (`fetch.rs`). Строка после имени
+/// крейта начинается с одного из них.
+const WEB_REQWEST_PATHS: &[&str] = &["::dns::", "::StatusCode"];
 
 /// Запуск процессов в исходнике `rel` (путь от корня через `/`) вне [`PROCESS_ALLOWED`]:
 /// `std::process::Command`, `tokio::process::Command`, `Command::new`, импорт `Command`
@@ -1221,6 +1245,45 @@ version = \"0.0.1\"
                 "{line}"
             );
         }
+    }
+    /// Финальное ревью безопасности, Minor 1 (m1 ревью fix-5/6): внутри `za-web` вне
+    /// `gateway.rs` из `reqwest` допустимы только `reqwest::dns::` и `reqwest::StatusCode`.
+    /// Клиент через импорт и `Default::default()` образцы `Client::…` не видят, а этот
+    /// страж — да; псевдоним крейта и импорт группы — тоже.
+    #[test]
+    fn web_crate_uses_only_allowed_reqwest_paths() {
+        let rel = "crates/za-web/src/x.rs";
+        for line in [
+            "use reqwest::{Client};",
+            "use reqwest::Client as C;",
+            "let c: Client = Default::default(); let t = ::reqwest::Url::parse(s);",
+            "use reqwest as r;",
+            "use reqwest;",
+            "extern crate reqwest;",
+            "let p = reqwest::Proxy::all(u);",
+        ] {
+            let v = check_http_client(rel, line);
+            assert!(!v.is_empty(), "{line}");
+            assert!(
+                v.iter().all(|x| x.0.contains("crates/za-web/src/x.rs:1")),
+                "{v:?}"
+            );
+        }
+        for line in [
+            "use reqwest::dns::{Addrs, Name, Resolve, Resolving};",
+            "match reqwest::StatusCode::from_u16(status) {",
+            "// use reqwest::Client — пример в комментарии",
+            "let reqwest_error = e;",
+            "let n = my_reqwest::Client::new_name();",
+        ] {
+            assert!(check_http_client(rel, line).is_empty(), "{line}");
+        }
+        // Вне `za-web` правило путей не действует (там — зависимость, `REQWEST_USERS`), а в
+        // `gateway.rs` клиент разрешён.
+        assert!(check_http_client("crates/za-llm/src/a.rs", "use reqwest::{Client};").is_empty());
+        assert!(
+            check_http_client("crates/za-web/src/gateway.rs", "use reqwest::{Client};").is_empty()
+        );
     }
     #[test]
     fn core_over_limit_is_reported() {
