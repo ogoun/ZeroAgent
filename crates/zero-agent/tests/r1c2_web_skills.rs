@@ -489,6 +489,35 @@ fn s1_local_address_refused_without_connection() {
     );
 }
 
+/// Правило `deny` по домену (D105, Review Focus 1; Minor 4 финального ревью безопасности),
+/// сквозь бинарник: глобальное правило на `docs.test`, модель зовёт `web_fetch` с хостом
+/// в другом регистре и с последней точкой (`DOCS.test.`). Нормализация хоста (D124) даёт
+/// совпадение: отказ `denied: policy rule` до вызова инструмента — у сайта ни одного
+/// запроса, событий `web.request` нет.
+#[test]
+fn deny_domain_rule_stops_web_fetch_without_connection() {
+    let site = FakeHttp::start(docs_site);
+    let names = resolve(&[("docs.test", site.port)]);
+    let srv = Fake::start(N_CTX, true, fetch_then_answer);
+    let cfg = format!(
+        "{}\n[[policy.rules]]\naction = \"deny\"\ndomain = \"docs.test\"\n",
+        web_cfg(&srv.base, &[site.port], None)
+    );
+    let e = env_in(GROUP, "deny-domain", &cfg);
+    let url = format!("http://DOCS.test.:{}/spawn", site.port);
+    let o = e.run(&run_args(&e, &names, &[&format!("Открой URL=|{url}|")]));
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let r = result_of(&srv.bodies(), "f1");
+    assert!(r.contains("denied: policy rule"), "{r}");
+    assert!(site.requests().is_empty(), "{:?}", site.requests());
+    let events = e.events(run_id(&o));
+    assert!(payloads(&events, EventKind::WebRequest).is_empty());
+    assert!(
+        of_call(&events, EventKind::ToolStarted, "f1").is_empty(),
+        "{events:?}"
+    );
+}
+
 /// Адрес своего экземпляра SearXNG (D126): исключение фильтра — только у `web_search`;
 /// `web_fetch` на тот же адрес — отказ, у SearXNG ни одного запроса.
 #[test]
