@@ -13,14 +13,16 @@
 //! 3. Запрет режима ([`gate`], D14) — `Deny`.
 //! 4. `Exec` в недоверенном проекте — [`Decision::Trust`], после отказа —
 //!    `Deny("untrusted project")` (D83).
-//! 5. Причины `Ask` собираются все: `irreversible` (не снимается ничем), `outside_project`
-//!    (снимают только грант или глобальное `allow` с `path`), `rule` и `mode` (снимают
-//!    глобальное `allow` и `bypass`, кроме `Approval::Always`). `rule` даёт и правило `deny`
-//!    или `ask` с `domain`, если хост вызова неизвестен ([`Subjects::hosts_unknown`], D104).
+//! 5. Причины `Ask` собираются все: `irreversible` и `rule` (не снимаются ничем: ни
+//!    грантом, ни `allow`, ни `bypass`), `outside_project` (снимают только грант или
+//!    глобальное `allow` с `path`), `mode` (снимают глобальное `allow` и `bypass`, кроме
+//!    `Approval::Always`). `rule` даёт правило `ask`, а также правило `deny` или `ask` с
+//!    `domain`, если хост вызова неизвестен ([`Subjects::hosts_unknown`], D104).
 //!
 //! Правило с `domain` (D105) только ужесточает: `deny` — отказ по совпавшему хосту, `ask` —
-//! вопрос; `allow` с `domain` ничего не разрешает. Хосты вызова нормализованы
-//! ([`normalize_host`], D124), шаблон нормализуется при сборке снимка (`domain_pattern`).
+//! вопрос; `allow` с `domain` ничего не разрешает (при сборке — `warn`). Хосты вызова
+//! нормализованы ([`normalize_host`], D124), шаблон нормализуется и проверяется при сборке
+//! снимка (`domain_pattern`: строгое подмножество, иначе ошибка).
 //!
 //! Метка недоверенного содержимого run ([`PolicyCx::taint`], D82) вопроса не даёт
 //! (решение заказчика 2026-11-11: чтение из сети на запуск команд не влияет). Она —
@@ -59,7 +61,8 @@ pub enum RuleAction {
 ///   с абсолютным каноническим путём (glob по компонентам, на Windows без учёта регистра);
 /// - `command` — разобранная команда (D81): `deny` и `ask` — `argv0` или текст любого
 ///   сегмента, `allow` — текст каждого сегмента без подстановок и перенаправлений;
-/// - `domain` — хост вызова (R1-C2 D105): glob без учёта регистра, `*` пересекает точки
+/// - `domain` — хост вызова (R1-C2 D105): имя с glob `*`, `?` без учёта регистра (метка —
+///   `[a-z0-9-]` после punycode) или IP-литерал без glob; `*` пересекает точки
 ///   (`*.example.com` — поддомены, но не сам `example.com`). Действует у `deny` и `ask`:
 ///   правило `allow` с `domain` ничего не разрешает. Неизвестный хост вызова при
 ///   подходящем правиле — вопрос с причиной `rule` (D104).
@@ -140,14 +143,23 @@ impl PolicySnapshot {
     /// Снимок из глобальной и проектной конфигурации (D80, ARC-041). Правило без полей
     /// и неверный шаблон — ошибка; проектные `allow` отбрасываются с `warn` и попадают в
     /// [`PolicySnapshot::ignored`]; `allow_bypass` и гранты проекта не действуют. Шаблон
-    /// `domain` в снимке — нормализованный (D105).
+    /// `domain` в снимке — нормализованный (D105); глобальное `allow` с `domain` остаётся в
+    /// снимке, но ничего не разрешает — `warn`.
     pub fn build(
         global: &PolicyConfig,
         project: Option<&PolicyConfig>,
     ) -> Result<Self, PolicyError> {
         let mut rules = Vec::new();
         for (i, r) in global.rules.iter().enumerate() {
-            rules.push((RuleSource::Global, check_rule(i, r)?));
+            let r = check_rule(i, r)?;
+            if r.action == RuleAction::Allow && r.domain.is_some() {
+                // Правило остаётся в снимке и хэше, но не действует (M3 ревью задачи 4).
+                tracing::warn!(
+                    index = i,
+                    "правило allow с domain ничего не разрешает (D105)"
+                );
+            }
+            rules.push((RuleSource::Global, r));
         }
         let mut ignored = Vec::new();
         if let Some(p) = project {
@@ -297,33 +309,47 @@ fn text_glob(pat: &str, case_insensitive: bool) -> Result<GlobMatcher, globset::
         .compile_matcher())
 }
 
-/// Символы шаблона glob в `domain`.
-const GLOB_META: [char; 6] = ['*', '?', '[', ']', '{', '}'];
+/// Символы шаблона glob в `domain`: только `*` и `?` (I1 ревью задачи 4). Классы `[…]` и
+/// альтернативы `{…}` не поддерживаются: в шаблоне это ошибка, а не glob.
+const GLOB_META: [char; 2] = ['*', '?'];
 
 /// Разделители меток IDNA (UTS 46): точка и её полноширинные и идеографические формы.
 const LABEL_DOTS: [char; 4] = ['.', '\u{3002}', '\u{ff0e}', '\u{ff61}'];
 
+/// Текст ошибки шаблона-имени с недопустимым символом.
+const BAD_NAME: &str =
+    "в имени допустимы только a-z, 0-9, `-` и шаблоны `*`, `?`: без схемы, порта, пути, скобок";
+
 /// Нормализованный шаблон `domain` (D105, D124) — та же форма, что у хостов вызова.
 ///
-/// - Шаблон без символов glob (имя хоста или IP-литерал, IPv6 — в `[…]` или без скобок)
+/// - Шаблон без `*` и `?` (имя хоста или IP-литерал, IPv6 — в `[…]` или без скобок)
 ///   нормализуется целиком [`normalize_host`]: последняя точка, регистр, punycode,
 ///   каноническая запись IP. Так `deny domain="127.1"` совпадает с хостом `127.0.0.1`.
-/// - Шаблон с символами glob — по меткам: снимается одна последняя точка; ASCII-метки
-///   только в нижний регистр (символы `*`, `?`, `[` в имени хоста недопустимы, WHATWG);
-///   метки не из ASCII — в punycode той же [`normalize_host`]. Метка не из ASCII с символом
-///   glob — ошибка: такой шаблон не совпал бы ни с одним хостом.
+/// - Шаблон с `*` или `?` — по меткам: снимается одна последняя точка; ASCII-метки только в
+///   нижний регистр; метки не из ASCII — в punycode той же [`normalize_host`]. Метка не из
+///   ASCII с символом glob — ошибка: такой шаблон не совпал бы ни с одним хостом.
+///
+/// **Строгое подмножество (I1 ревью задачи 4).** После нормализации каждая метка имени —
+/// только `[a-z0-9-]` и `*`, `?`; IP-адрес — только литералом, без glob ([`ip_like`]).
+/// Иначе (`evil.test/*`, `*.evil.test:443`, `https://*.evil.test`, пробел, `[fe80::*]`,
+/// `{a,b}`, `_`) — ошибка: такой `deny` молча не совпал бы ни с одним хостом.
 ///
 /// Пустой шаблон, пустая метка (`a..b`), недопустимое имя — ошибка. Результат функции —
 /// её неподвижная точка (снимок из журнала собирается тем же шаблоном).
 fn domain_pattern(pat: &str) -> Result<String, &'static str> {
-    let bracketed = pat.strip_prefix('[').and_then(|r| r.strip_suffix(']'));
-    if !bracketed.unwrap_or(pat).contains(GLOB_META) {
+    if !pat.contains(GLOB_META) {
         // IPv6 без скобок (так его записывает `normalize_host`) — как литерал в скобках.
-        let host = match bracketed {
-            None if pat.contains(':') => format!("[{pat}]"),
-            _ => pat.to_owned(),
+        let host = if pat.contains(':') && !pat.starts_with('[') {
+            format!("[{pat}]")
+        } else {
+            pat.to_owned()
         };
-        return normalize_host(&host).ok_or("недопустимое имя хоста");
+        let norm = normalize_host(&host).ok_or("недопустимое имя хоста")?;
+        return if norm.parse::<std::net::IpAddr>().is_ok() || name_chars(&norm) {
+            Ok(norm)
+        } else {
+            Err(BAD_NAME)
+        };
     }
     let s = pat.strip_suffix('.').unwrap_or(pat);
     let mut labels = Vec::new();
@@ -346,7 +372,48 @@ fn domain_pattern(pat: &str) -> Result<String, &'static str> {
             .ok_or("метка не переводится в punycode")?;
         labels.push(ascii);
     }
-    Ok(labels.join("."))
+    let norm = labels.join(".");
+    if !name_chars(&norm) {
+        return Err(BAD_NAME);
+    }
+    if ip_like(&labels) {
+        return Err("IP-адрес — только литералом, без `*` и `?`");
+    }
+    Ok(norm)
+}
+
+/// Каждая метка — непустая, из `[a-z0-9-]` и символов glob `*`, `?`.
+fn name_chars(s: &str) -> bool {
+    s.split('.').all(|l| {
+        !l.is_empty()
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-*?".contains(&b))
+    })
+}
+
+/// Шаблон с glob похож на IP-адрес (I1 ревью задачи 4: IP — только литералом).
+///
+/// - Все метки из цифр и `*`, `?` (`192.168.*.*`, `10.*`): шаблон по числам смешал бы адреса
+///   и имена (`10.*` — и `10.0.0.1`, и `10.example`).
+/// - Последняя метка — число IPv4 по WHATWG, десятичное или `0x…` (`*.1`, `a*.1`, `*.0x1`):
+///   хост с такой меткой — только IPv4, а имя с ней не совпадёт ни с одним хостом.
+fn ip_like(labels: &[String]) -> bool {
+    let num = |l: &str, hex: bool| {
+        l.bytes().all(|b| {
+            b"*?".contains(&b)
+                || if hex {
+                    b.is_ascii_hexdigit()
+                } else {
+                    b.is_ascii_digit()
+                }
+        })
+    };
+    let digit = |l: &String| l.bytes().any(|b| b.is_ascii_digit());
+    let last_num = labels.last().is_some_and(|l| match l.strip_prefix("0x") {
+        Some(h) => num(h, true),
+        None => digit(l) && num(l, false),
+    });
+    last_num || (labels.iter().all(|l| num(l, false)) && labels.iter().any(digit))
 }
 
 /// Шаблон `domain` (нормализованный): `*` пересекает точки, без учёта регистра.
@@ -1007,8 +1074,11 @@ mod tests {
             ("[::1]", "::1"),
             ("::FFFF:127.0.0.1", "::ffff:7f00:1"),
             ("*", "*"),
+            ("*.*", "*.*"),
             ("api-?.example.com", "api-?.example.com"),
-            ("[ab].test", "[ab].test"),
+            ("*.EVIL.test", "*.evil.test"),
+            ("1*.test", "1*.test"),
+            ("10.0.0.1", "10.0.0.1"),
         ] {
             let got = domain_pattern(pat).unwrap_or_else(|e| panic!("{pat}: {e}"));
             assert_eq!(got, want, "{pat}");
@@ -1025,6 +1095,28 @@ mod tests {
             "*.a..b",
             "при*мер.рф",
             "a b.test",
+            // I1 ревью задачи 4: метка — только `[a-z0-9-]` и `*`, `?`. Путь, порт, схема,
+            // пробел, скобки (класс glob и IPv6 с glob), фигурные скобки, `_`, `%`, `@`.
+            "evil.test/*",
+            "*.evil.test:443",
+            "https://*.evil.test",
+            "*.evil.test ",
+            "[fe80::*]",
+            "fe80::*",
+            "[ab].test",
+            "{a,b}.test",
+            "*.{a,b}.test",
+            "*.a_b.test",
+            "a_b.test",
+            "*.te%73t",
+            "me@*.evil.test",
+            "!*.evil.test",
+            // IP-литерал — только без glob.
+            "192.168.*.*",
+            "10.*",
+            "*.1",
+            "a*.1",
+            "*.0x1",
         ] {
             assert!(domain_pattern(bad).is_err(), "{bad}");
         }

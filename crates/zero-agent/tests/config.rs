@@ -332,6 +332,22 @@ fn policy_rule_with_domain() {
     )
     .unwrap();
     assert_eq!(p.policy.rules[0].domain.as_deref(), Some("docs.rs"));
+    // M3 ревью задачи 4: глобальное `allow` с `domain` ничего не разрешает — загрузка
+    // предупреждает, правило без `domain` предупреждения не даёт.
+    let cfg = zero_agent::config::parse_config(
+        "[[policy.rules]]\naction = \"allow\"\ndomain = \"x.test\"\ncommand = \"curl *\"\n",
+    )
+    .unwrap();
+    let (r, logs) = with_logs(|| zero_agent::config::validate(&cfg));
+    r.unwrap();
+    assert!(logs.contains("WARN") && logs.contains("domain"), "{logs}");
+    let cfg = zero_agent::config::parse_config(
+        "[[policy.rules]]\naction = \"allow\"\ncommand = \"curl *\"\n",
+    )
+    .unwrap();
+    let (r, logs) = with_logs(|| zero_agent::config::validate(&cfg));
+    r.unwrap();
+    assert!(!logs.contains("WARN"), "{logs}");
     // Опечатка в имени поля называет `domain` среди полей правила.
     let e =
         zero_agent::config::parse_config("[[policy.rules]]\naction = \"deny\"\ndomian = \"x\"\n")

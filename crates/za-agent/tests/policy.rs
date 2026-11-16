@@ -655,6 +655,31 @@ fn unknown_host_asks_only_with_domain_rules() {
     );
 }
 
+/// M1 ревью задачи 4: вопрос о неизвестном хосте (причина `rule`) не снимают ни `bypass`,
+/// ни глобальное `allow` с `command` — снимается только `mode`.
+#[test]
+fn unknown_host_rule_survives_bypass_and_allow() {
+    let r = roots();
+    let p = snap(vec![
+        cmd_rule(RuleAction::Allow, "curl *"),
+        domain_rule(RuleAction::Deny, "evil.test"),
+    ]);
+    assert!(p.allow_bypass);
+    let bypass = Cx::new(RunMode::Bypass).policy(p.clone());
+    let ask_mode = Cx::new(RunMode::Ask).policy(p);
+    for cx in [&bypass, &ask_mode] {
+        // `allow` действует: известный хост вне правила — без вопроса.
+        assert_eq!(
+            cx.decide(&bash_spec(), &bash(&r, "curl https://ok.test/")),
+            Decision::Allow
+        );
+        assert_eq!(
+            cx.decide(&bash_spec(), &bash(&r, "curl $URL")),
+            ask(&[ar::RULE])
+        );
+    }
+}
+
 /// D105: шаблон `domain` нормализуется по меткам — метки не из ASCII в punycode.
 #[test]
 fn domain_pattern_is_punycoded() {
@@ -705,7 +730,20 @@ fn bad_domain_pattern_rejected() {
         PolicySnapshot::build(&cfg_with(deny_domain("[")), None),
         Err(PolicyError::Glob(0, "domain", _))
     ));
-    for bad in ["", ".", "a..b", "evil.test.."] {
+    for bad in [
+        "",
+        ".",
+        "a..b",
+        "evil.test..",
+        // I1 ревью задачи 4: такой `deny` молча не совпал бы ни с одним хостом — ошибка
+        // сборки. Метка — только `[a-z0-9-]` и `*`, `?`; IP — только литералом.
+        "evil.test/*",
+        "*.evil.test:443",
+        "https://*.evil.test",
+        "*.evil.test ",
+        "[fe80::*]",
+        "192.168.*.*",
+    ] {
         assert!(
             matches!(
                 PolicySnapshot::build(&cfg_with(deny_domain(bad)), None),
@@ -713,6 +751,19 @@ fn bad_domain_pattern_rejected() {
             ),
             "{bad:?}"
         );
+    }
+    // Допустимые формы: имя с glob, IP-литерал (IPv6 — в скобках или без).
+    let deny = Decision::Deny(deny_reason::POLICY_RULE);
+    for (pat, host) in [
+        ("*", "a.test"),
+        ("*.evil.test", "a.evil.test"),
+        ("api-?.evil.test", "api-1.evil.test"),
+        ("10.0.0.1", "10.0.0.1"),
+        ("[::1]", "[::1]"),
+        ("::1", "[::1]"),
+    ] {
+        let cx = Cx::new(RunMode::Auto).policy(snap(deny_domain(pat)));
+        assert_eq!(cx.decide(&fetch_spec(), &fetch(host)), deny, "{pat}");
     }
     // Проектные правила проверяются так же.
     let project = PolicyConfig {
@@ -762,6 +813,38 @@ fn domain_in_hash_and_old_snapshots_read() {
     let back: PolicySnapshot =
         serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
     assert_eq!(back, with);
+}
+
+/// M4 ревью задачи 4: хэш политики R1-C1 закреплён значением, которое дал код R1-C1
+/// (`main`, 7aac95f), — любое изменение `policy_hash` или сериализации `Rule` видно.
+/// Политика задана JSON без `domain`: тот же текст собирается и кодом R1-C1. Пути — строкой
+/// через `/`: хэш одинаков на всех ОС. Значение не перезаписывать: смена хэша — новая запись
+/// `policy.loaded` у каждой прежней конфигурации (миграция в CHANGELOG).
+#[test]
+fn r1c1_policy_hash_is_pinned() {
+    let global: PolicyConfig = serde_json::from_value(json!({
+        "allow_bypass": true,
+        "rules": [
+            {"action": "allow", "command": "cargo test*"},
+            {"action": "ask", "tool": "edit"},
+            {"action": "deny", "path": "secrets/**"},
+            {"action": "deny", "tool": "bash", "command": "rm *", "path": "/data/**"},
+        ],
+        "grants": [
+            {"path": "/data", "mode": "ro", "reason": "r"},
+            {"path": "/srv", "mode": "rw"},
+        ],
+    }))
+    .unwrap();
+    let project: PolicyConfig = serde_json::from_value(json!({
+        "rules": [
+            {"action": "ask", "command": "git push*"},
+            {"action": "allow", "tool": "bash"},
+        ],
+    }))
+    .unwrap();
+    let hash = PolicySnapshot::build(&global, Some(&project)).unwrap().hash;
+    assert_eq!(hash, include_str!("golden/policy_r1c1.hash").trim());
 }
 
 // ---- Режим × вид инструмента ----
