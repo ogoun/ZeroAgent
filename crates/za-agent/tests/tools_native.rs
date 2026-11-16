@@ -1757,53 +1757,115 @@ async fn third_property_allowed_and_recorded() {
     assert_eq!(audit[1].payload["call_id"], "w2");
 }
 
-/// Ruling I1 ревью задачи 5: запись получает каждый вызов, исполняемый при всех трёх
-/// свойствах (снимок начала пакета плюс вклад вызова), а не только переход в три. При
-/// трёх свойствах в снимке — и сетевой вызов, и чтение внутри проекта без своего вклада;
-/// при двух в снимке вызов без недостающего свойства записи не получает.
+/// Пакет с одобрением каждого вопроса: неразобранная команда спрашивает (`irreversible`).
+async fn batch_approving(
+    b: &Bx,
+    reg: &ToolRegistry,
+    env: &ToolEnv,
+    step: u64,
+    calls: &[PlannedCall],
+) -> ToolsOutcome {
+    let mut out = b.batch(reg, env, step, calls).await;
+    while let Some(s) = out.suspend.take() {
+        b.approve(&s.id, json!({"approved": true})).await;
+        out = b.batch(reg, env, step, calls).await;
+    }
+    out
+}
+
+/// Вызовы `tool.started` с отметкой `rule_of_two`.
+fn marked_started(evs: &[Event]) -> Vec<String> {
+    of_kind(evs, EventKind::ToolStarted)
+        .iter()
+        .filter(|e| e.payload["rule_of_two"] == true)
+        .map(|e| e.payload["call_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Ruling I1 ревью задачи 5 и Ruling сомнения 1 прохода fix-5: запись получает каждый
+/// вызов с внешней связью, исполняемый при всех трёх свойствах (снимок начала пакета плюс
+/// вклад вызова). Внешняя связь — `risk = Network`, инструмент `web_*`, `bash`, сетевой
+/// или неразобранный (`unknown`). Вызовы без внешней связи — чтение внутри проекта,
+/// локальный `bash`, `finish` — записи не получают и при трёх свойствах в снимке.
 #[tokio::test]
-async fn every_call_under_three_properties_recorded() {
-    let b = bx("every_call_three").await;
+async fn only_external_link_calls_recorded_under_three_properties() {
+    let b = bx("link_three").await;
     std::fs::write(b.d.roots.project.join("in.txt"), "in").unwrap();
-    let reg = registry(vec![Arc::new(ReadStub::new()), Arc::new(WebStub::new())]);
+    let reg = registry(vec![
+        Arc::new(ReadStub::new()),
+        Arc::new(WebStub::new()),
+        Arc::new(BashStub::new()),
+        // `web_*` без `risk = Network`: внешняя связь — по имени инструмента.
+        Arc::new(TextStub::new("web_probe")),
+    ]);
     let mut env = b.env(RunMode::Auto);
     env.exposure = exposure(true, true, true);
     let calls = [
         pc("in1", "read", json!({"path": "in.txt"})),
         pc("w1", "web_fetch", json!({"url": "https://a.test/"})),
+        pc("bl", "bash", json!({"cmd": "ls -la"})),
+        pc("bn", "bash", json!({"cmd": "curl -s https://a.test/"})),
+        pc("bu", "bash", json!({"cmd": "echo 'a"})),
+        pc("wp", "web_probe", json!({"out": "x"})),
     ];
-    let out = b.batch(&reg, &env, 1, &calls).await;
-    assert_eq!(out.executed, ["in1", "w1"]);
-    assert_eq!(out.rule_of_two, ["in1", "w1"]);
-    assert_eq!(audit_ids(&rule_of_two_audit(&b.store).await), ["in1", "w1"]);
-    // Два свойства в снимке: чтение внутри проекта третьего не даёт — записи нет.
+    let out = batch_approving(&b, &reg, &env, 1, &calls).await;
+    assert!(
+        out.executed.ends_with(&["bu".to_owned(), "wp".to_owned()]),
+        "{:?}",
+        out.executed
+    );
+    assert_eq!(out.rule_of_two, ["w1", "bn", "bu", "wp"]);
+    assert_eq!(
+        audit_ids(&rule_of_two_audit(&b.store).await),
+        ["w1", "bn", "bu", "wp"]
+    );
+    assert_eq!(marked_started(&b.events().await), ["w1", "bn", "bu", "wp"]);
+    // `finish` при трёх свойствах — записи нет.
+    let calls = [pc("f1", "finish", json!({"status": "done", "result": "r"}))];
+    let out = b.batch(&reg, &env, 2, &calls).await;
+    assert!(out.finish.is_some());
+    assert!(out.rule_of_two.is_empty());
+    assert_eq!(rule_of_two_audit(&b.store).await.len(), 4);
+    // Два свойства в снимке: вызов с внешней связью, не дающий третьего (`bash` в
+    // свойства не входит), записи не получает, как и чтение внутри проекта.
     let mut env = b.env(RunMode::Auto);
     env.exposure = exposure(true, true, false);
-    let calls = [pc("in2", "read", json!({"path": "in.txt"}))];
-    let out = b.batch(&reg, &env, 2, &calls).await;
+    let calls = [
+        pc("bn2", "bash", json!({"cmd": "curl -s https://a.test/"})),
+        pc("in2", "read", json!({"path": "in.txt"})),
+    ];
+    let out = b.batch(&reg, &env, 3, &calls).await;
+    assert_eq!(out.executed, ["bn2", "in2"]);
     assert!(out.rule_of_two.is_empty());
-    assert_eq!(rule_of_two_audit(&b.store).await.len(), 2);
-    let evs = b.events().await;
-    let marked: Vec<&str> = of_kind(&evs, EventKind::ToolStarted)
-        .iter()
-        .filter(|e| e.payload["rule_of_two"] == true)
-        .map(|e| e.payload["call_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(marked, ["in1", "w1"]);
+    assert_eq!(rule_of_two_audit(&b.store).await.len(), 4);
+    assert_eq!(marked_started(&b.events().await), ["w1", "bn", "bu", "wp"]);
+}
+
+/// `bash`, вывод которого несёт метку из аргумента `taint` (как `reads_network` у
+/// настоящего `bash`): третье свойство даёт только метка результата.
+fn labelled_bash() -> BashStub {
+    BashStub::with(Arc::new(|cmd: &str, _cx: &ToolCx| ToolOutput {
+        taint: cmd.contains("label").then(|| "web".to_owned()),
+        ..ToolOutput::ok(format!("out of {cmd}"))
+    }))
 }
 
 /// Ruling I1 ревью задачи 5: третье свойство дала только метка результата (её до вызова
-/// не знать) — запись после вызова, отметка в `tool.finished`. Сбой этой записи —
+/// не знать) — запись после вызова, отметка в `tool.finished`; только у вызова с внешней
+/// связью (здесь — неразобранный `bash`, Ruling сомнения 1 fix-5). Сбой этой записи —
 /// результат не выдаётся (ошибка журнала, как у гранта), недоверенного содержимого в
 /// контексте нет; флаги `private`/`external` исполненного вызова остаются.
 #[tokio::test]
 async fn third_property_from_result_label_recorded_after_call() {
     let b = bx("third_from_label").await;
-    let reg = registry(vec![Arc::new(TextStub::new("probe"))]);
+    let reg = registry(vec![
+        Arc::new(labelled_bash()),
+        Arc::new(TextStub::new("probe")),
+    ]);
     let mut env = b.env(RunMode::Auto);
     env.exposure = exposure(false, true, true);
-    let calls = [pc("t1", "probe", json!({"out": "x", "taint": "web"}))];
-    let out = b.batch(&reg, &env, 1, &calls).await;
+    let calls = [pc("t1", "bash", json!({"cmd": "echo 'label"}))];
+    let out = batch_approving(&b, &reg, &env, 1, &calls).await;
     assert_eq!(out.rule_of_two, ["t1"]);
     assert_eq!(out.exposure, exposure(true, false, false));
     assert_eq!(rule_of_two_audit(&b.store).await.len(), 1);
@@ -1819,22 +1881,33 @@ async fn third_property_from_result_label_recorded_after_call() {
         true
     );
     // Без метки результата — два свойства, записи нет.
-    let calls = [pc("t2", "probe", json!({"out": "x"}))];
-    let out = b.batch(&reg, &env, 2, &calls).await;
+    let calls = [pc("t2", "bash", json!({"cmd": "echo 'plain"}))];
+    let out = batch_approving(&b, &reg, &env, 2, &calls).await;
     assert!(out.rule_of_two.is_empty());
+    // Метка результата у вызова без внешней связи: свойства три, записи нет.
+    let calls = [pc("p1", "probe", json!({"out": "x", "taint": "web"}))];
+    let out = b.batch(&reg, &env, 3, &calls).await;
+    assert_eq!(out.exposure, exposure(true, false, false));
+    assert!(out.rule_of_two.is_empty());
+    assert_eq!(rule_of_two_audit(&b.store).await.len(), 1);
+    let evs = b.events().await;
+    assert!(
+        of_kind(&evs, EventKind::ToolFinished)
+            .iter()
+            .all(|e| e.payload["call_id"] == "t1" || e.payload.get("rule_of_two").is_none())
+    );
     // Сбой записи после вызова.
     let mut faulty = env.clone();
     faulty.fault = Some(Arc::new(|p| matches!(p, FaultPoint::RuleOfTwoAudit { .. })));
-    let calls = [pc(
-        "t3",
-        "probe",
-        json!({"out": "secret page", "taint": "web"}),
-    )];
-    let r = b.try_batch(&reg, &faulty, 3, &calls).await;
+    let calls = [pc("t3", "bash", json!({"cmd": "echo 'label secret page"}))];
+    let asked = b.batch(&reg, &faulty, 4, &calls).await;
+    b.approve(&asked.suspend.unwrap().id, json!({"approved": true}))
+        .await;
+    let r = b.try_batch(&reg, &faulty, 4, &calls).await;
     assert!(matches!(r, Err(za_core::EffectError::Store(_))), "{r:?}");
     assert_eq!(rule_of_two_audit(&b.store).await.len(), 1);
     // Реплей шага: квитанция — отказ без содержимого, свойства `untrusted` нет.
-    let again = b.batch(&reg, &env, 3, &calls).await;
+    let again = b.batch(&reg, &env, 4, &calls).await;
     let (text, is_error) = content(&again, 0);
     assert!(is_error && text.contains("journal write failed"), "{text}");
     assert!(!text.contains("secret page"), "{text}");

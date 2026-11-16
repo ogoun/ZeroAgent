@@ -59,7 +59,7 @@ use za_core::{
 use za_llm::{BoxFuture, Part, ToolCall, ToolSchema};
 use za_protocol::{
     Actor, EffectClass, EffectKey, EventKind, NewEvent, RunId, RunMode, RunRole, Tier,
-    approval_reason, audit_action, canonical_json, mask_json_with, taint_origin,
+    approval_reason, audit_action, canonical_json, irreversible, mask_json_with, taint_origin,
 };
 use za_secrets::SecretMasker;
 use za_store::{AuditNew, StoreError};
@@ -150,8 +150,9 @@ pub struct ToolsOutcome {
     /// Флаги экспозиции исполненных вызовов (D106; вживую и по квитанции): драйвер
     /// объединяет их с флагами run. Отклонённый вызов флаг не ставит.
     pub exposure: Exposure,
-    /// `call_id` исполненных вызовов, исполненных при всех трёх свойствах — снимок начала
-    /// пакета ([`ToolEnv::exposure`]) плюс вклад самого вызова (Ruling I1 ревью задачи 5).
+    /// `call_id` исполненных вызовов с внешней связью, исполненных при всех трёх свойствах
+    /// — снимок начала пакета ([`ToolEnv::exposure`]) плюс вклад самого вызова (Ruling I1
+    /// ревью задачи 5, Ruling сомнения 1 прохода fix-5).
     /// О каждом есть запись аудита `rule_of_two`: её пишет слот, признак — в квитанции.
     pub rule_of_two: Vec<String>,
     /// `call_id` исполненных вызовов, поставивших флаг, которого в снимке начала пакета не
@@ -201,7 +202,7 @@ pub struct ToolEnv {
     pub trust_set: Option<TrustSetFn>,
     /// Экспозиция run на начало пакета (D106): вызов исполняется при всех трёх свойствах,
     /// если их дают она и вклад самого вызова, — аргументы вызовов пакета выбраны до их
-    /// результатов.
+    /// результатов. Запись `rule_of_two` — только у вызова с внешней связью.
     pub exposure: Exposure,
 }
 
@@ -303,9 +304,9 @@ struct Receipt {
     /// Нативный сетевой вызов дошёл до инструмента (D106: `external`).
     #[serde(default, skip_serializing_if = "is_false")]
     external: bool,
-    /// Вызов исполнен при всех трёх свойствах, запись аудита `rule_of_two` о нём есть
-    /// (Ruling I1, m2 ревью задачи 5): реплей квитанции даёт `ToolsOutcome.rule_of_two`
-    /// без повторной записи.
+    /// Вызов с внешней связью исполнен при всех трёх свойствах, запись аудита
+    /// `rule_of_two` о нём есть (Ruling I1, m2 ревью задачи 5): реплей квитанции даёт
+    /// `ToolsOutcome.rule_of_two` без повторной записи.
     #[serde(default, skip_serializing_if = "is_false")]
     rule_of_two: bool,
 }
@@ -384,7 +385,32 @@ impl ToolJob {
             external: native && spec.risk == RiskClass::Network,
         }
     }
+
+    /// Вызов с внешней связью (Ruling сомнения 1 прохода fix-5): только он получает запись
+    /// `rule_of_two` при всех трёх свойствах. Это `risk = Network`, инструмент `web_*` и
+    /// команда (`Exec`), классифицированная как сетевая или неопределённая: сегмент
+    /// неразобран, метка `unparsed` или команды в предметах нет. Чтение и правка в
+    /// проекте, локальная команда, `finish`, `ask_user`, `request_grant` — без внешней
+    /// связи. Свойства экспозиции это не меняет: `bash` в них по-прежнему не входит.
+    fn external_link(&self) -> bool {
+        external_link(self.tool.spec(), &self.subjects)
+    }
 }
+
+/// Условие [`ToolJob::external_link`] по спецификации и предметам вызова.
+fn external_link(spec: &ToolSpec, s: &Subjects) -> bool {
+    spec.risk == RiskClass::Network
+        || spec.schema.name.starts_with(WEB_TOOL_PREFIX)
+        || (spec.kind == ToolKind::Exec
+            && (s.command.is_none()
+                || s.network
+                || s.segments.iter().any(|g| g.unparsed)
+                || s.irreversible.contains(&irreversible::UNPARSED)))
+}
+
+/// Префикс имён веб-инструментов (`web_fetch`, `web_search`): вызов с внешней связью
+/// независимо от класса риска.
+const WEB_TOOL_PREFIX: &str = "web_";
 
 /// Что делает слот вызова вживую.
 enum Action {
@@ -412,8 +438,8 @@ struct Job {
     crash: Option<CrashHook>,
     /// Аргументы `finish` принятого вызова.
     finish: Option<FinishArgs>,
-    /// Экспозиция на начало пакета (D106): вызов при всех трёх свойствах пишет запись
-    /// аудита.
+    /// Экспозиция на начало пакета (D106): вызов с внешней связью при всех трёх свойствах
+    /// пишет запись аудита.
     exposure: Exposure,
 }
 
@@ -1705,22 +1731,30 @@ impl Live {
     ) -> Result<Value, String> {
         let started = Instant::now();
         let mut halt = Some(halt);
-        let (args, decision, paths, before) = match &action {
+        let (args, decision, paths, before, link) = match &action {
             Action::Tool(t) => (
                 mask_value(t.masker.as_deref(), &t.args),
                 t.decision.clone(),
                 path_classes(&t.raw, &t.planned),
                 t.exposure_before(),
+                t.external_link(),
             ),
-            _ => (Value::Null, Value::Null, Value::Null, Exposure::default()),
+            _ => (
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Exposure::default(),
+                false,
+            ),
         };
-        // D106, Ruling I1, m1, m2 ревью задачи 5: вызов, исполняемый при всех трёх
-        // свойствах (снимок начала пакета плюс вклад вызова), — запись аудита до вызова,
-        // вместе с `tool.started`: отмена посреди вызова её не теряет, а повтор замыкания
-        // после сбоя процесса не дублирует (одна запись на ключ эффекта). Реплей квитанции
-        // замыкание не запускает. Без записи вызов не исполняется — как грант (SEC-090).
+        // D106, Ruling I1, m1, m2 ревью задачи 5, Ruling сомнения 1 fix-5: вызов с внешней
+        // связью, исполняемый при всех трёх свойствах (снимок начала пакета плюс вклад
+        // вызова), — запись аудита до вызова, вместе с `tool.started`: отмена посреди вызова
+        // её не теряет, а повтор замыкания после сбоя процесса не дублирует (одна запись на
+        // ключ эффекта). Реплей квитанции замыкание не запускает. Без записи вызов не
+        // исполняется — как грант (SEC-090).
         let at_start = self.exposure.union(before);
-        let marked = at_start.all();
+        let marked = link && at_start.all();
         if marked && !self.rule_of_two(at_start, fref).await {
             return Err(JOURNAL_FAILED.to_owned());
         }
@@ -1762,7 +1796,7 @@ impl Live {
         // `private` и `external` исполненного вызова остаются.
         let at_end = self.exposure.union(receipt.exposure());
         let mut marked_after = false;
-        if !marked && at_end.all() {
+        if link && !marked && at_end.all() {
             marked_after = self.rule_of_two(at_end, fref).await;
             if !marked_after {
                 receipt = Receipt {
@@ -2331,6 +2365,77 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ruling сомнения 1 прохода fix-5: внешняя связь — `risk = Network`, `web_*`, команда
+    /// сетевая или неопределённая (неразобранный сегмент, метка `unparsed`, нет команды).
+    #[test]
+    fn external_link_cases() {
+        let spec = |name: &str, kind: ToolKind, risk: RiskClass| ToolSpec {
+            schema: ToolSchema {
+                name: name.into(),
+                description: String::new(),
+                parameters: json!({}),
+            },
+            class: EffectClass::ReadOnly,
+            kind,
+            approval: Approval::Mode,
+            risk,
+            roles: vec![RunRole::Top],
+            min_tier: Tier::Small,
+            timeout: BUILTIN_TIMEOUT,
+            output_limit: None,
+            tainted: false,
+        };
+        let cmd = |c: &str| Subjects {
+            command: Some(c.into()),
+            segments: za_core::shell::segments(c, za_core::shell::Dialect::Bash),
+            ..Subjects::default()
+        };
+        let none = Subjects::default();
+        let read = spec("read", ToolKind::Read, RiskClass::Read);
+        let bash = spec("bash", ToolKind::Exec, RiskClass::Exec);
+        assert!(external_link(
+            &spec("x", ToolKind::Read, RiskClass::Network),
+            &none
+        ));
+        assert!(external_link(
+            &spec("x", ToolKind::Exec, RiskClass::Network),
+            &cmd("ls")
+        ));
+        assert!(external_link(
+            &spec("web_search", ToolKind::Read, RiskClass::Read),
+            &none
+        ));
+        assert!(!external_link(&read, &none));
+        assert!(!external_link(
+            &spec("edit", ToolKind::Edit, RiskClass::LocalWrite),
+            &none
+        ));
+        assert!(!external_link(
+            &spec(FINISH_TOOL, ToolKind::Control, RiskClass::Read),
+            &none
+        ));
+        // Команда: локальная — нет; сетевая, неразобранная, с меткой `unparsed`, без
+        // команды в предметах — да.
+        assert!(!external_link(&bash, &cmd("ls -la")));
+        let net = Subjects {
+            network: true,
+            ..cmd("curl https://a.test/")
+        };
+        assert!(external_link(&bash, &net));
+        assert!(external_link(&bash, &cmd("echo 'a")));
+        let label = Subjects {
+            irreversible: vec![irreversible::UNPARSED],
+            ..cmd("ls")
+        };
+        assert!(external_link(&bash, &label));
+        assert!(external_link(&bash, &none));
+        // `web_` — префикс имени, не подстрока.
+        assert!(!external_link(
+            &spec("my_web_x", ToolKind::Read, RiskClass::Read),
+            &none
+        ));
+    }
 
     #[test]
     fn timeout_text_whole_and_fraction() {

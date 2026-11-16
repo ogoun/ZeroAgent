@@ -1129,7 +1129,8 @@ struct Printer {
     /// сводка для истории, а не ответ, и не печатаются.
     compacting: bool,
     crash: Option<RunCrash>,
-    /// Строка Rule of Two (D106): одна на run, по первому вызову при всех трёх свойствах.
+    /// Строка Rule of Two (D106): одна на run, по первому вызову с внешней связью при всех
+    /// трёх свойствах.
     rule_of_two: RuleOfTwoNotice,
 }
 

@@ -1,5 +1,6 @@
 //! Экспозиция Rule of Two (SEC-052, R1-C2 D106, ADR 0006): три независимых свойства run,
-//! отметка вызова, исполненного при всех трёх, и строка SEC-052 один раз на run.
+//! отметка вызова с внешней связью, исполненного при всех трёх, и строка SEC-052 один раз
+//! на run.
 //!
 //! Вызовов не прерывает — решение заказчика 2026-11-11 «Не спрашивать»: экспозиция
 //! пишется в журнал (`exposure.changed`) и аудит (`rule_of_two`); `decide` и `PolicyCx`
@@ -12,8 +13,8 @@ use serde_json::Value;
 use za_protocol::{EventKind, taint_origin};
 
 /// Поле payload `tool.started` (запись аудита до вызова) и `tool.finished` (запись после
-/// вызова, когда третье свойство дала метка результата): `true` — вызов исполняется при
-/// всех трёх свойствах, запись аудита `rule_of_two` о нём есть.
+/// вызова, когда третье свойство дала метка результата): `true` — вызов с внешней связью
+/// исполняется при всех трёх свойствах, запись аудита `rule_of_two` о нём есть.
 pub(crate) const RULE_OF_TWO_MARK: &str = "rule_of_two";
 
 /// Три независимых свойства run (D106).
@@ -47,7 +48,8 @@ impl Exposure {
     /// Установлены все три свойства. Вызов исполняется при всех трёх, если
     /// `snapshot.union(call).all()`: снимок начала пакета плюс собственный вклад вызова,
     /// независимо от того, сколько свойств добавил сам вызов и сколько было в снимке
-    /// (Ruling I1 ревью задачи 5).
+    /// (Ruling I1 ревью задачи 5). Запись `rule_of_two` получает только такой вызов с
+    /// внешней связью (Ruling сомнения 1 прохода fix-5, `ToolJob::external_link`).
     pub fn all(self) -> bool {
         self.untrusted && self.private && self.external
     }
@@ -65,15 +67,15 @@ pub(crate) fn untrusted_origin<'a>(origins: impl IntoIterator<Item = &'a String>
         .any(|o| o != taint_origin::OUTSIDE_PROJECT)
 }
 
-/// Событие вызова, исполненного при всех трёх свойствах: `tool.started` или
-/// `tool.finished` с отметкой `rule_of_two` (о вызове есть запись аудита).
+/// Событие вызова с внешней связью, исполненного при всех трёх свойствах: `tool.started`
+/// или `tool.finished` с отметкой `rule_of_two` (о вызове есть запись аудита).
 pub fn rule_of_two_marked(kind: &EventKind, payload: &Value) -> bool {
     matches!(kind, EventKind::ToolStarted | EventKind::ToolFinished)
         && payload.get(RULE_OF_TWO_MARK).and_then(Value::as_bool) == Some(true)
 }
 
 /// Строка SEC-052 один раз на run (D106, Ruling I1 ревью задачи 5): по первому событию
-/// вызова, исполненного при всех трёх свойствах ([`rule_of_two_marked`]). Run, у которого
+/// вызова с внешней связью, исполненного при всех трёх свойствах ([`rule_of_two_marked`]). Run, у которого
 /// запись аудита `rule_of_two` уже была до процесса (resume), строку получил раньше. Если
 /// событие не дошло (подписчик шины отстал), строку даёт проверка аудита в конце процесса.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
