@@ -14,5 +14,6 @@ pub mod attrs;
 pub mod guard;
 pub mod html;
 pub mod linear;
+mod merge;
 
 pub use html::{HTML_MAX_BYTES, Markdown, html_to_markdown};

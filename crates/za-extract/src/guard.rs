@@ -7,26 +7,36 @@
 //! реконструкции активных элементов форматирования, «Noah's Ark») прерываются на первых
 //! килобайтах входа, а не после полного разбора 2 МиБ.
 //!
-//! Счёт идёт по событиям самого разборщика — созданные элементы, глубина вставки и её
-//! сумма, — поэтому модели построителя дерева нет и расходиться не с чем (в отличие от
-//! текстовой предпроверки, которую обходит `<div></span>` или реконструкция, M2 ревью).
+//! Счёт идёт по событиям самого разборщика: созданные элементы, глубина вставленного элемента,
+//! сумма глубин и длина поисков узла среди детей родителя ([`MAX_SCAN`]). Глубина — настоящая глубина узла в дереве на момент вставки: подъём по
+//! указателям `parent` самого `RcDom` (m1 повторного ревью fix-7). Поэтому всё равно, как
+//! построитель вставил узел: обычным `append`, переносом из таблицы (foster parenting,
+//! `append_before_sibling`, `append_based_on_parent_node`) или после пересадки детей
+//! (`reparent_children`). Содержимое `template` — отдельный фрагмент без родителя; подъём
+//! продолжается от самого шаблона ([`TreeSink::get_template_contents`] запоминает пару).
+//! Своей модели построителя дерева у стража нет. Подъём стоит O(глубины) на вставку, сумма
+//! глубин ограничена порогом [`MAX_SUM_DEPTH`].
 //!
-//! Перед `htmd` — точная проверка готового DOM ([`dom_check`]): максимальная глубина
-//! (рекурсивный обход `htmd` переполняет стек) и цена слияния соседних одинаковых строчных
-//! элементов (`htmd` удаляет их `Vec::remove` в цикле — квадратично по числу детей
-//! родителя). Пороги — по замеру рецензента (`.tmp/review7-bench.log`), с запасом на
-//! медленный CI; на обычных страницах не срабатывают.
+//! Перед `htmd` — один итеративный проход по готовому DOM ([`prepare_dom`]):
+//! - точная проверка максимальной глубины: рекурсивный обход `htmd` переполняет стек;
+//! - слияние соседних одинаковых строчных элементов ([`crate::merge`]). `htmd` сливает их
+//!   сам квадратично по числу и длине текста, после прохода сливаемых пар нет.
+//!
+//! Пороги — по замеру рецензента (`.tmp/review7-bench.log`), с запасом на медленный CI; на
+//! обычных страницах не срабатывают.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::tree_builder::TreeBuilderOpts;
 use html5ever::{Attribute, ExpandedName, ParseOpts, QualName, parse_document};
 use markup5ever_rcdom::{Handle, Node, NodeData, RcDom};
+
+use crate::merge;
 
 /// Куски входа для разборщика: порог проверяется после каждого (ревью задачи 7).
 const CHUNK: usize = 16 * 1024;
@@ -39,9 +49,12 @@ pub const MAX_DEPTH: usize = 256;
 pub const MAX_SUM_DEPTH: u64 = 20_000_000;
 /// Предел числа созданных элементов: память дерева ≈ 100–200 МБ при 600 тыс.
 pub const MAX_CREATED: usize = 600_000;
-/// Предел цены слияния соседей `htmd` (Σ по родителям числа сливаемых пар на число детей):
-/// при 2·10^9 слияние ≈ 0,25 с.
-pub const MAX_MERGE: u128 = 2_000_000_000;
+/// Предел суммарной длины поиска узла среди детей его родителя. `RcDom` ищет место вставки
+/// и удаления линейным проходом (`get_parent_and_index`) при переносе из таблицы (foster
+/// parenting) и при `remove_from_parent` (алгоритм усыновления). Поток элементов,
+/// перенесённых из одной таблицы, стоит квадратично: 2 МиБ `<table><i></i>…` — ≈ 11 с в
+/// release (замер прохода fix-9).
+pub const MAX_SCAN: u64 = 200_000_000;
 
 /// Причина отказа стража: имя превышенной величины (для отчёта и тестов). Пустой `Ok`
 /// означает, что разбор прошёл под порогами.
@@ -50,10 +63,13 @@ pub type GuardResult = Result<Handle, &'static str>;
 /// Страж: делегирует всё `RcDom`, параллельно считая события разбора.
 struct Guard {
     dom: RcDom,
-    /// Глубина вставки по указателю узла (глубина родителя + 1).
-    depth: RefCell<HashMap<usize, u32>>,
+    /// Фрагмент содержимого шаблона (по указателю) → сам элемент `template`: подъём от узла
+    /// внутри шаблона продолжается от шаблона.
+    templates: RefCell<HashMap<usize, Weak<Node>>>,
     created: Cell<usize>,
     sum_depth: Cell<u64>,
+    /// Суммарная длина поисков среди детей родителя ([`MAX_SCAN`]).
+    scan: Cell<u64>,
     /// Первая превышенная величина; дальше разбор можно прекращать.
     over: Cell<Option<&'static str>>,
 }
@@ -63,29 +79,82 @@ fn key(h: &Handle) -> usize {
 }
 
 impl Guard {
-    fn note_append(&self, parent: &Handle, child: &NodeOrText<Handle>) {
-        let NodeOrText::AppendNode(node) = child else {
+    /// Счёт после вставки элемента: его глубина в дереве и сумма глубин. После превышения
+    /// порога глубины не считаются — разбор будет прерван после текущего куска.
+    fn note_inserted(&self, node: Option<Handle>) {
+        let Some(node) = node else {
             return;
         };
-        if !matches!(node.data, NodeData::Element { .. }) {
-            return;
-        }
-        let parent_depth = self.depth.borrow().get(&key(parent)).copied().unwrap_or(0);
-        let depth = parent_depth + 1;
-        self.depth.borrow_mut().insert(key(node), depth);
-        self.sum_depth.set(self.sum_depth.get() + u64::from(depth));
         if self.over.get().is_some() {
             return;
         }
+        let depth = self.depth_of(&node);
+        self.sum_depth.set(self.sum_depth.get() + u64::from(depth));
         if depth as usize > MAX_DEPTH {
             self.over.set(Some("depth"));
         } else if self.sum_depth.get() > MAX_SUM_DEPTH {
             self.over.set(Some("sum_depth"));
         }
     }
+
+    /// Счёт перед вставкой рядом с `node` или его удалением: `RcDom` ищет `node` среди детей
+    /// его родителя линейным проходом, цена — не больше числа этих детей.
+    fn note_scan(&self, node: &Handle) {
+        let parent = node.parent.take();
+        let up = parent.as_ref().and_then(Weak::upgrade);
+        node.parent.set(parent);
+        let Some(parent) = up else {
+            return;
+        };
+        let scan = self.scan.get() + parent.children.borrow().len() as u64;
+        self.scan.set(scan);
+        if self.over.get().is_none() && scan > MAX_SCAN {
+            self.over.set(Some("scan"));
+        }
+    }
+
+    /// Глубина элемента: он сам и его предки-элементы. Подъём по указателям `parent`;
+    /// фрагмент содержимого `template` продолжается от шаблона. Подъём обрывается, когда
+    /// глубина уже больше [`MAX_DEPTH`]: дальше точное число не нужно.
+    fn depth_of(&self, node: &Handle) -> u32 {
+        let mut depth = 0u32;
+        let mut cur = Rc::clone(node);
+        loop {
+            if matches!(cur.data, NodeData::Element { .. }) {
+                depth += 1;
+                if depth as usize > MAX_DEPTH {
+                    return depth;
+                }
+            }
+            let parent = cur.parent.take();
+            let up = parent.as_ref().and_then(Weak::upgrade);
+            cur.parent.set(parent);
+            let next = up.or_else(|| {
+                self.templates
+                    .borrow()
+                    .get(&key(&cur))
+                    .and_then(Weak::upgrade)
+            });
+            match next {
+                Some(next) => cur = next,
+                None => return depth,
+            }
+        }
+    }
 }
 
-// `TreeSink` делегируется `RcDom`; свои только `create_element` и `append` — точки счёта.
+/// Вставляемый элемент (текст и комментарии глубину не считают).
+fn element_of(child: &NodeOrText<Handle>) -> Option<Handle> {
+    match child {
+        NodeOrText::AppendNode(node) if matches!(node.data, NodeData::Element { .. }) => {
+            Some(Rc::clone(node))
+        }
+        _ => None,
+    }
+}
+
+// `TreeSink` делегируется `RcDom`; свои — точки счёта: `create_element`, три вида вставки и
+// `get_template_contents`.
 impl TreeSink for Guard {
     type Handle = Handle;
     type Output = Self;
@@ -121,8 +190,9 @@ impl TreeSink for Guard {
         self.dom.create_pi(target, data)
     }
     fn append(&self, parent: &Handle, child: NodeOrText<Handle>) {
-        self.note_append(parent, &child);
+        let node = element_of(&child);
         self.dom.append(parent, child);
+        self.note_inserted(node);
     }
     fn append_based_on_parent_node(
         &self,
@@ -130,7 +200,11 @@ impl TreeSink for Guard {
         prev: &Handle,
         child: NodeOrText<Handle>,
     ) {
+        let node = element_of(&child);
+        // `RcDom`: у таблицы есть родитель — вставка перед ней (поиск среди его детей).
+        self.note_scan(element);
         self.dom.append_based_on_parent_node(element, prev, child);
+        self.note_inserted(node);
     }
     fn append_doctype_to_document(&self, name: StrTendril, public: StrTendril, system: StrTendril) {
         self.dom.append_doctype_to_document(name, public, system);
@@ -142,7 +216,11 @@ impl TreeSink for Guard {
         self.dom.pop(node);
     }
     fn get_template_contents(&self, target: &Handle) -> Handle {
-        self.dom.get_template_contents(target)
+        let contents = self.dom.get_template_contents(target);
+        self.templates
+            .borrow_mut()
+            .insert(key(&contents), Rc::downgrade(target));
+        contents
     }
     fn same_node(&self, x: &Handle, y: &Handle) -> bool {
         self.dom.same_node(x, y)
@@ -151,7 +229,10 @@ impl TreeSink for Guard {
         self.dom.set_quirks_mode(mode);
     }
     fn append_before_sibling(&self, sibling: &Handle, new_node: NodeOrText<Handle>) {
+        let node = element_of(&new_node);
+        self.note_scan(sibling);
         self.dom.append_before_sibling(sibling, new_node);
+        self.note_inserted(node);
     }
     fn add_attrs_if_missing(&self, target: &Handle, attrs: Vec<Attribute>) {
         self.dom.add_attrs_if_missing(target, attrs);
@@ -165,6 +246,7 @@ impl TreeSink for Guard {
         self.dom.associate_with_form(target, form, nodes);
     }
     fn remove_from_parent(&self, target: &Handle) {
+        self.note_scan(target);
         self.dom.remove_from_parent(target);
     }
     fn reparent_children(&self, node: &Handle, new_parent: &Handle) {
@@ -199,9 +281,10 @@ impl TreeSink for Guard {
 pub fn guarded_parse(html: &str) -> GuardResult {
     let guard = Guard {
         dom: RcDom::default(),
-        depth: RefCell::new(HashMap::new()),
+        templates: RefCell::new(HashMap::new()),
         created: Cell::new(0),
         sum_depth: Cell::new(0),
+        scan: Cell::new(0),
         over: Cell::new(None),
     };
     let mut parser = parse_document(
@@ -233,140 +316,20 @@ pub fn guarded_parse(html: &str) -> GuardResult {
     }
 }
 
-/// Точная проверка готового DOM до `htmd`: максимальная глубина и цена слияния соседей.
-/// `Ok(())` — можно звать `htmd`; `Err(reason)` — нужно линейное извлечение. Обход
-/// итеративный (стек не переполняется), 1–50 мс на 2 МиБ.
-pub fn dom_check(root: &Handle) -> Result<(), &'static str> {
+/// Подготовка готового DOM к `htmd`, один итеративный проход (стек не переполняется):
+/// точная проверка максимальной глубины и слияние соседних одинаковых строчных элементов
+/// ([`merge::merge_children`], за линейное время). `Ok(())` — можно звать `htmd`, сливаемых
+/// пар в дереве нет; `Err(reason)` — нужно линейное извлечение. 1–50 мс на 2 МиБ.
+pub fn prepare_dom(root: &Handle) -> Result<(), &'static str> {
     let mut stack = vec![(Rc::clone(root), 0usize)];
-    let mut merge = 0u128;
     while let Some((node, depth)) = stack.pop() {
         if depth > MAX_DEPTH {
             return Err("dom_depth");
         }
-        let children = node.children.borrow();
-        if children.len() > 1 {
-            let pairs = children
-                .windows(2)
-                .filter(|w| combinable(&w[0], &w[1]))
-                .count() as u128;
-            merge = merge.saturating_add(pairs * children.len() as u128);
-            if merge > MAX_MERGE {
-                return Err("merge");
-            }
-        }
-        for child in children.iter() {
+        merge::merge_children(&node);
+        for child in node.children.borrow().iter() {
             stack.push((Rc::clone(child), depth + 1));
         }
     }
     Ok(())
-}
-
-/// Два соседних узла, которые `htmd` 0.5.6 сольёт (`can_combine`, `src/dom_walker.rs`):
-/// оба — не блочные строчные элементы с одним текстовым ребёнком, одинаковым именем (с
-/// учётом пар `i`/`em`, `b`/`strong`) и атрибутами, не `a`. Блочные (`is_block`) `htmd`
-/// не сливает, поэтому страницы с множеством `<li>`/`<p>` цены слияния не набирают.
-fn combinable(a: &Node, b: &Node) -> bool {
-    let (
-        NodeData::Element {
-            name: n1,
-            attrs: a1,
-            ..
-        },
-        NodeData::Element {
-            name: n2,
-            attrs: a2,
-            ..
-        },
-    ) = (&a.data, &b.data)
-    else {
-        return false;
-    };
-    if is_block(&n1.local) || *n1.local == *"a" {
-        return false;
-    }
-    let same_name = n1 == n2
-        || (*n1.local == *"i" && *n2.local == *"em")
-        || (*n1.local == *"em" && *n2.local == *"i")
-        || (*n1.local == *"b" && *n2.local == *"strong")
-        || (*n1.local == *"strong" && *n2.local == *"b");
-    same_name && *a1.borrow() == *a2.borrow() && one_text_child(a) && one_text_child(b)
-}
-
-fn one_text_child(node: &Node) -> bool {
-    let children = node.children.borrow();
-    children.len() == 1 && matches!(children[0].data, NodeData::Text { .. })
-}
-
-/// Блочные элементы CommonMark — копия `BLOCK_ELEMENTS` из `htmd` 0.5.6
-/// (`src/dom_walker.rs`); при обновлении `htmd` сверить.
-fn is_block(tag: &str) -> bool {
-    const BLOCK: &[&str] = &[
-        "address",
-        "article",
-        "aside",
-        "base",
-        "basefont",
-        "blockquote",
-        "body",
-        "caption",
-        "center",
-        "col",
-        "colgroup",
-        "dd",
-        "details",
-        "dialog",
-        "dir",
-        "div",
-        "dl",
-        "dt",
-        "fieldset",
-        "figcaption",
-        "figure",
-        "footer",
-        "form",
-        "frame",
-        "frameset",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "head",
-        "header",
-        "hr",
-        "html",
-        "iframe",
-        "legend",
-        "li",
-        "link",
-        "main",
-        "menu",
-        "menuitem",
-        "nav",
-        "noframes",
-        "ol",
-        "optgroup",
-        "option",
-        "p",
-        "param",
-        "pre",
-        "script",
-        "search",
-        "section",
-        "style",
-        "summary",
-        "table",
-        "tbody",
-        "td",
-        "textarea",
-        "tfoot",
-        "th",
-        "thead",
-        "title",
-        "tr",
-        "track",
-        "ul",
-    ];
-    BLOCK.contains(&tag)
 }

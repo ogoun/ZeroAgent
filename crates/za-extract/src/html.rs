@@ -7,10 +7,12 @@
 //!
 //! До токенизатора — линейный подсчёт атрибутов в тегах ([`crate::attrs`]): проверка
 //! повторов атрибута у `html5ever` квадратична по их числу в одном теге. Разбор идёт под
-//! онлайн-стражем ([`crate::guard`]): квадратичные классы `html5ever` и `htmd` (глубокая
-//! вложенность, реконструкция активных элементов форматирования, «Noah's Ark», слияние
-//! соседей) прерываются до их разрастания. При превышении любого порога текст извлекается
-//! линейно без DOM ([`crate::linear`]) и результат несёт признак [`Markdown::simplified`].
+//! онлайн-стражем ([`crate::guard`]): квадратичные классы `html5ever` (глубокая вложенность,
+//! реконструкция активных элементов форматирования, «Noah's Ark») прерываются до их
+//! разрастания. Соседние одинаковые строчные элементы сливаются до `htmd` за линейное время
+//! ([`crate::merge`]): у `htmd` это слияние квадратично. При превышении любого порога текст
+//! извлекается линейно без DOM ([`crate::linear`]) и результат несёт признак
+//! [`Markdown::simplified`].
 //!
 //! Вызывается только в подпроцессе (D127, задача 10): обход DOM у `htmd` рекурсивный, и
 //! даже под стражем остаётся жёсткая граница — тайм-аут и предел вывода подпроцесса.
@@ -65,25 +67,29 @@ pub fn html_to_markdown(html: &str) -> Markdown {
     if attrs::attr_check(html).is_err() {
         return linear::linear_extract(html);
     }
-    // Страж прерывает квадратичный разбор на первых килобайтах; `dom_check` ловит глубину
-    // (рекурсия `htmd`) и цену слияния соседей до вызова `htmd`.
+    // Страж прерывает квадратичный разбор на первых килобайтах; `prepare_dom` ловит глубину
+    // (рекурсия `htmd`) и сливает соседей до `htmd` за линейное время.
     let Ok(tree) = guard::guarded_parse(html) else {
         return linear::linear_extract(html);
     };
-    if guard::dom_check(&tree).is_err() {
+    if guard::prepare_dom(&tree).is_err() {
         return linear::linear_extract(html);
     }
+    Markdown {
+        title: document_title(&tree),
+        text: render(&tree),
+        simplified: false,
+    }
+}
+
+/// Готовое дерево в Markdown: `htmd` со списком пропуска [`SKIPPED_TAGS`] и без картинок
+/// `data:`, серии пустых строк сжаты.
+pub(crate) fn render(tree: &Rc<Node>) -> String {
     let converter = HtmlToMarkdown::builder()
         .skip_tags(SKIPPED_TAGS.to_vec())
         .add_handler(vec!["img"], drop_data_image)
         .build();
-    let title = document_title(&tree);
-    let text = collapse_blank_lines(&converter.tree_to_markdown(&tree));
-    Markdown {
-        title,
-        text,
-        simplified: false,
-    }
+    collapse_blank_lines(&converter.tree_to_markdown(tree))
 }
 
 /// Картинка с адресом `data:` (`src` или `href`, как их читает `htmd`) в текст не попадает:

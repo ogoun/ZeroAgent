@@ -23,7 +23,22 @@ fn time_scale() -> u32 {
 /// быстро, а не висит минутами. Поток с большим стеком — страховка на случай, если страж
 /// пропустит глубину и `htmd` уйдёт в рекурсию.
 fn bounded(label: &str, html: String) -> Markdown {
-    let limit = Duration::from_secs(30) * time_scale();
+    bounded_within(label, html, Duration::from_secs(30) * time_scale())
+}
+
+/// Предел «около секунды в release» (I1 повторного ревью fix-7): в release — 1 с ×
+/// `ZA_TEST_TIME_SCALE`, в отладочной сборке (в 10–20 раз медленнее) — общий предел 30 с ×
+/// масштаб, только от зависания.
+fn release_second() -> Duration {
+    if cfg!(debug_assertions) {
+        Duration::from_secs(30) * time_scale()
+    } else {
+        Duration::from_secs(1) * time_scale()
+    }
+}
+
+/// [`bounded`] со своим пределом времени.
+fn bounded_within(label: &str, html: String, limit: Duration) -> Markdown {
     let (tx, rx) = mpsc::channel();
     let started = Instant::now();
     thread::Builder::new()
@@ -296,13 +311,79 @@ fn noahs_ark_is_simplified() {
     assert!(m.simplified);
 }
 
-/// Слияние соседних одинаковых строчных элементов у `htmd` (квадратично по числу детей):
-/// серии по 5000 `<b>x</b>`. Страж ловит цену слияния в `dom_check` → `simplified`.
+/// Слияние соседних одинаковых строчных элементов. У `htmd` оно квадратично: каждое слияние
+/// сдвигает список детей и копирует весь накопленный текст. Серия из r элементов с текстом
+/// длины L стоит ≈ L·r²/2 байт копирования (I1 повторного ревью fix-7: L = 40 — 13,3 с в
+/// release, больше тайм-аута подпроцесса). Серии сливаются до `htmd`, одним проходом за
+/// линейное время, поэтому страница идёт полным путём и быстро, при любой длине текста.
 #[test]
-fn adjacent_merge_is_simplified() {
+fn adjacent_merge_series_are_linear() {
+    for len in [1usize, 40, 400] {
+        let unit = format!("<b>{}</b>", "y".repeat(len));
+        let html = format!("<p>{}</p>", unit.repeat((2 * MIB - 16) / unit.len()));
+        let m = bounded_within(&format!("merge L={len}"), html, release_second());
+        assert!(!m.simplified, "L={len}: серия должна идти полным путём");
+        // Одна серия — один жирный отрезок, текст целиком.
+        assert_eq!(m.text.matches("**").count(), 2, "L={len}");
+        assert!(m.text.starts_with("**yyy") && m.text.ends_with("yyy**"));
+    }
+    // Много серий по 5000 `<b>x</b>` через пробел (прежний вид класса).
     let unit = format!("{} ", "<b>x</b>".repeat(5000));
-    let m = bounded("adjacent_merge", rep(&unit, 2 * MIB));
-    assert!(m.simplified);
+    let m = bounded_within("merge runs", rep(&unit, 2 * MIB), release_second());
+    assert!(!m.simplified);
+    assert!(m.text.starts_with(&format!("**{}**", "x".repeat(5000))));
+}
+
+// --- Страж: глубина вставки и там, где построитель переносит элементы (m1 ревью fix-7) ---
+
+/// Глубина узла, перенесённого из таблицы (foster parenting, `append_before_sibling`), и
+/// узла в содержимом `template` считается от настоящего места в дереве, а не от нуля:
+/// поддерево, начатое внутри глубокой таблицы, превышает порог глубины онлайн.
+#[test]
+fn guard_counts_depth_of_fostered_and_template_nodes() {
+    use za_extract::guard::{MAX_DEPTH, guarded_parse};
+    let outer = MAX_DEPTH - 60;
+    let inner = 100;
+    // Перенос из таблицы: `<div>` внутри `<table>` вставляется перед таблицей.
+    let fostered = format!(
+        "<html><body>{}<table>{}x</table></body></html>",
+        "<div>".repeat(outer),
+        "<div>".repeat(inner)
+    );
+    assert_eq!(
+        guarded_parse(&fostered).err(),
+        Some("depth"),
+        "foster parenting"
+    );
+    // Содержимое `template` — фрагмент вне дерева, но открыто внутри шаблона.
+    let template = format!(
+        "<html><body>{}<template>{}x</template></body></html>",
+        "<div>".repeat(outer),
+        "<div>".repeat(inner)
+    );
+    assert_eq!(guarded_parse(&template).err(), Some("depth"), "template");
+    // Под порогом — без отказа.
+    let shallow = format!(
+        "<html><body>{}<table>{}x</table></body></html>",
+        "<div>".repeat(20),
+        "<div>".repeat(20)
+    );
+    assert!(guarded_parse(&shallow).is_ok());
+}
+
+/// Перенос из таблицы потоком элементов: `RcDom` на каждый перенос ищет таблицу среди детей
+/// её родителя линейным проходом (`get_parent_and_index`), и 2 МиБ `<table><i></i>…` до
+/// исправления разбирались ≈ 11 с в release. Страж считает длину этих поисков → `simplified`.
+#[test]
+fn foster_parenting_flood_is_simplified() {
+    for unit in ["<i></i>", "<b>x</b>", "<div></div>"] {
+        let html = format!(
+            "<html><body><div><table>{}</table></div></body></html>",
+            rep(unit, 2 * MIB - 64)
+        );
+        let m = bounded_within(&format!("foster {unit}"), html, release_second());
+        assert!(m.simplified, "{unit}: перенос из таблицы не замечен");
+    }
 }
 
 // --- Атрибуты: проверка повторов `html5ever` квадратична по их числу в теге (fix-8) ---
@@ -375,6 +456,296 @@ fn quoted_values_in_script_do_not_hide_attribute_flood() {
     html.push_str(">tail</div>");
     let m = bounded("quoted_attrs", html);
     assert!(m.simplified);
+}
+
+/// Ложное упрощение (Ruling прохода fix-8, сомнение 3): в скрипте `i<n` и дальше больше 1024
+/// «слов» без `>`. Для токенизатора это текст скрипта, а не тег. Подсчёт атрибутов пропускает
+/// содержимое raw-text элементов так же, как токенизатор, поэтому страница идёт полным путём.
+#[test]
+fn tag_like_text_in_raw_text_is_not_simplified() {
+    let mut code = String::from("if (i<n) {");
+    for k in 0..1500 {
+        code.push_str(&format!(" x{k} = {k};"));
+    }
+    code.push_str(" }");
+    // Встроенный массив данных графика после цикла `i<n` (замечание ревью fix-8).
+    let numbers: Vec<String> = (0..5000).map(|k| (k * 7 % 1000).to_string()).collect();
+    let chart = format!(
+        "for (var i = 0; i<n; i++) {{ draw(i); }} var series = [{}];",
+        numbers.join(", ")
+    );
+    let html =
+        format!("<html><head><script>{chart}</script></head><body><p>chart page</p></body></html>");
+    let m = bounded("chart data", html);
+    assert!(!m.simplified, "массив данных графика: ложное упрощение");
+    assert!(m.text.contains("chart page"));
+    for (open, close) in [
+        ("<script>", "</script>"),
+        ("<SCRIPT type=module>", "</Script >"),
+        ("<style>", "</style>"),
+        ("<textarea>", "</textarea>"),
+        ("<title>", "</title>"),
+        ("<noscript>", "</noscript>"),
+    ] {
+        let html = format!(
+            "<html><head>{open}{code}{close}</head><body><p>after raw text</p></body></html>"
+        );
+        let m = bounded(open, html);
+        assert!(!m.simplified, "{open}: ложное упрощение");
+        assert!(m.text.contains("after raw text"), "{open}: {:?}", m.text);
+    }
+}
+
+/// Пропуск raw text не прячет настоящий тег: подсчёт пропускает только там, где токенизатор
+/// точно в raw text. Каждый вход несёт тег с 2000 атрибутами там, где его разберёт токенизатор.
+#[test]
+fn raw_text_skip_does_not_hide_attribute_flood() {
+    let attrs: String = (0..2000).map(|i| format!(" a{i}")).collect();
+    let flood = format!("<div{attrs}>tail</div>");
+    let cases = [
+        // `<script>` внутри `<noscript>` — текст noscript, после `</noscript>` — настоящий тег.
+        ("noscript", format!("<noscript><script></noscript>{flood}")),
+        // Конец скрипта, затем тег.
+        (
+            "after script",
+            format!("<script>if (i<n) x</script>{flood}"),
+        ),
+        ("upper end tag", format!("<SCRIPT>a</SCRIPT\t>{flood}")),
+        // `</scriptx` — не конец скрипта; тег — после настоящего конца.
+        (
+            "not an end tag",
+            format!("<script>a</scriptx b</script/>{flood}"),
+        ),
+        // Атрибуты у закрывающего тега токенизатор тоже собирает.
+        ("end tag attrs", format!("<script>x</script{attrs}>")),
+        ("rcdata end", format!("<title>a</title>{flood}")),
+        // В SVG `<script>` — обычный элемент: его содержимое разбирается как теги.
+        ("svg script", format!("<svg><script>{flood}</script></svg>")),
+        ("math", format!("<math><style>{flood}</style></math>")),
+        // `<!--<script>` внутри скрипта: двойное экранирование, первый `</script>` скрипт не
+        // закрывает, тег — после второго.
+        (
+            "double escape",
+            format!("<script><!--<script></script><style></script>{flood}</style>"),
+        ),
+        // Комментарий `<!--!>` не закрыт: `<script>` в нём — текст, тег — после `-->`.
+        ("comment", format!("<!--!><script>-->{flood}")),
+        // В шаблоне после `<col>` построитель пропускает `<script>`: raw text не начинается.
+        (
+            "template col",
+            format!("<template><col><script>{flood}</template>"),
+        ),
+        ("frameset", format!("<frameset><script>{flood}")),
+    ];
+    for (name, html) in cases {
+        let m = bounded(name, html);
+        assert!(m.simplified, "{name}: тег с 2000 атрибутами не замечен");
+    }
+}
+
+// --- Линейное извлечение: стек открытых пропускаемых элементов (I2 повторного ревью fix-7) ---
+
+/// Пустые элементы, `option` и `head` без закрывающего тега не обрывают текст: счётчик
+/// пропуска застревал на них, и весь текст после пропадал.
+#[test]
+fn linear_extract_closes_skipped_elements() {
+    let cases = [
+        ("<p>before</p><input name=q><p>after</p>", "before\nafter"),
+        ("<p>before</p><input name=q/><p>after</p>", "before\nafter"),
+        ("<p>before</p><embed src=/e><p>after</p>", "before\nafter"),
+        (
+            "<p>a</p><select><option>one<option>two</select><p>after select</p>",
+            "a\nafter select",
+        ),
+        (
+            "<p>a</p><datalist><option value=x>one<option>two</datalist><p>after list</p>",
+            "a\nafter list",
+        ),
+        (
+            "<html><head><title>T</title><body><p>body text</p>",
+            "body text",
+        ),
+        // `<body>` закрывает `head`, поэтому лишний `</head>` в теле не снимает `<object>`.
+        (
+            "<head><title>T</title><body><object>fallback</head>inside</object><p>after</p>",
+            "after",
+        ),
+        // Первый элемент тела закрывает `head` и без `<body>`; содержимое `head` не видно.
+        (
+            "<head><meta charset=utf-8><style>p{}</style><div>body text</div>",
+            "body text",
+        ),
+        // Текст в `head` тоже переходит в тело (как у построителя дерева).
+        (
+            "<head><title>T</title>Loose text<p>more</p>",
+            "Loose text\nmore",
+        ),
+        // Самозакрытый `<button/>` в стек не кладётся.
+        ("<p>a</p><button/><p>b</p>", "a\nb"),
+        // Закрывающий без пары не трогает стек.
+        (
+            "<p>a</p><select></button><option>x</option></select><p>b</p>",
+            "a\nb",
+        ),
+        // Ячейки таблицы разделены (m3).
+        ("<table><tr><td>a</td><td>b</td></tr></table>", "a\nb"),
+    ];
+    for (html, want) in cases {
+        let m = za_extract::linear::linear_extract(html);
+        assert_eq!(m.text, want, "{html}");
+        assert!(m.simplified);
+    }
+    let m = za_extract::linear::linear_extract("<html><head><title>T</title><body><p>x</p>");
+    assert_eq!(m.title.as_deref(), Some("T"));
+    // `<title>` внутри SVG заголовком страницы не считается (как на полном пути, m3).
+    let m = za_extract::linear::linear_extract("<svg><title>svg t</title></svg><p>x</p>");
+    assert_eq!((m.title, m.text.as_str()), (None, "x"));
+}
+
+/// Страницы вида Википедии и MDN (шапка с `<input>`, `<button>`, `<select>` без `</option>`,
+/// значки SVG, шаблоны теневого DOM) и обычные страницы корпуса: линейное извлечение
+/// сохраняет весь текст статьи и не меньше половины слов полного пути.
+#[test]
+fn linear_extract_keeps_page_text() {
+    for (name, html, markers) in [
+        ("wiki-like", wiki_like(), 200usize),
+        ("mdn-like", mdn_like(), 150),
+    ] {
+        let m = za_extract::linear::linear_extract(&html);
+        for i in 0..markers {
+            assert!(
+                m.text.contains(&format!("marker{i} ")),
+                "{name}: нет абзаца {i} ({} байт текста)",
+                m.text.len()
+            );
+        }
+        for gone in [
+            "move to sidebar",
+            "Search Wikipedia",
+            "Español",
+            "Toggle menu",
+            "RLCONF",
+        ] {
+            assert!(!m.text.contains(gone), "{name}: {gone} в тексте");
+        }
+        assert!(m.title.is_some(), "{name}: нет заголовка");
+    }
+    let mut pages = realistic_pages();
+    pages.push(("wiki-like", wiki_like()));
+    pages.push(("mdn-like", mdn_like()));
+    for (name, html) in pages {
+        let full = words(&without_link_targets(&html_to_markdown(&html).text));
+        let linear = words(&za_extract::linear::linear_extract(&html).text);
+        println!("words {name}: linear {linear} / full {full}");
+        assert!(2 * linear >= full, "{name}: {linear} слов из {full}");
+    }
+}
+
+/// Число слов (буквенно-цифровых последовательностей) в тексте.
+fn words(text: &str) -> usize {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .count()
+}
+
+/// Markdown без адресов ссылок и картинок (`](…)`): линейное извлечение ссылок не даёт,
+/// сравнивать нужно только текст.
+fn without_link_targets(md: &str) -> String {
+    let mut prose = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(at) = rest.find("](") {
+        prose.push_str(&rest[..=at]);
+        rest = rest[at..].find(')').map_or("", |end| &rest[at + end + 1..]);
+    }
+    prose.push_str(rest);
+    prose
+}
+
+/// Страница вида статьи Википедии (Vector 2022): шапка с флажками-переключателями меню,
+/// кнопками и формой поиска, сноски, таблицы, `<noscript>` с картинкой, скрипты в конце.
+fn wiki_like() -> String {
+    let mut html = String::from(
+        "<!DOCTYPE html>\n<html class=\"client-nojs\" lang=\"en\" dir=\"ltr\">\n<head>\n\
+         <meta charset=\"UTF-8\">\n<title>Rust (programming language) - Wikipedia</title>\n\
+         <script>document.documentElement.className=\"client-js\";RLCONF={\"wgBreakFrames\":false,\"wgPageName\":\"Rust\"};</script>\n\
+         <link rel=\"stylesheet\" href=\"/w/load.php?modules=site.styles&amp;only=styles\">\n\
+         <meta name=\"viewport\" content=\"width=1120\">\n</head>\n\
+         <body class=\"skin-vector-2022 mediawiki ltr\">\n\
+         <a class=\"mw-jump-link\" href=\"#bodyContent\">Jump to content</a>\n\
+         <div class=\"vector-header-container\"><header class=\"vector-header mw-header\">\
+         <div class=\"vector-dropdown\"><input type=\"checkbox\" id=\"vector-main-menu-dropdown-checkbox\" role=\"button\" aria-haspopup=\"true\" class=\"vector-dropdown-checkbox\" aria-label=\"Main menu\">\
+         <label for=\"vector-main-menu-dropdown-checkbox\" class=\"vector-dropdown-label\"><span class=\"vector-icon\"></span><span class=\"vector-dropdown-label-text\">Main menu</span></label>\
+         <div class=\"vector-dropdown-content\"><div class=\"vector-pinnable-header\"><div class=\"vector-pinnable-header-label\">Main menu</div>\
+         <button class=\"vector-pinnable-header-toggle-button vector-pinnable-header-pin-button\">move to sidebar</button>\
+         <button class=\"vector-pinnable-header-toggle-button vector-pinnable-header-unpin-button\">hide</button></div>\
+         <ul><li><a href=\"/wiki/Main_Page\">Main page</a></li><li><a href=\"/wiki/Contents\">Contents</a></li></ul></div></div>\
+         <form action=\"/w/index.php\" id=\"searchform\"><div class=\"cdx-search-input\">\
+         <input class=\"cdx-text-input__input\" type=\"search\" name=\"search\" placeholder=\"Search Wikipedia\" title=\"Search Wikipedia [f]\" accesskey=\"f\" id=\"searchInput\">\
+         <input type=\"hidden\" name=\"title\" value=\"Special:Search\"><button class=\"cdx-button\">Search</button></div></form>\
+         <input type=\"checkbox\" id=\"vector-appearance-dropdown-checkbox\" role=\"button\" aria-label=\"Appearance\">\
+         <input type=\"checkbox\" id=\"vector-user-links-dropdown-checkbox\" role=\"button\" aria-label=\"Personal tools\">\
+         </header></div>\n<div class=\"mw-page-container\"><main id=\"content\" class=\"mw-body\">\
+         <h1 id=\"firstHeading\"><span class=\"mw-page-title-main\">Rust (programming language)</span></h1>\
+         <input type=\"checkbox\" id=\"vector-page-titlebar-toc-checkbox\" class=\"vector-menu-checkbox\" role=\"button\">\
+         <div id=\"bodyContent\"><div id=\"mw-content-text\" class=\"mw-body-content\"><div class=\"mw-parser-output\" lang=\"en\" dir=\"ltr\">\n",
+    );
+    for i in 0..200 {
+        html.push_str(&format!(
+            "<h2 id=\"S{i}\">Section {i}</h2><p><b>Rust</b> article paragraph marker{i} about \
+             <a href=\"/wiki/Memory_safety\" title=\"Memory safety\">memory safety</a> and \
+             <a href=\"/wiki/Concurrency\">concurrency</a> in practice.<sup id=\"cite_ref-{i}\" class=\"reference\">\
+             <a href=\"#cite_note-{i}\"><span class=\"cite-bracket\">[</span>{i}<span class=\"cite-bracket\">]</span></a></sup></p>\n\
+             <table class=\"wikitable\"><tbody><tr><th>Key {i}</th><td>value {i}</td></tr></tbody></table>\n"
+        ));
+    }
+    html.push_str(
+        "</div></div></div><noscript><img src=\"https://login.wikimedia.org/wiki/Special:CentralAutoLogin/start?type=1x1\" alt=\"\" width=\"1\" height=\"1\"></noscript>\
+         </main></div>\n<script>(RLQ=window.RLQ||[]).push(function(){mw.config.set({\"wgHostname\":\"mw-web\"});});</script>\n</body>\n</html>\n",
+    );
+    html
+}
+
+/// Страница вида справочника MDN: значки SVG в кнопках, шаблоны теневого DOM в шапке, поиск,
+/// выбор языка `<select>` с `<option>` без закрывающих тегов, статья с таблицами.
+fn mdn_like() -> String {
+    let mut html = String::from(
+        "<!doctype html><html lang=\"en-US\" data-theme=\"light dark\"><head><meta charset=\"utf-8\">\
+         <title>HTML elements reference - HTML | MDN</title>\
+         <script>window.__mdn = {\"lang\": \"en-US\"}; if (a < b) { start(); }</script>\
+         <style>:root { --text: #1b1b1b; } .skip-link { position: absolute; }</style></head>\
+         <body class=\"page-layout\"><a class=\"skip-link\" href=\"#content\">Skip to main content</a>\
+         <header class=\"top-navigation\"><nav>\
+         <button type=\"button\" class=\"button action has-icon\" aria-label=\"Toggle menu\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\"><path d=\"M3 12h18M3 6h18M3 18h18\"/></svg><span class=\"visually-hidden\">Toggle menu</span></button>",
+    );
+    for k in 0..12 {
+        html.push_str(&format!(
+            "<mdn-dropdown><template shadowroot=\"open\" shadowrootmode=\"open\"><button part=\"button\">Toggle menu {k}</button>\
+             <svg width=\"16\" height=\"16\"><path d=\"M1 1l7 7 7-7\"/></svg></template><a href=\"/en-US/docs/Web/{k}\">Docs {k}</a></mdn-dropdown>"
+        ));
+    }
+    html.push_str(
+        "<form role=\"search\" action=\"/en-US/search\"><input type=\"search\" name=\"q\" placeholder=\"Search MDN\" autocomplete=\"off\">\
+         <button type=\"submit\">Search</button></form>\
+         <select id=\"language-selector\" name=\"language\"><option value=\"en-US\" selected>English (US)\
+         <option value=\"es\">Español<option value=\"fr\">Français<option value=\"ja\">日本語</select>\
+         </nav></header><main id=\"content\" class=\"main-content\"><article class=\"main-page-content\" lang=\"en-US\">\
+         <header><h1>HTML elements reference</h1></header>",
+    );
+    for i in 0..150 {
+        html.push_str(&format!(
+            "<section aria-labelledby=\"s{i}\"><h2 id=\"s{i}\"><a href=\"#s{i}\">Section {i}</a></h2>\
+             <div class=\"section-content\"><p>Reference paragraph marker{i} explains the \
+             <a href=\"/en-US/docs/Web/HTML/Element/div\"><code>&lt;div&gt;</code></a> element and its use.</p>\
+             <table class=\"standard-table\"><thead><tr><th scope=\"col\">Element</th><th scope=\"col\">Description</th></tr></thead>\
+             <tbody><tr><td><a href=\"/en-US/docs/Web/HTML/Element/p\"><code>&lt;p&gt;</code></a></td>\
+             <td>Represents a paragraph number {i}.</td></tr></tbody></table></div></section>"
+        ));
+    }
+    html.push_str(
+        "</article></main><footer class=\"page-footer\"><p>Your blueprint for a better internet.</p></footer>\
+         <script>document.querySelectorAll(\"mdn-dropdown\").forEach(function (d) { d.upgrade(); });</script></body></html>",
+    );
+    html
 }
 
 // --- Обычные страницы не деградируют ---
