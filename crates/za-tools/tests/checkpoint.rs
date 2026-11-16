@@ -2035,3 +2035,63 @@ async fn content_scan_cached_by_stat_and_fingerprint() {
     create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
     assert_eq!(count(b"plain\n"), 2);
 }
+
+/// Время изменения файла `rel` проекта — `at`.
+fn set_mtime(c: &Case, rel: &str, at: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(c.project.join(rel))
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
+}
+
+/// Повторное ревью задач 1–2, Minor 1: восстановление проверяет содержимое заново, без
+/// кэша итогов. На Windows у файла нет `ctime` и `ino` в ключе, и файл, ставший секретом
+/// с прежними размером и `mtime`, иначе прошёл бы по записи кэша «не секрет».
+#[tokio::test]
+async fn restore_rescans_content_without_cache() {
+    for git in [true, false] {
+        let c = case(if git {
+            "secret-rescan-git"
+        } else {
+            "secret-rescan-files"
+        });
+        if git {
+            c.init();
+        }
+        let value = secret_value();
+        let secret = format!("token = {value}\n");
+        let plain = format!("{}\n", "p".repeat(secret.len() - 1));
+        c.write("config.txt", "level = 1\n");
+        c.write("a.txt", "one\n");
+        let ck = c.ck().with_secret_filter(value_filter(value.clone()));
+        let cp = create(&ck, c.req_edit(&["config.txt", "a.txt"], git, RunId::new())).await;
+        // Файл не секрет и «старый» (кэш не доверяет файлам моложе 2 с): чекпоинт «до»
+        // запоминает итог «не секрет» по stat.
+        let old = std::time::SystemTime::now() - Duration::from_secs(600);
+        c.write("config.txt", &plain);
+        set_mtime(&c, "config.txt", old);
+        c.write("a.txt", "two\n");
+        within(
+            Duration::from_secs(60),
+            "чекпоинт перед восстановлением",
+            backup_before_restore(&ck, &c.root(), &cp, false, git),
+        )
+        .await
+        .expect("чекпоинт «до»");
+        // Файл стал секретом с тем же размером и тем же `mtime`.
+        c.write("config.txt", &secret);
+        set_mtime(&c, "config.txt", old);
+        let r = within(
+            Duration::from_secs(60),
+            "восстановление",
+            restore(&ck, &c.root(), &cp, false, git),
+        )
+        .await
+        .expect("восстановление");
+        assert_eq!(c.read("config.txt"), secret.as_bytes(), "git={git}");
+        assert_eq!(c.read("a.txt"), b"one\n", "git={git}");
+        assert_eq!(r.secret_untouched, ["config.txt"], "git={git}: {r:?}");
+    }
+}

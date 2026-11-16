@@ -7,7 +7,8 @@
 //! известных значений». Запись верна, только если файл не менялся позже, чем за
 //! [`RACY`] до проверки (как у кэша stat git). Смена набора значений (другой отпечаток)
 //! или stat файла — новая проверка. Отпечаток хранится только в памяти и на диск не
-//! пишется.
+//! пишется. Восстановление ([`SecretScan::now`]) запомненным итогом не пользуется и
+//! читает файл заново.
 
 use std::collections::HashMap;
 use std::fs::Metadata;
@@ -173,10 +174,16 @@ impl SecretScan {
         if meta.len() > SECRET_SCAN_MAX {
             return false;
         }
-        let (key, fp) = (StatKey::of(meta), f.fingerprint());
-        if let Some(s) = self.cached(abs, key, fp) {
+        let key = StatKey::of(meta);
+        if let Some(s) = self.cached(abs, key, f.fingerprint()) {
             return s;
         }
+        self.scan(f, rel, abs, key)
+    }
+
+    /// Проверка содержимого фильтром `f` без кэша; итог записывается в кэш.
+    fn scan(&self, f: &SecretFilter, rel: &str, abs: &Path, key: StatKey) -> bool {
+        let fp = f.fingerprint();
         let at_ns = now_ns();
         let mut buf = Vec::new();
         let read = std::fs::File::open(abs)
@@ -199,13 +206,24 @@ impl SecretScan {
     }
 
     /// Секрет ли сейчас файл `abs` (имя `rel`) — для восстановления (ревью задачи 2, I2):
-    /// по имени — всегда, по содержимому — если это обычный файл. Нет файла — только имя.
+    /// по имени — всегда, по содержимому — если это обычный файл до
+    /// [`SECRET_SCAN_MAX`] байт. Нет файла — только имя.
+    ///
+    /// Содержимое читается всегда, запомненный итог не используется (повторное ревью
+    /// задач 1–2, Minor 1): на Windows в ключе нет `ctime` и `ino`, и файл, изменённый с
+    /// прежними размером и `mtime`, прошёл бы по устаревшей записи «не секрет», а
+    /// восстановление перезаписало бы его без копии «до». Новый итог попадает в кэш.
     pub(crate) fn now(&self, rel: &str, abs: &Path) -> bool {
         if secret_name(rel) {
             return true;
         }
+        let Some(f) = &self.filter else {
+            return false;
+        };
         match std::fs::symlink_metadata(abs) {
-            Ok(m) if m.is_file() => self.is_secret(rel, abs, &m),
+            Ok(m) if m.is_file() && m.len() <= SECRET_SCAN_MAX => {
+                self.scan(f, rel, abs, StatKey::of(&m))
+            }
             _ => false,
         }
     }
