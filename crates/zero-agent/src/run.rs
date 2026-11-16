@@ -579,8 +579,9 @@ struct Wiring {
     web_disabled: Option<&'static str>,
     /// Хост поставщика поиска, если `web_search` зарегистрирован (D105).
     search_host: Option<String>,
-    /// Resume: веб-инструменты замороженного префикса, которые конфигурация выключила после
-    /// старта run, — имя и текст вызова (`ToolRegistry::withdraw`, Ruling «Задача 15»).
+    /// Resume: веб-инструменты и `activate_skill` замороженного префикса, которые
+    /// конфигурация выключила после старта run, — имя и текст вызова
+    /// (`ToolRegistry::withdraw`, Ruling «Задача 15»; [`withdrawn_skills`]).
     withdrawn: Vec<(String, String)>,
 }
 
@@ -606,6 +607,21 @@ fn withdrawn_web(
             Some((n.to_owned(), za_web::withdrawn_text(n, reason)))
         })
         .collect()
+}
+
+/// `activate_skill` замороженного префикса `frozen`, когда скиллы выключены после старта
+/// run (`[skills] enabled = false`, каталога нет), — имя и текст вызова (Minor 4 финального
+/// ревью скиллов, по образцу веба). Записанный `skill.load` пакет реплеит до реестра (D92).
+fn withdrawn_skills(
+    frozen: &BTreeSet<String>,
+    catalog: Option<&Arc<za_skills::Catalog>>,
+) -> Option<(String, String)> {
+    (catalog.is_none() && frozen.contains(za_agent::ACTIVATE_SKILL_TOOL)).then(|| {
+        (
+            za_agent::ACTIVATE_SKILL_TOOL.to_owned(),
+            za_agent::skills_withdrawn_text(),
+        )
+    })
 }
 
 /// Строка stderr resume о снятых веб-инструментах (`withdrawn` из [`withdrawn_web`]).
@@ -744,6 +760,14 @@ async fn wire(
     } else {
         None
     };
+    let mut withdrawn = withdrawn;
+    if let Some(off) = allowed.and_then(|names| withdrawn_skills(names, catalog.as_ref())) {
+        eprintln!(
+            "zero-agent: скиллы выключены после старта run ([skills] enabled = false): вызовы {} этого run не исполняются",
+            off.0
+        );
+        withdrawn.push(off);
+    }
     Ok(Wiring {
         web,
         extractor,
@@ -2249,6 +2273,26 @@ mod tests {
             RunId::new(),
         );
         assert!(native.is_some());
+    }
+
+    /// Minor 4 финального ревью скиллов: `activate_skill` префикса при выключенных скиллах
+    /// снимается с исполнения с текстом причины; при включённых или без него в префиксе —
+    /// нет.
+    #[test]
+    fn withdrawn_activate_skill_of_frozen_prefix() {
+        let frozen: BTreeSet<String> = ["read", "activate_skill"].map(str::to_owned).into();
+        assert_eq!(
+            withdrawn_skills(&frozen, None),
+            Some((
+                "activate_skill".to_owned(),
+                "activate_skill: skills are disabled by configuration since this run started"
+                    .to_owned()
+            ))
+        );
+        let cat = Arc::new(za_skills::Catalog::default());
+        assert_eq!(withdrawn_skills(&frozen, Some(&cat)), None);
+        let without: BTreeSet<String> = ["read"].map(str::to_owned).into();
+        assert_eq!(withdrawn_skills(&without, None), None);
     }
 
     /// Ruling «Задача 15», находка 1: веб-инструменты префикса, которых нет в реестре resume,

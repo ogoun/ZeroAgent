@@ -1325,6 +1325,51 @@ fn disabled_web_tool_explains_after_resume() {
     assert_eq!(sx.requests().len(), 1, "{:?}", sx.requests());
 }
 
+/// Модель: `activate_skill tdd` (`a1`), пауза на `ask_user`, затем `activate_skill review`
+/// (`a2`), затем ответ.
+fn activate_pause_activate(seen: &[Value]) -> Response {
+    let cur = seen.last().unwrap();
+    match tool_results(cur) {
+        0 => call_reply("a1", "activate_skill", r#"{"name":"tdd"}"#),
+        1 => call_reply("q1", "ask_user", r#"{"question":"Продолжить?"}"#),
+        2 => call_reply("a2", "activate_skill", r#"{"name":"review"}"#),
+        _ => text_reply(&["готово"]),
+    }
+}
+
+/// Minor 4 финального ревью скиллов (по образцу веба, Ruling «Задача 15»): скиллы выключены
+/// во время паузы (`[skills] enabled = false`), а `activate_skill` остался в замороженном
+/// префиксе. Вызов после resume отвечает понятным текстом, а не `unknown tool`; в stderr
+/// resume — строка о выключенных скиллах; загрузка до паузы в истории не тронута.
+#[test]
+fn disabled_skills_explain_after_resume() {
+    let srv = Fake::start(N_CTX, true, activate_pause_activate);
+    let e = env_in(GROUP, "disabled-skills-text", &llama_config(&srv.base));
+    let first = e.run(&run_args(&e, &[], &["Проверь скилл"]));
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!("{}\n[skills]\nenabled = false\n", llama_config(&srv.base)),
+    )
+    .unwrap();
+    let r = pause_answer_resume(&e, &[], &first);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert!(
+        result_of(&srv.bodies(), "a1").contains("<skill_content name=\"tdd\" source=\"bundled\""),
+        "{:?}",
+        result_of(&srv.bodies(), "a1")
+    );
+    assert_eq!(
+        result_of(&srv.bodies(), "a2"),
+        "activate_skill: skills are disabled by configuration since this run started"
+    );
+    assert!(
+        r.stderr.contains(
+            "zero-agent: скиллы выключены после старта run ([skills] enabled = false): вызовы activate_skill этого run не исполняются"
+        ),
+        "{r:?}"
+    );
+}
+
 // ---- Секрет в URL ----
 
 /// Значение `ZA_SECRET_DEMO`: собирается из частей во время выполнения (сканеры
