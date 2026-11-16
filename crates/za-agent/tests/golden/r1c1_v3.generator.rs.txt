@@ -1,0 +1,40 @@
+//! Генератор фикстуры `r1c1_v3.json` (R1-C2 задача 5, шаг 0, D130): снимок v3, записанный
+//! кодом R1-C1 на 0fa250c (до правок задачи 5) — тест `crates/za-agent/tests/resume.rs`
+//! с помощниками этого файла (`fx`, `ask`, `start`, `server_error`, `paused`).
+//! Запуск: `GEN_V3_FILE=<путь> cargo test -p za-agent --test resume gen_r1c1_v3`.
+
+#[tokio::test]
+async fn gen_r1c1_v3() {
+    let Ok(out) = std::env::var("GEN_V3_FILE") else {
+        return;
+    };
+    let mut f = fx("gen_r1c1_v3");
+    let cfg = za_agent::PolicyConfig {
+        rules: vec![za_agent::Rule {
+            action: za_agent::RuleAction::Deny,
+            tool: Some("bash".into()),
+            path: None,
+            command: Some("git push*".into()),
+            domain: None,
+        }],
+        ..za_agent::PolicyConfig::default()
+    };
+    f.deps.policy = za_agent::PolicySnapshot::build(&cfg, None).unwrap();
+    f.deps.audit_head = Some(za_agent::AuditHead {
+        seq: 7,
+        hash: "ab".repeat(32),
+    });
+    let mut s = ask();
+    s.trusted = false;
+    s.grants = vec![za_agent::Grant {
+        path: PathBuf::from("H:/data"),
+        mode: za_agent::GrantMode::Ro,
+        source: za_agent::GrantSource::Cli,
+        reason: "fixture".into(),
+    }];
+    f.model.push(server_error());
+    assert_eq!(start(&f, s).await.unwrap(), paused("provider"));
+    let (_, v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    assert_eq!(v["v"], 3);
+    std::fs::write(out, serde_json::to_string_pretty(&v).unwrap() + "\n").unwrap();
+}

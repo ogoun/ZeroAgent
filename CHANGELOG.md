@@ -5,6 +5,13 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, задача 5 (Rule of Two без вопросов, снимок v4; D106, D130, ADR 0006):
+  - `za-agent`: `Exposure { untrusted, private, external }` и `Exposure::untrusted_from` (любое происхождение метки, кроме `outside_project`); `ToolEnv.exposure` — снимок на начало пакета; `ToolsOutcome.exposure`, `rule_of_two`, `exposure_calls`. Флаги вызова хранятся в квитанции (`private`, `external`), реплей даёт те же значения. `decide`, `PolicyCx`, `REASON_ORDER` не менялись: сочетание трёх свойств вызов не останавливает (решение заказчика 2026-11-11);
+  - `za-agent`: запись аудита `rule_of_two {call_id, tool, exposure}` пишет слот «третьего» вызова при живом исполнении; драйвер после пакета пишет `exposure.changed {untrusted, private, external, calls, rule_of_two}` (после пакета, остановленного на прерывании, — нет: шаг доигрывается при resume);
+  - `za-agent`: снимок v4 — `Snapshot.exposure`, `Snapshot.skills` (`ActiveSkill`, пусто до задачи 13); снимки v1–v3 читаются, фикстура v3 — `tests/golden/r1c1_v3.json`;
+  - `zero-agent`: строка stderr SEC-052 один раз на `run` по первому событию с «третьим» вызовом;
+  - README: раздел «Rule of Two: экспозиция run», отмена SEC-052 и SEC-053 решением заказчика; ADR 0006;
+  - миграция: `SNAPSHOT_V = 4`, снимок версии 5 и выше не читается («версия снимка 5»); литералы `ToolEnv {…}` и `LoopState {…}` получают `exposure` (и `skills`); квитанции нативных вызовов вне проекта и сетевых — поля `private`, `external`.
 - R1-C2, проход fix-4, переносы в задачу 5 (m3 и сомнение 2):
   - `za-shell`: туннели и SOCKS у `ssh` (`-W`, `-L`, `-R`, `-D`) — подмена адреса, хост неизвестен, как у `-J`. У `sftp` и `scp` таких ключей нет: `-D` у них уже подмена, `-R` и `-l` — другие опции;
   - `za-agent`: в метке шаблона `domain` допустим `_` (`_dmarc.example.com`, `*.a_b.test`); README обновлён;

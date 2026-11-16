@@ -17,12 +17,12 @@ use support::*;
 
 use serde_json::{Value, json};
 use za_agent::{
-    CallVerdict, CompactInput, ContextConfig, CrashPoint, EnvInfo, FaultPoint, Grant, GrantMode,
-    GrantSource, LoopDeps, LoopError, LoopOutcome, PlannedCall, PolicyConfig, PolicySnapshot,
-    ResumeChange, Rule, RuleAction, RunSetup, RunSpec, Snapshot, TaskBlock, ToolEnv, ToolsOutcome,
-    TrustSetFn, builtin_tools, compact, control_channel, freeze, grants_text, prompt_texts_hash,
-    prompt_texts_hash_for, reasoning_for, render_task, request_grant_tool, resume_run, run_tools,
-    signal_channel, start_run,
+    CallVerdict, CompactInput, ContextConfig, CrashPoint, EnvInfo, Exposure, FaultPoint, Grant,
+    GrantMode, GrantSource, LoopDeps, LoopError, LoopOutcome, PlannedCall, PolicyConfig,
+    PolicySnapshot, ResumeChange, Rule, RuleAction, RunSetup, RunSpec, Snapshot, TaskBlock,
+    ToolEnv, ToolsOutcome, TrustSetFn, builtin_tools, compact, control_channel, freeze,
+    grants_text, prompt_texts_hash, prompt_texts_hash_for, reasoning_for, render_task,
+    request_grant_tool, resume_run, run_tools, signal_channel, start_run,
 };
 use za_core::paths::Roots;
 use za_core::{EventBus, Journal, RunCtx, Tool, ToolCx, ToolOutput, ToolRegistry};
@@ -715,6 +715,11 @@ struct Lx {
 }
 
 fn lx_with(name: &str, bash: BashStub) -> Lx {
+    lx_tools(name, bash, Vec::new())
+}
+
+/// Оснастка цикла с дополнительными инструментами (`extra`) сверх `read`, `edit`, `bash`.
+fn lx_tools(name: &str, bash: BashStub, extra: Vec<Arc<dyn Tool>>) -> Lx {
     let d = dirs(name);
     let store = ProjectStore::open(&d.journal).unwrap();
     let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)));
@@ -724,7 +729,9 @@ fn lx_with(name: &str, bash: BashStub) -> Lx {
         Arc::clone(&edit.applied),
         Arc::clone(&bash.seen),
     );
-    let reg = registry(vec![Arc::new(read), Arc::new(edit), Arc::new(bash)]);
+    let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(read), Arc::new(edit), Arc::new(bash)];
+    tools.extend(extra);
+    let reg = registry(tools);
     let mut deps = LoopDeps::new(
         Journal::new(store.clone(), EventBus::new(EventBus::DEFAULT_CAPACITY)),
         model.clone(),
@@ -1301,11 +1308,19 @@ async fn snapshot_v2_resumes_with_defaults() {
     let o = start(&l, spec(&l, RunMode::Auto)).await.unwrap();
     assert!(matches!(o, LoopOutcome::Paused { .. }), "{o:?}");
     let (seq, mut v) = l.store.latest_snapshot(l.run).await.unwrap().unwrap();
-    assert_eq!(v["v"], 3);
+    assert_eq!(v["v"], 4);
     let obj = v.as_object_mut().unwrap();
     obj.insert("v".into(), json!(2));
-    for k in ["policy", "trusted", "trust_refused", "grants", "taint"] {
-        assert!(obj.remove(k).is_some(), "в снимке v3 нет поля {k}");
+    for k in [
+        "policy",
+        "trusted",
+        "trust_refused",
+        "grants",
+        "taint",
+        "exposure",
+        "skills",
+    ] {
+        assert!(obj.remove(k).is_some(), "в снимке v4 нет поля {k}");
     }
     let last = events_of(&l.store, l.run).await.last().unwrap().seq;
     assert!(last >= seq);
@@ -1317,7 +1332,7 @@ async fn snapshot_v2_resumes_with_defaults() {
     );
     let (_, v) = l.store.latest_snapshot(l.run).await.unwrap().unwrap();
     let snap: Snapshot = serde_json::from_value(v).unwrap();
-    assert_eq!(snap.v, 3);
+    assert_eq!(snap.v, 4);
     assert!(!snap.trusted);
     assert!(snap.taint.is_empty());
     assert_eq!(snap.policy, PolicySnapshot::default());
@@ -1591,4 +1606,294 @@ async fn old_tool_started_without_paths_redecides() {
     assert!(!out.suspend.unwrap().id.ends_with("-path"));
     assert_eq!(applied.load(Ordering::SeqCst), 0);
     assert!(!target.exists());
+}
+
+// ---- R1-C2, задача 5: экспозиция Rule of Two (D106) ----
+
+/// Грант `ro` на внешний каталог теста.
+fn grant_ro(p: &Path) -> Grant {
+    Grant {
+        path: p.to_path_buf(),
+        mode: GrantMode::Ro,
+        source: GrantSource::Cli,
+        reason: String::new(),
+    }
+}
+
+fn exposure(untrusted: bool, private: bool, external: bool) -> Exposure {
+    Exposure {
+        untrusted,
+        private,
+        external,
+    }
+}
+
+/// Записи аудита `rule_of_two` журнала проекта.
+async fn rule_of_two_audit(store: &ProjectStore) -> Vec<za_store::AuditEntry> {
+    store
+        .audit_entries(0, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.action == za_protocol::audit_action::RULE_OF_TWO)
+        .collect()
+}
+
+/// D106: флаги ставят исполненные вызовы — чтение вне проекта по гранту (`private`),
+/// нативный сетевой вызов (`external`, а его метки — `untrusted`); отклонённый вызов флаг
+/// не ставит; реплей квитанции даёт те же флаги без инструмента.
+#[tokio::test]
+async fn exposure_set_by_executed_calls() {
+    let b = bx("exposure_calls").await;
+    let a = b.d.outside.join("a.txt");
+    std::fs::write(&a, "hello").unwrap();
+    std::fs::write(b.d.roots.project.join("in.txt"), "in").unwrap();
+    let web = WebStub::new();
+    let web_calls = Arc::clone(&web.calls);
+    let reg = registry(vec![Arc::new(ReadStub::new()), Arc::new(web)]);
+    let mut env = b.env(RunMode::Auto);
+    env.grants = Arc::new(vec![grant_ro(&b.d.outside)]);
+    let deny_web = PolicyConfig {
+        rules: vec![Rule {
+            action: RuleAction::Deny,
+            tool: Some("web_fetch".into()),
+            path: None,
+            command: None,
+            domain: None,
+        }],
+        ..PolicyConfig::default()
+    };
+    env.policy = Arc::new(PolicySnapshot::build(&deny_web, None).unwrap());
+    let calls = [
+        pc("in1", "read", json!({"path": "in.txt"})),
+        pc("r1", "read", json!({"path": s(&a)})),
+        pc("w1", "web_fetch", json!({"url": "https://a.test/"})),
+    ];
+    let out = b.batch(&reg, &env, 1, &calls).await;
+    assert_eq!(out.executed, ["in1", "r1"]);
+    assert!(content(&out, 2).1, "web_fetch не отклонён");
+    assert_eq!(web_calls.load(Ordering::SeqCst), 0);
+    // Чтение внутри проекта флагов не ставит, `outside_project` — не `untrusted`.
+    assert_eq!(out.exposure, exposure(false, true, false));
+    assert_eq!(out.exposure_calls, ["r1"]);
+    assert!(out.rule_of_two.is_empty());
+
+    // Без запрета: сетевой вызов — `external` и `untrusted` (метки `web`, `network`, `tool`).
+    let env = b.env(RunMode::Auto);
+    let calls = [pc("w2", "web_fetch", json!({"url": "https://a.test/"}))];
+    let out = b.batch(&reg, &env, 2, &calls).await;
+    assert_eq!(out.executed, ["w2"]);
+    assert_eq!(out.exposure, exposure(true, false, true));
+    assert_eq!(out.exposure_calls, ["w2"]);
+    assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+    // Реплей того же шага: квитанция, те же флаги, инструмент не вызван.
+    let again = b.batch(&reg, &env, 2, &calls).await;
+    assert_eq!(again.exposure, out.exposure);
+    assert_eq!(again.exposure_calls, out.exposure_calls);
+    assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Решение заказчика «не спрашивать»: при `untrusted` и `private` в снимке начала пакета
+/// сетевой вызов исполняется без вопроса; он — «третий» (`rule_of_two`), слот пишет
+/// запись аудита `rule_of_two`; реплей квитанции записи не повторяет.
+#[tokio::test]
+async fn third_property_allowed_and_recorded() {
+    let b = bx("third_property").await;
+    let web = WebStub::new();
+    let web_calls = Arc::clone(&web.calls);
+    let reg = registry(vec![Arc::new(web)]);
+    let mut env = b.env(RunMode::Auto);
+    env.exposure = exposure(true, true, false);
+    let calls = [pc("w1", "web_fetch", json!({"url": "https://a.test/"}))];
+    let out = b.batch(&reg, &env, 1, &calls).await;
+    assert!(out.suspend.is_none(), "{:?}", out.suspend);
+    assert_eq!(out.executed, ["w1"]);
+    assert!(!content(&out, 0).1);
+    assert_eq!(out.rule_of_two, ["w1"]);
+    assert_eq!(out.exposure, exposure(true, false, true));
+    let audit = rule_of_two_audit(&b.store).await;
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].target, b.run.to_string());
+    assert_eq!(
+        audit[0].payload,
+        json!({
+            "call_id": "w1",
+            "tool": "web_fetch",
+            "exposure": {"untrusted": true, "private": true, "external": true},
+        })
+    );
+    // Решение `tool.started` — разрешение режимом, а не вопрос.
+    let evs = b.events().await;
+    let st = of_kind(&evs, EventKind::ToolStarted);
+    assert_eq!(st[0].payload["decision"]["action"], "allow");
+    assert!(of_kind(&evs, EventKind::InterruptOpened).is_empty());
+    // Реплей: тот же итог, записи аудита не дублируются.
+    let again = b.batch(&reg, &env, 1, &calls).await;
+    assert_eq!(again.rule_of_two, ["w1"]);
+    assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rule_of_two_audit(&b.store).await.len(), 1);
+    // Одно свойство в снимке — сетевой вызов не «третий».
+    let mut env = b.env(RunMode::Auto);
+    env.exposure = exposure(false, true, false);
+    let calls = [pc("w2", "web_fetch", json!({"url": "https://a.test/"}))];
+    let out = b.batch(&reg, &env, 2, &calls).await;
+    assert!(out.rule_of_two.is_empty());
+    assert_eq!(rule_of_two_audit(&b.store).await.len(), 1);
+}
+
+/// D106, preflight 1.10: свойства берутся со снимка начала пакета. Группа одновременных
+/// чтений — внешнее чтение и сетевой вызов при одном `untrusted` в снимке — ни одного
+/// «третьего» вызова; после пакета установлены все три флага.
+#[tokio::test]
+async fn exposure_uses_batch_start_snapshot() {
+    let b = bx("batch_start").await;
+    let a = b.d.outside.join("a.txt");
+    std::fs::write(&a, "hello").unwrap();
+    let reg = registry(vec![Arc::new(ReadStub::new()), Arc::new(WebStub::new())]);
+    let mut env = b.env(RunMode::Auto);
+    env.parallel = true;
+    env.grants = Arc::new(vec![grant_ro(&b.d.outside)]);
+    env.exposure = exposure(true, false, false);
+    let calls = [
+        pc("r1", "read", json!({"path": s(&a)})),
+        pc("w1", "web_fetch", json!({"url": "https://a.test/"})),
+    ];
+    let out = b.batch(&reg, &env, 1, &calls).await;
+    assert_eq!(out.executed, ["r1", "w1"]);
+    assert!(out.rule_of_two.is_empty(), "{:?}", out.rule_of_two);
+    assert_eq!(out.exposure, exposure(true, true, true));
+    assert_eq!(out.exposure_calls, ["r1", "w1"]);
+    assert!(rule_of_two_audit(&b.store).await.is_empty());
+}
+
+fn lx_web(name: &str) -> (Lx, Arc<std::sync::atomic::AtomicUsize>) {
+    let web = WebStub::new();
+    let calls = Arc::clone(&web.calls);
+    (lx_tools(name, BashStub::new(), vec![Arc::new(web)]), calls)
+}
+
+/// События `exposure.changed` run.
+async fn exposure_events(l: &Lx) -> Vec<Value> {
+    of_kind(
+        &events_of(&l.store, l.run).await,
+        EventKind::ExposureChanged,
+    )
+    .into_iter()
+    .map(|e| e.payload.clone())
+    .collect()
+}
+
+/// Драйвер (D106): после пакета — `exposure.changed` при изменении флагов, вызов «третий»
+/// исполнен без вопроса, снимок v4 хранит флаги run. Недоверенный проект стартует с
+/// `untrusted`.
+#[tokio::test]
+async fn third_property_recorded_by_driver() {
+    let (l, web_calls) = lx_web("third_driver");
+    let a = l.d.outside.join("a.txt");
+    std::fs::write(&a, "hello").unwrap();
+    let mut sp = spec(&l, RunMode::Auto);
+    sp.trusted = false;
+    sp.grants = vec![grant_ro(&l.d.outside)];
+    l.model
+        .push(calls(&[("r1", "read", json!({"path": s(&a)}))]));
+    l.model.push(calls(&[(
+        "w1",
+        "web_fetch",
+        json!({"url": "https://a.test/?q=hello"}),
+    )]));
+    l.model.push(answer("ok"));
+    assert_eq!(start(&l, sp).await.unwrap(), done("ok"));
+    assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        exposure_events(&l).await,
+        [
+            json!({"untrusted": true, "private": true, "external": false,
+                "calls": ["r1"], "rule_of_two": []}),
+            json!({"untrusted": true, "private": true, "external": true,
+                "calls": ["w1"], "rule_of_two": ["w1"]}),
+        ]
+    );
+    let audit = rule_of_two_audit(&l.store).await;
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].payload["call_id"], "w1");
+    let (_, v) = l.store.latest_snapshot(l.run).await.unwrap().unwrap();
+    let snap: Snapshot = serde_json::from_value(v).unwrap();
+    assert_eq!(snap.v, 4);
+    assert_eq!(snap.exposure, exposure(true, true, true));
+    assert!(snap.skills.is_empty());
+}
+
+/// D106: один пакет с внешним чтением и сетевым вызовом при одном `untrusted` — одно
+/// событие `exposure.changed` со всеми тремя флагами, без «третьего» вызова и записи аудита.
+#[tokio::test]
+async fn one_batch_two_properties_one_event() {
+    let (l, _) = lx_web("one_event");
+    let a = l.d.outside.join("a.txt");
+    std::fs::write(&a, "hello").unwrap();
+    let mut sp = spec(&l, RunMode::Auto);
+    sp.trusted = false;
+    sp.grants = vec![grant_ro(&l.d.outside)];
+    l.model.push(calls(&[
+        ("r1", "read", json!({"path": s(&a)})),
+        ("w1", "web_fetch", json!({"url": "https://a.test/"})),
+    ]));
+    l.model.push(answer("ok"));
+    assert_eq!(start(&l, sp).await.unwrap(), done("ok"));
+    assert_eq!(
+        exposure_events(&l).await,
+        [json!({"untrusted": true, "private": true, "external": true,
+            "calls": ["r1", "w1"], "rule_of_two": []})]
+    );
+    assert!(rule_of_two_audit(&l.store).await.is_empty());
+}
+
+/// D106: «третий» вызов исполнен до паузы одобрения соседнего вызова — запись аудита есть
+/// уже на паузе (run можно и не продолжить); после ответа шаг доигрывается по квитанции:
+/// сетевой вызов не повторяется, запись аудита не дублируется, `exposure.changed` — одно.
+#[tokio::test]
+async fn rule_of_two_recorded_once_across_approval_pause() {
+    let (l, web_calls) = lx_web("rot_pause");
+    let a = l.d.outside.join("a.txt");
+    std::fs::write(&a, "hello").unwrap();
+    let mut sp = spec(&l, RunMode::Ask);
+    sp.trusted = false;
+    sp.grants = vec![grant_ro(&l.d.outside)];
+    l.model
+        .push(calls(&[("r1", "read", json!({"path": s(&a)}))]));
+    l.model.push(calls(&[
+        ("w1", "web_fetch", json!({"url": "https://a.test/"})),
+        (
+            "e1",
+            "edit",
+            json!({"path": "n.txt", "old": "", "new": "x"}),
+        ),
+    ]));
+    let o = start(&l, sp).await.unwrap();
+    let id = paused_id(&o);
+    assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rule_of_two_audit(&l.store).await.len(), 1);
+    // На паузе — только событие первого пакета: второй доиграется при resume.
+    assert_eq!(exposure_events(&l).await.len(), 1);
+    assert!(
+        l.store
+            .resolve_interrupt(&id, json!({"approved": true}))
+            .await
+            .unwrap()
+    );
+    l.model.push(answer("ok"));
+    assert_eq!(
+        resume(&l, &l.deps, ResumeChange::default()).await.unwrap(),
+        done("ok")
+    );
+    assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(l.applied.load(Ordering::SeqCst), 1);
+    let audit = rule_of_two_audit(&l.store).await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    let ev = exposure_events(&l).await;
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    assert_eq!(
+        ev[1],
+        json!({"untrusted": true, "private": true, "external": true,
+            "calls": ["w1"], "rule_of_two": ["w1"]})
+    );
 }

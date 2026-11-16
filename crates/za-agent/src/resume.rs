@@ -64,6 +64,8 @@ const STATE_PAGE: usize = 512;
 const SNAPSHOT_V1: u32 = 1;
 /// Версия снимка R1-B2 (R1-C1 D92): читается, поля R1-C1 — по умолчанию.
 const SNAPSHOT_V2: u32 = 2;
+/// Версия снимка R1-C1 (R1-C2 D130): читается, экспозиция и скиллы — по умолчанию.
+const SNAPSHOT_V3: u32 = 3;
 /// Начало управляющего сообщения рантайма: не ввод пользователя (D66).
 pub(crate) const RUNTIME_CONTROL: &str = "<control from=\"runtime\"";
 /// Начало поправки пользователя (A.6, `prompts/control.txt`).
@@ -140,7 +142,7 @@ pub async fn resume_run(
         return Err(fail_broken(deps, run, status, generation, e).await);
     };
     let ver = v.get("v").and_then(Value::as_u64);
-    if ![SNAPSHOT_V, SNAPSHOT_V2, SNAPSHOT_V1]
+    if ![SNAPSHOT_V, SNAPSHOT_V3, SNAPSHOT_V2, SNAPSHOT_V1]
         .iter()
         .any(|v| ver == Some(u64::from(*v)))
     {
@@ -379,6 +381,9 @@ async fn restore(
         taint: snap.taint,
         // D91: голова аудита этого продолжения (бинарник сверил прежнюю), иначе прежняя.
         audit_head: deps.audit_head.clone().or(snap.audit_head),
+        // D106: снимок до R1-C2 — без флагов; `untrusted` следует меткам (`exposure_now`).
+        exposure: snap.exposure,
+        skills: snap.skills,
         detectors: {
             // D62: кэш сервера за время паузы или на новом эндпоинте не тот, что был.
             let mut d = snap.detectors;

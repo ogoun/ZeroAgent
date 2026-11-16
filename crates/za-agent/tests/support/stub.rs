@@ -291,6 +291,62 @@ impl Tool for TextStub {
     }
 }
 
+/// Сетевое чтение с контрактом `web_fetch` таблицы D123 (R1-C2): `kind = Read`,
+/// `risk = Network`, `tainted`, тайм-аут 60 с, вывод 128 КиБ; результат — `page <url>` с
+/// меткой `web`. Настоящий `web_fetch` — в `za-web` (задача 8). `calls` — число вызовов.
+pub struct WebStub {
+    pub spec: ToolSpec,
+    pub calls: Arc<AtomicUsize>,
+}
+
+impl WebStub {
+    pub fn new() -> Self {
+        Self {
+            spec: ToolSpec {
+                schema: ToolSchema {
+                    name: "web_fetch".into(),
+                    description: "stub web_fetch".into(),
+                    parameters: json!({"type": "object"}),
+                },
+                class: EffectClass::ReadOnly,
+                kind: ToolKind::Read,
+                approval: Approval::Mode,
+                risk: RiskClass::Network,
+                roles: vec![RunRole::Top, RunRole::Orchestrator, RunRole::Worker],
+                min_tier: Tier::Standard,
+                timeout: Duration::from_secs(60),
+                output_limit: Some(128 * 1024),
+                tainted: true,
+            },
+            calls: Arc::default(),
+        }
+    }
+}
+
+impl Tool for WebStub {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn subjects(&self, _args: &Value) -> Subjects {
+        Subjects {
+            network: true,
+            ..Subjects::default()
+        }
+    }
+
+    fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let url = args["url"].as_str().unwrap_or_default().to_owned();
+        Box::pin(async move {
+            ToolOutput {
+                taint: Some(za_protocol::taint_origin::WEB.to_owned()),
+                ..ToolOutput::ok(format!("page {url}"))
+            }
+        })
+    }
+}
+
 /// Чекпоинт-заглушка: запоминает запросы, отвечает видом `files` и пропущенными как
 /// секреты путями `secret_skipped` (D103).
 #[derive(Default)]

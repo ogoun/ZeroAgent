@@ -81,7 +81,9 @@ use crate::request::{
 };
 use crate::resume::state_block;
 use crate::state::{AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit};
-use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools};
+use crate::tools::{
+    Exposure, FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools,
+};
 use crate::turn::{
     CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed, Signal,
     TurnError, TurnOutput, model_turn_masked, output_tps, report_parse_errors, review,
@@ -531,6 +533,11 @@ async fn step_zero(
         // событии run. Шаг 0 не реплеится, поэтому это чтение — вход цикла, а не его ход.
         None => last_event_seq(&store, run).await?,
     };
+    let taint = if spec.trusted {
+        BTreeSet::new()
+    } else {
+        BTreeSet::from([taint_origin::UNTRUSTED_PROJECT.to_owned()])
+    };
     let st = LoopState {
         run,
         ctx,
@@ -567,13 +574,15 @@ async fn step_zero(
         trusted: spec.trusted,
         trust_refused: false,
         grants: spec.grants,
-        // D82, Ruling 7.20: недоверенный проект помечен с шага 0.
-        taint: if spec.trusted {
-            BTreeSet::new()
-        } else {
-            BTreeSet::from([taint_origin::UNTRUSTED_PROJECT.to_owned()])
+        // D106: недоверенный проект — `untrusted` с шага 0.
+        exposure: Exposure {
+            untrusted: Exposure::untrusted_from(&taint),
+            ..Exposure::default()
         },
+        // D82, Ruling 7.20: недоверенный проект помечен с шага 0.
+        taint,
         audit_head: deps.audit_head.clone(),
+        skills: Vec::new(),
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
@@ -2273,6 +2282,7 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         fault: deps.fault.clone(),
         step: st.ctx.step(),
         trust_set: deps.trust_set.clone(),
+        exposure: st.exposure_now(),
     };
     // Флаги наблюдаются рядом с пакетом (D26): `pausing`/`cancelling` пишутся сразу,
     // не дожидаясь конца идущего инструмента. На сигналы пакет реагирует сам.
@@ -2331,7 +2341,7 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
     if out.halted {
         return Err(LoopError::Halted);
     }
-    // Состояние пакета (D78, D82, D83): метки, гранты, доверие.
+    // Состояние пакета (D78, D82, D83, D106): метки, гранты, доверие, экспозиция.
     st.taint.append(&mut out.taint);
     st.grants.append(&mut out.grants);
     match out.trusted {
@@ -2339,9 +2349,17 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         Some(false) => st.trust_refused = true,
         None => {}
     }
+    let before = env.exposure;
+    st.exposure = before.union(out.exposure);
+    st.exposure.untrusted |= Exposure::untrusted_from(&st.taint);
     // `ToolsOutcome` не различает Pause и Input: решают флаги (Carry к задаче 12/14).
     let flags = *st.sig.flags().borrow();
     let verdict = tools_verdict(&out, flags)?;
+    // D106: пакет, остановленный на прерывании, доигрывается при resume по квитанциям —
+    // событие пишет тот проход, что дошёл до конца пакета (без дублей).
+    if verdict != ToolsVerdict::Suspend && st.exposure != before {
+        exposure_changed(deps, st, &out.exposure_calls, &out.rule_of_two).await?;
+    }
     let ToolsOutcome {
         results,
         suspend,
@@ -2702,6 +2720,33 @@ async fn backoff(deps: &LoopDeps, st: &mut LoopState, d: Duration) -> Result<(),
             }
         }
     }
+}
+
+/// `exposure.changed {untrusted, private, external, calls, rule_of_two}` (D106): флаги run
+/// после пакета, вызовы с новым флагом и «третьи» вызовы (о них — записи аудита
+/// `rule_of_two`; по непустому `rule_of_two` бинарник печатает строку SEC-052).
+async fn exposure_changed(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    calls: &[String],
+    rule_of_two: &[String],
+) -> Result<(), StoreError> {
+    let e = st.exposure;
+    st.last_seq = append(
+        &deps.journal,
+        st.run,
+        Actor::Runtime,
+        EventKind::ExposureChanged,
+        json!({
+            "untrusted": e.untrusted,
+            "private": e.private,
+            "external": e.external,
+            "calls": calls,
+            "rule_of_two": rule_of_two,
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// `loop.detected {detector, action, turn}` (D63).

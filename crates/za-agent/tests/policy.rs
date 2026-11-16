@@ -14,15 +14,17 @@ use std::time::Duration;
 
 use serde_json::json;
 use za_agent::{
-    Decision, Grant, GrantConfig, GrantMode, GrantSource, PolicyConfig, PolicyCx, PolicyError,
-    PolicySnapshot, Rule, RuleAction, RuleSource, covers, decide, grants_text, parse_grant_flag,
-    runtime_texts, subject_paths,
+    Decision, Exposure, Grant, GrantConfig, GrantMode, GrantSource, PolicyConfig, PolicyCx,
+    PolicyError, PolicySnapshot, Rule, RuleAction, RuleSource, covers, decide, grants_text,
+    parse_grant_flag, runtime_texts, subject_paths,
 };
 use za_core::net::{normalize_host, shell_hosts};
 use za_core::paths::{ResolvedPath, Roots, classify, protected_place, resolve, within};
 use za_core::shell::{self, Dialect};
 use za_core::{Access, Approval, RawPath, RiskClass, Subjects, ToolKind, ToolSchema, ToolSpec};
-use za_protocol::{EffectClass, RunMode, RunRole, Tier, approval_reason as ar, deny_reason};
+use za_protocol::{
+    EffectClass, RunMode, RunRole, Tier, approval_reason as ar, deny_reason, taint_origin,
+};
 
 // ---- Помощники ----
 
@@ -1055,6 +1057,93 @@ fn tainted_never_asks() {
         Cx::new(RunMode::Auto).decide(&bash_spec(), &bash(&r, "curl -s https://example.com")),
         Decision::Allow
     );
+}
+
+// ---- R1-C2, задача 5: Rule of Two без вопросов (D106, решение заказчика 2026-11-11) ----
+
+/// Решение заказчика «не спрашивать»: `decide` не знает экспозиции, и сочетание трёх
+/// свойств вопроса не даёт. Недоверенное содержимое — метка `web`, приватные данные —
+/// чтение вне проекта (`outside_project`); вызов, который добавил бы третье свойство,
+/// идёт по режиму. Без гранта чтение вне проекта спрашивается, как в R1-C1, — только
+/// `outside_project`, без `rule_of_two`.
+#[test]
+fn rule_of_two_never_asks() {
+    let r = roots();
+    let cx = Cx::new(RunMode::Auto)
+        .taint(taint_origin::WEB)
+        .taint(taint_origin::OUTSIDE_PROJECT);
+    // untrusted + private: сетевое чтение — внешняя связь.
+    assert_eq!(cx.decide(&fetch_spec(), &fetch("a.test")), Decision::Allow);
+    assert_eq!(cx.decide(&search_spec(), &search()), Decision::Allow);
+    // untrusted + external: чтение вне проекта по гранту ro — приватные данные.
+    let read_out = one(&r, &pat("/data/x"), Access::Read);
+    let with_grant = Cx::new(RunMode::Auto)
+        .taint(taint_origin::WEB)
+        .taint(taint_origin::NETWORK)
+        .grants(vec![g_ro("/data")]);
+    assert_eq!(with_grant.decide(&read_spec(), &read_out), Decision::Allow);
+    let no_grant = Cx::new(RunMode::Auto).taint(taint_origin::WEB);
+    assert_eq!(
+        no_grant.decide(&read_spec(), &read_out),
+        ask(&[ar::OUTSIDE_PROJECT])
+    );
+    // Команда с внешним путём по гранту rw после чтения сети — по режиму.
+    assert_eq!(
+        Cx::new(RunMode::Auto)
+            .taint(taint_origin::WEB)
+            .grants(vec![grant("/etc", GrantMode::Rw)])
+            .decide(&bash_spec(), &bash(&r, &format!("cat {}", pat("/etc/x")))),
+        Decision::Allow
+    );
+    // В порядке причин одобрения нет `rule_of_two` (REASON_ORDER R1-C1 без изменений).
+    assert!(
+        !runtime_texts()
+            .iter()
+            .any(|(_, t)| t.contains(za_protocol::audit_action::RULE_OF_TWO)),
+        "rule_of_two не должен попадать в тексты модели"
+    );
+}
+
+/// R1-C1 (D82, решение заказчика): метка `web` вопросов к командам не добавляет.
+#[test]
+fn tainted_never_asks_still_holds() {
+    let r = roots();
+    for origin in [taint_origin::WEB, taint_origin::NETWORK, taint_origin::TOOL] {
+        assert_eq!(
+            Cx::new(RunMode::Auto)
+                .taint(origin)
+                .decide(&bash_spec(), &bash(&r, "cargo test")),
+            Decision::Allow,
+            "{origin}"
+        );
+    }
+}
+
+/// D106, preflight 1.9: `untrusted` — любое происхождение метки, кроме `outside_project`
+/// (чтение вне проекта — свойство `private`, а не недоверенный ввод).
+#[test]
+fn untrusted_ignores_outside_project_origin() {
+    let set = |o: &[&str]| {
+        o.iter()
+            .map(|s| (*s).to_owned())
+            .collect::<BTreeSet<String>>()
+    };
+    assert!(!Exposure::untrusted_from(&BTreeSet::new()));
+    assert!(!Exposure::untrusted_from(&set(&[
+        taint_origin::OUTSIDE_PROJECT
+    ])));
+    for o in [
+        taint_origin::WEB,
+        taint_origin::NETWORK,
+        taint_origin::TOOL,
+        taint_origin::UNTRUSTED_PROJECT,
+    ] {
+        assert!(Exposure::untrusted_from(&set(&[o])), "{o}");
+        assert!(
+            Exposure::untrusted_from(&set(&[o, taint_origin::OUTSIDE_PROJECT])),
+            "{o} + outside_project"
+        );
+    }
 }
 
 #[test]

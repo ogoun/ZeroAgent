@@ -118,6 +118,62 @@ pub struct FinishArgs {
 /// Допустимые значения `FinishArgs::status`.
 const FINISH_STATUSES: [&str; 3] = ["done", "partial", "blocked"];
 
+/// Экспозиция Rule of Two (SEC-052, R1-C2 D106): три независимых свойства run. Вызовов не
+/// прерывает — решение заказчика 2026-11-11 «Не спрашивать» (ADR 0006): пишется в журнал
+/// (`exposure.changed`) и аудит (`rule_of_two`); `decide` и `PolicyCx` её не получают.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exposure {
+    /// В контексте недоверенное содержимое: метка любого происхождения, кроме
+    /// `outside_project`.
+    pub untrusted: bool,
+    /// Исполнен нативный вызов с путём вне проекта, в том числе по гранту.
+    pub private: bool,
+    /// Исполнен нативный сетевой вызов (`risk = Network`).
+    pub external: bool,
+}
+
+impl Exposure {
+    /// `untrusted` по меткам: любое происхождение, кроме `outside_project` — чтение вне
+    /// проекта даёт свойство `private`, а не недоверенный ввод (D106, preflight 1.9).
+    pub fn untrusted_from(taint: &BTreeSet<String>) -> bool {
+        untrusted_origin(taint)
+    }
+
+    /// Флаги, установленные хотя бы в одном из двух.
+    pub fn union(self, o: Self) -> Self {
+        Self {
+            untrusted: self.untrusted || o.untrusted,
+            private: self.private || o.private,
+            external: self.external || o.external,
+        }
+    }
+
+    /// Вызов с флагами `call` ставит третье свойство при двух, установленных в `self` —
+    /// снимке начала пакета (D106).
+    pub fn third_by(self, call: Self) -> bool {
+        self.count() == 2 && self.union(call).count() == 3
+    }
+
+    /// Вызов с флагами `call` ставит флаг, которого в `self` нет.
+    fn adds(self, call: Self) -> bool {
+        self.union(call) != self
+    }
+
+    fn count(self) -> usize {
+        [self.untrusted, self.private, self.external]
+            .into_iter()
+            .filter(|b| *b)
+            .count()
+    }
+}
+
+/// Среди происхождений есть недоверенное (не `outside_project`).
+fn untrusted_origin<'a>(origins: impl IntoIterator<Item = &'a String>) -> bool {
+    origins
+        .into_iter()
+        .any(|o| o != taint_origin::OUTSIDE_PROJECT)
+}
+
 /// Итог пакета вызовов.
 #[derive(Debug, Default)]
 pub struct ToolsOutcome {
@@ -146,6 +202,15 @@ pub struct ToolsOutcome {
     /// Точка сбоя [`CrashPoint::InTool`] сработала: future слота брошен (D92), драйвер
     /// возвращает `LoopError::Halted`.
     pub halted: bool,
+    /// Флаги экспозиции исполненных вызовов (D106; вживую и по квитанции): драйвер
+    /// объединяет их с флагами run. Отклонённый вызов флаг не ставит.
+    pub exposure: Exposure,
+    /// `call_id` исполненных вызовов, поставивших третье свойство при двух в снимке начала
+    /// пакета ([`ToolEnv::exposure`]); запись аудита `rule_of_two` о каждом пишет слот.
+    pub rule_of_two: Vec<String>,
+    /// `call_id` исполненных вызовов, поставивших флаг, которого в снимке начала пакета не
+    /// было (`calls` события `exposure.changed`).
+    pub exposure_calls: Vec<String>,
 }
 
 /// Набор доверенных файлов проекта для payload прерывания `Trust` (D83): по корню
@@ -188,6 +253,9 @@ pub struct ToolEnv {
     pub step: u64,
     /// Набор доверенных файлов для прерывания `Trust`; `None` — пустой набор.
     pub trust_set: Option<TrustSetFn>,
+    /// Экспозиция run на начало пакета (D106): по ней одной считается «третий» вызов —
+    /// аргументы вызовов пакета выбраны до их результатов.
+    pub exposure: Exposure,
 }
 
 impl fmt::Debug for ToolEnv {
@@ -206,6 +274,7 @@ impl fmt::Debug for ToolEnv {
             .field("checkpointer", &self.checkpointer.is_some())
             .field("masker", &self.masker.is_some())
             .field("step", &self.step)
+            .field("exposure", &self.exposure)
             .finish_non_exhaustive()
     }
 }
@@ -243,6 +312,7 @@ impl ToolEnv {
             fault: None,
             step: 0,
             trust_set: None,
+            exposure: Exposure::default(),
         }
     }
 }
@@ -257,12 +327,14 @@ pub(crate) fn fallback_roots(project: &Path) -> Roots {
     }
 }
 
-/// Состояние пакета: доверие, гранты и метки, которые меняют вызовы пакета.
+/// Состояние пакета: доверие, гранты и метки, которые меняют вызовы пакета, и
+/// неизменный снимок экспозиции на начало пакета.
 struct BatchState {
     trusted: bool,
     trust_refused: bool,
     taint: BTreeSet<String>,
     grants: Vec<Grant>,
+    exposure: Exposure,
 }
 
 /// Квитанция вызова: результат инструмента и признаки пакета. Поля пакета
@@ -277,6 +349,28 @@ struct Receipt {
     /// Выданный грант (`request_grant`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grant: Option<Grant>,
+    /// Нативный вызов дошёл до инструмента с путём вне проекта (D106: `private`). Флаги
+    /// в квитанции: реплей даёт их без инструмента и диска; квитанции R1-C1 — без флагов.
+    #[serde(default, skip_serializing_if = "is_false")]
+    private: bool,
+    /// Нативный сетевой вызов дошёл до инструмента (D106: `external`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    external: bool,
+}
+
+impl Receipt {
+    /// Флаги экспозиции вызова; `untrusted` — по происхождениям результата.
+    fn exposure(&self) -> Exposure {
+        Exposure {
+            untrusted: untrusted_origin(&self.origins),
+            private: self.private,
+            external: self.external,
+        }
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Выгрузка вывода одного вызова (D44): файл `<project>/.zero-agent/work/spill/{name}.txt`.
@@ -342,6 +436,8 @@ struct Job {
     crash: Option<CrashHook>,
     /// Аргументы `finish` принятого вызова.
     finish: Option<FinishArgs>,
+    /// Экспозиция на начало пакета (D106): «третий» вызов пишет запись аудита.
+    exposure: Exposure,
 }
 
 /// Итог запуска слота.
@@ -392,6 +488,7 @@ pub async fn run_tools(
         trust_refused: env.trust_refused,
         taint: env.taint.clone(),
         grants: env.grants.as_ref().clone(),
+        exposure: env.exposure,
     };
     let mut out = ToolsOutcome::default();
     batch(ctx, j, reg, env, calls, sig, &mut slots, &mut st, &mut out).await?;
@@ -1332,6 +1429,7 @@ fn job(
         fault: env.fault.clone(),
         crash: env.crash.clone(),
         finish,
+        exposure: env.exposure,
     }
 }
 
@@ -1401,6 +1499,7 @@ fn finish_part(
     match ex.result {
         Ok(v) => Ok(match serde_json::from_value::<Receipt>(v.clone()) {
             Ok(r) => {
+                note_exposure(call, r.exposure(), st, out);
                 st.taint.extend(r.origins);
                 if let Some(g) = r.grant {
                     st.grants.push(g.clone());
@@ -1414,6 +1513,18 @@ fn finish_part(
         Err(EffectError::Failed(m)) => Ok(result(call, escape_untrusted(&m), true)),
         Err(e) => Err(e),
     }
+}
+
+/// Флаги исполненного вызова в итог пакета (D106): объединение флагов, вызов с новым
+/// флагом и «третий» вызов — по снимку начала пакета, вживую и при реплее одинаково.
+fn note_exposure(call: &ToolCall, f: Exposure, st: &BatchState, out: &mut ToolsOutcome) {
+    if st.exposure.adds(f) {
+        out.exposure_calls.push(call.id.clone());
+    }
+    if st.exposure.third_by(f) {
+        out.rule_of_two.push(call.id.clone());
+    }
+    out.exposure = out.exposure.union(f);
 }
 
 /// Сигнал, уже ждущий в канале, без ожидания.
@@ -1515,6 +1626,7 @@ async fn execute(jb: Job) -> Executed {
         fault,
         crash,
         finish: _,
+        exposure,
     } = jb;
     let key = slot.key().0.clone();
     let name = spec.name.clone();
@@ -1530,6 +1642,7 @@ async fn execute(jb: Job) -> Executed {
         key,
         fault,
         crash,
+        exposure,
     };
     let result = {
         let fut = slot.run(spec, move || async move {
@@ -1561,6 +1674,8 @@ struct Live {
     key: String,
     fault: Option<FaultHook>,
     crash: Option<CrashHook>,
+    /// Экспозиция на начало пакета (D106).
+    exposure: Exposure,
 }
 
 impl Live {
@@ -1648,6 +1763,14 @@ impl Live {
             },
             Action::Grant(g) => self.grant(g, fref).await?,
         };
+        // D106: «третий» вызов — запись аудита при живом исполнении, как у гранта: реплей
+        // квитанции после паузы её не повторяет, а вызов до паузы записан, даже если run
+        // потом не продолжен. Вызов уже исполнен: сбой записи — ошибка журнала (пауза
+        // `store`), квитанция остаётся.
+        let call = receipt.exposure();
+        if self.exposure.third_by(call) {
+            self.rule_of_two(self.exposure.union(call), fref).await;
+        }
         let tainted = !receipt.origins.is_empty();
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Инструмент уже отработал: квитанция фиксирует его итог, а ошибка
@@ -1675,6 +1798,22 @@ impl Live {
             tracing::error!(key = %self.key, error = %e, "итог инструмента не сериализуется");
             JOURNAL_FAILED.to_owned()
         })
+    }
+
+    /// Запись аудита `rule_of_two {call_id, tool, exposure}` (D106), объект — run.
+    async fn rule_of_two(&self, exposure: Exposure, fref: &mut Option<StoreError>) {
+        let a = AuditNew {
+            actor: AUDIT_ACTOR.into(),
+            action: audit_action::RULE_OF_TWO.into(),
+            target: self.run.to_string(),
+            payload: json!({"call_id": self.call_id, "tool": self.name, "exposure": exposure}),
+        };
+        if let Err(e) = self.journal.store().append_audit(a).await {
+            tracing::error!(key = %self.key, error = %e, "запись аудита rule_of_two не удалась");
+            if fref.is_none() {
+                *fref = Some(e);
+            }
+        }
     }
 
     /// Одобренный грант (D78): запись аудита, затем `grant.added`. Без записи аудита
@@ -1717,8 +1856,8 @@ impl Live {
             .await;
         Ok(Receipt {
             out: ToolOutput::ok(granted_text(&g)),
-            origins: Vec::new(),
             grant: Some(g),
+            ..Receipt::default()
         })
     }
 
@@ -1778,6 +1917,11 @@ impl Live {
                 })
             })
             .collect();
+        // D106: нативный вызов, дошедший до инструмента с путём вне проекта, — `private`;
+        // нативный сетевой — `external`. `bash` в свойства не входит.
+        let native = spec.kind != ToolKind::Exec;
+        let private = native && !outside.is_empty();
+        let external = native && spec.risk == RiskClass::Network;
         if !outside.is_empty() {
             self.append(
                 EventKind::BoundaryOutside,
@@ -1893,6 +2037,8 @@ impl Live {
             out,
             origins,
             grant: None,
+            private,
+            external,
         }
     }
 }

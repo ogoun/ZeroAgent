@@ -1129,7 +1129,13 @@ struct Printer {
     /// сводка для истории, а не ответ, и не печатаются.
     compacting: bool,
     crash: Option<RunCrash>,
+    /// Строка Rule of Two (D106) уже напечатана: один раз на run.
+    rule_of_two_shown: bool,
 }
+
+/// Строка D106 (SEC-052): «третий» вызов исполнен по решению заказчика «не спрашивать».
+/// Модели не уходит.
+const RULE_OF_TWO_LINE: &str = "zero-agent: в этом запуске сошлись недоверенное содержимое, ваши файлы вне проекта и обращение в сеть (SEC-052); вызов выполнен, запись в аудите";
 
 impl Printer {
     fn new(crash: Option<RunCrash>, masker: SecretMasker) -> Self {
@@ -1182,6 +1188,11 @@ impl Printer {
                     eprintln!("zero-agent: повтор запроса к модели, ответ печатается заново");
                 }
             }
+            EventKind::ExposureChanged => {
+                if self.rule_of_two_first(p) {
+                    eprintln!("{RULE_OF_TWO_LINE}");
+                }
+            }
             // D96: исполненный вызов с путями вне проекта — строка на путь.
             EventKind::BoundaryOutside => {
                 let tool = p.get("tool").and_then(Value::as_str).unwrap_or("?");
@@ -1196,6 +1207,18 @@ impl Printer {
             }
             _ => {}
         }
+    }
+
+    /// Первое за run событие `exposure.changed` с «третьим» вызовом (`rule_of_two`
+    /// непуст; о каждом таком вызове — запись аудита `rule_of_two`, D106).
+    fn rule_of_two_first(&mut self, p: &Value) -> bool {
+        let hit = p
+            .get("rule_of_two")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty());
+        let first = hit && !self.rule_of_two_shown;
+        self.rule_of_two_shown |= hit;
+        first
     }
 
     fn lag(&mut self, n: u64) {
@@ -1745,6 +1768,21 @@ async fn reask_trust(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D106: строка Rule of Two — один раз на run, только по событию с «третьим» вызовом.
+    #[test]
+    fn rule_of_two_line_once_per_run() {
+        let mut p = Printer::default();
+        let ev = |r: Value| {
+            json!({"untrusted": true, "private": true, "external": true,
+            "calls": ["w1"], "rule_of_two": r})
+        };
+        assert!(!p.rule_of_two_first(&ev(json!([]))));
+        assert!(!p.rule_of_two_first(&json!({"untrusted": true})));
+        assert!(p.rule_of_two_first(&ev(json!(["w1"]))));
+        assert!(!p.rule_of_two_first(&ev(json!(["w2"]))));
+        assert!(RULE_OF_TWO_LINE.contains("SEC-052"));
+    }
 
     #[test]
     fn crash_parses() {

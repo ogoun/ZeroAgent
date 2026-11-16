@@ -89,11 +89,12 @@ pub use request::{
 };
 pub use resume::{ResumeChange, resume_run, state_block};
 pub use state::{
-    AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot,
+    ActiveSkill, AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit, SNAPSHOT_V,
+    Snapshot,
 };
 pub use tools::{
-    ASK_USER_TOOL, FINISH_TOOL, FinishArgs, REQUEST_GRANT_TOOL, ToolEnv, ToolsOutcome, TrustSetFn,
-    UNTRUSTED_MARK, builtin_tools, request_grant_tool, run_tools,
+    ASK_USER_TOOL, Exposure, FINISH_TOOL, FinishArgs, REQUEST_GRANT_TOOL, ToolEnv, ToolsOutcome,
+    TrustSetFn, UNTRUSTED_MARK, builtin_tools, request_grant_tool, run_tools,
 };
 pub use turn::{
     COMPACT_EFFECT, COMPACT_KIND, CallVerdict, ControlFlags, DELTA_FLUSH_AFTER, DELTA_FLUSH_BYTES,

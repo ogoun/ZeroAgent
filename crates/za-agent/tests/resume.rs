@@ -1075,12 +1075,12 @@ async fn broken_snapshot_fails_other_version_does_not() {
     // Снимок другой версии: статус не меняется, его может прочитать новая версия.
     let (f, last, _) = paused_run("other_version").await;
     f.store
-        .save_snapshot(f.run, last, json!({"v": 4}))
+        .save_snapshot(f.run, last, json!({"v": 5}))
         .await
         .unwrap();
     let err = resume(&f, ResumeChange::default()).await.unwrap_err();
     assert!(
-        matches!(&err, LoopError::Snapshot(s) if s == "версия снимка 4"),
+        matches!(&err, LoopError::Snapshot(s) if s == "версия снимка 5"),
         "{err:?}"
     );
     assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
@@ -1115,7 +1115,7 @@ async fn snapshot_v1_boundary_continues() {
     };
     assert_eq!(resume(&f, change).await.unwrap(), paused("provider"));
     let (_, snap) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(snap.v, 3);
+    assert_eq!(snap.v, 4);
     assert_eq!(snap.next, Next::Boundary);
     assert_eq!(snap.user_inputs.len(), 1);
     let v1 = as_v1(&snap);
@@ -1128,7 +1128,7 @@ async fn snapshot_v1_boundary_continues() {
         done("ок")
     );
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 3);
+    assert_eq!(after.v, 4);
     assert_eq!(after.task, "Задача");
     assert!(after.env_text.starts_with("<env>\n"), "{}", after.env_text);
     assert!(after.env_text.ends_with("\n</env>"), "{}", after.env_text);
@@ -1191,7 +1191,7 @@ async fn snapshot_v1_mid_step_continues() {
         EffectKey::derive(f.run, 1, 1).0
     );
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 3);
+    assert_eq!(after.v, 4);
     assert_eq!(after.task, "Задача");
     // PRM-010 (ревью задачи 5): run R1-B1 продолжает с версией своего префикса.
     for r in &reqs {
@@ -1224,7 +1224,7 @@ async fn snapshot_v1_approval_continues() {
     assert_eq!(cs.len(), 1, "ход R1-B1 вызван заново");
     assert!(cs[0].request.max_output_tokens.is_some());
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 3);
+    assert_eq!(after.v, 4);
     // Новый ход после обновления — с версией замороженного префикса R1-B1 (PRM-010).
     let evs = events(&f.store, f.run).await;
     let reqs = of_kind(&evs, EventKind::ModelRequest);
@@ -1380,4 +1380,73 @@ async fn approval_resume_counts_turn_once() {
     );
     assert_eq!(f.incr.load(Ordering::SeqCst), 1);
     assert_counted_once(&f).await;
+}
+
+// ---- R1-C2, задача 5: снимок v4 (D130) ----
+
+/// Фикстура `golden/r1c1_v3.json` — снимок v3, записанный кодом R1-C1 до правок задачи 5
+/// (генератор — `golden/r1c1_v3.generator.rs.txt`).
+fn golden_v3() -> Value {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/r1c1_v3.json");
+    serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+}
+
+/// Ключи объекта по порядку.
+fn keys(v: &Value) -> Vec<String> {
+    v.as_object().unwrap().keys().cloned().collect()
+}
+
+/// D130: снимок v3 читается, экспозиция и скиллы — по умолчанию, прочие поля — как
+/// были; resume снимка v3 продолжает run и пишет снимок v4.
+#[tokio::test]
+async fn snapshot_v3_reads_with_default_exposure() {
+    // (1) Настоящий снимок R1-C1: версия 3, без полей R1-C2, поля R1-C1 заданы.
+    let golden = golden_v3();
+    assert_eq!(golden["v"], 3);
+    assert!(golden.get("exposure").is_none() && golden.get("skills").is_none());
+    assert_eq!(golden["taint"], json!(["untrusted_project"]));
+    assert_eq!(golden["trusted"], json!(false));
+    assert_eq!(golden["grants"].as_array().unwrap().len(), 1);
+    assert!(golden["audit_head"].is_object());
+    // (2) Разбор: новые части по умолчанию, остальное без потерь.
+    let snap: Snapshot = serde_json::from_value(golden.clone()).unwrap();
+    assert_eq!(snap.v, 3);
+    assert_eq!(snap.exposure, za_agent::Exposure::default());
+    assert!(snap.skills.is_empty());
+    let mut back = serde_json::to_value(&snap).unwrap();
+    let o = back.as_object_mut().unwrap();
+    assert!(o.remove("exposure").is_some() && o.remove("skills").is_some());
+    assert_eq!(back, golden, "поля снимка v3 потеряны при чтении");
+
+    // (3) Resume: снимок той же формы, что фикстура, — живой run на паузе, сведённый к v3
+    // (голова аудита задана, как в фикстуре: поле необязательное).
+    let mut f = fx("v3_resume");
+    f.deps.audit_head = Some(za_agent::AuditHead {
+        seq: 7,
+        hash: "ab".repeat(32),
+    });
+    f.model.push(server_error());
+    assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+    let (seq, mut v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    assert_eq!(v["v"], 4);
+    let o = v.as_object_mut().unwrap();
+    o.insert("v".into(), json!(3));
+    assert!(o.remove("exposure").is_some() && o.remove("skills").is_some());
+    assert_eq!(
+        keys(&v),
+        keys(&golden),
+        "форма снимка v3 разошлась с фикстурой"
+    );
+    let last = events(&f.store, f.run).await.last().unwrap().seq;
+    assert!(last >= seq);
+    f.store.save_snapshot(f.run, last, v).await.unwrap();
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    let (_, after) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(after.v, 4);
+    assert_eq!(after.exposure, za_agent::Exposure::default());
+    assert!(after.skills.is_empty());
 }
