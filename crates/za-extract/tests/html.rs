@@ -893,6 +893,61 @@ fn plain_header_table_is_unchanged() {
     assert!(lines[1].contains("---") && lines[2].contains("alpha"));
 }
 
+/// Позиция первой строки текста, содержащей `s`.
+fn line_of(text: &str, s: &str) -> Option<usize> {
+    text.lines().position(|l| l.contains(s))
+}
+
+/// m6 ревью задачи 10. Пустой `thead`: `htmd` считает, что заголовок уже есть, и строку из
+/// одних `th` в теле не берёт ни заголовком, ни данными — она пропадала целиком.
+#[test]
+fn empty_thead_keeps_header_row_of_body() {
+    let html = "<table><thead></thead><tbody><tr><th>Alpha</th><th>Beta</th></tr>\
+        <tr><td>one</td><td>two</td></tr></tbody></table>";
+    let m = html_to_markdown(html);
+    for want in ["Alpha", "Beta", "one", "two"] {
+        assert!(m.text.contains(want), "нет {want:?}: {:?}", m.text);
+    }
+    assert!(
+        line_of(&m.text, "Alpha") < line_of(&m.text, "one"),
+        "{}",
+        m.text
+    );
+}
+
+/// m6 ревью задачи 10. Многострочный `thead`: `htmd` читает только первую строку, остальные
+/// пропадали. Первая строка — заголовок, следующие — строки данных перед телом.
+#[test]
+fn multi_row_thead_keeps_every_row() {
+    let html = "<table><thead><tr><th>Name</th><th>Size</th></tr>\
+        <tr><th>first</th><th>bytes</th></tr></thead>\
+        <tbody><tr><td>alpha</td><td>1</td></tr></tbody></table>";
+    let m = html_to_markdown(html);
+    let lines = table_lines(&m.text);
+    assert_eq!(lines.len(), 4, "{}", m.text);
+    assert!(lines[0].contains("Name") && lines[0].contains("Size"));
+    assert!(lines[2].contains("first") && lines[2].contains("bytes"));
+    assert!(lines[3].contains("alpha"));
+}
+
+/// m6 ревью задачи 10. Второй `thead` (после тела) или пустой `thead` после заголовка
+/// заменял заголовок у `htmd`: прежний пропадал. Заголовок — первый, остальные строки —
+/// данные в порядке документа.
+#[test]
+fn later_thead_does_not_replace_header() {
+    let html = "<table><thead><tr><th>Head</th></tr></thead><tbody><tr><td>value</td></tr></tbody>\
+        <thead><tr><th>Later</th></tr></thead></table>";
+    let m = html_to_markdown(html);
+    let lines = table_lines(&m.text);
+    assert_eq!(lines.len(), 4, "{}", m.text);
+    assert!(lines[0].contains("Head"), "{}", m.text);
+    assert!(lines[2].contains("value") && lines[3].contains("Later"));
+    let html = "<table><thead><tr><th>Head</th></tr></thead><tbody><tr><td>value</td></tr></tbody>\
+        <thead></thead></table>";
+    let m = html_to_markdown(html);
+    assert!(table_lines(&m.text)[0].contains("Head"), "{}", m.text);
+}
+
 /// Страница вида Википедии: значения таблиц «ключ — значение» не теряются.
 #[test]
 fn wiki_like_keeps_table_values() {

@@ -17,17 +17,22 @@
 //! подзаголовков (`<tr><th colspan=2>…</th></tr>`) и пустая угловая ячейка матрицы, после
 //! чего столбцы заголовка сдвигаются.
 //!
-//! [`normalize_table`] (вызов из `guard::prepare_dom`) меняет имена ячеек так, чтобы `htmd`
-//! ни одну не потерял:
-//! - первая строка таблицы, если она в `thead`, — заголовок: её `td` становятся `th`;
-//! - первая строка таблицы вне `thead` из одних `th` — заголовок, как у `htmd`; смешанная —
-//!   строка данных: её `th` становятся `td`;
+//! [`normalize_table`] (вызов из `guard::prepare_dom`) меняет имена ячеек и секций так,
+//! чтобы `htmd` ни одну ячейку не потерял:
+//! - заголовок один: первая строка первого `thead` (её `td` становятся `th`), а если `thead`
+//!   до неё не было — первая строка таблицы из одних `th`, как у `htmd`; смешанная первая
+//!   строка — строка данных;
+//! - остальные строки этого `thead` переносятся в новый `tbody` сразу за ним: `htmd` читает
+//!   из `thead` только первую строку (m6 ревью задачи 10);
+//! - `thead` после выбранного заголовка, в том числе пустой, становится `tbody`: у `htmd`
+//!   он заменил бы заголовок. Пустой `thead` до заголовка остаётся, но строка из одних `th`
+//!   после него — данные: `htmd` после `thead` заголовок из тела не берёт;
 //! - во всех прочих строках `th` становятся `td`.
 //!
 //! Текст и порядок ячеек не меняются. Таблица, где после замены нет ни `th`, ни `thead`,
 //! у `htmd` идёт обычным обходом детей (режим `Pure`) — текст ячеек сохраняется и там.
 //! Вложенные таблицы — отдельные элементы `table`, их обрабатывает свой вызов. Цена — один
-//! проход по строкам и ячейкам таблицы.
+//! проход по секциям, строкам и ячейкам таблицы.
 //!
 //! ## Выравнивание
 //!
@@ -84,38 +89,99 @@ fn is_html(node: &Node, local: &str) -> bool {
     matches!(&node.data, NodeData::Element { name, .. } if name.ns == ns!(html) && *name.local == *local)
 }
 
-/// Привести ячейки строк таблицы `table` к виду, в котором `htmd` их не теряет (см.
-/// документацию модуля). Узел не `table` — ничего.
+/// Привести ячейки и секции таблицы `table` к виду, в котором `htmd` ни одной ячейки не
+/// теряет (см. документацию модуля). Узел не `table` — ничего. Список детей таблицы
+/// пересобирается один раз.
 pub(crate) fn normalize_table(table: &Handle) {
     if !is_html(table, "table") {
         return;
     }
+    // Состояние `htmd`: `has_thead` — встречен `thead` или взята строка заголовка из тела;
+    // `header` — строка заголовка выбрана; `first` — ещё не было ни одной строки.
+    let mut has_thead = false;
+    let mut header = false;
     let mut first = true;
-    for section in table.children.borrow().iter() {
-        let in_thead = is_html(section, "thead");
-        let rows: Vec<Handle> = if is_html(section, "tr") {
-            vec![Rc::clone(section)]
-        } else if in_thead || is_html(section, "tbody") || is_html(section, "tfoot") {
-            section
-                .children
-                .borrow()
-                .iter()
-                .filter(|r| is_html(r, "tr"))
-                .cloned()
-                .collect()
-        } else {
+    let old = std::mem::take(&mut *table.children.borrow_mut());
+    let mut kept: Vec<Handle> = Vec::with_capacity(old.len());
+    for section in old {
+        if is_html(&section, "thead") && !header {
+            has_thead = true;
+            let rows = rows_of(&section);
+            if let Some(head) = rows.first() {
+                rename_cells(head, "td", "th");
+                header = cell_counts(head).0 > 0;
+                first = false;
+            }
+            let rest = (rows.len() > 1).then(|| split_after(&section, &rows[0], table));
+            kept.push(section);
+            if let Some(body) = rest {
+                for row in rows_of(&body) {
+                    rename_cells(&row, "th", "td");
+                }
+                kept.push(body);
+            }
             continue;
+        }
+        // `thead` после заголовка — тело: у `htmd` он заменил бы заголовок.
+        let section = if is_html(&section, "thead") {
+            renamed(&section, "tbody", table)
+        } else {
+            section
+        };
+        let rows = if is_html(&section, "tr") {
+            vec![Rc::clone(&section)]
+        } else if is_html(&section, "tbody") || is_html(&section, "tfoot") {
+            rows_of(&section)
+        } else {
+            Vec::new()
         };
         for row in rows {
             let (th, td) = cell_counts(&row);
-            if first && in_thead {
-                rename_cells(&row, "td", "th");
-            } else if !(first && td == 0 && th > 0) {
+            if first && !has_thead && td == 0 && th > 0 {
+                header = true;
+                has_thead = true;
+            } else {
                 rename_cells(&row, "th", "td");
             }
             first = false;
         }
+        kept.push(section);
     }
+    *table.children.borrow_mut() = kept;
+}
+
+/// Строки `tr` среди детей секции.
+fn rows_of(section: &Node) -> Vec<Handle> {
+    section
+        .children
+        .borrow()
+        .iter()
+        .filter(|r| is_html(r, "tr"))
+        .cloned()
+        .collect()
+}
+
+/// Перенести детей `thead` после его строки `head` в новый `tbody` (ребёнок `table`, место в
+/// списке детей таблицы задаёт вызывающий).
+fn split_after(thead: &Handle, head: &Handle, table: &Handle) -> Handle {
+    let body = Node::new(NodeData::Element {
+        name: QualName::new(None, ns!(html), LocalName::from("tbody")),
+        attrs: RefCell::new(Vec::new()),
+        template_contents: RefCell::new(None),
+        mathml_annotation_xml_integration_point: false,
+    });
+    let mut kids = thead.children.borrow_mut();
+    let at = kids
+        .iter()
+        .position(|k| Rc::ptr_eq(k, head))
+        .map_or(kids.len(), |i| i + 1);
+    let moved = kids.split_off(at);
+    for kid in &moved {
+        kid.parent.set(Some(Rc::downgrade(&body)));
+    }
+    *body.children.borrow_mut() = moved;
+    body.parent.set(Some(Rc::downgrade(table)));
+    body
 }
 
 /// Число ячеек `th` и `td` среди детей строки.
@@ -126,38 +192,43 @@ fn cell_counts(row: &Node) -> (usize, usize) {
     (th, td)
 }
 
-/// Заменить ячейки `from` среди детей строки на `to`: новый узел с теми же атрибутами и
-/// детьми на том же месте (имя элемента в `RcDom` не меняется на месте).
+/// Заменить ячейки `from` среди детей строки на `to` ([`renamed`]) на том же месте.
 fn rename_cells(row: &Handle, from: &str, to: &str) {
     let mut children = row.children.borrow_mut();
     for slot in children.iter_mut() {
-        if !is_html(slot, from) {
-            continue;
+        if is_html(slot, from) {
+            *slot = renamed(slot, to, row);
         }
-        let NodeData::Element {
-            name,
-            attrs,
-            mathml_annotation_xml_integration_point,
-            ..
-        } = &slot.data
-        else {
-            continue;
-        };
-        let cell = Node::new(NodeData::Element {
-            name: QualName::new(name.prefix.clone(), name.ns.clone(), LocalName::from(to)),
-            attrs: RefCell::new(std::mem::take(&mut *attrs.borrow_mut())),
-            template_contents: RefCell::new(None),
-            mathml_annotation_xml_integration_point: *mathml_annotation_xml_integration_point,
-        });
-        let kids = std::mem::take(&mut *slot.children.borrow_mut());
-        for kid in &kids {
-            kid.parent.set(Some(Rc::downgrade(&cell)));
-        }
-        *cell.children.borrow_mut() = kids;
-        cell.parent.set(Some(Rc::downgrade(row)));
-        slot.parent.set(None);
-        *slot = cell;
     }
+}
+
+/// Элемент `node` с именем `to`: новый узел с теми же атрибутами и детьми, родитель —
+/// `parent` (имя элемента в `RcDom` не меняется на месте). Прежний узел остаётся пустым и
+/// без родителя; ставит новый узел на его место вызывающий.
+fn renamed(node: &Handle, to: &str, parent: &Handle) -> Handle {
+    let NodeData::Element {
+        name,
+        attrs,
+        mathml_annotation_xml_integration_point,
+        ..
+    } = &node.data
+    else {
+        return Rc::clone(node);
+    };
+    let new = Node::new(NodeData::Element {
+        name: QualName::new(name.prefix.clone(), name.ns.clone(), LocalName::from(to)),
+        attrs: RefCell::new(std::mem::take(&mut *attrs.borrow_mut())),
+        template_contents: RefCell::new(None),
+        mathml_annotation_xml_integration_point: *mathml_annotation_xml_integration_point,
+    });
+    let kids = std::mem::take(&mut *node.children.borrow_mut());
+    for kid in &kids {
+        kid.parent.set(Some(Rc::downgrade(&new)));
+    }
+    *new.children.borrow_mut() = kids;
+    new.parent.set(Some(Rc::downgrade(parent)));
+    node.parent.set(None);
+    new
 }
 
 // --- Выравнивание под бюджетом ---
@@ -493,42 +564,62 @@ mod tests {
     use html5ever::tendril::TendrilSink;
     use markup5ever_rcdom::RcDom;
 
-    /// Имена ячеек строк первой таблицы документа, по строкам.
-    fn cells(html: &str) -> Vec<Vec<String>> {
+    /// Родитель узла по указателю — `parent`.
+    fn assert_parent(node: &Handle, parent: &Handle) {
+        let p = node.parent.take();
+        let up = p.as_ref().and_then(std::rc::Weak::upgrade);
+        node.parent.set(p);
+        assert!(up.is_some_and(|u| Rc::ptr_eq(&u, parent)));
+    }
+
+    /// Имя элемента.
+    fn name_of(node: &Node) -> Option<String> {
+        match &node.data {
+            NodeData::Element { name, .. } => Some(name.local.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Первая таблица документа после [`normalize_table`]: имена секций и имена ячеек строк
+    /// по строкам. Указатели `parent` секций, строк и детей ячеек проверены.
+    fn layout(html: &str) -> (Vec<String>, Vec<Vec<String>>) {
         let dom = parse_document(RcDom::default(), Default::default()).one(html);
         let mut stack = vec![dom.document.clone()];
         while let Some(n) = stack.pop() {
             if is_html(&n, "table") {
                 normalize_table(&n);
+                let mut sections = Vec::new();
                 let mut out = Vec::new();
                 for s in n.children.borrow().iter() {
+                    assert_parent(s, &n);
+                    sections.extend(name_of(s));
                     for r in s.children.borrow().iter().filter(|r| is_html(r, "tr")) {
+                        assert_parent(r, s);
                         let names = r
                             .children
                             .borrow()
                             .iter()
-                            .filter_map(|c| match &c.data {
-                                NodeData::Element { name, .. } => Some(name.local.to_string()),
-                                _ => None,
-                            })
+                            .filter_map(|c| name_of(c))
                             .collect();
-                        // Родитель детей ячейки — новая ячейка.
                         for c in r.children.borrow().iter() {
+                            assert_parent(c, r);
                             for k in c.children.borrow().iter() {
-                                let p = k.parent.take();
-                                let up = p.as_ref().and_then(std::rc::Weak::upgrade);
-                                k.parent.set(p);
-                                assert!(up.is_some_and(|u| Rc::ptr_eq(&u, c)));
+                                assert_parent(k, c);
                             }
                         }
                         out.push(names);
                     }
                 }
-                return out;
+                return (sections, out);
             }
             stack.extend(n.children.borrow().iter().cloned());
         }
-        Vec::new()
+        (Vec::new(), Vec::new())
+    }
+
+    /// Имена ячеек строк первой таблицы документа, по строкам.
+    fn cells(html: &str) -> Vec<Vec<String>> {
+        layout(html).1
     }
 
     #[test]
@@ -566,6 +657,50 @@ mod tests {
         );
     }
 
+    /// Секции (m6 ревью задачи 10): строки `thead` после первой — в новом `tbody` сразу за ним,
+    /// `thead` после заголовка — `tbody`, пустой `thead` до заголовка остаётся, а строка из
+    /// `th` после него — данные.
+    #[test]
+    fn normalize_sections() {
+        let names = |n: &[&str]| -> Vec<String> { n.iter().map(|s| (*s).to_owned()).collect() };
+        let v = |rows: &[&[&str]]| -> Vec<Vec<String>> {
+            rows.iter()
+                .map(|r| r.iter().map(|s| (*s).to_owned()).collect())
+                .collect()
+        };
+        assert_eq!(
+            layout(
+                "<table><thead><tr><th>A</th></tr><tr><th>a</th><td>b</td></tr></thead><tbody><tr><th>r</th></tr></tbody></table>"
+            ),
+            (
+                names(&["thead", "tbody", "tbody"]),
+                v(&[&["th"], &["td", "td"], &["td"]])
+            )
+        );
+        assert_eq!(
+            layout(
+                "<table><thead><tr><th>A</th></tr></thead><tbody><tr><td>1</td></tr></tbody><thead><tr><th>B</th></tr></thead><thead></thead></table>"
+            ),
+            (
+                names(&["thead", "tbody", "tbody", "tbody"]),
+                v(&[&["th"], &["td"], &["td"]])
+            )
+        );
+        assert_eq!(
+            layout(
+                "<table><thead></thead><tbody><tr><th>A</th><th>B</th></tr><tr><td>1</td></tr></tbody></table>"
+            ),
+            (names(&["thead", "tbody"]), v(&[&["td", "td"], &["td"]]))
+        );
+        // Тело до `thead`: заголовок — строка `thead` (у `htmd` он и так первый в выводе).
+        assert_eq!(
+            layout(
+                "<table><tbody><tr><td>1</td></tr></tbody><thead><tr><td>H</td></tr></thead></table>"
+            ),
+            (names(&["tbody", "thead"]), v(&[&["td"], &["th"]]))
+        );
+    }
+
     // --- Выравнивание под бюджетом ---
 
     use std::sync::{Arc, Mutex};
@@ -577,7 +712,7 @@ mod tests {
     /// Таблицы разного строения: заголовки, матрица, «ключ — значение», недостающие ячейки,
     /// многобайтовые символы, `|` и переводы строк в ячейках, вложенная таблица, подпись,
     /// пустые ячейки и строки, ссылки и форматирование, несколько `tbody`, `tfoot`, список в
-    /// ячейке.
+    /// ячейке, пустой, многострочный и повторный `thead`.
     const TABLES: &[&str] = &[
         "<table><thead><tr><th>Name</th><th>Kind</th></tr></thead><tbody><tr><td>alpha</td><td>first</td></tr><tr><td>beta</td><td>second item</td></tr></tbody></table>",
         "<table><thead><tr><td></td><th>A</th><th>B</th></tr></thead><tbody><tr><th>r1</th><td>one</td><td>two</td></tr><tr><th>r2</th><td>three</td><td>four</td></tr></tbody></table>",
@@ -592,6 +727,9 @@ mod tests {
         "<table><thead><tr><th>k</th></tr></thead><tbody><tr><td>1</td></tr></tbody><tbody><tr><td>22</td></tr></tbody><tfoot><tr><td>total 333</td></tr></tfoot></table>",
         "<table><thead><tr><th>only header, no rows</th></tr></thead></table>",
         "<table><tr><th>x</th></tr><tr><td><ul><li>one</li><li>two<ul><li>deep</li></ul></li></ul></td></tr></table>",
+        "<table><thead></thead><tbody><tr><th>Alpha</th><th>Beta</th></tr><tr><td>one</td><td>two</td></tr></tbody></table>",
+        "<table><thead><tr><th>Name</th><th>Size</th></tr><tr><th>first</th><th>bytes</th></tr></thead><tbody><tr><td>alpha</td><td>1</td></tr></tbody></table>",
+        "<table><thead><tr><th>Head</th></tr></thead><tbody><tr><td>value</td></tr></tbody><thead><tr><th>Later</th></tr><tr><td>more</td></tr></thead><thead></thead></table>",
     ];
 
     /// Подготовленное дерево, как в `html_to_markdown`.
