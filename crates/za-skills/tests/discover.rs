@@ -838,6 +838,71 @@ fn links_inside_skill_dir() {
     check_links(&cat, |d| format!(".claude/skills/{d}"), links);
 }
 
+/// Minor 4 повторного ревью финального прохода: причина `linked skill directory` — только у
+/// ссылки на каталог. Ссылка на файл в корне источника вне каталога скилла — то же значение
+/// `external-link` обхода, но каталогом не считается: без проверки цели (`is_dir_link`)
+/// каждая такая ссылка давала бы ложный пропуск. Ссылке на файл на Windows нужны права,
+/// поэтому тест — только Unix.
+#[cfg(unix)]
+#[test]
+fn file_link_in_source_root_is_not_linked_dir() {
+    use za_skills::LINKED_SKILL_DIR;
+    let base = dir("file-link-root");
+    write(&base.join("outside/notes.md"), "notes outside the source");
+    let user = base.join("user");
+    skill(&user, "real", "real", "a regular skill");
+    file_link(&user.join("notes.md"), &base.join("outside/notes.md")).unwrap();
+    std::fs::create_dir_all(user.join("group")).unwrap();
+    file_link(&user.join("group/notes.md"), &base.join("outside/notes.md")).unwrap();
+    let cat = discover(&DiscoverInput {
+        user_dir: Some(user),
+        ..DiscoverInput::default()
+    });
+    assert!(cat.get("real").is_some(), "{cat:?}");
+    assert!(
+        cat.skipped.iter().all(|s| s.reason != LINKED_SKILL_DIR),
+        "{:?}",
+        reasons(&cat)
+    );
+}
+
+/// Minor 4 повторного ревью финального прохода: предел глубины обнаружения действует и на
+/// каталоги-ссылки. Ссылка на границе (`depth` компонентов) — в пропущенных, глубже — нет:
+/// скилла там обнаружение не искало бы.
+#[test]
+fn linked_dir_beyond_depth_is_not_reported() {
+    use za_skills::LINKED_SKILL_DIR;
+    let base = dir("linked-depth");
+    let target = base.join("outside").join("ext");
+    skill(&base, "outside/ext", "ext", "skill outside the source");
+    let user = base.join("user");
+    skill(&user, "real", "real", "a regular skill");
+    std::fs::create_dir_all(user.join("a").join("b")).unwrap();
+    dir_link(&user.join("a").join("edge"), &target);
+    dir_link(&user.join("a").join("b").join("deep"), &target);
+    let cat = discover(&DiscoverInput {
+        user_dir: Some(user.clone()),
+        limits: Limits {
+            depth: 2,
+            ..Limits::default()
+        },
+        ..DiscoverInput::default()
+    });
+    assert!(cat.get("real").is_some(), "{cat:?}");
+    let linked: Vec<String> = cat
+        .skipped
+        .iter()
+        .filter(|s| s.reason == LINKED_SKILL_DIR)
+        .map(|s| s.path.clone())
+        .collect();
+    assert_eq!(
+        linked,
+        [user.join("a").join("edge").display().to_string()],
+        "{:?}",
+        reasons(&cat)
+    );
+}
+
 /// I1 финального ревью скиллов: каталог скилла, подключённый ссылкой (junction на Windows,
 /// символическая ссылка на Unix), не обходится (D116), но и не пропадает молча — он среди
 /// пропущенных с причиной `linked skill directory` у `user`, `extra` и в дереве проекта,

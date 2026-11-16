@@ -12,8 +12,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Barrier, watch};
 use tokio::time::{Instant, timeout};
 use za_agent::{
-    CallVerdict, Grant, GrantMode, GrantSource, PlannedCall, SPILL_DIR, Signals, SpillCfg, ToolEnv,
-    ToolsOutcome, builtin_tools, run_tools, signal_channel, spill_limit_bytes,
+    ACTIVATE_SKILL_TOOL, CallVerdict, Grant, GrantMode, GrantSource, PlannedCall, SPILL_DIR,
+    Signals, SpillCfg, ToolEnv, ToolsOutcome, builtin_tools, run_tools, signal_channel,
+    skills_withdrawn_text, spill_limit_bytes,
 };
 use za_core::paths::Roots;
 use za_core::{
@@ -604,6 +605,43 @@ async fn ask_user_answer_is_cleaned() {
         result_of(&out.results[0]),
         ("q1", "abcd \u{1F468}\u{200D}\u{1F469}", false)
     );
+}
+
+/// Minor 4 повторного ревью финального прохода: реплей `activate_skill` до реестра — только
+/// по квитанции. Записано лишь намерение `skill.load` (сбой посреди загрузки), а скиллы
+/// выключены после старта run (`activate_skill` снят с исполнения): итога нет, поэтому
+/// ответ — текст снятия, без новой загрузки и без квитанции. Без условия квитанции
+/// намерение ушло бы в загрузку по записанным аргументам.
+#[tokio::test]
+async fn skill_intent_without_receipt_is_withdrawn() {
+    let (s, j, run) = setup("skill_intent_withdrawn").await;
+    let mut reg = registry(builtin_tools());
+    reg.withdraw(ACTIVATE_SKILL_TOOL, skills_withdrawn_text());
+    let key = EffectKey::derive(run, 0, 0);
+    let hash = "0".repeat(64);
+    s.record_intent(
+        run,
+        &key,
+        EffectClass::ReadOnly,
+        "skill.load",
+        json!({"name": "tdd", "file": null, "hash": hash}),
+    )
+    .await
+    .unwrap();
+    let calls = [planned("c1", ACTIVATE_SKILL_TOOL, json!({"name": "tdd"}))];
+    let e = env(run, RunMode::Auto, true);
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]),
+        (
+            "c1",
+            "activate_skill: skills are disabled by configuration since this run started",
+            true
+        )
+    );
+    let row = s.effect(run, &key).await.unwrap().expect("намерение");
+    assert!(row.result.is_none(), "новая квитанция: {:?}", row.result);
 }
 
 /// Minor 3 повторного ревью финального прохода: соседние каналы текста пользователя тоже
