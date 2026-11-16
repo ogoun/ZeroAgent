@@ -316,6 +316,30 @@ fn rank_prefers_more_common_words() {
     assert_eq!(r, "tokio runtime spawn tasks all together");
 }
 
+/// I2 ревью задачи 8: бюджет — в байтах текста после `escape_untrusted`, как его меряет слот:
+/// `<` и `>` весят по 4 байта (`&lt;`, `&gt;`). Так и выборка совпадений, и голова страницы,
+/// и текст «в пределах бюджета» не выходят за предел после экранирования.
+#[test]
+fn rank_budget_counts_escaped_angles() {
+    let shown = |s: &str| s.len() + 3 * s.matches(['<', '>']).count();
+    let mut text = String::new();
+    for i in 0..200 {
+        text.push_str(&format!("<tokio> runtime <spawn> note {i}\n\n"));
+    }
+    for budget in [10, 50, 333, 1000, 4000] {
+        let r = rank_passages(&text, "tokio runtime spawn", budget);
+        assert!(shown(&r) <= budget, "{budget}: {} > {budget}", shown(&r));
+    }
+    // Голова без совпадений — тоже по экранированной длине.
+    let r = rank_passages(&text, "quantum", 100);
+    assert!(shown(&r) <= 100 && !r.is_empty(), "{r:?}");
+    // Короткий текст с угловыми скобками: сырой помещается, экранированный — нет.
+    let small = "<a> <b> <c> <d> <e>";
+    assert_eq!(small.len(), 19);
+    let r = rank_passages(small, "zzz", 30);
+    assert!(shown(&r) <= 30, "{r:?}");
+}
+
 /// Итог не длиннее бюджета; абзац больше доли совпадений режется по строкам; текст в пределах
 /// бюджета возвращается как есть.
 #[test]

@@ -14,7 +14,10 @@ use serde_json::{Value, json};
 use support::extractor::StubExtractor;
 use support::{Server, drip, redirect, scaled, serve, text, typed, within};
 use za_core::extract::{ExtractError, Extractor};
-use za_core::{Approval, NetRequest, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, call_deadline};
+use za_core::{
+    Approval, DIGEST_RESERVE, NetRequest, RiskClass, Tool, ToolCx, ToolKind, ToolOutput,
+    call_deadline,
+};
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier, canonical_json, net_outcome};
 use za_web::{WebConfig, WebGateway, web_fetch_tool};
 
@@ -53,8 +56,17 @@ fn cx(deadline: Option<std::time::Instant>) -> ToolCx {
 
 /// Вызов с дедлайном слота (`call_deadline` от старта под пределом теста).
 async fn fetch(tool: &Arc<dyn Tool>, args: Value) -> ToolOutput {
+    fetch_within(tool, args, None).await
+}
+
+/// Вызов с пределом результата слота `output_budget` (I2 ревью задачи 8).
+async fn fetch_within(tool: &Arc<dyn Tool>, args: Value, budget: Option<usize>) -> ToolOutput {
     let d = call_deadline(std::time::Instant::now(), scaled(LONG));
-    within(LONG * 2, "web_fetch", tool.call(args, cx(Some(d)))).await
+    let cx = ToolCx {
+        output_budget: budget,
+        ..cx(Some(d))
+    };
+    within(LONG * 2, "web_fetch", tool.call(args, cx)).await
 }
 
 fn page_url(s: &Server, path: &str) -> String {
@@ -284,12 +296,92 @@ async fn long_page_with_prompt_gets_ranked_digest() {
     let digest = out.digest.expect("digest при prompt");
     assert!(digest.starts_with(&format!("url: {url}\nstatus: 200\ntype: text/plain\n\n")));
     assert!(digest.contains(needle), "{}", &digest[..200]);
-    // Бюджет — 60 % output_limit (128 КиБ).
-    assert!(digest.len() <= 128 * 1024 * 60 / 100, "{}", digest.len());
+    // Вызов вне пакета (`output_budget = None`): предел — `output_limit` (128 КиБ) за
+    // вычетом запаса под строки слота (I2 ревью задачи 8).
+    assert!(
+        digest.len() <= 128 * 1024 - DIGEST_RESERVE,
+        "{}",
+        digest.len()
+    );
 
     // Без prompt — digest нет: голова и хвост D44 делает пакет.
     let out = fetch(&tool, json!({"url": url})).await;
     assert!(out.digest.is_none());
+}
+
+/// Длина текста после `escape_untrusted` для ASCII: `<` и `>` становятся `&lt;` и `&gt;`.
+fn escaped_ascii_len(s: &str) -> usize {
+    s.len() + 3 * s.matches(['<', '>']).count()
+}
+
+/// I2 ревью задачи 8: бюджет `digest` — фактический предел слота `ToolCx::output_budget`, а
+/// не 60 % `output_limit`. На окнах 16k (9830 байт) и 64k (39 321 байт) `digest` с запасом
+/// под строки слота помещается в предел (слот не режет его головой и хвостом), а лучшее
+/// совпадение из середины страницы в нём есть. Длина меряется после экранирования: слабые
+/// совпадения несут `<` и `>`.
+#[tokio::test]
+async fn digest_fits_slot_budget_on_small_windows() {
+    let filler = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do\n\n";
+    let weak = |i: usize| format!("weather note {i}: <rains> expected later in the region\n\n");
+    let needle = "zebra migration follows the seasonal rains across the plains";
+    let mut body = String::new();
+    for i in 0..3000 {
+        body.push_str(filler);
+        body.push_str(&weak(i));
+        if i == 1500 {
+            body.push_str(needle);
+            body.push_str("\n\n");
+        }
+    }
+    let weak_total = (0..3000).map(|i| weak(i).len()).sum::<usize>();
+    assert!(
+        weak_total > 2 * 39_321,
+        "слабых совпадений больше любого бюджета"
+    );
+    let s = site(move |_| typed(200, "text/plain", body.clone().into_bytes())).await;
+    let tool = web_fetch_tool(gateway(&s), StubExtractor::new());
+    let url = page_url(&s, "/long");
+    for budget in [9830usize, 39_321] {
+        let args = json!({"url": url, "prompt": "zebra migration in the seasonal rains"});
+        let out = fetch_within(&tool, args, Some(budget)).await;
+        assert!(!out.is_error, "{}", out.content);
+        let digest = out.digest.expect("digest при prompt");
+        assert!(
+            digest.starts_with(&format!("url: {url}\nstatus: 200\ntype: text/plain\n\n")),
+            "{budget}"
+        );
+        assert!(digest.contains(needle), "{budget}: нет лучшего совпадения");
+        let shown = escaped_ascii_len(&digest);
+        assert!(
+            shown + DIGEST_RESERVE <= budget,
+            "{budget}: digest {shown} байт после экранирования"
+        );
+        // Слабые совпадения заполняют остаток, но не все: ранжирование работает.
+        let weak_in = digest.matches("weather note").count();
+        assert!(weak_in > 0 && weak_in < 3000, "{budget}: {weak_in}");
+        assert!(
+            shown > budget / 2,
+            "{budget}: бюджет использован слабо ({shown})"
+        );
+    }
+}
+
+/// M3 ревью задачи 8: HTML из одной разметки — извлекатель вернул пустой текст, ответ
+/// `no readable text on the page` (ветка после извлекателя).
+#[tokio::test]
+async fn markup_only_html_has_no_readable_text() {
+    let html = "<html><body><div><span></span></div></body></html>";
+    let s = site(move |_| typed(200, "text/html", html.as_bytes().to_vec())).await;
+    let ex = StubExtractor::new();
+    let tool = web_fetch_tool(gateway(&s), ex.clone());
+    let url = page_url(&s, "/markup");
+    let out = fetch(&tool, json!({"url": url})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        out.content,
+        format!("url: {url}\nstatus: 200\ntype: text/html\n\nno readable text on the page")
+    );
+    assert_eq!(ex.html_requests().len(), 1, "извлекатель вызван");
 }
 
 #[tokio::test]
@@ -368,6 +460,63 @@ async fn truncated_body_is_marked() {
     );
 }
 
+/// M2 ревью задачи 8: двоичные данные под `text/html; charset=windows-1251` — в однобайтовой
+/// кодировке байты ≥ 0x80 становятся буквами, но управляющие «двоичные» байты WHATWG
+/// (0x00–0x08, 0x0B, 0x0E–0x1A, 0x1C–0x1F) остаются управляющими символами: их доля
+/// выдаёт двоичные данные. Извлекатель не вызывается.
+#[tokio::test]
+async fn binary_under_single_byte_charset_has_no_readable_text() {
+    // Каждый 20-й байт — NUL (5 %), остальные — «буквы» cp1251.
+    let bytes: Vec<u8> = (0..4096u32)
+        .map(|i| {
+            if i % 20 == 0 {
+                0
+            } else {
+                (i * 7 + 3) as u8 | 0xC0
+            }
+        })
+        .collect();
+    let s = site(move |_| typed(200, "text/html; charset=windows-1251", bytes.clone())).await;
+    let ex = StubExtractor::new();
+    let tool = web_fetch_tool(gateway(&s), ex.clone());
+    let url = page_url(&s, "/bin");
+    let out = fetch(&tool, json!({"url": url})).await;
+    assert_eq!(
+        out.content,
+        format!("url: {url}\nstatus: 200\ntype: text/html\n\nno readable text on the page")
+    );
+    assert!(ex.html_requests().is_empty(), "извлекатель не вызван");
+}
+
+/// M5 ревью задачи 8: оборванное на `max_bytes` нечитаемое тело — `no readable text` с
+/// пометкой обрыва: ответ не выглядит полным.
+#[tokio::test]
+async fn truncated_unreadable_body_keeps_marker() {
+    let s = site(|_| typed(200, "text/plain", vec![0u8; 100_000])).await;
+    let cfg = WebConfig {
+        ports: vec![s.port()],
+        host_interval: Duration::ZERO,
+        max_bytes: 64 * 1024,
+        ..WebConfig::default()
+    };
+    let gw = Arc::new(
+        WebGateway::new(cfg)
+            .unwrap()
+            .with_test_resolve(vec![("site.test".into(), s.addr)]),
+    );
+    let tool = web_fetch_tool(gw, StubExtractor::new());
+    let url = page_url(&s, "/bin");
+    let out = fetch(&tool, json!({"url": url})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        out.content,
+        format!(
+            "url: {url}\nstatus: 200\ntype: text/plain\n\nno readable text on the page\n\
+             [truncated at 65536 bytes]"
+        )
+    );
+}
+
 #[test]
 fn subjects_host_normalized() {
     let tool = web_fetch_tool(offline(), StubExtractor::new());
@@ -429,7 +578,9 @@ fn golden_descriptions() {
     // Канонический JSON, как `za_llm::render_tools` (массив по имени, объекты
     // `{description, name, parameters}`): `za-web` не зависит от `za-llm` (политика
     // направлений), а замена CRLF не нужна — переводов строк CR в описании нет.
-    let tools: Vec<Arc<dyn Tool>> = vec![web_fetch_tool(offline(), StubExtractor::new())];
+    let mut tools: Vec<Arc<dyn Tool>> = vec![web_fetch_tool(offline(), StubExtractor::new())];
+    // Порядок — по имени, как у `render_tools` (M6 ревью задачи 8: с `web_search` он важен).
+    tools.sort_by(|a, b| a.spec().schema.name.cmp(&b.spec().schema.name));
     let arr: Vec<Value> = tools
         .iter()
         .map(|t| {

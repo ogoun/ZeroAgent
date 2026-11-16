@@ -12,8 +12,11 @@
 //!   ограничена), пустая строка, текст; обрыв тела — `[truncated at N bytes]`. Код не 2xx —
 //!   ошибка `HTTP <код> <фраза>` и до 2 КиБ текста тела. Пустой или нечитаемый текст —
 //!   `no readable text on the page`. Метка — всегда `web` (своё происхождение, D110).
-//! - **`digest`** при `prompt` — отрывки [`rank_passages`] в 60 % `output_limit` под теми же
-//!   строками заголовка: пакет покажет его вместо выгрузки длинной страницы (D44).
+//! - **`digest`** при `prompt` — отрывки [`rank_passages`] под теми же строками заголовка:
+//!   пакет покажет его вместо выгрузки длинной страницы (D44). Бюджет — фактический предел
+//!   слота `ToolCx::output_budget` (вне пакета — `output_limit`) за вычетом шапки, пометки
+//!   обрыва и запаса [`DIGEST_RESERVE`] под строки слота; длина меряется после
+//!   экранирования. Доли 60/40 внутри бюджета делит сам `rank_passages` (I2 ревью задачи 8).
 //! - **Журнал обращений** — `ToolOutput::requests` (D112), в квитанцию не попадает.
 //!
 //! PDF (`application/pdf`) — задача 10 (D113); до неё — `unsupported content type`.
@@ -26,9 +29,10 @@ use serde_json::{Value, json};
 use url::Url;
 use za_core::extract::{ExtractError, Extractor, HtmlRequest};
 use za_core::net::normalize_host;
+use za_core::text::escaped_len;
 use za_core::{
-    Approval, BoxFuture, RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput, ToolSchema,
-    ToolSpec, call_deadline,
+    Approval, BoxFuture, DIGEST_RESERVE, RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput,
+    ToolSchema, ToolSpec, call_deadline,
 };
 use za_protocol::{EffectClass, RunRole, Tier, taint_origin};
 
@@ -41,8 +45,6 @@ pub const WEB_FETCH: &str = "web_fetch";
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// Предел результата, байт (D123).
 const OUTPUT_LIMIT: usize = 128 * 1024;
-/// Доля `output_limit` под `digest`, процентов (D110).
-const DIGEST_SHARE_PERCENT: usize = 60;
 /// Сколько байт текста тела показывать при коде не 2xx (D110).
 const ERROR_BODY_MAX: usize = 2048;
 /// Предел строки `title:`, символов, вместе с `...` (перенос задачи 7: заголовок враждебной
@@ -51,6 +53,9 @@ const TITLE_MAX_CHARS: usize = 200;
 /// Больше этой доли символов замены и управляющих среди непробельных — текст нечитаем
 /// (двоичные данные под текстовым типом), процентов.
 const GARBAGE_PERCENT_MAX: usize = 10;
+/// Больше этой доли «двоичных» управляющих символов среди всех — двоичные данные, процентов
+/// (M2 ревью задачи 8).
+const BINARY_PERCENT_MAX: usize = 1;
 
 /// Пустой или нечитаемый текст страницы (D110).
 const NO_TEXT: &str = "no readable text on the page";
@@ -153,8 +158,11 @@ impl Tool for WebFetch {
         Box::pin(async move {
             let start = Instant::now();
             let deadline = cx.deadline.unwrap_or_else(|| call_deadline(start, TIMEOUT));
+            // Предел результата слота на этом окне (I2 ревью задачи 8); вне пакета —
+            // `output_limit` инструмента.
+            let budget = cx.output_budget.unwrap_or(OUTPUT_LIMIT);
             let mut out = match serde_json::from_value::<Args>(args) {
-                Ok(a) => fetch(&gw, extractor, a, start, deadline).await,
+                Ok(a) => fetch(&gw, extractor, a, start, deadline, budget).await,
                 Err(e) => ToolOutput::error(invalid_args_text(&e.to_string())),
             };
             out.taint = Some(taint_origin::WEB.to_owned());
@@ -243,41 +251,53 @@ impl Tool for WebFetch {
 }
 
 /// Вызов: шлюз, затем разбор ответа. Журнал обращений — в `requests` результата при любом
-/// исходе, в том числе при тайм-ауте.
+/// исходе, в том числе при тайм-ауте. `budget` — предел результата в контексте (байт после
+/// экранирования), в него укладывается `digest`.
 async fn fetch(
     gw: &WebGateway,
     extractor: Arc<dyn Extractor>,
     args: Args,
     start: Instant,
     deadline: Instant,
+    budget: usize,
 ) -> ToolOutput {
     // Синтаксис URL; проверки адреса и порта — в шлюзе, с записью отказа в журнал.
     let url = match Url::parse(&args.url) {
         Ok(u) => u,
         Err(e) => return ToolOutput::error(FetchError::InvalidUrl(e.to_string()).text()),
     };
-    let budget = deadline.saturating_duration_since(start);
+    let time = deadline.saturating_duration_since(start);
     let tokio_deadline = tokio::time::Instant::from_std(deadline);
     let fetched = gw.get(&url, tokio_deadline).await;
     let mut out = match fetched.result {
         Ok(body) => {
-            let prompt = args.prompt.filter(|p| !p.trim().is_empty());
-            match tokio::time::timeout_at(tokio_deadline, page(body, prompt, extractor)).await {
+            let digest = args
+                .prompt
+                .filter(|p| !p.trim().is_empty())
+                .map(|prompt| DigestJob { prompt, budget });
+            match tokio::time::timeout_at(tokio_deadline, page(body, digest, extractor)).await {
                 Ok(o) => o,
-                Err(_) => ToolOutput::error(timeout_text(budget)),
+                Err(_) => ToolOutput::error(timeout_text(time)),
             }
         }
         // Редирект на другой хост — не сбой: ответ называет адрес для следующего вызова.
         Err(e @ FetchError::Redirect(_)) => ToolOutput::ok(e.text()),
-        Err(FetchError::Timeout) => ToolOutput::error(timeout_text(budget)),
+        Err(FetchError::Timeout) => ToolOutput::error(timeout_text(time)),
         Err(e) => ToolOutput::error(e.text()),
     };
     out.requests = fetched.requests.into_boxed_slice();
     out
 }
 
+/// Запрос сжатого представления длинной страницы (D110): что искать и предел результата
+/// слота, байт после экранирования.
+struct DigestJob {
+    prompt: String,
+    budget: usize,
+}
+
 /// Ответ сервера → результат: тип и кодировка, извлечение HTML, сборка текста.
-async fn page(body: Body, prompt: Option<String>, extractor: Arc<dyn Extractor>) -> ToolOutput {
+async fn page(body: Body, digest: Option<DigestJob>, extractor: Arc<dyn Extractor>) -> ToolOutput {
     let Body {
         final_url,
         status,
@@ -319,7 +339,7 @@ async fn page(body: Body, prompt: Option<String>, extractor: Arc<dyn Extractor>)
         truncated: truncated.then_some(shown),
         simplified,
     };
-    match blocking(move || assemble(rendered, prompt)).await {
+    match blocking(move || assemble(rendered, digest)).await {
         Ok(o) | Err(o) => o,
     }
 }
@@ -364,8 +384,8 @@ struct Rendered {
     simplified: bool,
 }
 
-/// Сборка результата из [`Rendered`]; `prompt` задаёт `digest` (D110).
-fn assemble(r: Rendered, prompt: Option<String>) -> ToolOutput {
+/// Сборка результата из [`Rendered`]; `job` задаёт `digest` (D110).
+fn assemble(r: Rendered, job: Option<DigestJob>) -> ToolOutput {
     let text = r.text.filter(|t| readable(t));
     if !(200..300).contains(&r.status) {
         let mut content = status_line(r.status);
@@ -393,12 +413,18 @@ fn assemble(r: Rendered, prompt: Option<String>) -> ToolOutput {
         .map(|n| format!("\n{}", truncated_text(n)))
         .unwrap_or_default();
     let Some(text) = text else {
-        return ToolOutput::ok(format!("{head}\n{NO_TEXT}"));
+        // Пометка обрыва остаётся и здесь: ответ на оборванное тело не выглядит полным (M5).
+        return ToolOutput::ok(format!("{head}\n{NO_TEXT}{marker}"));
     };
-    let digest = prompt.map(|p| {
-        let budget = (OUTPUT_LIMIT * DIGEST_SHARE_PERCENT / 100)
-            .saturating_sub(head.len() + 1 + marker.len());
-        format!("{head}\n{}{marker}", rank_passages(&text, &p, budget))
+    // Бюджет отрывков — предел слота за вычетом шапки, пометки обрыва и строк слота, всё
+    // после экранирования; доли 60/40 делит `rank_passages` (I2 ревью задачи 8).
+    let digest = job.map(|j| {
+        let frame = escaped_len(&head) + 1 + escaped_len(&marker) + DIGEST_RESERVE;
+        let budget = j.budget.saturating_sub(frame);
+        format!(
+            "{head}\n{}{marker}",
+            rank_passages(&text, &j.prompt, budget)
+        )
     });
     ToolOutput {
         digest,
@@ -416,18 +442,36 @@ async fn blocking<T: Send + 'static>(
     })
 }
 
-/// В тексте есть непробельные символы, и символов замены (U+FFFD) и управляющих среди них
-/// не больше [`GARBAGE_PERCENT_MAX`] процентов. Так отсеиваются двоичные данные под
-/// текстовым типом: `convert` декодирует их с заменой (D109, без эвристик типа).
+/// В тексте есть непробельные символы; символов замены (U+FFFD) и управляющих среди них не
+/// больше [`GARBAGE_PERCENT_MAX`] процентов; «двоичных» управляющих символов WHATWG MIME
+/// Sniffing ([`binary_char`]) — не больше [`BINARY_PERCENT_MAX`] процентов всех символов.
+/// Так отсеиваются двоичные данные под текстовым типом: `convert` декодирует их с заменой
+/// (D109, без эвристик типа). Вторая доля ловит двоичные данные в однобайтовой кодировке
+/// (`windows-1251`): там байты ≥ 0x80 становятся буквами, а управляющие байты остаются
+/// управляющими (M2 ревью задачи 8). Мерится текст после декодирования, поэтому нулевые
+/// байты UTF-16 сюда не попадают.
 fn readable(s: &str) -> bool {
-    let (mut seen, mut bad) = (0usize, 0usize);
-    for c in s.chars().filter(|c| !c.is_whitespace()) {
+    let (mut seen, mut bad, mut all, mut binary) = (0usize, 0usize, 0usize, 0usize);
+    for c in s.chars() {
+        all += 1;
+        if binary_char(c) {
+            binary += 1;
+        }
+        if c.is_whitespace() {
+            continue;
+        }
         seen += 1;
         if c == char::REPLACEMENT_CHARACTER || c.is_control() {
             bad += 1;
         }
     }
-    seen > 0 && bad * 100 <= seen * GARBAGE_PERCENT_MAX
+    seen > 0 && bad * 100 <= seen * GARBAGE_PERCENT_MAX && binary * 100 <= all * BINARY_PERCENT_MAX
+}
+
+/// «Двоичный» байт WHATWG MIME Sniffing (0x00–0x08, 0x0B, 0x0E–0x1A, 0x1C–0x1F) как символ:
+/// в тексте его не бывает (TAB, LF, FF, CR и ESC сюда не входят).
+fn binary_char(c: char) -> bool {
+    matches!(c, '\u{0}'..='\u{8}' | '\u{B}' | '\u{E}'..='\u{1A}' | '\u{1C}'..='\u{1F}')
 }
 
 /// Заголовок страницы для строки `title:`: пробелы, переводы строк и управляющие символы —
@@ -519,6 +563,11 @@ mod tests {
         assert!(!readable("a\0b\0c\0"));
         // Одиночная замена в длинном тексте — читаемо.
         assert!(readable(&format!("{}\u{FFFD}", "a".repeat(50))));
+        // «Двоичные» управляющие символы WHATWG: больше 1 % всех символов — нечитаемо (M2).
+        assert!(!readable(&format!("{}\0\0", "я".repeat(98))));
+        assert!(readable(&format!("{}\u{1}", "я".repeat(200))));
+        // TAB, LF, FF, CR — не «двоичные».
+        assert!(readable(&"a\t\n\u{C}\r".repeat(50)));
     }
 
     #[test]
