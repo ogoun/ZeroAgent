@@ -10,11 +10,17 @@
 //! - `web_does_not_make_commands_ask` — чтение из сети не влияет на запуск команд (D101);
 //! - `rule_of_two_logged_without_pause` — Rule of Two без вопросов (D106): журнал, аудит,
 //!   строка stderr один раз; недоверенный контекст от проекта и от самой страницы;
+//!   `rule_of_two_two_fetches_in_ask_mode` — два внешних вызова в режиме `ask`: две записи
+//!   аудита, одна строка (m1 ревью задачи 15);
+//! - `read_pdf_through_binary` — `read` PDF через подпроцесс `extract pdf` (таблица 5.2);
 //! - `skill_activation_end_to_end`, `slash_name_loads_skill`, `router_card_on_small` —
 //!   скиллы проекта: `activate_skill`, `/имя`, карточка роутера на small (D118, D119);
 //! - `resume_after_crash_in_web_fetch_repeats_read_only`,
 //!   `resume_after_receipt_does_not_touch_network` — resume веба (Review Focus 5, D112);
-//! - `resume_keeps_frozen_web_tools` — resume run с веб-инструментами (m6 ревью задачи 14);
+//! - `resume_keeps_frozen_web_tools` — resume run с веб-инструментами (m6 ревью задачи 14),
+//!   `policy.loaded` на resume (I1 ревью задачи 14);
+//! - `disabled_web_tool_explains_after_resume` — веб или поиск выключили во время паузы:
+//!   вызов из замороженного префикса отвечает понятным текстом (Ruling «Задача 15»);
 //! - `secret_in_fetch_url_masked` — значение `ZA_SECRET_*` в URL не попадает на диск;
 //! - `proxy_env_is_ignored` — переменные прокси процесса не действуют (D107, D121).
 //!
@@ -25,12 +31,16 @@
 //! держат runtime tokio. Предел каждого процесса — 60 с × `ZA_TEST_TIME_SCALE`.
 //!
 //! Живой шаг (`live_llama_s1`) помечен `#[ignore]` и берёт адреса из `LLAMA_TEST_URL` и
-//! `SEARXNG_TEST_URL`:
+//! `SEARXNG_TEST_URL`; окно llama-server — от 32768 токенов (`-c 32768`), иначе тир small и
+//! веб-инструментов нет:
 //! `LLAMA_TEST_URL=http://127.0.0.1:8080 SEARXNG_TEST_URL=http://127.0.0.1:8888
 //! ZA_TEST_TIME_SCALE=6 cargo test -p zero-agent --features test-hooks --test r1c2_web_skills
 //! -- --ignored --nocapture`.
 
 mod support;
+
+#[path = "../../../test-support/pdf.rs"]
+mod pdf;
 
 use std::path::{Path, PathBuf};
 
@@ -695,6 +705,106 @@ fn rule_of_two_logged_without_pause() {
             );
         }
     }
+}
+
+/// Модель: чтение внешнего файла по гранту, две разные страницы, ответ.
+fn read_then_two_fetches(seen: &[Value]) -> Response {
+    let cur = seen.last().unwrap();
+    match tool_results(cur) {
+        0 => call_reply(
+            "r1",
+            "read",
+            &json!({ "path": format!("{}/a.txt", task_arg(cur, "EXT")) }).to_string(),
+        ),
+        1 => call_reply(
+            "w1",
+            "web_fetch",
+            &json!({ "url": task_arg(cur, "URL") }).to_string(),
+        ),
+        2 => call_reply(
+            "w2",
+            "web_fetch",
+            &json!({ "url": task_arg(cur, "URL2") }).to_string(),
+        ),
+        _ => text_reply(&["готово"]),
+    }
+}
+
+/// m1 ревью задачи 15: два вызова с внешней связью при всех трёх свойствах в режиме по
+/// умолчанию (`ask`, без `--mode`) — run без паузы (у `read` по гранту и `web_fetch` вид
+/// `Read`, D123), две записи аудита `rule_of_two` (у каждого вызова) и одна строка SEC-052
+/// на run (D106, Ruling I1 ревью задачи 5).
+#[test]
+fn rule_of_two_two_fetches_in_ask_mode() {
+    let site = FakeHttp::start(docs_site);
+    let srv = Fake::start(N_CTX, true, read_then_two_fetches);
+    let url = format!("http://docs.test:{}/spawn", site.port);
+    let url2 = format!("http://docs.test:{}/x?p=2", site.port);
+    let names = resolve(&[("docs.test", site.port)]);
+    let name = "rule-of-two-ask";
+    let e = env_in(GROUP, name, &web_cfg(&srv.base, &[site.port], None));
+    let ext_root = unique_dir_in(&repo_root().join(".tmp/r1c2-acceptance"), name);
+    let ext = shown(&std::fs::canonicalize(&ext_root).unwrap()).join("ext");
+    write(&ext.join("a.txt"), "private note\n");
+    let ext_arg = ext.to_string_lossy().replace('\\', "/");
+    let grant = format!("{}=ro", ext.display());
+    let task = format!("Сверь EXT=|{ext_arg}| с URL=|{url}| и URL2=|{url2}|");
+    let o = e.run(&run_args(&e, &names, &["--grant", &grant, &task]));
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert_eq!(o.stdout, "готово\n", "{o:?}");
+    let events = e.events(run_id(&o));
+    assert_eq!(count(&events, EventKind::InterruptOpened), 0, "{events:?}");
+    assert_eq!(
+        site.requests(),
+        ["/robots.txt", "/spawn", "/x?p=2"],
+        "обе страницы запрошены"
+    );
+    let audit = e.audit("rule_of_two");
+    let calls: Vec<&str> = audit
+        .iter()
+        .map(|a| a.payload["call_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(calls, ["w1", "w2"], "{audit:?}");
+    for a in &audit {
+        assert_eq!(
+            a.payload["exposure"],
+            json!({"untrusted": true, "private": true, "external": true}),
+            "{a:?}"
+        );
+    }
+    assert_eq!(o.stderr.matches(RULE_OF_TWO_LINE).count(), 1, "{o:?}");
+}
+
+// ---- read PDF (таблица 5.2, D113) ----
+
+/// Модель: `read` PDF проекта, затем ответ.
+fn read_pdf_then_answer(seen: &[Value]) -> Response {
+    if tool_results(seen.last().unwrap()) > 0 {
+        return text_reply(&["готово"]);
+    }
+    call_reply("p1", "read", r#"{"path":"doc.pdf"}"#)
+}
+
+/// m4 ревью задачи 15 (таблица 5.2): `read` PDF через бинарник — извлекатель подключён к
+/// нативным инструментам run (`deps`, `NativeDeps.extractor`), текст страниц разбирает
+/// подпроцесс `extract pdf` (D113); копия PDF — в `.zero-agent/work/tmp/<run>`, после run
+/// каталога нет.
+#[test]
+fn read_pdf_through_binary() {
+    let srv = Fake::start(N_CTX, true, read_pdf_then_answer);
+    let e = env_in(GROUP, "read-pdf", &llama_config(&srv.base));
+    std::fs::write(e.project.join("doc.pdf"), pdf::two_page_pdf()).unwrap();
+    let o = e.run_cmd(&["Прочитай doc.pdf"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let p1 = result_of(&srv.bodies(), "p1");
+    assert!(
+        p1.contains("--- page 1 ---\nalpha") && p1.contains("--- page 2 ---\nbeta"),
+        "{p1}"
+    );
+    assert!(!p1.contains("binary file"), "{p1}");
+    let run = run_id(&o);
+    let tmp = e.project.join(format!(".zero-agent/work/tmp/{run}"));
+    assert!(!tmp.exists(), "{} не убран", tmp.display());
 }
 
 // ---- Скиллы (D116, D118, D119) ----
@@ -1391,8 +1501,13 @@ fn proxy_env_is_ignored() {
 /// Ручная проверка S1 (шаг 1): настоящая модель отвечает на вопрос с поиском через свой
 /// экземпляр SearXNG и открытием страниц в настоящем интернете. Ссылки ответа проверяются
 /// вручную; итог печатается для `docs/journal.md`.
+///
+/// Окно llama-server — от 32768 токенов (`-c 32768` или больше; m3 ревью задачи 15): на
+/// меньшем окне тир run — small (`Tier::for_context`), а у `web_search` и `web_fetch`
+/// `min_tier = standard` (D123) — веб-инструментов в run нет. Тест проверяет это первым,
+/// с понятным сообщением.
 #[test]
-#[ignore = "живые llama-server и SearXNG: LLAMA_TEST_URL=http://127.0.0.1:8080 SEARXNG_TEST_URL=http://127.0.0.1:8888 ZA_TEST_TIME_SCALE=6 cargo test -p zero-agent --features test-hooks --test r1c2_web_skills -- --ignored --nocapture"]
+#[ignore = "живые llama-server (окно от 32768: -c 32768) и SearXNG: LLAMA_TEST_URL=http://127.0.0.1:8080 SEARXNG_TEST_URL=http://127.0.0.1:8888 ZA_TEST_TIME_SCALE=6 cargo test -p zero-agent --features test-hooks --test r1c2_web_skills -- --ignored --nocapture"]
 fn live_llama_s1() {
     let need = |k: &str| {
         std::env::var(k).unwrap_or_else(|_| {
@@ -1422,6 +1537,16 @@ fn live_llama_s1() {
         &[("ZA_LOG", "info")],
     );
     println!("stdout:\n{}\nstderr:\n{}", o.stdout, o.stderr);
+    let tools: Vec<String> = e.snapshot(run_id(&o))["frozen"]["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        tools.iter().any(|n| n == "web_search"),
+        "в run нет web_search: окно модели меньше 32768 (тир small) — запустите llama-server с -c 32768 или больше; инструменты run: {tools:?}"
+    );
     assert_eq!(o.code(), Some(0), "{o:?}");
     let events = e.events(run_id(&o));
     let reqs = payloads(&events, EventKind::WebRequest);
