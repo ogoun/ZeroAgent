@@ -36,13 +36,11 @@ use za_protocol::net_outcome;
 
 use crate::addr::{FilteredResolver, ResolveFail, check_url};
 use crate::limit::RateLimiter;
-use crate::robots::robots_allows;
+use crate::robots::{ROBOTS_MAX_BYTES, Rules};
 use crate::{Body, FetchError, Fetched, WebConfig, WebError};
 
 /// Предел переходов по редиректам на тот же хост.
 const MAX_REDIRECTS: usize = 5;
-/// Предел `robots.txt` (RFC 9309, 2.5): дальше текст не разбирается.
-const ROBOTS_MAX: u64 = 500 * 1024;
 /// Срок кэша `robots.txt` на источник.
 const ROBOTS_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Токен агента в `robots.txt` и `User-Agent`.
@@ -60,8 +58,9 @@ pub struct WebGateway {
     #[cfg(feature = "test-hooks")]
     resolver: Arc<FilteredResolver>,
     limiter: RateLimiter,
-    /// `robots.txt` по источнику (`scheme://host:port`): время получения и текст.
-    robots: Mutex<HashMap<String, (Instant, Arc<str>)>>,
+    /// `robots.txt` по источнику (`scheme://host:port`): время получения и правила агента,
+    /// разобранные один раз (M4 ревью задачи 6: запрос не разбирает текст заново).
+    robots: Mutex<HashMap<String, (Instant, Arc<Rules>)>>,
     /// Замки хостов (нормализованный хост).
     hosts: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -78,7 +77,8 @@ struct Resp {
 
 /// Исход получения `robots.txt`.
 enum Robots {
-    Text(Arc<str>),
+    /// Правила агента; пустые — разрешено всё (4xx, редирект на другой хост).
+    Rules(Arc<Rules>),
     /// 5xx или сбой: всё запрещено (`blocked by robots.txt: unavailable`).
     Unavailable,
 }
@@ -169,7 +169,7 @@ impl WebGateway {
             let r = self
                 .request(&url, self.cfg.max_bytes, deadline, &mut rec)
                 .await;
-            finish(&mut rec, &r);
+            finish(&mut rec, &r, &url);
             log.push(rec);
             let resp = r?;
             let Some(target) = resp.location else {
@@ -182,7 +182,8 @@ impl WebGateway {
                 });
             };
             if !same_host(&url, &target) {
-                return Err(FetchError::Redirect(target.to_string()));
+                // Адрес для модели — без userinfo и фрагмента (M2 ревью задачи 6).
+                return Err(FetchError::Redirect(shown(&target)));
             }
             if hop == MAX_REDIRECTS {
                 break;
@@ -212,12 +213,12 @@ impl WebGateway {
         log: &mut Vec<NetRequest>,
     ) -> Result<(), FetchError> {
         let origin = url.origin().ascii_serialization();
-        let text = match self.cached_robots(&origin) {
-            Some(t) => t,
+        let rules = match self.cached_robots(&origin) {
+            Some(r) => r,
             None => match self.fetch_robots(url, deadline, log).await {
-                Ok(Robots::Text(t)) => {
-                    self.cache_robots(origin, t.clone());
-                    t
+                Ok(Robots::Rules(r)) => {
+                    self.cache_robots(origin, r.clone());
+                    r
                 }
                 Ok(Robots::Unavailable) => {
                     let e = FetchError::Robots("unavailable");
@@ -237,7 +238,7 @@ impl WebGateway {
         if let Some(q) = url.query() {
             path = format!("{path}?{q}");
         }
-        if robots_allows(&text, AGENT, &path) {
+        if rules.allows(&path) {
             return Ok(());
         }
         let e = FetchError::Robots("disallowed");
@@ -247,8 +248,9 @@ impl WebGateway {
 
     /// Получить `robots.txt` (RFC 9309, 2.3.1): 2xx — текст до 500 КиБ; 4xx — всё
     /// разрешено; 5xx и сбой — `Unavailable`. Редирект на тот же хост исполняется (до
-    /// пяти); на другой хост или дальше — как 4xx (RFC 9309, 2.3.1.2: «недоступен»).
-    /// `Err` — только `Timeout` и отказ фильтра (`Blocked`): тогда и страница не идёт.
+    /// пяти); на другой хост, цель, отвергнутая фильтром (запись `blocked`), или дальше
+    /// пяти — как 4xx (RFC 9309, 2.3.1.2: «недоступен»). `Err` — только `Timeout` и отказ
+    /// фильтра при запросе (`Blocked`): тогда и страница не идёт.
     async fn fetch_robots(
         &self,
         page: &Url,
@@ -260,8 +262,10 @@ impl WebGateway {
         url.set_query(None);
         for _ in 0..=MAX_REDIRECTS {
             let mut rec = record(url.as_str());
-            let r = self.request(&url, ROBOTS_MAX, deadline, &mut rec).await;
-            finish(&mut rec, &r);
+            let r = self
+                .request(&url, ROBOTS_MAX_BYTES as u64, deadline, &mut rec)
+                .await;
+            finish(&mut rec, &r, &url);
             log.push(rec);
             let resp = match r {
                 Ok(resp) => resp,
@@ -269,21 +273,32 @@ impl WebGateway {
                 Err(_) => return Ok(Robots::Unavailable),
             };
             if let Some(target) = resp.location {
+                // Другой хост не исполняется: соединения с ним нет (как у страницы).
+                if !same_host(&url, &target) {
+                    break;
+                }
+                // Отказ фильтра — запись, как у редиректа страницы (D112, M3 ревью задачи 6).
                 match self.admit(&target) {
-                    Ok(t) if same_host(&url, &t) => {
+                    Ok(t) => {
                         url = t;
                         continue;
                     }
-                    _ => break,
+                    Err(e) => {
+                        log.push(refused(&shown(&target), &e));
+                        break;
+                    }
                 }
             }
             return Ok(match resp.status {
-                200..=299 => Robots::Text(robots_text(&resp.bytes, resp.truncated)),
-                400..=499 => Robots::Text("".into()),
+                200..=299 => {
+                    let text = robots_text(&resp.bytes, resp.truncated);
+                    Robots::Rules(Arc::new(Rules::parse(&text, AGENT)))
+                }
+                400..=499 => Robots::Rules(Arc::default()),
                 _ => Robots::Unavailable,
             });
         }
-        Ok(Robots::Text("".into()))
+        Ok(Robots::Rules(Arc::default()))
     }
 
     /// Один `GET`: место в лимитере, запрос, заголовки, тело до `limit`. Запись `rec`
@@ -324,7 +339,9 @@ impl WebGateway {
             let target = url
                 .join(loc.to_str().map_err(|_| bad())?)
                 .map_err(|_| bad())?;
-            rec.final_url = Some(target.to_string());
+            // В журнал — без userinfo и фрагмента (M2 ревью задачи 6); цель с userinfo
+            // дальше отвергнет фильтр.
+            rec.final_url = Some(shown(&target));
             return Ok(Resp {
                 status,
                 location: Some(target),
@@ -382,14 +399,14 @@ impl WebGateway {
         m.entry(host.to_string()).or_default().clone()
     }
 
-    fn cached_robots(&self, origin: &str) -> Option<Arc<str>> {
+    fn cached_robots(&self, origin: &str) -> Option<Arc<Rules>> {
         let m = self.robots.lock().unwrap_or_else(|e| e.into_inner());
         m.get(origin)
             .filter(|(at, _)| at.elapsed() < ROBOTS_TTL)
             .map(|(_, t)| t.clone())
     }
 
-    fn cache_robots(&self, origin: String, text: Arc<str>) {
+    fn cache_robots(&self, origin: String, rules: Arc<Rules>) {
         let mut m = self.robots.lock().unwrap_or_else(|e| e.into_inner());
         if m.len() >= KEPT {
             m.retain(|_, (at, _)| at.elapsed() < ROBOTS_TTL);
@@ -397,18 +414,18 @@ impl WebGateway {
                 m.clear();
             }
         }
-        m.insert(origin, (Instant::now(), text));
+        m.insert(origin, (Instant::now(), rules));
     }
 }
 
 /// Текст `robots.txt`: UTF-8 с заменой; обрезанный — до последней целой строки.
-fn robots_text(bytes: &[u8], truncated: bool) -> Arc<str> {
+fn robots_text(bytes: &[u8], truncated: bool) -> std::borrow::Cow<'_, str> {
     let bytes = match bytes.iter().rposition(|b| *b == b'\n') {
         Some(i) if truncated => &bytes[..=i],
         _ if truncated => &[],
         _ => bytes,
     };
-    String::from_utf8_lossy(bytes).into()
+    String::from_utf8_lossy(bytes)
 }
 
 /// Переход допустим: тот же нормализованный хост, `http` → `http`/`https`,
@@ -459,8 +476,9 @@ fn timed_out(url: &str) -> NetRequest {
     }
 }
 
-/// Исход записи по результату запроса.
-fn finish(rec: &mut NetRequest, r: &Result<Resp, FetchError>) {
+/// Исход записи по результату запроса. В лог отладки — только хост и исход: строка
+/// запроса может нести секрет, маскирует её только запись журнала (D112, M5 ревью задачи 6).
+fn finish(rec: &mut NetRequest, r: &Result<Resp, FetchError>, url: &Url) {
     if let Err(e) = r {
         rec.outcome = match e {
             FetchError::Blocked(_) => net_outcome::BLOCKED,
@@ -470,7 +488,7 @@ fn finish(rec: &mut NetRequest, r: &Result<Resp, FetchError>) {
         rec.reason = Some(e.reason());
     }
     tracing::debug!(
-        url = %rec.url,
+        host = url.host_str().unwrap_or_default(),
         status = ?rec.status,
         bytes = rec.bytes,
         outcome = %rec.outcome,

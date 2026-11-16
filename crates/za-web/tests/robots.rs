@@ -1,6 +1,6 @@
 //! Разбор `robots.txt` (RFC 9309, D107) — без сети.
 
-use za_web::robots_allows;
+use za_web::{ROBOTS_MAX_BYTES, ROBOTS_MAX_RULES, robots_allows};
 
 #[test]
 fn robots_table() {
@@ -73,6 +73,114 @@ fn robots_percent_encoding_is_normalized() {
     // `%2F` — зарезервированный `/`: не равен буквальному `/`.
     assert!(!robots_allows(r, "z", "/a%2Fb"));
     assert!(robots_allows(r, "z", "/a/b"));
+}
+
+/// M4 ревью задачи 6: разбор ограничен текстом 500 КиБ (как у основных поисковиков,
+/// RFC 9309 2.5) — правило дальше предела не действует; обрезка — по последней целой
+/// строке.
+#[test]
+fn robots_text_beyond_500_kib_is_ignored() {
+    let mut r = String::from("User-agent: *\nDisallow: /early\n");
+    while r.len() < ROBOTS_MAX_BYTES - 100 {
+        r.push_str("# filler filler\n");
+    }
+    // Строка, пересекающая предел, отбрасывается целиком.
+    let cross = "Disallow: /cross\n";
+    let pad = ROBOTS_MAX_BYTES - r.len() - cross.len() + 3;
+    r.push_str(&"#".repeat(pad));
+    r.push('\n');
+    r.push_str(cross);
+    r.push_str("Disallow: /late\n");
+    assert!(r.len() > ROBOTS_MAX_BYTES);
+    assert!(!robots_allows(&r, "z", "/early"));
+    assert!(robots_allows(&r, "z", "/cross"));
+    assert!(robots_allows(&r, "z", "/late"));
+    // Тот же текст до предела действует целиком.
+    let short = "User-agent: *\nDisallow: /early\nDisallow: /late\n";
+    assert!(!robots_allows(short, "z", "/late"));
+}
+
+/// M4: число правил группы агента ограничено (`ROBOTS_MAX_RULES`): дальше правила не
+/// действуют — разбор и сопоставление не растут с текстом.
+#[test]
+fn robots_rule_count_is_capped() {
+    let mut r = String::from("User-agent: *\n");
+    for i in 0..ROBOTS_MAX_RULES - 1 {
+        r.push_str(&format!("Disallow: /d{i}/\n"));
+    }
+    r.push_str("Disallow: /last-kept\n");
+    r.push_str("Disallow: /dropped\n");
+    assert!(!robots_allows(&r, "z", "/d0/x"));
+    assert!(!robots_allows(&r, "z", "/last-kept"));
+    assert!(robots_allows(&r, "z", "/dropped"));
+    // Пустой `Disallow` правилом не считается и место не занимает.
+    let mut r = String::from("User-agent: *\n");
+    for _ in 0..ROBOTS_MAX_RULES + 10 {
+        r.push_str("Disallow:\n");
+    }
+    r.push_str("Disallow: /kept\n");
+    assert!(!robots_allows(&r, "z", "/kept"));
+    // Правила чужих групп в предел не входят.
+    let mut r = String::from("User-agent: other\n");
+    for i in 0..ROBOTS_MAX_RULES + 10 {
+        r.push_str(&format!("Disallow: /o{i}\n"));
+    }
+    r.push_str("\nUser-agent: *\nDisallow: /mine\n");
+    assert!(!robots_allows(&r, "z", "/mine"));
+}
+
+/// M4: худший случай у предела текста и длины URL — доли секунды даже в отладочной сборке
+/// (в release — единицы миллисекунд, замер в отчёте). Прежняя динамика O(шаблон × путь)
+/// давала около 0,5 с в release.
+#[test]
+fn robots_worst_case_is_bounded() {
+    let fill = |line: &str| {
+        let mut r = String::from("User-agent: *\n");
+        while r.len() + line.len() < ROBOTS_MAX_BYTES {
+            r.push_str(line);
+        }
+        r
+    };
+    let path = format!("/{}", "a".repeat(2000));
+    for r in [
+        fill(&format!("Disallow: /{}b\n", "*a".repeat(500))),
+        fill(&format!("Disallow: /{}b\n", "a".repeat(1990))),
+        fill("Disallow: /*b\n"),
+    ] {
+        let t = std::time::Instant::now();
+        assert!(robots_allows(&r, "z", &path));
+        let spent = t.elapsed();
+        assert!(spent < std::time::Duration::from_secs(1), "{spent:?}");
+    }
+}
+
+/// Сопоставление `*` и `$` жадным разбором совпадает с определением RFC 9309.
+#[test]
+fn robots_wildcard_matching_cases() {
+    let m = |pat: &str, path: &str| {
+        let r = format!("User-agent: *\nDisallow: {pat}\n");
+        !robots_allows(&r, "z", path)
+    };
+    // Буквальный шаблон — префикс пути; с `$` — путь целиком.
+    assert!(m("/a/b", "/a/bc"));
+    assert!(!m("/a/b$", "/a/bc"));
+    assert!(m("/a/b$", "/a/b"));
+    // `*` в середине, подряд, в конце; самое левое вхождение не мешает следующему.
+    assert!(m("/a*c", "/abbbc"));
+    assert!(m("/a**c", "/ac"));
+    assert!(m("/a*", "/a"));
+    assert!(m("/*a*b*c$", "/xaybzc"));
+    assert!(!m("/*a*b*c$", "/xaybzcd"));
+    assert!(m("/*ab*ab$", "/abab"));
+    assert!(!m("/*aba*aba$", "/ababa"));
+    assert!(m("/*aba*aba$", "/abaaba"));
+    // Конец `$` после `*`: хвост пути не перекрывает уже совпавшую часть.
+    assert!(!m("/*xy*y$", "/xy"));
+    assert!(m("/*xy*y$", "/xyy"));
+    assert!(m("/*$", "/anything"));
+    assert!(m("*", "/"));
+    // Не с начала пути — не совпадение.
+    assert!(!m("/b", "/ab"));
 }
 
 #[test]

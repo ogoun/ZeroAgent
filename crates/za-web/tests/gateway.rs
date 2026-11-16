@@ -382,6 +382,154 @@ async fn robots_5xx_disallows_and_4xx_allows() {
     assert_eq!(down.paths(), ["/page"]);
 }
 
+/// M1, M3 ревью задачи 6: редирект самого `robots.txt` (RFC 9309, 2.3.1.2). Тот же хост —
+/// исполняется (и `http` → `https`); другой хост — не исполняется, подключений к нему нет,
+/// `robots.txt` «недоступен» (как 4xx: всё разрешено); 3xx без `Location` — как 5xx; цель,
+/// которую отверг фильтр (порт), — запись `blocked`, подключений к ней нет.
+#[tokio::test]
+async fn robots_redirect_branches() {
+    // Тот же хост: правила берутся из цели редиректа.
+    let mut same = serve(|p| match p {
+        "/robots.txt" => redirect("/rules.txt"),
+        "/rules.txt" => text(200, "User-agent: *\nDisallow: /private\n"),
+        _ => text(200, "page"),
+    })
+    .await;
+    let gw = site(&same);
+    let base = format!("http://site.test:{}", same.port());
+    let f = get(&gw, &format!("{base}/private")).await;
+    assert_eq!(f.result.err(), Some(FetchError::Robots("disallowed")));
+    assert_eq!(same.paths(), ["/robots.txt", "/rules.txt"]);
+    let r: Vec<(&str, Option<u16>, Option<&str>)> = f
+        .requests
+        .iter()
+        .map(|r| (r.url.as_str(), r.status, r.final_url.as_deref()))
+        .collect();
+    let (robots, rules) = (format!("{base}/robots.txt"), format!("{base}/rules.txt"));
+    let private = format!("{base}/private");
+    assert_eq!(
+        r,
+        [
+            (robots.as_str(), Some(302), Some(rules.as_str())),
+            (rules.as_str(), Some(200), None),
+            (private.as_str(), None, None),
+        ]
+    );
+    assert_eq!(f.requests[2].outcome, net_outcome::BLOCKED);
+    get(&gw, &format!("{base}/public")).await.result.unwrap();
+    assert_eq!(same.paths(), ["/public"], "правила из кэша");
+
+    // `http` → `https` того же хоста исполняется: TLS к простому серверу не проходит,
+    // `robots.txt` недоступен — страница не запрашивается.
+    let mut tls = serve(move |p| match p {
+        "/robots.txt" => redirect("https://site.test/robots.txt"),
+        _ => text(200, "page"),
+    })
+    .await;
+    let gw = gateway(config(&[tls.port(), 443]), &[("site.test", tls.addr)]);
+    let f = get(&gw, &format!("http://site.test:{}/page", tls.port())).await;
+    assert_eq!(f.result.err(), Some(FetchError::Robots("unavailable")));
+    assert_eq!(f.requests[1].url, "https://site.test/robots.txt");
+    assert_eq!(f.requests[1].outcome, net_outcome::ERROR);
+    assert!(!tls.paths().contains(&"/page".to_string()));
+
+    // Другой хост: не исполняется, к нему подключений нет; страница получена.
+    let mut other = serve(|_| text(200, "User-agent: *\nDisallow: /\n")).await;
+    let target = format!("http://other.test:{}/robots.txt", other.port());
+    let t = target.clone();
+    let mut away = serve(move |p| match p {
+        "/robots.txt" => redirect(&t),
+        _ => text(200, "page"),
+    })
+    .await;
+    let gw = gateway(
+        config(&[away.port(), other.port()]),
+        &[("site.test", away.addr), ("other.test", other.addr)],
+    );
+    let f = get(&gw, &format!("http://site.test:{}/page", away.port())).await;
+    assert_eq!(f.result.unwrap().bytes, b"page");
+    assert_eq!(away.paths(), ["/robots.txt", "/page"]);
+    assert!(
+        other.rx.try_recv().is_err(),
+        "other.test запросов не получил"
+    );
+    assert_eq!(f.requests[0].final_url.as_deref(), Some(target.as_str()));
+    assert_eq!(f.requests.len(), 2);
+
+    // 3xx без `Location` — как 5xx: всё запрещено.
+    let mut bare = serve(|p| match p {
+        "/robots.txt" => text(302, ""),
+        _ => text(200, "page"),
+    })
+    .await;
+    let gw = site(&bare);
+    let f = get(&gw, &format!("http://site.test:{}/page", bare.port())).await;
+    assert_eq!(f.result.err(), Some(FetchError::Robots("unavailable")));
+    assert_eq!(bare.paths(), ["/robots.txt"]);
+
+    // Цель с портом вне списка: запись `blocked`, подключений к ней нет; `robots.txt`
+    // недоступен — как 4xx, страница получена.
+    let mut port = serve(|p| match p {
+        "/robots.txt" => redirect("http://site.test:25/robots.txt"),
+        _ => text(200, "page"),
+    })
+    .await;
+    let gw = site(&port);
+    let f = get(&gw, &format!("http://site.test:{}/page", port.port())).await;
+    assert_eq!(f.result.unwrap().bytes, b"page");
+    assert_eq!(port.paths(), ["/robots.txt", "/page"]);
+    let blocked = &f.requests[1];
+    assert_eq!(blocked.url, "http://site.test:25/robots.txt");
+    assert_eq!(blocked.outcome, net_outcome::BLOCKED);
+    assert_eq!(blocked.reason.as_deref(), Some("port 25 is not allowed"));
+    assert_eq!(f.requests.len(), 3, "{:?}", f.requests);
+}
+
+/// M2 ревью задачи 6: userinfo из `Location` не попадает ни в журнал (`final_url`, `url`
+/// отказа), ни в текст `Redirect` для модели.
+#[tokio::test]
+async fn redirect_userinfo_is_not_logged_or_shown() {
+    let other = serve(|_| text(200, "other")).await;
+    let oport = other.port();
+    let port = Arc::new(std::sync::OnceLock::<u16>::new());
+    let p = port.clone();
+    let mut s = serve(move |path| match path {
+        "/away" => redirect(&format!("http://u:pw@other.test:{oport}/x#frag")),
+        "/same" => redirect(&format!("http://u:pw@site.test:{}/y", p.get().unwrap())),
+        _ => text(404, ""),
+    })
+    .await;
+    port.set(s.port()).unwrap();
+    let gw = gateway(
+        config(&[s.port(), oport]),
+        &[("site.test", s.addr), ("other.test", other.addr)],
+    );
+    let base = format!("http://site.test:{}", s.port());
+    let clean = format!("http://other.test:{oport}/x");
+    let f = get(&gw, &format!("{base}/away")).await;
+    let e = f.result.unwrap_err();
+    assert_eq!(e, FetchError::Redirect(clean.clone()));
+    assert!(!e.text().contains("pw"), "{}", e.text());
+    assert_eq!(
+        f.requests.last().unwrap().final_url.as_deref(),
+        Some(clean.as_str())
+    );
+    // Тот же хост: цель с userinfo отвергает фильтр, запись отказа — без userinfo.
+    let f = get(&gw, &format!("{base}/same")).await;
+    assert_eq!(f.result.err(), Some(FetchError::Credentials));
+    let y = format!("{base}/y");
+    let last = &f.requests[f.requests.len() - 1];
+    assert_eq!(last.url, y);
+    assert_eq!(last.outcome, net_outcome::BLOCKED);
+    assert_eq!(
+        f.requests[f.requests.len() - 2].final_url.as_deref(),
+        Some(y.as_str())
+    );
+    let all = format!("{:?}", f.requests);
+    assert!(!all.contains("pw"), "{all}");
+    assert_eq!(s.paths(), ["/robots.txt", "/away", "/same"]);
+}
+
 #[tokio::test]
 async fn requests_logged_including_robots_and_blocked() {
     let mut s = serve(|p| match p {

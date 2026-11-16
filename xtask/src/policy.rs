@@ -9,9 +9,10 @@
 //! (`std::process::Command`, `tokio::process::Command`) в `crates/*/src` — только в
 //! `za-jail` (SEC-006); в `Cargo.lock` нет `openssl-sys`, `native-tls`, `libdbus-sys`.
 //! R1-C2 (D107, D129): `za-web` — только от `za-protocol` и `za-core`, от него — только
-//! `zero-agent` и `xtask`; у `reqwest` в сборке workspace (с тестами) нет функций сжатия,
-//! cookie, SOCKS, HTTP/2 и корней ОС; HTTP-клиент `reqwest` строится только в
-//! `crates/za-web/src/gateway.rs` и `crates/za-llm`.
+//! `zero-agent` и `xtask`; от `reqwest` напрямую (любой вид) — только `za-llm` и `za-web`;
+//! у `reqwest` в сборке workspace (с тестами) нет функций сжатия, cookie, SOCKS, HTTP/2 и
+//! корней ОС; HTTP-клиент `reqwest` строится только в `crates/za-web/src/gateway.rs` и
+//! `crates/za-llm`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -32,7 +33,7 @@ const CORE_FORBIDDEN_DEPS: &[&str] = &[
     "za-browser",
     // `za-agent` — общим правилом нижних слоёв ниже.
     "za-res",
-    "reqwest",
+    // `reqwest` — общим правилом `REQWEST_USERS` ниже.
     // Крейты R1-C1 стоят над `za-core` (D73).
     "za-jail",
     "za-tools",
@@ -50,8 +51,6 @@ const AGENT_ALLOWED_ZA_DEPS: &[&str] = &[
 ];
 /// Крейты, подключающие `za-llm` только без функций: без HTTP и `Gateway`.
 const PURE_LLM_USERS: &[&str] = &["za-core", "za-agent"];
-/// Внешние крейты, которые `za-agent` подключать не должен: модель — только через `ModelPort`.
-const AGENT_FORBIDDEN_DEPS: &[&str] = &["reqwest"];
 /// Крейты `za-*`, от которых может зависеть `za-res`: протокол (D1) и запуск
 /// `nvidia-smi` через `za-jail` (R1-C1 D73).
 const RES_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-jail"];
@@ -90,6 +89,9 @@ const REQWEST_FORBIDDEN_FEATURES: &[&str] = &[
     "native-tls",
     "default-tls",
 ];
+/// Кто может зависеть от `reqwest` напрямую (все виды; Ruling I2 ревью задачи 6, D129):
+/// транспорт моделей и сетевой шлюз.
+const REQWEST_USERS: &[&str] = &["za-llm", "za-web"];
 /// Где можно строить HTTP-клиент `reqwest`, и почему (D129). Путь — от корня, через `/`.
 const HTTP_CLIENT_ALLOWED: &[(&str, &str)] = &[
     (
@@ -260,13 +262,15 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     AGENT_ALLOWED_ZA_DEPS.join(", ")
                 )));
             }
-            if pkg.name == "za-agent"
-                && dep.kind.as_deref() != Some("dev")
-                && AGENT_FORBIDDEN_DEPS.contains(&dep.name.as_str())
-            {
+            // Все виды (Ruling I2 ревью задачи 6, D129): HTTP-клиент `reqwest` — только у
+            // транспорта моделей и сетевого шлюза. Иначе второй клиент вне шлюза строится и
+            // без `Client::builder` в исходнике. `za-agent` видит модель только через
+            // `ModelPort`, `za-core` — без HTTP.
+            if dep.name == "reqwest" && !REQWEST_USERS.contains(&pkg.name.as_str()) {
                 out.push(Violation(format!(
-                    "za-agent не должен зависеть от {}",
-                    dep.name
+                    "{} не должен зависеть от reqwest (только {}; D129: HTTP-клиент вне шлюза — обход фильтра адресов)",
+                    pkg.name,
+                    REQWEST_USERS.join(", ")
                 )));
             }
             // Все виды: и dev-зависимость тянет крейт в сборку тестов продукта.
@@ -401,14 +405,17 @@ fn resolved_features(root: &Path, sel: &[&str], krate: &str) -> Result<Vec<Strin
 }
 
 /// Построение HTTP-клиента `reqwest` в исходнике `rel` вне [`HTTP_CLIENT_ALLOWED`] (D129):
-/// `Client::builder`, `ClientBuilder`, `Client::new(`, `reqwest::get(`, `reqwest::blocking`.
-/// Имя должно начинаться словом: `MemoryClient::new(` — не клиент `reqwest`. Строки-
-/// комментарии не считаются.
+/// `Client::builder`, `ClientBuilder`, `Client::new(`, `Client::default(`, упоминание типа
+/// `reqwest::Client`, `reqwest::get(`, `reqwest::blocking`. Имя должно начинаться словом:
+/// `MemoryClient::new(` — не клиент `reqwest`. Строки-комментарии не считаются. Главный
+/// страж — зависимость (`REQWEST_USERS`): этот проверяет файлы внутри `za-web`.
 pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
     const PATTERNS: &[&str] = &[
         "Client::builder",
         "ClientBuilder",
         "Client::new(",
+        "Client::default(",
+        "reqwest::Client",
         "reqwest::get(",
         "reqwest::blocking",
     ];
@@ -970,6 +977,52 @@ version = \"0.0.1\"
             assert!(to_web(check_direction(&meta_with(bad, dev))), "dev {bad}");
         }
     }
+    /// Ruling I2 ревью задачи 6: прямая зависимость от `reqwest` любого вида (обычная, dev,
+    /// build) — только у `za-llm` и `za-web`. Иначе второй HTTP-клиент вне шлюза строится
+    /// и без `Client::builder` в исходнике (`Client::default()`, обёртка, макрос).
+    #[test]
+    fn reqwest_only_in_llm_and_web() {
+        let kinds = [None, Some("dev"), Some("build")];
+        let with_kind = |k: Option<&str>| Dependency {
+            kind: k.map(str::to_owned),
+            ..dep("reqwest")
+        };
+        let reqwest_rule = |v: &[Violation]| {
+            v.iter()
+                .filter(|x| x.0.contains("от reqwest (только za-llm, za-web"))
+                .count()
+        };
+        for ok in ["za-llm", "za-web"] {
+            for k in kinds {
+                let v = check_direction(&meta_with(ok, with_kind(k)));
+                assert!(v.is_empty(), "{ok} {k:?}: {v:?}");
+            }
+        }
+        for bad in [
+            "za-agent",
+            "za-core",
+            "za-tools",
+            "za-skills",
+            "za-extract",
+            "za-store",
+            "za-jail",
+            "za-res",
+            "za-protocol",
+            "zero-agent",
+            "xtask",
+        ] {
+            for k in kinds {
+                let v = check_direction(&meta_with(bad, with_kind(k)));
+                assert_eq!(reqwest_rule(&v), 1, "{bad} {k:?}: {v:?}");
+            }
+        }
+        // Переименование (`http = { package = "reqwest" }`) не прячет крейт: `cargo
+        // metadata` даёт в `name` имя пакета.
+        let json = r#"{"packages":[{"name":"za-tools","dependencies":[
+            {"name":"reqwest","rename":"http","uses_default_features":false,"kind":null}]}]}"#;
+        let m: Metadata = serde_json::from_str(json).unwrap();
+        assert_eq!(reqwest_rule(&check_direction(&m)), 1);
+    }
     #[test]
     fn reqwest_features_are_guarded() {
         let clean = "reqwest v0.12.28|__rustls,__tls,json,rustls-tls,rustls-tls-webpki-roots\n\
@@ -991,6 +1044,9 @@ version = \"0.0.1\"
             "let c = Client::builder()",
             "let b: reqwest::ClientBuilder = x;",
             "let c = reqwest::Client::new();",
+            "let c = reqwest::Client::default();",
+            "let c = Client::default();",
+            "let c = <reqwest::Client as Default>::default();",
             "let r = reqwest::get(url).await?;",
             "let c = reqwest::blocking::Client::new();",
         ] {

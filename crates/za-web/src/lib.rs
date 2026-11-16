@@ -23,7 +23,7 @@ use std::time::Duration;
 pub use addr::{Block, IANA_SNAPSHOT, IPV4_SPECIAL, IPV6_SPECIAL, check_ip, parse_url};
 pub use gateway::WebGateway;
 pub use limit::RateLimiter;
-pub use robots::robots_allows;
+pub use robots::{ROBOTS_MAX_BYTES, ROBOTS_MAX_RULES, robots_allows};
 use za_core::NetRequest;
 
 /// Типы резолвера `reqwest` для тестовой подмены внутреннего резолвера (D128).

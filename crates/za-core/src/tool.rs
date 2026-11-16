@@ -117,7 +117,8 @@ pub struct NetRequest {
     pub method: String,
     /// Адрес запроса (после нормализации хоста, без userinfo).
     pub url: String,
-    /// Куда указал ответ-редирект (`Location`, абсолютный адрес); иначе `None`.
+    /// Куда указал ответ-редирект (`Location`, абсолютный адрес без userinfo и фрагмента);
+    /// иначе `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_url: Option<String>,
     /// Код ответа, если заголовки ответа получены.
