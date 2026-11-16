@@ -5,6 +5,12 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, задача 8 (трейт извлечения, `web_fetch`, журнал сетевых обращений):
+  - `za-core`: модуль `extract` — трейт `Extractor` (`html`, `pdf`) и типы `HtmlRequest`, `Markdown`, `PdfRequest`, `PdfText`, `ExtractError` (D113); реализация — подпроцесс, задача 10;
+  - `za-core`: `ToolOutput.requests` (`#[serde(skip)]`, в квитанцию эффекта не попадает), `ToolCx.deadline`, `call_deadline` и `DEADLINE_GRACE` (дедлайн вызова — тайм-аут минус 1 с);
+  - `za-web`: `web_fetch_tool(gateway, extractor)` — `web_fetch(url, prompt?)` по контракту D123: строки `url`, `status`, `type`, `title` (до 200 символов, без переводов строк), текст, пометка обрыва; код не 2xx — `HTTP <код> <фраза>` и до 2 КиБ тела; `no readable text on the page` для пустого и двоичного текста; `digest` с отрывками `rank_passages` при `prompt`; метка `web`; тайм-аут шлюза и извлечения — `timeout after N s` с журналом обращений. В продукте не регистрируется до задачи 14;
+  - `za-agent`: слот вызова ставит дедлайн вызова и пишет события `web.request` (маска секретов во всех строках) до `tool.finished`; собственное происхождение инструмента заменяет общие `tool` и `network` (`[untrusted content: web]`), `outside_project` остаётся;
+  - документация: README (Rule of Two) и ADR 0006 — команда `bash`, которую разбор считает локальной (`python x.py`), может передать данные наружу без записи `rule_of_two`, а run, где наружу выходит только `bash`, трёх свойств не набирает; принятый риск, граница shell — best effort (SEC-002). ADR 0006 — раздел «Инструмент `web_fetch`».
 - R1-C2, задача 7 (тип и кодировка ответа, ранжирование, HTML в Markdown):
   - `za-web`: `convert` — тип строго по `Content-Type` (HTML, текстовые типы, PDF, прочее — `Unsupported`), без заголовка — сигнатура в начале тела после BOM и пробелов; кодировка — BOM, `charset` заголовка, `<meta>` у HTML в первых 1024 байтах, иначе UTF-8 с заменой; `Content-Encoding` не `identity` — ошибка `unsupported content encoding <x>`;
   - `za-web`: `rank_passages` — абзацы с общими словами запроса по убыванию их числа в 60 % бюджета, голова страницы — без совпадений или целиком в оставшиеся 40 %, итог в исходном порядке;

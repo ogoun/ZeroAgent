@@ -84,6 +84,26 @@ pub fn convert(
     })
 }
 
+/// Имя типа для строки `type:` результата `web_fetch` (D110): объявленный тип из таблиц
+/// D109, если ответ разобран по нему, иначе тип по сигнатуре (`text/html`, `text/plain`).
+/// Значение всегда из таблиц: заголовок сервера модели как есть не уходит.
+pub(crate) fn type_name(content_type: Option<&str>, conv: &Converted) -> &'static str {
+    let declared = content_type.and_then(MediaType::parse).map(|t| t.essence);
+    let from = |table: &[&'static str], default: &'static str| {
+        table
+            .iter()
+            .copied()
+            .find(|t| declared.as_deref() == Some(*t))
+            .unwrap_or(default)
+    };
+    match conv {
+        Converted::Html { .. } => from(HTML_TYPES, "text/html"),
+        Converted::Text { .. } => from(TEXT_TYPES, "text/plain"),
+        Converted::Pdf => "application/pdf",
+        Converted::Unsupported(_) => "application/octet-stream",
+    }
+}
+
 /// Первое кодирование из значения `Content-Encoding`, кроме `identity`: нижний регистр,
 /// только `[a-z0-9.+_-]`, до 40 символов (значение уходит модели); `None` — кодирования нет.
 /// Тем же правилом пользуется шлюз (D107).

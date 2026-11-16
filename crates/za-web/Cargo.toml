@@ -18,8 +18,12 @@ za-core = { path = "../za-core" }
 # `rustls-tls`), без сжатия, cookie, SOCKS и HTTP/2; клиент строится только в `gateway.rs`.
 reqwest.workspace = true
 # `sync` — замки хостов, лимитера и кэша; `time` — дедлайн вызова; `net` — системный
-# резолвер (`lookup_host`) под фильтром адресов (D108).
-tokio = { workspace = true, features = ["sync", "time", "net"] }
+# резолвер (`lookup_host`) под фильтром адресов (D108); `rt` — `spawn_blocking` у
+# `web_fetch` (тип, кодировка и сборка длинного текста — вне потока рантайма).
+tokio = { workspace = true, features = ["sync", "time", "net", "rt"] }
+# Аргументы `web_fetch` (`Deserialize`) и схема инструмента для модели.
+serde.workspace = true
+serde_json.workspace = true
 url.workspace = true
 # Кодировка ответа (D109, `convert`): BOM, `charset` заголовка или `<meta>`, замена битых
 # байт. Разборщика HTML (`htmd`) здесь нет: он только в `za-extract`, в подпроцессе (D127).
@@ -34,6 +38,10 @@ test-hooks = []
 
 [[test]]
 name = "gateway"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "fetch"
 required-features = ["test-hooks"]
 
 [dev-dependencies]

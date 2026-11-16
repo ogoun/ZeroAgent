@@ -7,9 +7,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use za_core::{
-    AgentEvent, Approval, BoxFuture, DuplicateTool, EventBus, Gate, Interrupt, InterruptKind,
-    Journal, Postcondition, RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
-    ToolSpec, gate, pause_reason_for,
+    AgentEvent, Approval, BoxFuture, DEADLINE_GRACE, DuplicateTool, EventBus, Gate, Interrupt,
+    InterruptKind, Journal, NetRequest, Postcondition, RiskClass, Subjects, Tool, ToolCx, ToolKind,
+    ToolOutput, ToolRegistry, ToolSpec, call_deadline, gate, pause_reason_for,
 };
 use za_llm::ToolSchema;
 use za_protocol::{
@@ -193,6 +193,42 @@ fn tool_output_reads_r1b_receipt() {
                      {"kind": "file_absent", "path": "b"}]})
     );
     assert_eq!(serde_json::from_value::<ToolOutput>(v).unwrap(), full);
+}
+
+/// R1-C2 D112: журнал обращений в квитанцию не пишется, квитанции без поля читаются.
+#[test]
+fn tool_output_requests_not_in_receipt() {
+    let out = ToolOutput {
+        requests: vec![NetRequest {
+            method: "GET".into(),
+            url: "http://h/?k=v".into(),
+            outcome: "ok".into(),
+            ..NetRequest::default()
+        }]
+        .into(),
+        ..ToolOutput::ok("x")
+    };
+    assert_eq!(
+        serde_json::to_value(&out).unwrap(),
+        json!({"content": "x", "is_error": false})
+    );
+    let back: ToolOutput = serde_json::from_str(r#"{"content":"x","is_error":false}"#).unwrap();
+    assert!(back.requests.is_empty());
+}
+
+/// R1-C2 D107: дедлайн вызова — тайм-аут минус запас; предел не больше запаса — половина.
+#[test]
+fn call_deadline_leaves_grace() {
+    let t0 = std::time::Instant::now();
+    assert_eq!(
+        call_deadline(t0, Duration::from_secs(60)),
+        t0 + Duration::from_secs(60) - DEADLINE_GRACE
+    );
+    assert_eq!(
+        call_deadline(t0, Duration::from_millis(800)),
+        t0 + Duration::from_millis(400)
+    );
+    assert_eq!(call_deadline(t0, DEADLINE_GRACE), t0 + DEADLINE_GRACE / 2);
 }
 
 /// Умолчания трейта: предметов и текстов нет; классы риска упорядочены и в snake_case.

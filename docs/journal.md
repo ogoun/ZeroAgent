@@ -2,6 +2,24 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-16. R1-C2, задача 8: трейт извлечения, `web_fetch`, журнал сетевых обращений
+
+- **Перенос Ruling I1 повторного ревью fix-5 + fix-6** (первый коммит, `docs`). README (Rule of Two) и ADR 0006 больше не утверждают, что через локальную команду данные наружу не уходят. Команда `bash`, которую разбор считает локальной (`python x.py`), может сама открыть соединение, а записи `rule_of_two` у неё нет. Run, где наружу выходит только `bash`, без нативного сетевого вызова, трёх свойств не набирает. Записано как принятый риск: граница shell — best effort (SEC-002).
+- **`za_core::extract`** (D113). Трейта в `za-core` после задачи 7 не было: создан здесь, реализация — задача 10. Типы `Markdown` и `PdfText` — serde, той же формы, что `za_extract::Markdown` (JSON подкоманды). Тексты `ExtractError` — для модели: `document is encrypted`, `malformed document: …`, `extractor timed out`, `extractor output too large`, `extractor failed: …`.
+- **`ToolOutput.requests`** (D112) — `#[serde(skip)]`: квитанции R1-C1 без поля читаются, новые его не пишут. **`ToolCx.deadline`** — `Option<std::time::Instant>`: у `tokio` в `za-core` только `sync`, шлюз переводит через `tokio::time::Instant::from_std`. `za_core::call_deadline(start, timeout)` — тайм-аут минус `DEADLINE_GRACE` (1 с); у пределов до 1 с — половина предела, чтобы дедлайн не совпал со стартом (тесты пакета с пределами в доли секунды).
+- **Слот вызова** (`za-agent`). Перед `tool.call` — `cx.deadline`. После вызова — события `web.request {call_id, tool, ...NetRequest}` из `out.requests` (поле забирается из результата), до точки сбоя `after_call` и до `tool.finished`. Маска секретов — на весь payload: в `reason` редиректа бывает адрес с секретом из параметра. Actor — `runtime`, как у `boundary.outside`.
+- **`origins_of`** (D110): при `own.is_some()` не добавляются `tool` и `network` от спецификации (`spec.tainted`, `risk = Network`). По предметам вызова — как прежде: `outside_project` по путям и `network` сетевой команды. Последнее важно для `bash`: его метка — `network` или `outside_project`, и сетевая команда (`git push https://…`) с путём вне проекта без этого потеряла бы `network`, а с ним и свойство `untrusted` (`outside_project` его не даёт). Модульный тест `own_origin_replaces_spec_origins_only`. `exposure_before` зовёт `origins_of` без `own`, как раньше: до вызова `untrusted` веба дают `tool` и `network`, после — `web`; свойство то же.
+- **`web_fetch`** (`za-web/src/fetch.rs`, D110, D123, D127). Синтаксис URL — `Url::parse`, проверки адреса и порта — внутри `WebGateway::get` (тот же `check_url`, что у `parse_url`): так отказ `blocked` попадает в журнал обращений (тест `fetch_blocked_local` требует запись `outcome = "blocked"`). `convert` и сборка текста — в `spawn_blocking`; извлечение HTML и обработка тела ограничены тем же дедлайном, что шлюз.
+  - Тайм-аут шлюза или извлечения — `timeout after N s` (N — бюджет до дедлайна целыми секундами), как у тайм-аута слота; текст шлюза `request timed out` модели не уходит.
+  - Строка `type:` — значение из таблиц D109 (`type_name` в `convert.rs`), а не заголовок сервера.
+  - `title` (перенос задачи 7): пробелы, переводы строк и управляющие — один пробел, не длиннее 200 символов с `...`.
+  - Нечитаемый текст (перенос задачи 7): нет непробельных символов или доля U+FFFD и управляющих больше 10 % непробельных — `no readable text on the page` (не ошибка: ответ 2xx получен). Проверка до извлекателя (двоичное под `text/html` в подпроцесс не уходит) и после.
+  - Редирект на другой хост — не ошибка (`is_error = false`): текст называет адрес для следующего вызова.
+  - Код не 2xx — `HTTP <код> <фраза>` (`reqwest::StatusCode::canonical_reason`), до 2 КиБ текста тела после преобразования; без читаемого текста — только строка статуса.
+  - PDF — `unsupported content type application/pdf` до задачи 10.
+  - Golden описаний `crates/za-web/tests/golden/web_tools.json`: `za-web` не может зависеть от `za-llm` даже как dev (политика направлений), поэтому тест строит тот же канонический JSON через `za_protocol::canonical_json` и проверяет отсутствие CR.
+- **Зависимости `za-web`**: `serde`, `serde_json` (уже в workspace), у `tokio` — функция `rt` (`spawn_blocking`). Новых крейтов в `Cargo.lock` нет.
+
 ## 2026-11-16. R1-C2, задача 7: тип и кодировка ответа, ранжирование абзацев, `za-extract`
 
 - **`za_web::convert`** (D109). Тип определяется строго по `Content-Type`: таблицы `HTML_TYPES`, `TEXT_TYPES` и `application/pdf`. Прочие типы — `Converted::Unsupported(<тип>)`: нижний регистр, без параметров, только символы имён RFC 6838, до 80 символов. Без заголовка (и при пустом) — сигнатура после BOM и пробелов ASCII: `%PDF-` (с учётом регистра), `<!doctype html` или `<html` без учёта регистра и только целым именем тега (дальше конец, пробел или `>`, как в WHATWG MIME Sniffing), иначе `text/plain`.

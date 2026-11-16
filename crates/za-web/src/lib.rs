@@ -12,12 +12,16 @@
 //! - [`convert`] — тип и кодировка ответа (D109): строго по `Content-Type`, сигнатуры только
 //!   в начале тела; HTML и текст — в UTF-8.
 //! - [`rank_passages`] — отрывки длинной страницы по запросу `prompt` (D110).
+//! - [`web_fetch_tool`] — инструмент `web_fetch` (D110): шлюз, тип и кодировка, извлечение
+//!   HTML через `za_core::extract::Extractor`, метка `web`, журнал обращений в
+//!   `ToolOutput::requests` (D112).
 //!
 //! Враждебный HTML шлюз не разбирает (D127): это делает `za-extract` в отдельном процессе.
 //! Тестовые подмены резолвера существуют только с признаком сборки `test-hooks` (D128).
 
 mod addr;
 mod convert;
+mod fetch;
 mod gateway;
 mod limit;
 mod rank;
@@ -27,6 +31,7 @@ use std::time::Duration;
 
 pub use addr::{Block, IANA_SNAPSHOT, IPV4_SPECIAL, IPV6_SPECIAL, check_ip, parse_url};
 pub use convert::{Converted, HTML_TYPES, META_SCAN_BYTES, TEXT_TYPES, convert};
+pub use fetch::{WEB_FETCH, web_fetch_tool};
 pub use gateway::WebGateway;
 pub use limit::RateLimiter;
 pub use rank::rank_passages;

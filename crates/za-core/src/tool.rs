@@ -189,6 +189,14 @@ pub struct ToolOutput {
     /// Постусловия (TOOL-004).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post: Vec<Postcondition>,
+    /// Журнал сетевых обращений вызова (R1-C2 D112): по записи на HTTP-запрос шлюза.
+    /// Пакет пишет из них события `web.request` (строки — через маску секретов) и в
+    /// квитанцию эффекта поле не кладёт: URL с секретом в параметре оказался бы там без
+    /// маски, а при реплее записи не нужны — события уже в журнале. `Box<[_]>`, а не `Vec`:
+    /// `ToolOutput` — `Err` многих функций инструментов, и лишние 8 байт довели бы его до
+    /// предела `clippy::result_large_err` (128 байт).
+    #[serde(skip)]
+    pub requests: Box<[NetRequest]>,
 }
 
 impl ToolOutput {
@@ -224,6 +232,26 @@ pub struct ToolCx {
     /// предметов политики (`Subjects::paths`, затем `cwd`); пусто — пакет путей не
     /// разрешал (вызов вне пакета, тест инструмента).
     pub paths: Vec<crate::paths::ResolvedPath>,
+    /// Дедлайн вызова (R1-C2 D107, D112): слот ставит [`call_deadline`] от старта вызова.
+    /// Инструмент, который сам соблюдает дедлайн (сетевой шлюз), успевает вернуть журнал
+    /// обращений раньше внешнего тайм-аута слота. `None` — вызов вне пакета: инструмент
+    /// считает дедлайн сам от своего старта.
+    pub deadline: Option<std::time::Instant>,
+}
+
+/// Запас до внешнего тайм-аута слота (D107): дедлайн вызова — тайм-аут инструмента минус
+/// это значение.
+pub const DEADLINE_GRACE: Duration = Duration::from_secs(1);
+
+/// Дедлайн вызова, начатого в `start`, с пределом `timeout` (D107): `timeout` минус
+/// [`DEADLINE_GRACE`]. Предел не больше запаса (тесты с долями секунды) — половина предела:
+/// дедлайн остаётся раньше внешнего тайм-аута и не совпадает со стартом.
+pub fn call_deadline(start: std::time::Instant, timeout: Duration) -> std::time::Instant {
+    let budget = match timeout.checked_sub(DEADLINE_GRACE) {
+        Some(d) if !d.is_zero() => d,
+        _ => timeout / 2,
+    };
+    start + budget
 }
 
 /// Инструмент run.

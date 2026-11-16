@@ -1,0 +1,422 @@
+//! Инструмент `web_fetch` (R1-C2 D110, D112, D113, D123, D127) против поддельного сервера
+//! на `127.0.0.1:0` под именем `site.test` (`with_test_resolve`, признак `test-hooks`) и
+//! заглушки извлекателя (`support::extractor`). Настоящий интернет не используется.
+//!
+//! Golden описаний — `tests/golden/web_tools.json`, пишется только с `ZA_UPDATE_GOLDEN=1`.
+
+mod support;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use support::extractor::StubExtractor;
+use support::{Server, drip, redirect, scaled, serve, text, typed, within};
+use za_core::extract::{ExtractError, Extractor};
+use za_core::{Approval, NetRequest, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, call_deadline};
+use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier, canonical_json, net_outcome};
+use za_web::{WebConfig, WebGateway, web_fetch_tool};
+
+const LONG: Duration = Duration::from_secs(20);
+
+fn gateway(s: &Server) -> Arc<WebGateway> {
+    let cfg = WebConfig {
+        ports: vec![s.port()],
+        host_interval: Duration::ZERO,
+        ..WebConfig::default()
+    };
+    Arc::new(
+        WebGateway::new(cfg)
+            .unwrap()
+            .with_test_resolve(vec![("site.test".into(), s.addr)]),
+    )
+}
+
+/// Шлюз без сервера: вызовы отвергаются до соединения.
+fn offline() -> Arc<WebGateway> {
+    Arc::new(WebGateway::new(WebConfig::default()).unwrap())
+}
+
+fn cx(deadline: Option<std::time::Instant>) -> ToolCx {
+    let run = RunId::new();
+    ToolCx {
+        run,
+        project_dir: PathBuf::from("."),
+        call_id: "c1".into(),
+        effect_key: EffectKey::derive(run, 0, 0),
+        paths: Vec::new(),
+        deadline,
+    }
+}
+
+/// Вызов с дедлайном слота (`call_deadline` от старта под пределом теста).
+async fn fetch(tool: &Arc<dyn Tool>, args: Value) -> ToolOutput {
+    let d = call_deadline(std::time::Instant::now(), scaled(LONG));
+    within(LONG * 2, "web_fetch", tool.call(args, cx(Some(d)))).await
+}
+
+fn page_url(s: &Server, path: &str) -> String {
+    format!("http://site.test:{}{path}", s.port())
+}
+
+/// Сайт: `robots.txt` — 404 (всё разрешено), остальные пути — `route`.
+async fn site<F>(route: F) -> Server
+where
+    F: Fn(&str) -> axum::response::Response + Send + Sync + 'static,
+{
+    serve(move |p| {
+        if p == "/robots.txt" {
+            text(404, "")
+        } else {
+            route(p)
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn fetch_html_page() {
+    // Страница в windows-1251: извлекатель получает её уже в UTF-8 (D109).
+    let html = "<html><head><title>T</title></head><body><p>Привет, мир</p></body></html>";
+    let (bytes, _, _) = encoding_rs::WINDOWS_1251.encode(html);
+    let bytes = bytes.into_owned();
+    let s = site(move |_| typed(200, "text/html; charset=windows-1251", bytes.clone())).await;
+    let ex = StubExtractor::new();
+    let tool = web_fetch_tool(gateway(&s), ex.clone());
+    let url = page_url(&s, "/a");
+    let out = fetch(&tool, json!({"url": url})).await;
+
+    assert!(!out.is_error, "{}", out.content);
+    let head = format!("url: {url}\nstatus: 200\ntype: text/html\ntitle: T\n\n");
+    assert!(out.content.starts_with(&head), "{}", out.content);
+    assert!(out.content.ends_with("Привет, мир"), "{}", out.content);
+    let seen = ex.html_requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].html, html, "HTML уходит извлекателю в UTF-8");
+    assert_eq!(seen[0].base_url, url);
+    assert_eq!(out.taint.as_deref(), Some("web"));
+    // robots.txt и страница (D112).
+    assert_eq!(out.requests.len(), 2, "{:?}", out.requests);
+    assert!(out.requests[0].url.ends_with("/robots.txt"));
+    assert_eq!(out.requests[1].url, url);
+    assert_eq!(out.requests[1].status, Some(200));
+}
+
+#[tokio::test]
+async fn extractor_failure_is_tool_error() {
+    let s = site(|_| typed(200, "text/html", b"<p>x</p>".to_vec())).await;
+    let ex = StubExtractor::failing(ExtractError::Failed("crashed".into()));
+    let tool = web_fetch_tool(gateway(&s), ex);
+    let out = fetch(&tool, json!({"url": page_url(&s, "/a")})).await;
+    assert!(out.is_error);
+    assert_eq!(out.content, "html: extractor failed: crashed");
+    assert_eq!(out.taint.as_deref(), Some("web"));
+    assert_eq!(out.requests.len(), 2);
+}
+
+#[tokio::test]
+async fn slow_server_timeout_keeps_requests() {
+    // Тело по байту раз в 50 мс, без конца; дедлайн вызова — 2 с (× масштаб времени).
+    let s = site(|_| drip(Duration::from_millis(50))).await;
+    let tool = web_fetch_tool(gateway(&s), StubExtractor::new());
+    let budget = scaled(Duration::from_secs(2));
+    let deadline = std::time::Instant::now() + budget;
+    // Внешний предел — как тайм-аут слота: дедлайн плюс запас. Вызов возвращается сам.
+    let out = tokio::time::timeout(
+        budget + scaled(Duration::from_secs(10)),
+        tool.call(json!({"url": page_url(&s, "/a")}), cx(Some(deadline))),
+    )
+    .await
+    .expect("внешний тайм-аут не должен срабатывать: дедлайн соблюдает шлюз");
+    assert!(out.is_error);
+    assert!(out.content.starts_with("timeout after "), "{}", out.content);
+    // Журнал обращений не пуст (D112): robots.txt и прерванный запрос страницы.
+    assert!(!out.requests.is_empty());
+    let last = out.requests.last().unwrap();
+    assert_eq!(last.outcome, net_outcome::ERROR);
+    assert_eq!(last.reason.as_deref(), Some("timeout"));
+    assert!(last.bytes > 0, "{last:?}");
+}
+
+#[test]
+fn requests_not_serialized() {
+    let out = ToolOutput {
+        requests: vec![NetRequest {
+            method: "GET".into(),
+            url: "http://site.test/?token=x".into(),
+            outcome: net_outcome::OK.into(),
+            ..NetRequest::default()
+        }]
+        .into(),
+        ..ToolOutput::ok("x")
+    };
+    let v = serde_json::to_value(&out).unwrap();
+    assert!(v.get("requests").is_none(), "{v}");
+    assert!(!v.to_string().contains("token"), "{v}");
+    // Квитанция читается обратно без записей.
+    let back: ToolOutput = serde_json::from_value(v).unwrap();
+    assert!(back.requests.is_empty());
+    assert_eq!(back.content, "x");
+}
+
+#[tokio::test]
+async fn fetch_404_is_error_with_status() {
+    let s = site(|_| {
+        typed(
+            404,
+            "text/html",
+            b"<html><body>gone away</body></html>".to_vec(),
+        )
+    })
+    .await;
+    let tool = web_fetch_tool(gateway(&s), StubExtractor::new());
+    let out = fetch(&tool, json!({"url": page_url(&s, "/missing")})).await;
+    assert!(out.is_error);
+    assert!(
+        out.content.starts_with("HTTP 404 Not Found"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("gone away"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn error_body_is_cut_to_2_kib() {
+    let body = "e".repeat(10_000);
+    let s = site(move |_| typed(500, "text/plain", body.clone().into_bytes())).await;
+    let tool = web_fetch_tool(gateway(&s), StubExtractor::new());
+    let out = fetch(&tool, json!({"url": page_url(&s, "/a")})).await;
+    assert!(out.is_error);
+    let body = out
+        .content
+        .strip_prefix("HTTP 500 Internal Server Error\n\n")
+        .expect("строка статуса и пустая строка");
+    assert!((1..=2048).contains(&body.len()), "{}", body.len());
+    assert!(body.chars().all(|c| c == 'e'));
+}
+
+#[tokio::test]
+async fn fetch_redirect_other_host_text() {
+    let s = site(|_| redirect("http://other.test/")).await;
+    let tool = web_fetch_tool(gateway(&s), StubExtractor::new());
+    let out = fetch(&tool, json!({"url": page_url(&s, "/a")})).await;
+    assert_eq!(
+        out.content,
+        "redirected to http://other.test/; call web_fetch with it if it is the page you need"
+    );
+    assert_eq!(out.taint.as_deref(), Some("web"));
+}
+
+#[tokio::test]
+async fn fetch_blocked_local() {
+    let tool = web_fetch_tool(offline(), StubExtractor::new());
+    let out = fetch(&tool, json!({"url": "http://127.0.0.1/"})).await;
+    assert!(out.is_error);
+    assert_eq!(out.content, "blocked: local or private address");
+    assert_eq!(out.requests.len(), 1);
+    assert_eq!(out.requests[0].outcome, net_outcome::BLOCKED);
+}
+
+#[tokio::test]
+async fn invalid_arguments_and_url() {
+    let tool = web_fetch_tool(offline(), StubExtractor::new());
+    let out = fetch(&tool, json!({})).await;
+    assert!(out.is_error);
+    assert!(
+        out.content.starts_with("invalid arguments: "),
+        "{}",
+        out.content
+    );
+    let out = fetch(&tool, json!({"url": "not a url"})).await;
+    assert!(out.is_error);
+    assert!(out.content.starts_with("invalid URL: "), "{}", out.content);
+    assert!(out.requests.is_empty());
+}
+
+#[tokio::test]
+async fn long_page_with_prompt_gets_ranked_digest() {
+    // 400 КиБ текста: абзацы-заполнители и один абзац со словами запроса.
+    let filler = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do\n\n";
+    let needle = "zebra migration follows the seasonal rains across the plains";
+    let mut body = filler.repeat(3300);
+    body.push_str(needle);
+    body.push_str("\n\n");
+    body.push_str(&filler.repeat(3300));
+    assert!(body.len() > 400 * 1024);
+    let s = site(move |_| typed(200, "text/plain", body.clone().into_bytes())).await;
+    let tool = web_fetch_tool(gateway(&s), StubExtractor::new());
+    let url = page_url(&s, "/long");
+    let out = fetch(&tool, json!({"url": url, "prompt": "zebra migration"})).await;
+    assert!(!out.is_error);
+    assert!(out.content.contains(needle));
+    let digest = out.digest.expect("digest при prompt");
+    assert!(digest.starts_with(&format!("url: {url}\nstatus: 200\ntype: text/plain\n\n")));
+    assert!(digest.contains(needle), "{}", &digest[..200]);
+    // Бюджет — 60 % output_limit (128 КиБ).
+    assert!(digest.len() <= 128 * 1024 * 60 / 100, "{}", digest.len());
+
+    // Без prompt — digest нет: голова и хвост D44 делает пакет.
+    let out = fetch(&tool, json!({"url": url})).await;
+    assert!(out.digest.is_none());
+}
+
+#[tokio::test]
+async fn long_title_is_cut() {
+    // Перенос задачи 7: заголовок враждебной страницы ограничен, переводы строк — пробелы.
+    let title = format!("A\nstatus: 200\n{}", "t".repeat(5000));
+    let html = format!("<html><title>{title}</title><p>body</p></html>");
+    let s = site(move |_| typed(200, "text/html", html.clone().into_bytes())).await;
+    let tool = web_fetch_tool(gateway(&s), StubExtractor::new());
+    let out = fetch(&tool, json!({"url": page_url(&s, "/a")})).await;
+    let line = out
+        .content
+        .lines()
+        .find(|l| l.starts_with("title: "))
+        .expect("строка title");
+    assert!(line.starts_with("title: A status: 200 ttt"), "{line}");
+    assert!(line.ends_with("..."), "{line}");
+    assert!(
+        line.chars().count() <= "title: ".len() + 200,
+        "{}",
+        line.len()
+    );
+    let status_lines = out.content.lines().filter(|l| l.starts_with("status: "));
+    assert_eq!(status_lines.count(), 1, "{}", out.content);
+}
+
+#[tokio::test]
+async fn binary_under_text_html_has_no_readable_text() {
+    // Перенос задачи 7: двоичные данные с `Content-Type: text/html` — честный ответ, без
+    // разбора извлекателем.
+    let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8 | 0x80).collect();
+    let s = site(move |_| typed(200, "text/html", bytes.clone())).await;
+    let ex = StubExtractor::new();
+    let tool = web_fetch_tool(gateway(&s), ex.clone());
+    let url = page_url(&s, "/bin");
+    let out = fetch(&tool, json!({"url": url})).await;
+    assert_eq!(
+        out.content,
+        format!("url: {url}\nstatus: 200\ntype: text/html\n\nno readable text on the page")
+    );
+    assert!(ex.html_requests().is_empty(), "извлекатель не вызван");
+
+    // Пустая страница — тот же ответ.
+    let s = site(|_| typed(200, "text/plain", b"  \n\n ".to_vec())).await;
+    let tool = web_fetch_tool(gateway(&s), StubExtractor::new());
+    let url = page_url(&s, "/empty");
+    let out = fetch(&tool, json!({"url": url})).await;
+    assert!(
+        out.content.ends_with("\n\nno readable text on the page"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn truncated_body_is_marked() {
+    let s = site(|_| support::endless()).await;
+    let cfg = WebConfig {
+        ports: vec![s.port()],
+        host_interval: Duration::ZERO,
+        max_bytes: 64 * 1024,
+        ..WebConfig::default()
+    };
+    let gw = Arc::new(
+        WebGateway::new(cfg)
+            .unwrap()
+            .with_test_resolve(vec![("site.test".into(), s.addr)]),
+    );
+    let tool = web_fetch_tool(gw, StubExtractor::new());
+    let out = fetch(&tool, json!({"url": page_url(&s, "/a")})).await;
+    assert!(!out.is_error);
+    assert!(
+        out.content.ends_with("\n[truncated at 65536 bytes]"),
+        "{}",
+        &out.content[out.content.len() - 60..]
+    );
+}
+
+#[test]
+fn subjects_host_normalized() {
+    let tool = web_fetch_tool(offline(), StubExtractor::new());
+    let s = tool.subjects(&json!({"url": "http://Пример.РФ./x"}));
+    assert!(s.network);
+    assert_eq!(s.hosts, ["xn--e1afmkfd.xn--p1ai"]);
+    assert!(!s.hosts_unknown);
+    // Хост не определить — неизвестен (D104: строгое подмножество).
+    let s = tool.subjects(&json!({"url": "::"}));
+    assert!(s.network && s.hosts.is_empty() && s.hosts_unknown);
+}
+
+#[test]
+fn contract_matches_d123() {
+    let tool = web_fetch_tool(offline(), StubExtractor::new());
+    let s = tool.spec();
+    assert_eq!(s.schema.name, "web_fetch");
+    assert_eq!(s.kind, ToolKind::Read);
+    assert_eq!(s.class, EffectClass::ReadOnly);
+    assert_eq!(s.risk, RiskClass::Network);
+    assert_eq!(s.min_tier, Tier::Standard);
+    assert_eq!(s.timeout, Duration::from_secs(60));
+    assert_eq!(s.output_limit, Some(128 * 1024));
+    assert!(s.tainted);
+    assert_eq!(s.approval, Approval::Mode);
+    assert_eq!(
+        s.roles,
+        [RunRole::Top, RunRole::Orchestrator, RunRole::Worker]
+    );
+    assert!(s.schema.description.is_ascii());
+    assert_eq!(s.schema.parameters["type"], "object");
+    assert_eq!(s.schema.parameters["required"], json!(["url"]));
+    // Тексты для модели — `runtime/web.*`, ASCII (D94).
+    let texts = tool.texts();
+    assert!(!texts.is_empty());
+    for (name, text) in texts {
+        assert!(name.starts_with("runtime/web."), "{name}");
+        assert!(text.is_ascii(), "{name}: {text}");
+    }
+}
+
+/// Сравнивает `actual` с golden `tests/golden/<file>`; с `ZA_UPDATE_GOLDEN=1` — пишет.
+fn check_golden(file: &str, actual: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(file);
+    if std::env::var("ZA_UPDATE_GOLDEN").as_deref() == Ok("1") {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, actual).unwrap();
+    }
+    let golden = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}; ZA_UPDATE_GOLDEN=1", path.display()))
+        .replace("\r\n", "\n");
+    assert_eq!(golden, actual, "{file}: обновить — ZA_UPDATE_GOLDEN=1");
+}
+
+#[test]
+fn golden_descriptions() {
+    // Канонический JSON, как `za_llm::render_tools` (массив по имени, объекты
+    // `{description, name, parameters}`): `za-web` не зависит от `za-llm` (политика
+    // направлений), а замена CRLF не нужна — переводов строк CR в описании нет.
+    let tools: Vec<Arc<dyn Tool>> = vec![web_fetch_tool(offline(), StubExtractor::new())];
+    let arr: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            let s = &t.spec().schema;
+            assert!(!s.description.contains('\r'));
+            json!({"name": s.name, "description": s.description, "parameters": s.parameters})
+        })
+        .collect();
+    let rendered = canonical_json(&Value::Array(arr));
+    let v: Value = serde_json::from_str(&rendered).unwrap();
+    check_golden(
+        "web_tools.json",
+        &format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    );
+}
+
+/// Заглушка — `Arc<dyn Extractor>` (форма аргумента `web_fetch_tool`).
+#[test]
+fn stub_is_extractor() {
+    let _: Arc<dyn Extractor> = StubExtractor::new();
+}

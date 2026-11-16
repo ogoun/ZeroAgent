@@ -736,7 +736,7 @@ impl Tool for BashTool {
                     is_error,
                     taint,
                     digest,
-                    post: Vec::new(),
+                    ..ToolOutput::default()
                 },
                 Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
                 Err(e) => ToolOutput::error(failed_text(&e.to_string())),

@@ -29,7 +29,9 @@
 //! маскированными аргументами; повторное разрешение путей — смена класса даёт ошибку
 //! `path changed since planning; call again` (D98); `boundary.outside`; чекпоинт `Edit` и
 //! `Exec` и `checkpoint.created` (D89); точка сбоя [`CrashPoint::InTool`] до и после
-//! вызова; вызов; постусловия (TOOL-004); `file.changed`; метки происхождения и очистка
+//! вызова; вызов с дедлайном `ToolCx::deadline` (R1-C2 D107); события `web.request` из
+//! журнала обращений вызова (D112, маска секретов; в квитанцию записи не попадают);
+//! постусловия (TOOL-004); `file.changed`; метки происхождения и очистка
 //! невидимых символов (D82, SEC-051); маскировка секретов (D90); выгрузка или обрезка по
 //! `output_limit` с `digest` (D44, D75, D86); `tool.finished` с `tainted`.
 //!
@@ -53,8 +55,8 @@ use za_core::paths::{self, PathError, ResolvedPath, Roots};
 use za_core::text::{Clean, clean_invisible};
 use za_core::{
     Access, Approval, CheckpointRequest, Checkpointer, EffectError, EffectSlot, EffectSpec, Gate,
-    Interrupt, InterruptKind, Journal, Postcondition, RawPath, RiskClass, RunCtx, Subjects, Tool,
-    ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
+    Interrupt, InterruptKind, Journal, NetRequest, Postcondition, RawPath, RiskClass, RunCtx,
+    Subjects, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, call_deadline, gate,
 };
 use za_llm::{BoxFuture, Part, ToolCall, ToolSchema};
 use za_protocol::{
@@ -1390,6 +1392,8 @@ fn tool_action(
             call_id: call.id.clone(),
             effect_key: key.clone(),
             paths: planned.clone(),
+            // Ставит слот от старта вызова (D107).
+            deadline: None,
         },
         timeout: spec.timeout,
         cut,
@@ -2030,12 +2034,19 @@ impl Live {
             )
             .await;
         }
-        // (5)–(7) Вызов между точками сбоя.
+        // (5)–(7) Вызов между точками сбоя. Дедлайн вызова — раньше внешнего тайм-аута
+        // (D107): инструмент, соблюдающий его сам, возвращает журнал обращений; внешний
+        // тайм-аут — страховка, при нём future брошен и журнала нет.
         self.crash_at(false, halt).await;
+        cx.deadline = Some(call_deadline(std::time::Instant::now(), timeout));
         let mut out = match tokio::time::timeout(timeout, tool.call(args, cx)).await {
             Ok(o) => o,
             Err(_) => ToolOutput::error(timeout_text(timeout)),
         };
+        // (6a) Сетевые обращения вызова (D112): события до `tool.finished`, в квитанцию
+        // записи не попадают. Реплей квитанции замыкание не запускает — повтора нет.
+        let requests = std::mem::take(&mut out.requests);
+        self.web_requests(&requests, masker.as_deref(), fref).await;
         self.crash_at(true, halt).await;
         if secret_skipped {
             if !out.content.is_empty() && !out.content.ends_with('\n') {
@@ -2098,11 +2109,44 @@ impl Live {
             ..Receipt::default()
         }
     }
+
+    /// События `web.request {call_id, tool, ...NetRequest}` (D112, SEC-045) — тем же путём,
+    /// что `boundary.outside`. Строки маскируются (D90): `url`, `final_url` и `reason` (в
+    /// причине бывает адрес редиректа) могут нести секрет из параметра запроса.
+    async fn web_requests(
+        &self,
+        requests: &[NetRequest],
+        masker: Option<&SecretMasker>,
+        fref: &mut Option<StoreError>,
+    ) {
+        for r in requests {
+            let mut payload = match serde_json::to_value(r) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(key = %self.key, error = %e, "запись обращения не сериализуется");
+                    continue;
+                }
+            };
+            if let Some(o) = payload.as_object_mut() {
+                o.insert("call_id".into(), json!(self.call_id));
+                o.insert("tool".into(), json!(self.name));
+            }
+            let payload = mask_value(masker, &payload);
+            self.append(EventKind::WebRequest, Actor::Runtime, payload, false, fref)
+                .await;
+        }
+    }
 }
 
 /// Происхождения недоверенного содержимого результата (D82): внешний путь чтения (и по
 /// гранту, Ruling 7.24), у `Exec` — любой внешний путь и сетевая команда, метка самого
 /// инструмента или `spec.tainted`.
+///
+/// Собственное происхождение инструмента (`own`, например `web`) заменяет общие `tool` и
+/// `network` от спецификации (`spec.tainted`, `risk = Network`; R1-C2 D110): инструмент
+/// знает точнее, откуда содержимое, и первая строка результата веба —
+/// `[untrusted content: web]`. По предметам вызова — как прежде: `outside_project` по путям,
+/// `network` у сетевой команды (`bash` с меткой `outside_project` и сетевым сегментом).
 fn origins_of(
     spec: &ToolSpec,
     s: &Subjects,
@@ -2124,6 +2168,7 @@ fn origins_of(
     }
     if let Some(o) = own {
         set.insert(o.to_owned());
+        return set.into_iter().collect();
     }
     if spec.tainted {
         set.insert(taint_origin::TOOL.to_owned());
@@ -2202,6 +2247,7 @@ async fn shorten(out: ToolOutput, cut: Cut) -> ToolOutput {
         taint,
         digest,
         post,
+        requests,
     } = out;
     let work = tokio::task::spawn_blocking(move || {
         let escaped = escape_untrusted(&content);
@@ -2239,6 +2285,7 @@ async fn shorten(out: ToolOutput, cut: Cut) -> ToolOutput {
             taint,
             digest: None,
             post,
+            requests,
         },
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         Err(e) => {
@@ -2500,5 +2547,64 @@ mod tests {
             serde_json::from_value(json!({"content": "c", "is_error": false})).unwrap();
         assert_eq!(r.out.content, "c");
         assert!(r.origins.is_empty() && r.grant.is_none());
+    }
+
+    /// D110: своё происхождение заменяет `tool` и `network` от спецификации; по предметам
+    /// вызова — как прежде (`outside_project` по путям, `network` сетевой команды).
+    #[test]
+    fn own_origin_replaces_spec_origins_only() {
+        let spec = |kind: ToolKind, risk: RiskClass, tainted: bool| ToolSpec {
+            schema: ToolSchema {
+                name: "t".into(),
+                description: String::new(),
+                parameters: json!({}),
+            },
+            class: EffectClass::ReadOnly,
+            kind,
+            approval: Approval::Mode,
+            risk,
+            roles: vec![RunRole::Top],
+            min_tier: Tier::Small,
+            timeout: BUILTIN_TIMEOUT,
+            output_limit: None,
+            tainted,
+        };
+        let roots = Roots {
+            project: PathBuf::from("/p"),
+            za_home: PathBuf::from("/h"),
+        };
+        let raw = [RawPath {
+            arg: "/x/a".into(),
+            access: Access::Read,
+        }];
+        let outside = [ResolvedPath {
+            path: PathBuf::from("/x/a"),
+            inside: false,
+            protected: false,
+        }];
+        let net = Subjects {
+            network: true,
+            ..Subjects::default()
+        };
+        let web = spec(ToolKind::Read, RiskClass::Network, true);
+        let none = Subjects::default();
+        let of = |s: &ToolSpec, sub: &Subjects, own: Option<&str>, out: bool| {
+            let (r, p): (&[RawPath], &[ResolvedPath]) =
+                if out { (&raw, &outside) } else { (&[], &[]) };
+            origins_of(s, sub, r, p, &roots, own)
+        };
+        assert_eq!(of(&web, &net, None, false), ["network", "tool"]);
+        assert_eq!(of(&web, &net, Some("web"), false), ["web"]);
+        assert_eq!(
+            of(&web, &net, Some("web"), true),
+            ["outside_project", "web"]
+        );
+        // `bash`: сетевая команда с меткой `outside_project` — `network` остаётся.
+        let bash = spec(ToolKind::Exec, RiskClass::Exec, false);
+        assert_eq!(
+            of(&bash, &net, Some("outside_project"), true),
+            ["network", "outside_project"]
+        );
+        assert_eq!(of(&bash, &none, Some("network"), false), ["network"]);
     }
 }

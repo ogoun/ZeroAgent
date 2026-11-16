@@ -2511,6 +2511,8 @@ dependencies = [
  "encoding_rs",
  "http-body",
  "reqwest",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

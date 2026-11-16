@@ -12,16 +12,22 @@ use serde_json::{Value, json};
 use tokio::sync::{Barrier, watch};
 use tokio::time::{Instant, timeout};
 use za_agent::{
-    CallVerdict, PlannedCall, Signals, ToolEnv, ToolsOutcome, builtin_tools, run_tools,
-    signal_channel,
+    CallVerdict, Grant, GrantMode, GrantSource, PlannedCall, Signals, ToolEnv, ToolsOutcome,
+    builtin_tools, run_tools, signal_channel,
 };
+use za_core::paths::Roots;
 use za_core::{
-    Approval, EffectError, EventBus, InterruptKind, InterruptState, Journal, RiskClass, RunCtx,
-    Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, interrupt,
+    Access, Approval, DEADLINE_GRACE, EffectError, EventBus, InterruptKind, InterruptState,
+    Journal, NetRequest, RawPath, RiskClass, RunCtx, Subjects, Tool, ToolCx, ToolKind, ToolOutput,
+    ToolRegistry, ToolSpec, interrupt,
 };
 use za_llm::normalize::CallSource;
 use za_llm::{BoxFuture, Part, ToolCall, ToolSchema};
-use za_protocol::{Actor, EffectClass, EffectKey, EventKind, RunId, RunMode, RunRole, Seq, Tier};
+use za_protocol::{
+    Actor, EffectClass, EffectKey, EventKind, RunId, RunMode, RunRole, Seq, Tier, net_outcome,
+    taint_origin,
+};
+use za_secrets::SecretMasker;
 use za_store::{NewRun, ProjectStore};
 
 // ---- Помощники ----
@@ -71,6 +77,10 @@ struct TestTool {
     barrier: Option<Arc<Barrier>>,
     /// Вызов держится, пока тест не отпустит (`true`); не дождался — `hold timeout`.
     hold: Option<watch::Receiver<bool>>,
+    /// Предметы вызова (по умолчанию — пусто).
+    subjects: Subjects,
+    /// Дедлайны полученных вызовов (`ToolCx::deadline`).
+    deadlines: Arc<Mutex<Vec<Option<std::time::Instant>>>>,
 }
 
 impl Tool for TestTool {
@@ -78,7 +88,12 @@ impl Tool for TestTool {
         &self.spec
     }
 
+    fn subjects(&self, _args: &Value) -> Subjects {
+        self.subjects.clone()
+    }
+
     fn call(&self, _args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        self.deadlines.lock().unwrap().push(cx.deadline);
         let delay = self.delay;
         let out = self.out.clone();
         let log = Arc::clone(&self.log);
@@ -166,6 +181,8 @@ fn test_tool(
         log: Arc::clone(log),
         barrier: None,
         hold: None,
+        subjects: Subjects::default(),
+        deadlines: Arc::default(),
     }
 }
 
@@ -966,4 +983,221 @@ async fn secret_skipped_line_appended_by_slot() {
         .find(|ev| ev.kind == EventKind::CheckpointCreated)
         .expect("checkpoint.created");
     assert!(cp.payload.get("secret_skipped").is_none(), "{}", cp.payload);
+}
+
+// ---- R1-C2 D110, D112: результат веба и журнал сетевых обращений ----
+
+/// Сетевое чтение с контрактом `web_fetch` (D123): `Read`, `Network`, `tainted`; вывод `out`.
+fn web_tool(out: ToolOutput, log: &SharedLog) -> TestTool {
+    let mut t = test_tool(
+        "web_fetch",
+        ToolKind::Read,
+        0,
+        Duration::from_secs(60),
+        out,
+        log,
+    );
+    t.spec.risk = RiskClass::Network;
+    t.spec.tainted = true;
+    t.subjects.network = true;
+    t
+}
+
+fn request(url: &str, final_url: Option<&str>, status: u16) -> NetRequest {
+    NetRequest {
+        method: "GET".into(),
+        url: url.into(),
+        final_url: final_url.map(str::to_owned),
+        status: Some(status),
+        bytes: 10,
+        ms: 1,
+        outcome: net_outcome::OK.into(),
+        reason: None,
+    }
+}
+
+#[tokio::test]
+async fn web_request_events_written_in_slot() {
+    let (s, j, run) = setup("web-requests").await;
+    let log = SharedLog::default();
+    // Секрет — в параметре адреса; собран из частей (сканеры репозитория).
+    let secret = ["zsk", "k7q2", "webkey", "9x"].concat();
+    let page = format!("https://site.test/a?key={secret}");
+    let moved = format!("https://site.test/b?key={secret}");
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        requests: vec![
+            request("https://site.test/robots.txt", None, 404),
+            request(&page, Some(&moved), 302),
+        ]
+        .into(),
+        ..ToolOutput::ok("page body")
+    };
+    let tool = web_tool(out, &log);
+    let deadlines = Arc::clone(&tool.deadlines);
+    let reg = registry(vec![Arc::new(tool)]);
+    let mut e = env(run, RunMode::Auto, true);
+    e.masker = Some(Arc::new(SecretMasker::new(vec![(
+        "WEB_KEY".into(),
+        secret.clone(),
+    )])));
+    let calls = [planned(
+        "c1",
+        "web_fetch",
+        json!({"url": "https://site.test/a"}),
+    )];
+    let (_tx, mut sig) = signal_channel();
+    let before = std::time::Instant::now();
+    let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert!(!result_of(&o.results[0]).2);
+
+    // Слот ставит дедлайн вызова: старт + тайм-аут − 1 с (D107).
+    let got = deadlines.lock().unwrap().clone();
+    assert_eq!(got.len(), 1);
+    let d = got[0].expect("ToolCx.deadline");
+    assert!(
+        d >= before + Duration::from_secs(60) - DEADLINE_GRACE,
+        "{d:?}"
+    );
+    assert!(d <= std::time::Instant::now() + Duration::from_secs(60) - DEADLINE_GRACE);
+
+    let all = s.read_run(run, Seq(0), 10_000).await.unwrap();
+    let kinds: Vec<EventKind> = all
+        .iter()
+        .map(|e| e.kind.clone())
+        .filter(|k| {
+            matches!(
+                k,
+                EventKind::ToolStarted | EventKind::WebRequest | EventKind::ToolFinished
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            EventKind::ToolStarted,
+            EventKind::WebRequest,
+            EventKind::WebRequest,
+            EventKind::ToolFinished
+        ]
+    );
+    let web: Vec<&Value> = all
+        .iter()
+        .filter(|e| e.kind == EventKind::WebRequest)
+        .map(|e| &e.payload)
+        .collect();
+    assert_eq!(
+        *web[0],
+        json!({"call_id": "c1", "tool": "web_fetch", "method": "GET",
+            "url": "https://site.test/robots.txt", "status": 404, "bytes": 10, "ms": 1,
+            "outcome": "ok"})
+    );
+    assert_eq!(
+        web[1]["url"],
+        "https://site.test/a?key=[secret masked: WEB_KEY]"
+    );
+    assert_eq!(
+        web[1]["final_url"],
+        "https://site.test/b?key=[secret masked: WEB_KEY]"
+    );
+    // Ни в событиях, ни в квитанции эффекта нет секрета; записей обращений в квитанции нет.
+    for ev in &all {
+        assert!(!ev.payload.to_string().contains(&secret), "{:?}", ev.kind);
+    }
+    let row = s
+        .effect(run, &EffectKey::derive(run, 0, 0))
+        .await
+        .unwrap()
+        .unwrap();
+    let receipt = row.result.expect("квитанция").to_string();
+    assert!(!receipt.contains("requests"), "{receipt}");
+    assert!(!receipt.contains(&secret), "{receipt}");
+
+    // Реплей квитанции: вызова и новых событий `web.request` нет.
+    let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert!(result_of(&o.results[0]).1.ends_with("page body"));
+    let again = s.read_run(run, Seq(0), 10_000).await.unwrap();
+    assert_eq!(
+        again
+            .iter()
+            .filter(|e| e.kind == EventKind::WebRequest)
+            .count(),
+        2
+    );
+    assert_eq!(log.lock().unwrap().starts.len(), 1);
+}
+
+#[tokio::test]
+async fn web_result_tainted_and_cleaned() {
+    let (s, j, run) = setup("web-tainted").await;
+    let log = SharedLog::default();
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        ..ToolOutput::ok("hello \u{202E}world")
+    };
+    let reg = registry(vec![Arc::new(web_tool(out, &log))]);
+    let calls = [planned(
+        "c1",
+        "web_fetch",
+        json!({"url": "https://site.test/"}),
+    )];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    let (_, text, is_error) = result_of(&o.results[0]);
+    assert!(!is_error);
+    // Своё происхождение заменяет `tool` и `network` (D110); bidi удалён (D102).
+    assert_eq!(text, "[untrusted content: web]\nhello world");
+    let ev = tool_events(&s, run).await;
+    assert_eq!(ev[1].0, EventKind::ToolFinished);
+    assert_eq!(ev[1].2["tainted"], true);
+}
+
+#[tokio::test]
+async fn own_origin_keeps_outside_project() {
+    let base = dir("own-outside");
+    let (project, outside, home) = (base.join("proj"), base.join("out"), base.join("home"));
+    for d in [&project, &outside, &home] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(outside.join("a.txt"), "x").unwrap();
+    let roots = Roots::canonical(&project, &home).unwrap();
+    let outside = std::fs::canonicalize(&outside).unwrap();
+    let (s, j, run) = setup("own-outside-journal").await;
+    let log = SharedLog::default();
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        ..ToolOutput::ok("page")
+    };
+    let mut tool = web_tool(out, &log);
+    tool.subjects.paths = vec![RawPath {
+        arg: outside.join("a.txt").to_string_lossy().into_owned(),
+        access: Access::Read,
+    }];
+    let reg = registry(vec![Arc::new(tool)]);
+    let mut e = ToolEnv::new(run, roots.project.clone(), RunMode::Auto, true, None);
+    e.roots = Arc::new(roots);
+    e.grants = Arc::new(vec![Grant {
+        path: outside.clone(),
+        mode: GrantMode::Ro,
+        source: GrantSource::Cli,
+        reason: String::new(),
+    }]);
+    let calls = [planned("c1", "web_fetch", json!({}))];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let (_, text, is_error) = result_of(&o.results[0]);
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        text, "[untrusted content: outside_project, web]\npage",
+        "outside_project — по путям, tool и network — нет"
+    );
 }

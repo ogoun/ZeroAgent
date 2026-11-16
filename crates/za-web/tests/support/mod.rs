@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod extractor;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -115,6 +117,13 @@ pub fn text(status: u16, body: &str) -> Response {
     let mut r = Response::new(Body::from(body.to_string()));
     *r.status_mut() = StatusCode::from_u16(status).unwrap();
     r
+}
+
+/// Ответ с кодом, заголовком `Content-Type` и телом из байт.
+pub fn typed(status: u16, content_type: &str, body: Vec<u8>) -> Response {
+    let mut r = Response::new(Body::from(body));
+    *r.status_mut() = StatusCode::from_u16(status).unwrap();
+    with_header(r, header::CONTENT_TYPE.as_str(), content_type)
 }
 
 /// Редирект 302 на `location`.

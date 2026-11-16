@@ -23,7 +23,8 @@
 //! копии (D89).
 //!
 //! Модуль [`text`] удаляет невидимые символы Unicode из результатов инструментов,
-//! ввода пользователя и `AGENTS.md` (SEC-051, D102).
+//! ввода пользователя и `AGENTS.md` (SEC-051, D102). Модуль [`extract`] — контракт
+//! извлечения текста из HTML и PDF в отдельном процессе (D113, D127).
 //!
 //! [`run_demo`] — детерминированный демонстрационный run для сквозной проверки
 //! журнала и протокола эффектов, [`replay_hash`] — хэш его значимых событий.
@@ -32,6 +33,7 @@ mod bus;
 mod capability;
 mod checkpoint;
 mod demo;
+pub mod extract;
 mod graph;
 pub mod interrupt;
 pub mod net;
@@ -52,8 +54,9 @@ pub use recovery::{
 };
 pub use runtime::{EffectError, EffectFailure, EffectSlot, EffectSource, EffectSpec, RunCtx};
 pub use tool::{
-    Access, Approval, DuplicateTool, Gate, NetRequest, Postcondition, RawPath, RiskClass, Subjects,
-    Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
+    Access, Approval, DEADLINE_GRACE, DuplicateTool, Gate, NetRequest, Postcondition, RawPath,
+    RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, call_deadline,
+    gate,
 };
 /// Схема инструмента для модели (поле [`ToolSpec::schema`]): крейты инструментов
 /// (`za-tools`) строят её без зависимости от `za-llm`.
