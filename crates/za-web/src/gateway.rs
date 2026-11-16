@@ -24,9 +24,12 @@
 //! с теми же свойствами (без прокси, cookie и сжатия, `Policy::none`) и резолвером
 //! [`ProviderResolver`], который разрешает только хост `[web.search] url` глобальной
 //! конфигурации (в любые адреса, в том числе частные) и отказывает любому другому имени.
+//! Заголовки клиента поставщика — [`provider_headers`] (`Accept: application/json`,
+//! `Accept-Encoding: identity`, `Accept-Language: en`; M2 ревью задачи 9).
 //! Им пользуется только [`WebGateway::get_provider`]: сверка происхождения (схема,
-//! нормализованный хост, порт) с настроенным, любой 3xx — ошибка без перехода,
-//! `robots.txt` не запрашивается, лимитер общий, ответ до 1 МиБ, не дольше 20 с.
+//! нормализованный хост, порт) с настроенным, любой 3xx — ошибка без перехода (в том
+//! числе без `Location` и с `Location`, который не разбирается), `robots.txt` не
+//! запрашивается, лимитер общий, ответ до 1 МиБ, не дольше 20 с.
 //! [`WebGateway::get`] (`web_fetch`) на тот же адрес идёт через полный фильтр и получает
 //! отказ `local or private address`: исключение привязано к методу, а не к адресу.
 
@@ -36,7 +39,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::dns::{Name, Resolve, Resolving};
-use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, LOCATION};
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap,
+    HeaderValue, LOCATION,
+};
 use reqwest::{Client, redirect};
 use tokio::time::{Instant, timeout_at};
 use url::Url;
@@ -64,6 +70,24 @@ const NOT_PROVIDER: &str = "not the configured search provider";
 pub const PROVIDER_MAX_BYTES: u64 = 1024 * 1024;
 /// Предел времени запроса к поставщику поиска (D111, D126).
 pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Заголовки каждого запроса клиента поставщика (M2 ревью задачи 9): ответ — JSON, без
+/// сжатия (D107: распаковки нет), тексты ошибок SearXNG (`unresponsive_engines`) — на
+/// английском. Клиент страниц (`web_fetch`) их не шлёт.
+///
+/// `limiter` SearXNG (botdetection на `/search`) требует ещё `text/html` в `Accept` и
+/// `gzip` или `deflate` в `Accept-Encoding`: такому экземпляру клиент без сжатия всё равно
+/// получит 429. Подсказка пользователю — ADR 0006, README и `doctor` (задача 14).
+fn provider_headers() -> HeaderMap {
+    [
+        (ACCEPT, "application/json"),
+        (ACCEPT_ENCODING, "identity"),
+        (ACCEPT_LANGUAGE, "en"),
+    ]
+    .into_iter()
+    .map(|(n, v)| (n, HeaderValue::from_static(v)))
+    .collect()
+}
 
 /// Сетевой шлюз: один объект на процесс, в `Arc` (D107). `Send + Sync`.
 pub struct WebGateway {
@@ -140,7 +164,7 @@ impl WebGateway {
             ));
         }
         let resolver = Arc::new(FilteredResolver::new());
-        let client = build_client(&cfg, resolver.clone())?;
+        let client = build_client(&cfg, resolver.clone(), HeaderMap::new())?;
         let provider = match &cfg.search_endpoint {
             Some(ep) => Some(Provider::new(ep, &cfg)?),
             None => None,
@@ -251,11 +275,13 @@ impl WebGateway {
         let mut rec = record(url.as_str());
         let r = self
             .request(&p.client, &url, PROVIDER_MAX_BYTES, deadline, &mut rec)
-            .await
-            .and_then(|resp| match resp.status {
-                300..=399 => Err(FetchError::ProviderRedirect),
-                _ => Ok(resp),
-            });
+            .await;
+        // Любой 3xx — переход не исполняется (M3 ревью задачи 9): и без `Location`, и с
+        // `Location`, который не разбирается (у `exchange` это ошибка сети).
+        let r = match rec.status {
+            Some(300..=399) => Err(FetchError::ProviderRedirect),
+            _ => r,
+        };
         finish(&mut rec, &r, &url);
         log.push(rec);
         let resp = r?;
@@ -486,7 +512,7 @@ impl Provider {
         }
         let resolver = Arc::new(ProviderResolver::new(origin.host.clone()));
         Ok(Self {
-            client: build_client(cfg, resolver.clone())?,
+            client: build_client(cfg, resolver.clone(), provider_headers())?,
             origin,
             #[cfg(feature = "test-hooks")]
             resolver,
@@ -494,12 +520,14 @@ impl Provider {
     }
 }
 
-/// HTTP-клиент шлюза с резолвером `resolver` — одни свойства у клиента страниц и клиента
-/// поставщика (D107, D126): без прокси (`no_proxy()`), редиректы исполняет не `reqwest`
-/// (`Policy::none`), без `Referer`, без cookie и сжатия (функций нет, D129).
+/// HTTP-клиент шлюза с резолвером `resolver` и заголовками `headers` каждого запроса — одни
+/// свойства у клиента страниц и клиента поставщика (D107, D126): без прокси
+/// (`no_proxy()`), редиректы исполняет не `reqwest` (`Policy::none`), без `Referer`, без
+/// cookie и сжатия (функций нет, D129).
 fn build_client<R: Resolve + 'static>(
     cfg: &WebConfig,
     resolver: Arc<R>,
+    headers: HeaderMap,
 ) -> Result<Client, WebError> {
     Client::builder()
         .no_proxy()
@@ -507,6 +535,7 @@ fn build_client<R: Resolve + 'static>(
         .referer(false)
         .connect_timeout(cfg.connect_timeout)
         .user_agent(concat!("zero-agent/", env!("CARGO_PKG_VERSION")))
+        .default_headers(headers)
         .dns_resolver(resolver)
         .build()
         .map_err(|e| WebError::Client(e.to_string()))

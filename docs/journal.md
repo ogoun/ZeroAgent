@@ -2,6 +2,16 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-16. R1-C2, проход fix-9s: `web_search` — простой текст, сбой движков, заголовки поставщика, предел выдачи
+
+- **I1. Простой текст.** Ответ SearXNG `format=json` не экранирует HTML: экранирование и подсветка в `searx/webapp.py` есть только у `format=html`. Поэтому `strip_tags` и `decode_entities` удалены, у заголовка и описания остался только `one_line`. Угловые скобки экранирует слот, секреты маскирует он же. Так `<details>`, `Vec<T>` и `HashMap<K, V>` доходят до модели (как `&lt;details&gt;`). Тест брифа `snippet_html_stripped` заменён на `snippet_plain_text_kept`; D111 «теги в описании удаляются» правит контроллер.
+- **M1. Сбой движков.** У трейта появился метод `unresponsive(body) -> Vec<String>` со значением по умолчанию (пусто), как D125 и предполагал для расширений. Инструмент зовёт его только при пустой выдаче. У `Searxng` метод читает `unresponsive_engines` — пары `[движок, причина]` из `webutils.get_json_response`, причина переведена на язык `Accept-Language`. Выдача: `no results (search engines unresponsive: …)`, не больше 10 движков, каждый одной строкой. Это не ошибка, как и `no results`.
+- **M2. Заголовки клиента поставщика.** `build_client` получил параметр заголовков. Клиент поставщика шлёт `Accept: application/json`, `Accept-Encoding: identity`, `Accept-Language: en`, клиент страниц шлёт прежние (`Accept: */*`, без двух других). Сверка с исходниками SearXNG master (2026-11-16): `limiter` на `/search` требует `text/html` в `Accept` (`http_accept.py`) и `gzip` или `deflate` в `Accept-Encoding` (`http_accept_encoding.py`, точное совпадение элемента списка). Значит, с `limiter` экземпляр ответит 429 и на эти заголовки, а пройти проверку без сжатия нельзя (D107). Подсказка пользователю (выключить `limiter` или внести адрес агента в `botdetection.ip_lists.pass_ip`) записана в ADR 0006; README и `doctor` — задача 14.
+- **M3.** Любой статус 3xx у поставщика даёт `ProviderRedirect` по `rec.status`, до разбора `Location`.
+- **M4.** `count` теперь `serde_json::Number`: целая часть `f64`, затем обрезка до 1..=20. Схема прежняя (`integer`, `minimum: 1`, без `maximum`), golden не менялся.
+- **M5.** Новые тесты: `localhost` из конфигурации через системный резолвер без подмены, `.invalid` даёт `search provider unavailable: …` с записью; тайм-аут на теле по байту даёт `request timed out` и запись `error` с `reason = "timeout"`. Тесты были зелёными до правок. Мутации их ловят: пустой ответ системного резолвера роняет тест `localhost`, потеря записи при ошибке роняет тест тайм-аута.
+- **M6. Предел выдачи.** Предел — `output_budget`, не больше 32 КиБ, минус `DIGEST_RESERVE`; длина меряется `escaped_len`. Отбрасываются целые результаты с конца, пометка — `[k of n results omitted to fit the output limit]`. Худший случай до правки — 79 855 байт (20 результатов: адрес около 2 КиБ, заголовок из `<`, описание из `>`).
+
 ## 2026-11-16. R1-C2, задача 11: `za-skills` — разбор, обход, обнаружение, загрузка
 
 - **Крейт `za-skills`** (D114): зависимости — `za-protocol`, `za-core`, `blake3`, `serde_json`, `thiserror`; новых внешних крейтов нет, прирост `Cargo.lock` — только сам `za-skills`. Направления проверяет `cargo xtask policy` (`SKILLS_ALLOWED_ZA_DEPS`, `za-skills` в `AGENT_ALLOWED_ZA_DEPS`).

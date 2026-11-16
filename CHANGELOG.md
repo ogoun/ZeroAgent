@@ -5,6 +5,14 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, проход fix-9s (ревью задачи 9, `web_search`):
+  - `za-web`: заголовок и описание результата SearXNG — простой текст. Теги не снимаются, сущности не раскрываются, остаётся только `one_line`; маскирует и экранирует слот. `<details>`, `Vec<T>`, `HashMap<K, V>` больше не теряются (I1). Это отступление от D111 «теги в описании удаляются» по Ruling I1;
+  - `za-web`: пустая выдача при сбое движков — `no results (search engines unresponsive: <движок> (<причина>), …)`, не больше 10 движков (M1). Новый метод трейта `SearchProvider::unresponsive` со значением по умолчанию; у `Searxng` он читает `unresponsive_engines`;
+  - `za-web`: клиент поставщика шлёт `Accept: application/json`, `Accept-Encoding: identity`, `Accept-Language: en`, клиент страниц — нет (M2). ADR 0006 объясняет 429 от `limiter` SearXNG и даёт подсказку: выключить `limiter` или внести адрес агента в `pass_ip`;
+  - `za-web`: любой ответ 3xx поставщика — `search provider redirected; not followed`, в том числе без `Location` и с `Location`, который не разбирается (M3);
+  - `za-web`: `count` — любое число JSON: целая часть, затем обрезка до 1..=20. `0`, `5.0` и целое больше `i64::MAX` ошибки не дают; текст `count must be at least 1` удалён (M4);
+  - `za-web`: выдача `web_search` укладывается в предел слота после экранирования: `output_budget`, не больше 32 КиБ, минус `DIGEST_RESERVE`. Лишние результаты отбрасываются целиком с конца, с пометкой `[k of n results omitted to fit the output limit]` (M6);
+  - тесты: системный резолвер для имени из конфигурации (`localhost`, `.invalid`), тайм-аут поставщика с записью `reason = "timeout"` (M5); тест брифа `snippet_html_stripped` заменён на `snippet_plain_text_kept`; в поддельном сервере появился `serve_with` — маршрут видит заголовки запроса.
 - R1-C2, задача 11 (крейт `za-skills`, D114–D116, D118):
   - `za-skills`: разбор `SKILL.md` своим строгим подмножеством YAML (`parse_skill_md`, модуль `yaml`) — всё строки, корректный YAML вне подмножества (якоря, алиасы, теги, flow-карты, второй документ, директивы) — `unsupported YAML feature: …`, ошибки синтаксиса (табуляция в отступе, повтор ключа) — `unparseable frontmatter: …`; файл до 256 КиБ, frontmatter до 64 КиБ; описание очищается уровнем `Untrusted`; недопустимое имя заменяется именем каталога; `hooks`, `commands`, `scripts` — предупреждение, ничего не исполняется;
   - `za-skills`: обход доверенных деревьев `tree_listing` и `tree_hash` (вынос из `zero-agent/src/trust.rs`, итеративный, сначала перечень записей) с пределами `TreeLimits`;

@@ -86,6 +86,14 @@ pub async fn serve<F>(route: F) -> Server
 where
     F: Fn(&str) -> Response + Send + Sync + 'static,
 {
+    serve_with(move |p, _| route(p)).await
+}
+
+/// Сервер, отвечающий `route(путь, заголовки запроса)` на любой запрос.
+pub async fn serve_with<F>(route: F) -> Server
+where
+    F: Fn(&str, &HeaderMap) -> Response + Send + Sync + 'static,
+{
     let (tx, rx) = mpsc::unbounded_channel();
     let route = Arc::new(route);
     let app = Router::new().fallback(move |req: Request| {
@@ -101,7 +109,7 @@ where
                 path: path.clone(),
                 headers: req.headers().clone(),
             });
-            route(&path)
+            route(&path, req.headers())
         }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

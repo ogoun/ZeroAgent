@@ -13,10 +13,15 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use support::extractor::StubExtractor;
-use support::{Server, redirect, scaled, serve, text, typed, within};
+use support::{
+    Server, drip, redirect, scaled, serve, serve_with, text, typed, with_header, within,
+};
 use tokio::time::Instant;
 use url::Url;
-use za_core::{Approval, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, call_deadline};
+use za_core::text::escaped_len;
+use za_core::{
+    Approval, DIGEST_RESERVE, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, call_deadline,
+};
 use za_protocol::{EffectClass, EffectKey, RunId, RunRole, Tier, net_outcome};
 use za_web::search::{SearchHit, SearchProvider, Searxng};
 use za_web::{FetchError, Fetched, WebConfig, WebGateway, web_fetch_tool, web_search_tool};
@@ -66,6 +71,11 @@ fn offline() -> Arc<dyn Tool> {
 }
 
 fn cx() -> ToolCx {
+    cx_with(call_deadline(std::time::Instant::now(), scaled(LONG)), None)
+}
+
+/// Контекст вызова с дедлайном `deadline` и пределом результата слота `budget`.
+fn cx_with(deadline: std::time::Instant, budget: Option<usize>) -> ToolCx {
     let run = RunId::new();
     ToolCx {
         run,
@@ -73,14 +83,21 @@ fn cx() -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 0, 0),
         paths: Vec::new(),
-        deadline: Some(call_deadline(std::time::Instant::now(), scaled(LONG))),
-        output_budget: None,
+        deadline: Some(deadline),
+        output_budget: budget,
     }
 }
 
 async fn search(tool: &Arc<dyn Tool>, args: Value) -> ToolOutput {
     within(LONG * 2, "web_search", tool.call(args, cx())).await
 }
+
+/// Заголовки, без которых `limiter` поддельного экземпляра отвечает 429 (M2 ревью задачи 9).
+const PROVIDER_HEADERS: [(&str, &str); 3] = [
+    ("accept", "application/json"),
+    ("accept-encoding", "identity"),
+    ("accept-language", "en"),
+];
 
 async fn provider_get(gw: &WebGateway, u: &str) -> Fetched {
     within(LONG * 2, u, gw.get_provider(&url(u), deadline())).await
@@ -162,9 +179,59 @@ async fn searxng_results_rendered() {
     let seen = s.seen();
     let paths: Vec<&str> = seen.iter().map(|x| x.path.as_str()).collect();
     assert_eq!(paths, ["/search?q=rust+tokio&format=json"]);
-    // Клиент поставщика — те же свойства, что у клиента страниц: без cookie и сжатия.
-    assert!(seen[0].headers.get("accept-encoding").is_none());
+    // Клиент поставщика — без cookie и сжатия (`Accept-Encoding: identity`), со своими
+    // заголовками `Accept` и `Accept-Language` (M2 ревью задачи 9).
+    for (name, value) in PROVIDER_HEADERS {
+        assert_eq!(seen[0].headers[name], value, "{name}");
+    }
     assert!(seen[0].headers.get("cookie").is_none());
+}
+
+/// M2 ревью задачи 9: экземпляр с `limiter` отвечает 429 клиенту без `Accept`,
+/// `Accept-Encoding` и `Accept-Language`. Клиент поставщика шлёт их всегда; клиент страниц
+/// (`web_fetch`) — нет: заголовки — свойство только клиента поставщика.
+#[tokio::test]
+async fn provider_sends_accept_headers() {
+    let body = results(&[("Tokio", "https://tokio.rs/", "An async runtime")]);
+    let mut s = serve_with(move |p, h| {
+        let ok = PROVIDER_HEADERS
+            .iter()
+            .all(|(n, v)| h.get(*n).and_then(|x| x.to_str().ok()) == Some(*v));
+        match (p.starts_with("/search?"), ok) {
+            (true, true) => typed(200, "application/json", body.clone()),
+            (true, false) => text(429, "Too Many Requests"),
+            _ => text(404, ""),
+        }
+    })
+    .await;
+    let out = search(&searx(&endpoint(&s)), json!({"query": "tokio"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        out.content,
+        "1. Tokio\n   https://tokio.rs/\n   An async runtime"
+    );
+    assert_eq!(s.paths().len(), 1);
+
+    // Клиент страниц на публичный хост (подмена имени) — без этих заголовков.
+    let gw = WebGateway::new(WebConfig {
+        robots: false,
+        ports: vec![s.port()],
+        ..config(&endpoint(&s))
+    })
+    .unwrap()
+    .with_test_resolve(vec![("site.test".into(), s.addr)]);
+    let page = format!("http://site.test:{}/search?q=x&format=json", s.port());
+    let f = within(LONG * 2, "get", gw.get(&url(&page), deadline())).await;
+    assert_eq!(f.result.unwrap().status, 429);
+    let seen = s.seen();
+    assert_eq!(seen.len(), 1);
+    for (name, _) in PROVIDER_HEADERS {
+        if name == "accept" {
+            assert_eq!(seen[0].headers[name], "*/*");
+        } else {
+            assert!(seen[0].headers.get(name).is_none(), "{name}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -302,18 +369,43 @@ async fn count_and_query_limits() {
     assert!(!out.is_error, "{}", out.content);
     assert_eq!(s.paths().len(), 1);
 
-    // count меньше 1 и пустой запрос — ошибки аргументов без обращения.
-    let out = search(&t, json!({"query": "x", "count": 0})).await;
-    assert_eq!(
-        (out.is_error, out.content.as_str()),
-        (true, "count must be at least 1")
-    );
+    // Пустой запрос и нет `query` — ошибки аргументов без обращения.
     let out = search(&t, json!({"query": "  "})).await;
     assert_eq!(
         (out.is_error, out.content.as_str()),
         (true, "query is empty")
     );
     let out = search(&t, json!({"count": 2})).await;
+    assert!(out.is_error && out.content.starts_with("invalid arguments: "));
+    assert!(s.paths().is_empty());
+}
+
+/// M4 ревью задачи 9: `count` — любое число JSON. Берётся целая часть, затем обрезка до
+/// 1..=20; целое больше `i64::MAX` и `5.0` (целое по JSON Schema) не дают ошибки аргументов.
+#[tokio::test]
+async fn count_accepts_any_number() {
+    let mut s = instance(many(30)).await;
+    let t = searx(&endpoint(&s));
+    let shown = |content: &str| content.lines().filter(|l| !l.starts_with(' ')).count();
+    for (count, want) in [
+        (json!(0), 1),
+        (json!(-3), 1),
+        (json!(0.5), 1),
+        (json!(5.0), 5),
+        (json!(5.7), 5),
+        (json!(20.9), 20),
+        (json!(10_000_000_000_000_000_000_u64), 20),
+        (json!(1e300), 20),
+        (json!(-1e300), 1),
+        (Value::Null, 8),
+    ] {
+        let out = search(&t, json!({"query": "x", "count": count})).await;
+        assert!(!out.is_error, "{count}: {}", out.content);
+        assert_eq!(shown(&out.content), want, "{count}: {}", out.content);
+    }
+    assert_eq!(s.paths().len(), 10);
+    // Не число — ошибка аргументов.
+    let out = search(&t, json!({"query": "x", "count": "5"})).await;
     assert!(out.is_error && out.content.starts_with("invalid arguments: "));
     assert!(s.paths().is_empty());
 }
@@ -355,6 +447,35 @@ async fn provider_redirect_not_followed() {
     );
 }
 
+/// M3 ревью задачи 9: любой 3xx — `redirected`, в том числе с `Location`, который не
+/// разбирается, и без `Location`.
+#[tokio::test]
+async fn provider_any_3xx_is_redirect() {
+    for (status, location) in [
+        (302, Some("http://[")),
+        (301, Some("http://exa mple.test/")),
+        (300, None),
+        (304, None),
+        (308, Some("/next")),
+    ] {
+        let mut s = serve(move |_| match location {
+            Some(l) => with_header(text(status, ""), "location", l),
+            None => text(status, ""),
+        })
+        .await;
+        let out = search(&searx(&endpoint(&s)), json!({"query": "x"})).await;
+        assert_eq!(
+            (out.is_error, out.content.as_str()),
+            (true, "search provider redirected; not followed"),
+            "{status} {location:?}"
+        );
+        assert_eq!(out.requests.len(), 1, "{status}");
+        assert_eq!(out.requests[0].status, Some(status));
+        assert_eq!(out.requests[0].outcome, net_outcome::ERROR);
+        assert_eq!(s.paths().len(), 1, "{status}: второй запрос не пришёл");
+    }
+}
+
 #[tokio::test]
 async fn provider_unavailable() {
     // Порт, на котором никто не слушает.
@@ -386,6 +507,219 @@ async fn empty_results() {
     assert_eq!(out.content, "no results");
     assert_eq!(out.taint.as_deref(), Some("web"));
     assert_eq!(s.paths().len(), 1);
+}
+
+/// Ответ SearXNG с пустым `results` и списком `unresponsive_engines` — пары
+/// `[движок, причина]`, как их отдаёт `webutils.get_json_response`.
+fn unresponsive(hits: &[(&str, &str, &str)], engines: &[(&str, &str)]) -> Vec<u8> {
+    let mut v: Value = serde_json::from_slice(&results(hits)).unwrap();
+    v["unresponsive_engines"] = engines.iter().map(|(e, r)| json!([e, r])).collect();
+    serde_json::to_vec(&v).unwrap()
+}
+
+/// M1 ревью задачи 9: все движки не ответили (CAPTCHA, тайм-аут, лимит) — SearXNG отвечает
+/// 200 с пустым `results`, причины — в `unresponsive_engines`. Модель должна видеть, что
+/// это сбой движков, а не «ничего не найдено».
+#[tokio::test]
+async fn no_results_names_unresponsive_engines() {
+    let s = instance(unresponsive(
+        &[],
+        &[("duckduckgo", "Suspended: CAPTCHA"), ("google", "timeout")],
+    ))
+    .await;
+    let out = search(&searx(&endpoint(&s)), json!({"query": "x"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        out.content,
+        "no results (search engines unresponsive: duckduckgo (Suspended: CAPTCHA), google (timeout))"
+    );
+    assert_eq!(out.taint.as_deref(), Some("web"));
+
+    // Есть результаты — частичный сбой движков в выдачу не попадает.
+    let s = instance(unresponsive(
+        &[("Tokio", "https://tokio.rs/", "rt")],
+        &[("google", "timeout")],
+    ))
+    .await;
+    let out = search(&searx(&endpoint(&s)), json!({"query": "x"})).await;
+    assert_eq!(out.content, "1. Tokio\n   https://tokio.rs/\n   rt");
+
+    // Список — не больше 10 движков; поля — одной строкой; движок без имени пропускается.
+    let names: Vec<String> = (1..=12).map(|i| format!("e{i:02}")).collect();
+    let mut engines: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "timeout")).collect();
+    engines.insert(0, ("", "x"));
+    engines.insert(1, ("multi\nline", "too many\nrequests"));
+    let s = instance(unresponsive(&[], &engines)).await;
+    let out = search(&searx(&endpoint(&s)), json!({"query": "x"})).await;
+    let listed: Vec<String> = (1..=9).map(|i| format!("e{i:02} (timeout)")).collect();
+    assert_eq!(
+        out.content,
+        format!(
+            "no results (search engines unresponsive: multi line (too many requests), {}, and 3 more)",
+            listed.join(", ")
+        )
+    );
+
+    // Не список или элементы другого вида — обычное `no results`.
+    let mut v: Value = serde_json::from_slice(&results(&[])).unwrap();
+    v["unresponsive_engines"] = json!("google");
+    let s = instance(serde_json::to_vec(&v).unwrap()).await;
+    let out = search(&searx(&endpoint(&s)), json!({"query": "x"})).await;
+    assert_eq!(out.content, "no results");
+}
+
+/// I1 ревью задачи 9: угловые скобки выдачи доходят до слота как есть (экранирует слот).
+#[tokio::test]
+async fn angle_brackets_reach_output() {
+    let s = instance(results(&[(
+        "<details>: The Details disclosure element",
+        "https://developer.mozilla.org/",
+        "HashMap<K, V> and Vec<T>",
+    )]))
+    .await;
+    let out = search(&searx(&endpoint(&s)), json!({"query": "details"})).await;
+    assert_eq!(
+        out.content,
+        "1. <details>: The Details disclosure element\n   https://developer.mozilla.org/\n   HashMap<K, V> and Vec<T>"
+    );
+}
+
+/// M5 ревью задачи 9: имя из конфигурации разрешает системный резолвер (без подмены
+/// `with_test_resolve`): `http://localhost:<порт>/` — частый случай своего экземпляра.
+#[tokio::test]
+async fn provider_system_resolver_for_configured_name() {
+    let mut s = instance(results(&[("A", "https://a.example/", "a")])).await;
+    let ep = format!("http://localhost:{}/", s.port());
+    let out = search(&searx(&ep), json!({"query": "a"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(out.content, "1. A\n   https://a.example/\n   a");
+    assert_eq!(out.requests.len(), 1);
+    assert_eq!(out.requests[0].url, format!("{ep}search?q=a&format=json"));
+    assert_eq!(s.paths(), ["/search?q=a&format=json"]);
+
+    // Имя, которое не разрешается (RFC 6761 `.invalid`), — честная ошибка с записью.
+    let ep = format!("http://searx.invalid:{}/", s.port());
+    let out = search(&searx(&ep), json!({"query": "a"})).await;
+    assert!(out.is_error);
+    assert!(
+        out.content.starts_with("search provider unavailable: "),
+        "{}",
+        out.content
+    );
+    assert!(out.content.is_ascii(), "{}", out.content);
+    assert_eq!(out.requests.len(), 1);
+    assert_eq!(out.requests[0].outcome, net_outcome::ERROR);
+    assert!(s.paths().is_empty());
+}
+
+/// M5 ревью задачи 9: дедлайн вызова — `search provider unavailable: request timed out`, и
+/// запись прерванного запроса (`reason = "timeout"`) не теряется (SEC-045).
+#[tokio::test]
+async fn provider_timeout_keeps_request() {
+    let s = serve(|_| drip(Duration::from_millis(50))).await;
+    let t = searx(&endpoint(&s));
+    let budget = scaled(Duration::from_secs(1));
+    let dl = std::time::Instant::now() + budget;
+    // Внешний предел — как тайм-аут слота: вызов возвращается сам, по дедлайну.
+    let out = tokio::time::timeout(
+        budget + scaled(Duration::from_secs(10)),
+        t.call(json!({"query": "x"}), cx_with(dl, None)),
+    )
+    .await
+    .expect("внешний тайм-аут не должен срабатывать: дедлайн соблюдает шлюз");
+    assert!(std::time::Instant::now() >= dl);
+    assert_eq!(
+        (out.is_error, out.content.as_str()),
+        (true, "search provider unavailable: request timed out")
+    );
+    assert_eq!(out.taint.as_deref(), Some("web"));
+    assert_eq!(out.requests.len(), 1, "{:?}", out.requests);
+    let r = &out.requests[0];
+    assert_eq!(r.outcome, net_outcome::ERROR);
+    assert_eq!(r.reason.as_deref(), Some("timeout"));
+    assert_eq!(r.status, Some(200));
+}
+
+/// 20 результатов в худшем случае: адрес почти 2048 байт, заголовок 200 символов,
+/// описание 300 символов, угловые скобки (экранирование слота их удлиняет).
+fn huge(n: usize) -> Vec<u8> {
+    let hits: Vec<(String, String, String)> = (1..=n)
+        .map(|i| {
+            let path = "p".repeat(2000);
+            (
+                format!("T{i} {}", "<".repeat(200)),
+                format!("https://e{i}.example/{path}"),
+                format!("s{i} {}", ">".repeat(300)),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, &str, &str)> = hits
+        .iter()
+        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+        .collect();
+    results(&refs)
+}
+
+/// M6 ревью задачи 9: выдача после экранирования вместе со строками слота укладывается в
+/// предел (`output_limit` 32 КиБ или меньший `output_budget` окна): лишние результаты
+/// отбрасываются целиком с конца, с пометкой; слот не режет выдачу посередине.
+#[tokio::test]
+async fn output_fits_limit() {
+    let s = instance(huge(20)).await;
+    let t = searx(&endpoint(&s));
+    let call = |budget: Option<usize>| {
+        let t = t.clone();
+        async move {
+            let dl = call_deadline(std::time::Instant::now(), scaled(LONG));
+            within(
+                LONG * 2,
+                "web_search",
+                t.call(json!({"query": "x", "count": 20}), cx_with(dl, budget)),
+            )
+            .await
+        }
+    };
+    for (budget, limit) in [
+        (None, 32 * 1024),
+        (Some(64 * 1024), 32 * 1024),
+        (Some(9000), 9000),
+        // Ни один результат не помещается — только пометка.
+        (Some(600), 600),
+    ] {
+        let out = call(budget).await;
+        assert!(!out.is_error, "{}", out.content);
+        let len = escaped_len(&out.content);
+        assert!(len <= limit - DIGEST_RESERVE, "{budget:?}: {len}");
+        let last = out.content.lines().last().unwrap();
+        let shown = out
+            .content
+            .lines()
+            .filter(|l| {
+                l.split_once(". ")
+                    .is_some_and(|(n, _)| n.parse::<u32>().is_ok())
+            })
+            .count();
+        assert_eq!(
+            last,
+            format!(
+                "[{} of 20 results omitted to fit the output limit]",
+                20 - shown
+            ),
+            "{budget:?}"
+        );
+        // Показанные результаты — целиком: по три строки, номера сплошные.
+        assert_eq!(out.content.lines().count(), shown * 3 + 1, "{budget:?}");
+        for i in 1..=shown {
+            assert!(
+                out.content.contains(&format!("\n   https://e{i}.example/")),
+                "{budget:?}: {i}"
+            );
+        }
+    }
+    // На обычной выдаче пометки нет.
+    let s = instance(many(20)).await;
+    let out = search(&searx(&endpoint(&s)), json!({"query": "x", "count": 20})).await;
+    assert!(!out.content.contains("omitted"), "{}", out.content);
 }
 
 #[tokio::test]
@@ -458,12 +792,18 @@ fn bad_endpoint_rejected() {
     );
 }
 
+/// I1 ревью задачи 9 (вместо `snippet_html_stripped` брифа): SearXNG `format=json` отдаёт
+/// заголовок и описание простым текстом (экранирование и подсветка у него — только для
+/// `format=html`). Теги не снимаются и сущности не раскрываются: поле проходит только
+/// `one_line`, дальше — общая маска и экранирование слота. Иначе `<details>`, `Vec<T>` и
+/// `HashMap<K, V>` теряли бы главное слово выдачи.
 #[test]
-fn snippet_html_stripped() {
+fn snippet_plain_text_kept() {
     let p = Searxng::new(url("http://127.0.0.1:8888/"));
     let body = json!({"results": [
-        {"title": "<b>Tokio</b> &amp; Rust", "url": "https://tokio.rs/", "content": "<strong>Tokio</strong> runtime"},
-        {"title": "a < b", "url": "https://x.example/", "content": "1 &lt; 2 &#x26; 3 &#38; <span\nclass=\"h\">four</span>"},
+        {"title": "<details>: The Details disclosure element - HTML", "url": "https://developer.mozilla.org/", "content": "The <details> HTML element creates a disclosure widget"},
+        {"title": "Vec<T> in std::vec", "url": "https://doc.rust-lang.org/", "content": "A contiguous growable array type, written as Vec<T>; see also HashMap<K, V>"},
+        {"title": "<b>Tokio</b> &amp; Rust", "url": "https://tokio.rs/", "content": "<strong>Tokio</strong> runtime, a<b>c, 1 &lt; 2"},
         {"title": "no url"},
         {"title": "script", "url": "javascript:alert(1)", "content": "x"},
         {"title": "Multi\nline\r\n2. fake", "url": "https://y.example/", "content": null},
@@ -475,14 +815,21 @@ fn snippet_html_stripped() {
         hits,
         [
             SearchHit {
-                title: "Tokio & Rust".into(),
-                url: "https://tokio.rs/".into(),
-                snippet: "Tokio runtime".into(),
+                title: "<details>: The Details disclosure element - HTML".into(),
+                url: "https://developer.mozilla.org/".into(),
+                snippet: "The <details> HTML element creates a disclosure widget".into(),
             },
             SearchHit {
-                title: "a < b".into(),
-                url: "https://x.example/".into(),
-                snippet: "1 < 2 & 3 & four".into(),
+                title: "Vec<T> in std::vec".into(),
+                url: "https://doc.rust-lang.org/".into(),
+                snippet:
+                    "A contiguous growable array type, written as Vec<T>; see also HashMap<K, V>"
+                        .into(),
+            },
+            SearchHit {
+                title: "<b>Tokio</b> &amp; Rust".into(),
+                url: "https://tokio.rs/".into(),
+                snippet: "<strong>Tokio</strong> runtime, a<b>c, 1 &lt; 2".into(),
             },
             SearchHit {
                 title: "Multi line 2. fake".into(),
