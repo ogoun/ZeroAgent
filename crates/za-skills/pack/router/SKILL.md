@@ -6,12 +6,29 @@ description: Use when you are unsure which skill fits the current step, or wheth
 
 Pick at most one skill for the current step, or none.
 
+## Steps and skills
+- clarify a vague request: grill
+- write down what to build and how to tell it is done: spec
+- split agreed work into tasks: tickets
+- get to know unfamiliar code: wayfinder
+- write code test first: tdd
+- find the cause of a fault: diagnose
+- check a change: review
+- check your own conclusion before reporting it: doubt
+- rely on exact library or API behavior: source-driven
+- answer from web sources: research-with-citations
+- pin down terms or record a decision: domain-model
+- look back at finished work: retro
+- pass the work on: handoff
+
+A skill catalog, when one is shown, may list more skills; each description says when its skill applies.
+
 ## How to choose
-1. Name the step you are about to take in a few words: clarify, specify, split, explore, test first, debug, review, verify, research, define terms, look back, hand over.
-2. Match it to a skill by its description in the activate_skill list. Each description says when the skill applies.
-3. Load a skill with activate_skill only if its steps change what you would do. A skill you would follow anyway only costs context.
-4. One skill at a time. Load the next one when the work moves to a different kind of step.
-5. If two skills fit, take the one for the earlier step: clarify before specify, specify before split, debug before review.
+1. Name the step you are about to take in a few words and find it above or in the catalog.
+2. Take a skill only if its steps would change what you do. A skill you would follow anyway only costs context.
+3. One skill at a time. Take the next one when the work moves to a different kind of step.
+4. If two fit, take the one for the earlier step: clarify before specify, specify before split, debug before review.
+5. To load it, call the skill tool with the exact name if that tool is listed. If it is not, tell the user which skill fits: they can load it by typing a slash and its name, for example /tdd.
 
 ## A typical path for a new feature
 grill, spec, tickets, then for each ticket tdd, review and doubt. In an unfamiliar codebase start with wayfinder.

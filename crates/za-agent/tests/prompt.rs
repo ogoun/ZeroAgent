@@ -780,7 +780,9 @@ fn runtime_texts_are_listed_and_hashed() {
 /// R1-C2 D120 (PRM-010): тексты core pack входят в хэш промптов под именами
 /// `skills/<name>` — правка любого скилла поставки меняет `prompt_texts_hash()`. Тест
 /// здесь, а не в `za-skills`: dev-зависимость `za-skills → za-agent` нарушила бы правило
-/// нижних слоёв `xtask policy` (preflight 1.3).
+/// нижних слоёв `xtask policy` (preflight 1.3). Что хэш считается по всему
+/// `runtime_texts()`, а значит и по `skills/*`, проверяет точным равенством
+/// `prompt_hash_covers_names_and_texts`; здесь — что тексты поставки в нём есть.
 #[test]
 fn pack_texts_in_prompt_hash() {
     let texts = runtime_texts();
@@ -793,7 +795,7 @@ fn pack_texts_in_prompt_hash() {
         .iter()
         .map(|(n, t)| (format!("skills/{n}"), *t))
         .collect();
-    assert_eq!(skills.len(), 14);
+    assert_eq!(skills.len(), za_skills::PACK.len());
     assert_eq!(
         skills,
         expected
@@ -801,22 +803,6 @@ fn pack_texts_in_prompt_hash() {
             .map(|(n, t)| (n.as_str(), *t))
             .collect::<Vec<_>>()
     );
-    // Тексты участвуют в хэше: без них хэш другой (формат — `prompt_hash_covers_names_and_texts`).
-    let mut h = blake3::Hasher::new();
-    h.update(b"za-prompts-v2\0");
-    let rest = prompt_files().iter().map(|(n, t)| (*n, *t)).chain(
-        texts
-            .iter()
-            .filter(|(n, _)| !n.starts_with("skills/"))
-            .map(|(n, t)| (*n, t.as_str())),
-    );
-    for (name, text) in rest {
-        for part in [name.as_bytes(), text.as_bytes()] {
-            h.update(&(part.len() as u64).to_le_bytes());
-            h.update(part);
-        }
-    }
-    assert_ne!(h.finalize().to_hex().to_string(), prompt_texts_hash());
 }
 
 /// D120: у каждого скилла поставки — случай CI-лимита `skills/<name>` с пределом

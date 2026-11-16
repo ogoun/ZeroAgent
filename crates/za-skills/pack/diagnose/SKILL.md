@@ -4,22 +4,27 @@ description: Use when a bug, failing test, crash or wrong output needs its root 
 ---
 # Diagnose
 
-Find the cause of a fault from evidence, then fix that cause once.
+Explain the fault from evidence first, then change the code at the place the evidence points to.
 
-## Steps
-1. Pin the symptom: the exact command, input, expected and actual output. Copy error text verbatim.
-2. Reproduce it with the shortest command you can run again. If it does not reproduce, collect logs, versions and recent changes instead, and say so.
-3. Narrow the search. Compare a working case with a failing one, bisect recent commits or inputs, and read the code on the failing path.
-4. Write one hypothesis that explains every observation, and the check that would prove it wrong.
-5. Run that check. A failed prediction rules the hypothesis out: record it and form the next one.
-6. When a check confirms the cause, write a test that fails because of it, then make the smallest fix.
-7. Rerun the reproduction and the nearby tests. Report the cause, the evidence and the fix.
+## Set up
+1. Write the fault down exactly: the command, input and environment, the expected and the actual result, the error text copied as is.
+2. Find the shortest command that makes it happen again. If it will not happen again, work from what it left behind (logs, journals, versions, recent changes) and say that the diagnosis rests on those traces.
+3. Start a log of observations. Each entry says what you checked, what you expected and what you saw.
+
+## Loop
+4. Propose a cause that fits every entry in the log, and one thing it predicts that you have not seen yet.
+5. Look. A useful look narrows the space: put a case that works next to one that fails and move one toward the other (inputs, commits, config, environment) until one difference is left.
+6. Log the result. A failed prediction rules the cause out: go back to step 4 with the new entry.
+
+## Fix
+7. When a prediction holds, write a test that fails because of the cause. Then make the smallest change in the code that holds the cause, even if the symptom appears somewhere else.
+8. Run the original command and the tests near the change. Report the cause, the log entries that show it and the fix.
 
 ## Stop when
-- The reproduction passes after the fix, and the new test fails without it.
-- Or three hypotheses have failed: report what was ruled out and ask the user for access or data.
+- The original command gives the expected result, and the new test fails without the fix.
+- Or no check within your reach can tell the remaining causes apart. Report the log, the causes still standing and the one observation that would separate them, and ask the user whether they can provide it.
 
 ## Do not
-- Change code to see whether the symptom goes away before you know why it happens.
-- Silence the error, add retries or widen a timeout as the fix.
-- Change several things in one experiment.
+- Edit code as an experiment before the log names a cause for it to test.
+- Hide the fault with catch-all handlers, retries, longer timeouts or skipped tests.
+- Change more than one thing per look: the log could not tell which one mattered.

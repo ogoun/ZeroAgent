@@ -10,8 +10,8 @@ use za_core::paths::Roots;
 use za_protocol::skill_source;
 use za_skills::{
     Catalog, DiscoverInput, EXTERNAL_LINK, LOCAL_TREE_LIMITS, Limits, LoadError, PROJECT_TREES,
-    Place, ProjectSkills, TRUST_LIMITS, TreeLimits, TreeListing, discover, load, tree_hash,
-    tree_listing,
+    Place, ProjectSkills, TRUST_LIMITS, TreeLimits, TreeListing, discover, file_value, load,
+    tree_hash, tree_listing,
 };
 
 /// Свой каталог на процесс и вызов.
@@ -764,6 +764,28 @@ fn links_inside_skill_dir() {
         ..DiscoverInput::default()
     });
     check_links(&cat, |d| format!(".claude/skills/{d}"), links);
+}
+
+/// Ревью задачи 12, m8: доверенный файл корня проекта (`AGENTS.md`, `CLAUDE.md`,
+/// `.zero-agent/config.toml` R1-C1) в виде ссылки (junction) на каталог внутри проекта —
+/// значение `external-link`, а не ошибка. Это та же ветка `entry_value`, что у обхода
+/// дерева: на Windows открытие каталога давало `PermissionDenied`, и `trust_set` падал.
+#[test]
+fn trusted_file_link_to_dir_is_external() {
+    let project = dir("file-value-link");
+    write(&project.join("docs/notes.md"), "notes");
+    write(&project.join("CLAUDE.md"), "rules");
+    dir_link(&project.join("AGENTS.md"), &project.join("docs"));
+    let roots = roots(&project);
+    assert_eq!(
+        file_value(&roots, "AGENTS.md").unwrap().as_deref(),
+        Some(EXTERNAL_LINK)
+    );
+    assert_eq!(
+        file_value(&roots, "CLAUDE.md").unwrap(),
+        Some(hex(b"rules"))
+    );
+    assert_eq!(file_value(&roots, "missing.md").unwrap(), None);
 }
 
 #[test]

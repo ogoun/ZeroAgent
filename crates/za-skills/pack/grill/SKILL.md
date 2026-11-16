@@ -4,20 +4,20 @@ description: Use when a request is vague or hides choices and risky assumptions,
 ---
 # Grill
 
-Turn a vague request into clear requirements by asking the user, one question at a time, before the work starts.
+Turn a vague request into clear requirements by putting short questions to the user, in turn, before the work starts.
 
 ## Steps
 1. Read what already exists (code, docs, earlier messages), so that you ask only what the sources cannot answer.
 2. List the unknowns: goal, users, scope, inputs and outputs, limits, failure cases, what done looks like.
 3. Rank them by the cost of a wrong guess and start with the most expensive.
-4. Ask one question per ask_user call, in plain words, with two to four concrete options and the one you recommend.
+4. Each question covers exactly one unknown and waits for its answer (use ask_user if it is listed). Use plain words, offer two to four concrete answers to choose from, and say which one you advise and why, in one line.
 5. After each answer update the list: drop what it settled, add what it opened.
-6. Restate the agreed requirements as a short list and ask for a final yes.
+6. Write the settled requirements as a short numbered list, each one checkable, and let the user correct it.
 
 ## Stop when
-The user confirms the summary, or the remaining unknowns are cheap to change later. Write those down as assumptions.
+The user accepts the list, or the remaining unknowns are cheap to change later. Write those down as assumptions.
 
 ## Do not
-- Ask what you can find out yourself.
-- Send many questions at once, or use internal jargon.
-- Start building before the summary is confirmed, unless the user says to go ahead.
+- Send many questions at once.
+- Use internal jargon. If a term is needed, explain it in one plain sentence.
+- Start building before the list is accepted, unless the user says to go ahead.

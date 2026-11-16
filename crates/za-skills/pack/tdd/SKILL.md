@@ -4,25 +4,25 @@ description: Use when writing or changing code whose behavior an automated test 
 ---
 # TDD
 
-Grow the code in small cycles, each starting with a failing test.
+Express each small behavior as a test before the code exists, make it pass with plain code, then tidy up while the tests stay green.
 
 ## Cycle
-1. Red: write one test for the next small behavior. Run it and see it fail for the expected reason, not because of a typo or a missing import.
-2. Green: write the least code that makes it pass. Run it together with the tests near it.
-3. Refactor: with every test green, improve names, remove duplication, simplify. Run the tests again.
-4. Commit or note the step, then pick the next behavior.
+1. Red. Choose the next small behavior and express it as one test. Run that test alone. It must fail on the check of the new behavior itself; a stop before that check means the test is not ready yet, so repair it and run it again.
+2. Green. Change the code until that test passes, and stop there. Then run the tests of the module you touched.
+3. Refactor. Make the new code and its tests easy to read and to change, while everything stays green. Rerun the same tests after each change.
+4. Move to the next behavior. Commit only if the user asked for commits.
 
-## Choosing tests
-- Test behavior through the public interface, not private details.
-- Start with the simplest case, then the edges: empty, one, many, limits, errors.
-- One reason to fail per test; name the test after the behavior.
-- Use the project's test framework and fixtures. Keep tests fast and independent.
-- A bug fix starts with a test that reproduces the bug.
+## Choosing behaviors
+- The main case first, then the edges: no input, a single item, a full batch, exactly at a limit and one past it, malformed input, a dependency that fails.
+- Drive the code the way its callers do (public functions, the command line, the API) and assert on what they can observe.
+- Small, fast, independent tests. Name each one as a statement about the behavior, so that a failure reads like a bug report.
+- The project's own test framework, helpers and fixtures. Temporary files stay inside the project.
+- A reported bug becomes a test that reproduces it, before any fix.
 
 ## Stop when
-Every behavior in the task has a test that failed before and passes now, and the relevant suite is green.
+Each behavior of the task has a test that failed on its own check before the change and passes after it, and the tests of the touched code pass.
 
 ## Do not
-- Write production code for behavior that no failing test asks for.
-- Change a test to match broken code.
-- Skip the red run: a test that already passes on the old code does not cover the new behavior.
+- Write code ahead of the test that needs it.
+- Weaken a test or fake its data to get it to pass.
+- Report tests as passing without naming the command you ran.

@@ -7,12 +7,15 @@ description: Use when a question needs current or outside information and a quic
 Answer a question quickly from sources you have opened, with a link for every claim.
 
 ## Budget
-3 to 10 calls of web_search and web_fetch in total. Work alone, without sub-agents.
+3 to 10 search and page calls in total (web_search and web_fetch, if they are listed). Work alone, without sub-agents.
+
+## Without web tools
+If there is no search tool, say so, and work from pages the user gave or that you can open directly. If no page can be opened at all, say that the answer could not be checked and mark every claim as unverified.
 
 ## Steps
 1. Restate the question and what a good answer must contain. Note names, versions and dates that narrow the search.
 2. Search with one to three focused queries. Prefer primary sources: official docs, standards, papers, release notes, the project's own pages.
-3. Open every page you will cite with web_fetch before citing it. A search snippet is not a source.
+3. Open every page you will cite before citing it. A search snippet is not a source.
 4. Write down each fact with its URL as you read. Check dates and versions; prefer the newest authoritative source.
 5. When sources disagree, keep both and say which is more credible and why.
 

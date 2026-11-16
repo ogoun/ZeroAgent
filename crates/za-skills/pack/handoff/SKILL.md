@@ -16,7 +16,7 @@ Leave the work so that someone with no memory of this session can continue it wi
 7. Risks: what may break, what is fragile, what needs care.
 
 ## Where
-Put the note where the project keeps such notes (a plan or progress file); otherwise in your final reply. Keep it under one screen and link details instead of copying them.
+Put the note where the project keeps such notes (a plan or progress file); otherwise in your final reply. Keep it under one screen.
 
 ## Stop when
 A reader could take the next step from the note alone.

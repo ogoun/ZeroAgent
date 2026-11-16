@@ -4,20 +4,20 @@ description: Use when a task, iteration or incident is over and the user wants t
 ---
 # Retro
 
-Look back at finished work and turn it into a few concrete changes.
+Turn finished work into a few lessons that will come back at the moment they are needed.
 
 ## Steps
-1. Collect facts first: the goal, the plan, what was delivered, the time and steps spent, failures, rework, review findings. Take them from logs, commits and notes, not from memory.
-2. Compare the plan with the outcome. Where did they differ, and when did it become visible?
-3. Sort the observations into three lists: keep (worked, repeat it), change (cost time or quality), try (a new idea worth one experiment).
-4. For each item in change find the cause, not the symptom: a missing check, an unclear requirement, the wrong tool, late feedback.
-5. Turn the top one to three causes into actions, each with an owner and a way to tell whether it helped.
-6. Save the result where the project keeps notes, so that the next task can read it.
+1. Rebuild the timeline from records, not from memory: the plan, commits, logs, review notes, failed runs, rework.
+2. Mark each point where the work left the plan: a step took much longer, a result had to be redone, a check failed late, a requirement changed.
+3. For each mark ask what the earliest signal was and what would have caught it then. Name the cause in terms of the process (a missing check, an unclear requirement, a wrong tool, late feedback), not of a person.
+4. Note also what went better than planned and why, so that it can be repeated on purpose.
+5. Pick at most three lessons. Write each with the situation that should bring it to mind next time, the action to take then, and how to tell later whether it helped.
+6. Store them where the project keeps notes or memory, so that the next task finds them.
 
 ## Stop when
-There are at most three actions, each specific enough to carry out next time.
+At most three lessons are written, each with its situation, its action and its check.
 
 ## Do not
 - Blame people. Describe events and conditions.
-- List everything. Pick what matters most.
-- Record lessons that no one will act on.
+- Collect every observation. Keep the few that change future work.
+- Write a lesson that names no situation in which it applies.

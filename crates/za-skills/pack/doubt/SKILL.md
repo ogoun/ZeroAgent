@@ -1,24 +1,27 @@
 ---
 name: doubt
-description: Use before you report that work is done, fixed or passing, to test the claim against fresh evidence.
+description: Use when you are about to say that work is done, fixed or passing, to look first for the case that proves you wrong.
 ---
 # Doubt
 
-Treat your own conclusion as a hypothesis until a check you have just run supports it.
+Try to refute your own conclusion, and report it only as far as the attempts failed.
 
 ## Steps
-1. Write the claim in one sentence: what works, for which input, under which conditions.
-2. Name the evidence that would prove it: a command, a test, an output, a file state.
-3. Run it now. Earlier output, memory and a sub-agent's report do not count.
-4. Read the whole result: exit code, failures, warnings, skipped tests.
-5. Pick the case most likely to break the claim (an edge input, another platform, cleanup, the original reproduction) and check it too.
-6. Compare the result with the user's request item by item. Anything asked for and not done is not done.
-7. Report what was verified and how, and what was not.
+1. Write the conclusion as one sentence with its scope: which behavior, for which inputs, in which environment.
+2. List the ways it could still be false. The usual suspects:
+   - the evidence came from other code: a stale build, a cached result, another branch, file or binary;
+   - it came from other inputs: an easy case instead of the one in the request or in the original report;
+   - it came from another place: a different OS, config, permissions or data than the user has;
+   - it covered only a part: tests skipped, filtered or ignored, one package out of several;
+   - something else moved too: another caller, a file format, a stored hash, a generated file.
+3. For each way, name what you would observe if it were true. Then go and look, after your last edit.
+4. A look that finds nothing makes the conclusion stronger. A look that finds something makes it false: fix the work or shrink the conclusion, and say which you did.
+5. Compare the result with the request as a whole: a promise, a step or a check that is still open goes into the report as open.
 
 ## Stop when
-Each part of the claim has fresh evidence, or is reported as unverified.
+Every way on the list has been looked at, or is reported as not looked at, with the reason.
 
 ## Do not
-- Say done, fixed, works or passes without output that shows it.
-- Quietly narrow the claim to fit what passed.
-- Retry until green without knowing why it was red.
+- Present a shrunken conclusion as if it were the original one.
+- Repeat a flaky check until it passes and count that as evidence.
+- Drop a way from the list because it is hard to check.

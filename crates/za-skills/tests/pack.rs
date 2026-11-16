@@ -47,13 +47,50 @@ fn pack_texts_follow_format() {
         let keys: Vec<&str> = p.fields.keys().map(String::as_str).collect();
         assert_eq!(keys, ["description", "name"], "{n}");
         assert_eq!(p.name.as_deref(), Some(*n));
-        assert!(p.description.starts_with("Use "), "{n}: {}", p.description);
+        assert!(
+            p.description.starts_with("Use when "),
+            "{n}: {}",
+            p.description
+        );
         assert!(p.description.len() <= 160, "{n}: {}", p.description.len());
         for part in ["## Stop when\n", "## Do not\n"] {
             assert!(p.body.contains(part), "{n}: {part}");
         }
         assert!(!t.contains(['<', '>', '\r', '\t']), "{n}");
         assert!(t.ends_with(".\n") && !t.ends_with("\n\n"), "{n}");
+    }
+}
+
+/// Ruling m3 ревью задачи 12: набор инструментов run задают тир, режим и конфигурация, и
+/// нужного может не быть (`plan_update` — до R1-D, `web_search` — без `[web.search] url`,
+/// `activate_skill` — на small). Поэтому текст поставки называет инструмент только условно:
+/// строка с его именем содержит `if `. Без условия текст должен обходиться без имени.
+#[test]
+fn pack_texts_name_tools_conditionally() {
+    const OPTIONAL: [&str; 6] = [
+        "activate_skill",
+        "ask_user",
+        "glob",
+        "plan_update",
+        "web_fetch",
+        "web_search",
+    ];
+    for (n, t) in bundled() {
+        for line in t.lines() {
+            if let Some(tool) = OPTIONAL.iter().find(|tool| line.contains(*tool)) {
+                assert!(line.contains("if "), "{n}: {tool} без условия: {line}");
+            }
+        }
+    }
+}
+
+/// `router` сам перечисляет скиллы поставки строками `- <шаг>: <имя>`: так он работает и без
+/// каталога (small, `/router`). Новый скилл поставки должен попасть и в этот список.
+#[test]
+fn router_lists_every_pack_skill() {
+    let (_, router) = bundled().iter().find(|(n, _)| *n == "router").unwrap();
+    for n in PACK.iter().filter(|n| **n != "router") {
+        assert!(router.contains(&format!(": {n}\n")), "{n}");
     }
 }
 

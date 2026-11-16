@@ -18,12 +18,14 @@ pub const PACK_TOKEN_LIMIT: u32 = 700;
 /// имени (так их выдаёт [`crate::bundled`]).
 macro_rules! pack {
     ($($name:literal),* $(,)?) => {
+        /// Число скиллов поставки — длина списка: новый скилл не требует править её руками.
+        const PACK_LEN: usize = [$($name),*].len();
         /// Имена скиллов поставки по порядку байтов.
-        pub const PACK: [&str; 14] = [$($name),*];
+        pub const PACK: [&str; PACK_LEN] = [$($name),*];
         /// Имена текстов поставки в хэше промптов: `skills/<name>`, в порядке [`PACK`].
-        pub const PACK_TEXT_NAMES: [&str; 14] = [$(concat!("skills/", $name)),*];
+        pub const PACK_TEXT_NAMES: [&str; PACK_LEN] = [$(concat!("skills/", $name)),*];
         /// Пары (имя каталога, текст `SKILL.md`) в порядке [`PACK`].
-        pub(crate) static BUNDLED: [(&str, &str); 14] = [
+        pub(crate) static BUNDLED: [(&str, &str); PACK_LEN] = [
             $(($name, include_str!(concat!("../pack/", $name, "/SKILL.md")))),*
         ];
     };

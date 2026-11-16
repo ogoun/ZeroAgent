@@ -8,7 +8,7 @@ Build a quick, accurate map of unfamiliar code, then go deep only where the task
 
 ## Steps
 1. Read the entry docs: README, AGENTS.md, CONTRIBUTING, the docs index. Note the build, test and run commands.
-2. Get the shape: top-level folders, manifests and workspaces, languages. Use glob and directory listings, not full reads.
+2. Get the shape: top-level folders, manifests and workspaces, languages. Use file name searches and directory listings, not full reads.
 3. Find the entry points: main functions, CLI commands, servers, exported APIs.
 4. Trace one path that matters for the task, from an entry point to the code that does the work. Search for names and read only those regions.
 5. Note the conventions: error handling, logging, configuration, test layout, naming. New code must follow them.

@@ -4,20 +4,21 @@ description: Use when an accepted spec or plan must be split into small tasks th
 ---
 # Tickets
 
-Split agreed work into thin tasks, each delivering a piece of behavior that can be tested.
+Turn agreed work into an ordered list of small tasks, each ending in a result that someone can check.
 
 ## Steps
-1. Start from the acceptance criteria. Each ticket covers one or a few of them end to end: interface, logic, storage and tests together.
-2. Prefer thin slices through all layers to one ticket per layer. Make the first ticket the simplest path that works end to end.
-3. For each ticket write a title, the behavior it adds, its checks (tests or commands), the files or modules it will likely touch, and the tickets it depends on.
-4. Size: one ticket fits one focused session. Split anything larger; merge tickets that cannot be tested apart.
-5. Order by dependency and risk: put unknowns and risky parts early.
-6. Check coverage: every acceptance criterion maps to a ticket, and no ticket adds scope nobody asked for.
-7. Record the list where the project tracks work (a plan file, issues) or with plan_update.
+1. Number the acceptance criteria of the spec, so that tickets can refer to them.
+2. Cut by behavior, not by component: after each ticket, some command, request or screen does something new that can be seen. Work that only prepares for a later ticket belongs to the ticket that first uses it.
+3. Make the first ticket the thinnest version that runs at all. Each later ticket widens it.
+4. Write each ticket as one sentence: after it, who can do what, and which test or command shows it. Add the numbers of the criteria it serves and of the tickets it needs first.
+5. A ticket is small enough when its sentence names one behavior and its check is one command. Otherwise split it by behavior. Two tickets that cannot be checked apart become one.
+6. Place each ticket after the tickets it needs. Among the rest, start with the one whose outcome could change the plan, while a wrong assumption is still cheap.
+7. Cross-check both ways: every criterion appears in some ticket, and no ticket adds behavior the spec does not ask for.
+8. Save the list where the project tracks work (a plan file, issues), or with a plan tool if one is available.
 
 ## Stop when
-Every criterion is covered, each ticket has its own checks, and the order is clear.
+Every criterion has a ticket, every ticket has its own check, and the order is fixed.
 
 ## Do not
-- Write tickets such as set up X or refactor Y with no visible behavior, unless a later ticket needs them and says why.
-- Hide open questions inside tickets. List them separately.
+- Create tickets with nothing to check, such as set up X or refactor Y, unless a later ticket depends on them and says why.
+- Bury open questions inside tickets. List them apart, with who can answer them.
