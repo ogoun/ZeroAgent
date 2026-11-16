@@ -36,7 +36,7 @@ use html5ever::tokenizer::{
 };
 
 use crate::attrs::sanitize;
-use crate::html::{Markdown, SKIPPED_TAGS, collapse_blank_lines};
+use crate::html::{Markdown, SKIPPED_TAGS, collapse_blank_lines, cut_title};
 
 /// Предел глубины стека пропускаемых элементов.
 pub const MAX_STACK: usize = 64;
@@ -196,11 +196,14 @@ pub fn linear_extract(html: &str) -> Markdown {
     let _ = tok.feed(&input);
     tok.end();
     let sink = tok.sink;
-    let title = {
-        let raw = sink.title.borrow();
-        let joined = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!joined.is_empty()).then_some(joined)
-    };
+    // Заголовок — не длиннее `TITLE_MAX_BYTES`, как на полном пути (m1 финального ревью).
+    let title = cut_title(
+        sink.title
+            .borrow()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     let text = collapse_blank_lines(sink.out.borrow().trim());
     Markdown {
         title,

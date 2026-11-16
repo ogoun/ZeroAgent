@@ -1109,43 +1109,84 @@ fn output_bound(html: &str) -> u64 {
 /// оценки: в начале страницы таблица из одних `|` (каждый — `&#124;`, 6 байт вывода; её
 /// надбавка больше четверти, она не выравнивается) почти исчерпывает бюджет вывода 4 МиБ, за
 /// ней тысяча одинаковых узких таблиц. Выровнены ровно столько первых, сколько надбавок по 7
-/// байт помещается в остаток; остальные — без дополнения.
+/// байт помещается в остаток; остальные — без дополнения. Заголовок страницы входит в бюджет
+/// вывода (m1 финального ревью извлечения): с заголовком в 1000 байт остаток меньше на него.
 #[test]
 fn align_budget_is_rest_of_output_budget() {
     use za_extract::{HTML_OUTPUT_BUDGET, TABLE_ALIGN_BUDGET};
     const TABLES: u64 = 1000;
-    let page = |pipes: usize| {
+    let page = |title: usize, pipes: usize| {
         let mut html = format!(
-            "<html><body><table><tr><th>p</th></tr><tr><td>{}</td></tr></table>",
+            "<html><head><title>{}</title></head><body><table><tr><th>p</th></tr><tr><td>{}</td></tr></table>",
+            "T".repeat(title),
             "|".repeat(pipes)
         );
         html.push_str(&NARROW_TABLE.repeat(TABLES as usize));
         html.push_str("</body></html>");
         html
     };
-    // Остаток бюджета — на половину надбавок узких таблиц.
+    // Остаток бюджета без заголовка — на половину надбавок узких таблиц.
     let target = HTML_OUTPUT_BUDGET as u64 - 7 * TABLES / 2;
     let mut pipes = 600_000usize;
     for _ in 0..3 {
-        let b = output_bound(&page(pipes));
+        let b = output_bound(&page(0, pipes));
         pipes = (pipes as i64 + (target as i64 - b as i64) / 6) as usize;
     }
-    let html = page(pipes);
-    assert!(html.len() <= HTML_MAX_BYTES, "{}", html.len());
-    let rest = (HTML_OUTPUT_BUDGET as u64).saturating_sub(output_bound(&html));
-    let aligned = TABLE_ALIGN_BUDGET.min(rest) / 7;
-    assert!(aligned > 0 && aligned < TABLES, "{aligned}");
-    let m = bounded_within("rest of budget", html, release_second());
-    assert!(!m.simplified);
-    assert_eq!(
-        m.text.matches("| abcdefg  |").count() as u64,
-        aligned,
-        "остаток {rest}"
-    );
-    assert_eq!(
-        m.text.matches("\n| abcdefg |\n").count() as u64,
-        TABLES - aligned
-    );
+    let mut counts = Vec::new();
+    for title in [0usize, 1000] {
+        let html = page(title, pipes);
+        assert!(html.len() <= HTML_MAX_BYTES, "{}", html.len());
+        let rest = (HTML_OUTPUT_BUDGET as u64).saturating_sub(output_bound(&html) + title as u64);
+        let aligned = TABLE_ALIGN_BUDGET.min(rest) / 7;
+        assert!(aligned > 0 && aligned < TABLES, "{aligned}");
+        let m = bounded_within("rest of budget", html, release_second());
+        assert!(!m.simplified);
+        assert_eq!(m.title.as_deref().map_or(0, str::len), title);
+        assert_eq!(
+            m.text.matches("| abcdefg  |").count() as u64,
+            aligned,
+            "заголовок {title}, остаток {rest}"
+        );
+        assert_eq!(
+            m.text.matches("\n| abcdefg |\n").count() as u64,
+            TABLES - aligned
+        );
+        counts.push(aligned);
+    }
+    assert!(counts[0] - counts[1] >= 1000 / 7, "{counts:?}");
+}
+
+/// Заголовок страницы режется до [`za_extract::TITLE_MAX_BYTES`] по границе символа на обоих
+/// путях (m1 финального ревью извлечения): прежде заголовок в 0,9 МБ при тексте в бюджете
+/// давал ответ подпроцесса больше предела вывода, и `web_fetch` падал с ошибкой. Потребитель
+/// всё равно показывает не больше 200 символов.
+#[test]
+fn long_title_is_cut() {
+    use za_extract::TITLE_MAX_BYTES;
+    let cases = [
+        ("T".repeat(MIB), TITLE_MAX_BYTES),
+        ("ж".repeat(1000), TITLE_MAX_BYTES),
+        (format!("a{}", "ж".repeat(1000)), TITLE_MAX_BYTES - 1),
+        ("short title".to_owned(), 11),
+    ];
+    for (title, len) in &cases {
+        let full = format!("<html><head><title>{title}</title></head><body><p>x</p></body></html>");
+        let m = bounded("long title", full);
+        assert!(!m.simplified);
+        let got = m.title.expect("заголовок");
+        assert_eq!(got.len(), *len);
+        assert!(title.starts_with(&got));
+        // Линейный путь: тег с тысячами атрибутов уводит страницу в упрощённое извлечение.
+        let tag: String = (0..5000).map(|i| format!(" a{i}=x")).collect();
+        let flood = format!(
+            "<html><head><title>{title}</title></head><body><div{tag}>x</div></body></html>"
+        );
+        let m = bounded("long title linear", flood);
+        assert!(m.simplified);
+        let got = m.title.expect("заголовок линейного пути");
+        assert_eq!(got.len(), *len);
+        assert!(title.starts_with(&got));
+    }
 }
 
 /// Недостающие ячейки `htmd` тоже дополняет: одна строка из 40 000 `th` и 40 000 строк по

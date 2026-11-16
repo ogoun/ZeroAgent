@@ -1,7 +1,8 @@
 //! HTML в Markdown (R1-C2 D109, D127).
 //!
 //! [`html_to_markdown`] — `htmd` с пропуском служебных, встраиваемых элементов и элементов
-//! управления ([`SKIPPED_TAGS`]), заголовок — текст `<title>` отдельным полем. Вход длиннее
+//! управления ([`SKIPPED_TAGS`]), заголовок — текст `<title>` отдельным полем, не длиннее
+//! [`TITLE_MAX_BYTES`]. Вход длиннее
 //! [`HTML_MAX_BYTES`] обрезается до разбора. После преобразования картинки `data:`
 //! отсутствуют, серии пустых строк сжаты в одну.
 //!
@@ -35,11 +36,19 @@ use crate::{attrs, guard, linear};
 pub const HTML_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// Бюджет вывода `htmd` одной страницы, байт (I-1 повторного ревью fix-10): верхняя оценка
-/// вывода ([`crate::bound`]) больше него — линейное извлечение, а сумма оценки и надбавки
-/// выравнивания таблиц ([`TABLE_ALIGN_BUDGET`]) его не превышает. Равен пределу вывода
+/// вывода ([`crate::bound`]) вместе с заголовком ([`TITLE_MAX_BYTES`], m1 финального ревью)
+/// больше него — линейное извлечение, а сумма оценки, заголовка и надбавки выравнивания
+/// таблиц ([`TABLE_ALIGN_BUDGET`]) его не превышает. Равен пределу вывода
 /// подпроцесса `zero_agent::extract::HTML_OUTPUT_MAX` (проверка при сборке там): страница,
 /// чей текст заведомо больше предела, не строится, чтобы затем упасть.
 pub const HTML_OUTPUT_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Предел заголовка страницы, байт (m1 финального ревью извлечения): заголовок режется по
+/// границе символа на обоих путях и входит в бюджет вывода [`HTML_OUTPUT_BUDGET`] вместе с
+/// текстом. Прежде заголовок в 0,9 МБ при тексте в бюджете давал ответ подпроцесса больше
+/// предела вывода, и страница целиком падала. Потребитель (`za-web`, строка `title:`)
+/// показывает не больше 200 символов — до 800 байт UTF-8, предел их вмещает.
+pub const TITLE_MAX_BYTES: usize = 1024;
 
 /// Элементы, содержимое которых в текст не попадает (D109, I1 ревью задачи 7).
 /// - служебные и встраиваемые: `head`, `title`, `script`, `style`, `noscript`, `template`,
@@ -87,17 +96,33 @@ pub fn html_to_markdown(html: &str) -> Markdown {
     let Ok(bound) = guard::prepare_dom(&tree) else {
         return linear::linear_extract(html);
     };
+    // Заголовок входит в бюджет вывода вместе с текстом (m1 финального ревью извлечения).
+    let title = document_title(&tree);
+    let used = bound.saturating_add(title.as_deref().map_or(0, str::len) as u64);
+    if used > HTML_OUTPUT_BUDGET as u64 {
+        return linear::linear_extract(html);
+    }
     Markdown {
-        title: document_title(&tree),
-        text: render_with(&tree, TableLayout::with_budget(align_budget(bound))),
+        title,
+        text: render_with(&tree, TableLayout::with_budget(align_budget(used))),
         simplified: false,
     }
 }
 
-/// Бюджет надбавки выравнивания таблиц страницы с оценкой вывода `bound` (не больше
-/// [`HTML_OUTPUT_BUDGET`]): [`TABLE_ALIGN_BUDGET`], но не больше остатка бюджета вывода.
-fn align_budget(bound: u64) -> u64 {
-    TABLE_ALIGN_BUDGET.min((HTML_OUTPUT_BUDGET as u64).saturating_sub(bound))
+/// Бюджет надбавки выравнивания таблиц страницы, у которой верхняя оценка вывода вместе с
+/// заголовком — `used` (не больше [`HTML_OUTPUT_BUDGET`]): [`TABLE_ALIGN_BUDGET`], но не
+/// больше остатка бюджета вывода.
+fn align_budget(used: u64) -> u64 {
+    TABLE_ALIGN_BUDGET.min((HTML_OUTPUT_BUDGET as u64).saturating_sub(used))
+}
+
+/// Заголовок страницы из слов `<title>` (пробелы уже схлопнуты): не длиннее
+/// [`TITLE_MAX_BYTES`] — обрезка по границе символа, без пробела в конце; пустой — `None`.
+/// Общий у полного и линейного пути.
+pub(crate) fn cut_title(mut title: String) -> Option<String> {
+    title.truncate(title.floor_char_boundary(TITLE_MAX_BYTES));
+    title.truncate(title.trim_end_matches(' ').len());
+    (!title.is_empty()).then_some(title)
 }
 
 /// Готовое дерево в Markdown с полным бюджетом выравнивания таблиц (модульные тесты).
@@ -137,8 +162,8 @@ fn drop_data_image(handlers: &dyn Handlers, element: Element) -> Option<HandlerR
 }
 
 /// Текст первого элемента `title` из пространства имён HTML в порядке документа (как
-/// `document.title`): текстовые дети подряд, пробелы ASCII схлопнуты. Обход — явным
-/// стеком: глубина дерева не ограничена.
+/// `document.title`): текстовые дети подряд, пробелы ASCII схлопнуты, не длиннее
+/// [`TITLE_MAX_BYTES`] ([`cut_title`]). Обход — явным стеком: глубина дерева не ограничена.
 fn document_title(root: &Rc<Node>) -> Option<String> {
     let mut stack = vec![Rc::clone(root)];
     while let Some(node) = stack.pop() {
@@ -152,8 +177,7 @@ fn document_title(root: &Rc<Node>) -> Option<String> {
                     raw.push_str(&contents.borrow());
                 }
             }
-            let title = raw.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
-            return (!title.is_empty()).then_some(title);
+            return cut_title(raw.split_ascii_whitespace().collect::<Vec<_>>().join(" "));
         }
         stack.extend(node.children.borrow().iter().rev().cloned());
     }
