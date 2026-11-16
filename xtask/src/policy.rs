@@ -157,6 +157,10 @@ pub struct Dependency {
     /// Явно включённые функции зависимости (`features = [...]`).
     #[serde(default)]
     pub features: Vec<String>,
+    /// Имя зависимости в крейте, если оно отличается от имени пакета
+    /// (`http = { package = "reqwest" }`); `name` — всегда имя пакета.
+    #[serde(default)]
+    pub rename: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -293,6 +297,17 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     "{} не должен зависеть от reqwest (только {}; D129: HTTP-клиент вне шлюза — обход фильтра адресов)",
                     pkg.name,
                     REQWEST_USERS.join(", ")
+                )));
+            }
+            // Все виды и все манифесты (Minor 2 повторного ревью финального прохода):
+            // переименованный `reqwest` прячет имя крейта от стража исходников
+            // (`check_http_client`), и внутри `za-web` клиент строился бы вне шлюза.
+            if dep.name == "reqwest"
+                && let Some(alias) = &dep.rename
+            {
+                out.push(Violation(format!(
+                    "{}: зависимость reqwest переименована в `{alias}` (D129: страж HTTP-клиента ищет имя крейта в исходнике)",
+                    pkg.name
                 )));
             }
             // Все виды: и dev-зависимость тянет крейт в сборку тестов продукта.
@@ -523,6 +538,42 @@ pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
     out
 }
 
+/// Подключение файла в обход `src/` в исходнике `rel` крейта `za-web` (Minor 2 повторного
+/// ревью финального прохода, D129): атрибут `path` (`#[path = …]`, `#![path = …]`, аргумент
+/// `cfg_attr`, отдельная строка многострочного атрибута) и `include!`. Страж исходников
+/// сканирует только `crates/*/src` и `build.rs`, а модуль с атрибутом `path` или `include!`
+/// взял бы код из любого файла, в том числе вне крейта. Строка сравнивается без пробелов
+/// (`# [ path = …]`, `include ! (…)`); признак атрибута — `path=` перед строковым литералом,
+/// поэтому присваивание `path = format!(…)` не нарушение. Строки-комментарии не считаются.
+/// Правило — для всех файлов `za-web`, и для `gateway.rs`: клиент строится только в нём
+/// самом.
+pub fn check_web_includes(rel: &str, text: &str) -> Vec<Violation> {
+    if !rel.starts_with("crates/za-web/") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        let tight: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        let hit = tight.contains("#[path")
+            || tight.contains("#![path")
+            || tight.contains("include!")
+            || ["path=\"", "path=r\"", "path=r#"]
+                .iter()
+                .any(|p| tight.contains(p));
+        if hit {
+            out.push(Violation(format!(
+                "{rel}:{}: в za-web атрибут path и include! запрещены (D129: код крейта — только модули src/, их видит страж HTTP-клиента)",
+                i + 1
+            )));
+        }
+    }
+    out
+}
+
 /// Пути `reqwest`, допустимые в `za-web` вне `gateway.rs` (D129): типы резолвера
 /// (`addr.rs`, тестовая подмена `lib.rs`) и код статуса (`fetch.rs`). Строка после имени
 /// крейта начинается с одного из них.
@@ -687,6 +738,7 @@ fn collect(root: &Path) -> Result<Vec<Violation>, String> {
     for (rel, text) in crate_sources(root).map_err(|e| format!("crates/*/src: {e}"))? {
         out.extend(check_process_spawn(&rel, &text));
         out.extend(check_http_client(&rel, &text));
+        out.extend(check_web_includes(&rel, &text));
     }
     Ok(out)
 }
@@ -751,6 +803,7 @@ version = \"0.0.1\"
             uses_default_features: true,
             kind: None,
             features: Vec::new(),
+            rename: None,
         }
     }
     fn meta_with(name: &str, dep: Dependency) -> Metadata {
@@ -1191,6 +1244,73 @@ version = \"0.0.1\"
             {"name":"reqwest","rename":"http","uses_default_features":false,"kind":null}]}]}"#;
         let m: Metadata = serde_json::from_str(json).unwrap();
         assert_eq!(reqwest_rule(&check_direction(&m)), 1);
+    }
+    /// Minor 2 повторного ревью финального прохода: переименование зависимости `reqwest`
+    /// запрещено во всех манифестах, в том числе у разрешённых держателей. Иначе в
+    /// исходнике `za-web` нет слова `reqwest` (`http = { package = "reqwest" }`, затем
+    /// `use http::Client`), и страж путей `check_http_client` клиента вне шлюза не видит.
+    #[test]
+    fn renamed_reqwest_is_rejected_everywhere() {
+        let meta = |pkg: &str, rename: &str| -> Metadata {
+            let json = format!(
+                r#"{{"packages":[{{"name":"{pkg}","dependencies":[
+                {{"name":"reqwest","rename":{rename},"uses_default_features":false,"kind":null}}]}}]}}"#
+            );
+            serde_json::from_str(&json).unwrap()
+        };
+        let renamed = |v: &[Violation]| v.iter().filter(|x| x.0.contains("переименована")).count();
+        for pkg in ["za-web", "za-llm", "za-tools"] {
+            let v = check_direction(&meta(pkg, r#""http""#));
+            assert_eq!(renamed(&v), 1, "{pkg}: {v:?}");
+        }
+        for pkg in ["za-web", "za-llm"] {
+            let v = check_direction(&meta(pkg, "null"));
+            assert!(v.is_empty(), "{pkg}: {v:?}");
+        }
+        // Переименование другого крейта — не это правило.
+        let json = r#"{"packages":[{"name":"za-web","dependencies":[
+            {"name":"url","rename":"u","uses_default_features":true,"kind":null}]}]}"#;
+        let m: Metadata = serde_json::from_str(json).unwrap();
+        assert_eq!(renamed(&check_direction(&m)), 0);
+    }
+    /// Minor 2 повторного ревью финального прохода: в `za-web` код подключается только из
+    /// `src/` обычными модулями. Атрибут `path` (`#[path = …]`, `#![path = …]`, внутри
+    /// `cfg_attr`, с пробелами между лексемами) и `include!` подключили бы файл, который
+    /// страж исходников не сканирует. Правило — для всех файлов `za-web`, и для `gateway.rs`.
+    #[test]
+    fn web_crate_includes_no_outside_files() {
+        for rel in ["crates/za-web/src/lib.rs", "crates/za-web/src/gateway.rs"] {
+            for line in [
+                r#"#[path = "../extra/client.rs"] mod client;"#,
+                r#"# [ path = "../../za-core/src/x.rs" ]"#,
+                r#"#![path = "x.rs"]"#,
+                r#"#[cfg_attr(all(), path = "../extra/client.rs")]"#,
+                r#"    path = "../extra/client.rs""#,
+                r#"    path = r"../extra/client.rs","#,
+                r#"include!("../extra/client.rs");"#,
+                r#"include ! (concat!(env!("OUT_DIR"), "/gen.rs"));"#,
+            ] {
+                let v = check_web_includes(rel, line);
+                assert_eq!(v.len(), 1, "{rel}: {line}");
+                assert!(v[0].0.contains(&format!("{rel}:1")), "{v:?}");
+            }
+        }
+        for line in [
+            "// #[path = \"x.rs\"] — пример в комментарии",
+            "path = format!(\"{path}?{q}\");",
+            "let path = normalize(path);",
+            "const DOC: &str = include_str!(\"doc.md\");",
+            "mod gateway;",
+        ] {
+            assert!(
+                check_web_includes("crates/za-web/src/gateway.rs", line).is_empty(),
+                "{line}"
+            );
+        }
+        // Вне `za-web` правило не действует.
+        assert!(
+            check_web_includes("crates/zero-agent/tests/x.rs", "#[path = \"a.rs\"]").is_empty()
+        );
     }
     #[test]
     fn reqwest_features_are_guarded() {
