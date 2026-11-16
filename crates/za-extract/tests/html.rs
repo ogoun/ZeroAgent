@@ -899,7 +899,9 @@ fn line_of(text: &str, s: &str) -> Option<usize> {
 }
 
 /// m6 ревью задачи 10. Пустой `thead`: `htmd` считает, что заголовок уже есть, и строку из
-/// одних `th` в теле не берёт ни заголовком, ни данными — она пропадала целиком.
+/// одних `th` в теле не берёт ни заголовком, ни данными — она пропадала целиком. m-2
+/// повторного ревью fix-10: пустой `thead` до заголовка становится телом, и строка `th` —
+/// заголовком таблицы GFM, с разделителем.
 #[test]
 fn empty_thead_keeps_header_row_of_body() {
     let html = "<table><thead></thead><tbody><tr><th>Alpha</th><th>Beta</th></tr>\
@@ -913,6 +915,14 @@ fn empty_thead_keeps_header_row_of_body() {
         "{}",
         m.text
     );
+    let lines = table_lines(&m.text);
+    assert_eq!(lines.len(), 3, "{}", m.text);
+    assert!(lines[0].contains("Alpha") && lines[0].contains("Beta"));
+    assert!(lines[1].contains("---"), "нет разделителя: {}", m.text);
+    let html = "<table><thead><tr></tr></thead><tbody><tr><th>Alpha</th></tr>\
+        <tr><td>one</td></tr></tbody></table>";
+    let lines = table_lines(&html_to_markdown(html).text).len();
+    assert_eq!(lines, 3, "пустая строка thead");
 }
 
 /// m6 ревью задачи 10. Многострочный `thead`: `htmd` читает только первую строку, остальные
@@ -1122,6 +1132,105 @@ fn foreign_th_does_not_bring_back_padding() {
         "{}",
         &m.text[m.text.len() - 100..]
     );
+}
+
+// --- Префиксы строк цитат и списков (I-1 повторного ревью fix-10) ---
+
+/// `depth` уровней вложенности: открывающие теги `open`, затем `inner`, затем закрывающие.
+fn nested(open: &str, close: &str, depth: usize, inner: &str) -> String {
+    let mut html = String::with_capacity(inner.len() + depth * (open.len() + close.len()));
+    html.push_str(&open.repeat(depth));
+    html.push_str(inner);
+    html.push_str(&close.repeat(depth));
+    html
+}
+
+/// Случай повторного ревью fix-10 (I-1): 20 000 строк `pre` под 120 уровнями цитат, 43 КБ
+/// входа. `htmd` ставит `> ` перед каждой строкой на каждом уровне: 4,8 МБ текста, больше
+/// предела вывода подпроцесса, и страница целиком падала с `extractor output too large`.
+/// Оценка вывода больше бюджета — линейное извлечение, текст на месте.
+#[test]
+fn quote_prefixes_over_budget_are_simplified() {
+    let html = nested(
+        "<blockquote>",
+        "</blockquote>",
+        120,
+        &format!("<pre>{}</pre>", "x\n".repeat(20_000)),
+    );
+    assert!(html.len() < 45_000, "{}", html.len());
+    let m = bounded_within("quote prefixes", html, release_second());
+    assert!(m.simplified);
+    assert!(m.text.len() < 100_000, "{} байт", m.text.len());
+    assert!(m.text.contains('x'));
+}
+
+/// 2 МиБ строк `pre` под предельной вложенностью цитат, списков и их смеси. До исправления
+/// `htmd` на 60 уровнях цитат давал 128 МБ за 6,6 с, на 120 уровнях списков не укладывался
+/// в 12 с при 0,75 ГБ памяти. Пустые строки под пунктом списка отступа не получают, и вывод
+/// не растёт, но `htmd` проходит их на каждом уровне. Оценка ловит все формы: `simplified` за
+/// ≤ ~1 с в release, вывод меньше предела.
+#[test]
+fn nested_quote_and_list_prefixes_are_bounded() {
+    let pre = |unit: &str| format!("<pre>a\n{}a</pre>", rep(unit, 2 * MIB - 8 * 1024));
+    let cases = [
+        (
+            "quotes 60",
+            nested("<blockquote>", "</blockquote>", 60, &pre("x\n")),
+        ),
+        (
+            "quotes 240",
+            nested("<blockquote>", "</blockquote>", 240, &pre("q\n")),
+        ),
+        (
+            "lists 120",
+            nested("<ul><li>", "</li></ul>", 120, &pre("item\n")),
+        ),
+        (
+            "ordered 120",
+            nested("<ol start=1000000><li>", "</li></ol>", 120, &pre("n\n")),
+        ),
+        (
+            "mixed 80",
+            nested(
+                "<blockquote><ul><li>",
+                "</li></ul></blockquote>",
+                80,
+                &pre("m\n"),
+            ),
+        ),
+        (
+            "blank lines 125",
+            nested("<ul><li>", "</li></ul>", 125, &pre("\n")),
+        ),
+    ];
+    for (label, html) in cases {
+        assert!(html.len() <= HTML_MAX_BYTES, "{label}: {}", html.len());
+        let m = bounded_within(label, html, release_second());
+        assert!(m.simplified, "{label}");
+        assert!(m.text.len() < 4 * MIB, "{label}: {} байт", m.text.len());
+        assert!(m.text.starts_with('a'), "{label}");
+    }
+}
+
+/// Обычная вложенность цитат и списков с `pre` идёт полным путём: оценка вывода в бюджете,
+/// префиксы строк на месте.
+#[test]
+fn moderate_quote_and_list_nesting_is_full_path() {
+    let html = nested(
+        "<blockquote><ul><li>",
+        "</li></ul></blockquote>",
+        3,
+        &format!("<pre>{}</pre>", "code line\n".repeat(2000)),
+    );
+    let m = bounded("moderate nesting", html);
+    assert!(!m.simplified);
+    let lines: Vec<&str> = m
+        .text
+        .lines()
+        .filter(|l| l.ends_with("code line"))
+        .collect();
+    assert_eq!(lines.len(), 2000);
+    assert!(lines.iter().all(|l| l.starts_with("> ")), "{}", lines[1]);
 }
 
 /// Строит семь страниц с разнообразным, но обычным строением.

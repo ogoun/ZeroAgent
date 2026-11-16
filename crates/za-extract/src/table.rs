@@ -1,5 +1,5 @@
 //! Таблицы и `htmd` (R1-C2): имена ячеек до `htmd` (перенос прохода fix-9 в задачу 10) и
-//! выравнивание под бюджетом (I1 ревью задачи 10).
+//! выравнивание под бюджетом (I1 ревью задачи 10, m-1, m-2, m-4 повторного ревью fix-10).
 //!
 //! Оба правила повторяют обработчик таблиц `htmd` 0.5.6 (`src/element_handler/table.rs`).
 //! При обновлении `htmd` их нужно сверить с ним; расхождение подсчёта размера ловит модульный
@@ -25,8 +25,10 @@
 //! - остальные строки этого `thead` переносятся в новый `tbody` сразу за ним: `htmd` читает
 //!   из `thead` только первую строку (m6 ревью задачи 10);
 //! - `thead` после выбранного заголовка, в том числе пустой, становится `tbody`: у `htmd`
-//!   он заменил бы заголовок. Пустой `thead` до заголовка остаётся, но строка из одних `th`
-//!   после него — данные: `htmd` после `thead` заголовок из тела не берёт;
+//!   он заменил бы заголовок. Пустой `thead` до заголовка (без ячеек в строке, которую `htmd`
+//!   взял бы заголовком) тоже становится `tbody`: иначе `htmd` считал бы заголовок выбранным,
+//!   и таблица вышла бы без строки заголовка и разделителя (m-2 повторного ревью fix-10).
+//!   Пустые строки выбор заголовка не сдвигают — `htmd` их пропускает;
 //! - во всех прочих строках `th` становятся `td`.
 //!
 //! Текст и порядок ячеек не меняются. Таблица, где после замены нет ни `th`, ни `thead`,
@@ -41,18 +43,22 @@
 //! строки × сумма ширин столбцов: одна ячейка в 1 МиБ и 55 000 строк — около 55 ГБ в памяти
 //! подпроцесса ещё до печати.
 //!
-//! [`TableLayout`] — свой обработчик `table` в `htmd` (вызов из `html::render`), он стоит
+//! [`TableLayout`] — свой обработчик `table` в `htmd` (вызов из `html::render_with`), он стоит
 //! перед встроенным:
 //! - таблицу, которую `htmd` выводит обходом детей (без явных заголовков или внутри ячейки),
 //!   сразу отдаёт встроенному обработчику;
 //! - у остальных отрисовывает ячейки теми же обработчиками `htmd` и считает **точный** размер
 //!   выровненной таблицы за O(ячеек), не строя её. Разница с той же таблицей без дополнения —
 //!   надбавка выравнивания;
-//! - пока сумма надбавок страницы не больше [`TABLE_ALIGN_BUDGET`], таблицу строит сам
-//!   `htmd`: вывод байт в байт прежний;
+//! - пока сумма надбавок страницы не больше бюджета страницы, строит выровненную таблицу из
+//!   уже отрисованных ячеек по правилам `htmd` (`format_row_padded`): вывод байт в байт тот
+//!   же, что у `htmd`, а ячейки отрисованы один раз (m-4 повторного ревью fix-10);
 //! - иначе — та же таблица Markdown без дополнения: те же подписи, строки, ячейки и их
-//!   экранирование, разделитель `---`, строка не длиннее своих ячеек. Размер линеен по
-//!   ячейкам.
+//!   экранирование, разделитель `---`, строка не длиннее своих ячеек, заголовок — на все
+//!   столбцы (m-1). Размер линеен по ячейкам.
+//!
+//! Бюджет страницы — [`TABLE_ALIGN_BUDGET`], но не больше остатка бюджета вывода после верхней
+//! оценки вывода страницы без дополнения ([`crate::bound`], `html::html_to_markdown`).
 //!
 //! Размер считается по Markdown ячеек, а не по DOM: адрес ссылки, отступы вложенных списков
 //! и экранирование входят в ширину, а текстом узлов не видны. Решение принимается у самого
@@ -60,9 +66,9 @@
 //! заголовками» по любому потомку `th` или `thead` в любом пространстве имён (`th` внутри
 //! `<math>`), и переименованная таблица вернулась бы к выравниванию.
 //!
-//! Цена — ячейки выровненной таблицы отрисовываются дважды (подсчёт и сам `htmd`). Таблицы
-//! внутри ячеек не считаются (их `htmd` выравнивать не станет), подписи при подсчёте не
-//! отрисовываются: повторная отрисовка не складывается по вложенности.
+//! Ячейки отрисовываются один раз: и подсчёт, и обе раскладки строятся из [`Grid`]. Таблицы
+//! внутри ячеек не считаются (их `htmd` выравнивать не станет), подписи отрисовываются только
+//! при построении.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -77,11 +83,13 @@ use markup5ever_rcdom::{Handle, Node, NodeData};
 /// дополнения, тире разделителя сверх `---` и пустые ячейки, которыми `htmd` выравнивает
 /// таблицы. Сверх бюджета таблица идёт без дополнения (обработчик `TableLayout`).
 ///
-/// 2 МиБ — половина предела вывода подпроцесса (`zero_agent::extract::HTML_OUTPUT_MAX`,
-/// 4 МиБ): страница не упирается в предел из-за пробелов. Реальные страницы корпуса его не
+/// 2 МиБ — половина бюджета вывода [`crate::HTML_OUTPUT_BUDGET`] (4 МиБ): пробелы дополнения
+/// занимают не больше половины предела (m-6 повторного ревью fix-10). Страница получает
+/// меньше, если верхняя оценка её вывода без дополнения ([`crate::bound`]) оставляет меньше:
+/// оценка и надбавка вместе не больше бюджета вывода. Реальные страницы корпуса бюджета не
 /// достигают (замер fix-10): надбавка страницы — от 0 до 98 КБ, у списка государств
 /// Википедии (`wiki_states`) — 1,79 МБ, из них 1,71 МБ в одной таблице на 197 строк
-/// Markdown (столбец примечаний шириной 5700 символов).
+/// Markdown (столбец примечаний шириной 5700 символов); оценка этой страницы — 0,52 МБ.
 pub const TABLE_ALIGN_BUDGET: u64 = 2 * 1024 * 1024;
 
 /// Элемент HTML с именем `local` (иностранное содержимое SVG и MathML не трогается).
@@ -104,6 +112,13 @@ pub(crate) fn normalize_table(table: &Handle) {
     let old = std::mem::take(&mut *table.children.borrow_mut());
     let mut kept: Vec<Handle> = Vec::with_capacity(old.len());
     for section in old {
+        // Пустой `thead` до заголовка — тело (m-2 повторного ревью fix-10): у `htmd` он
+        // занял бы место заголовка, и таблица вышла бы без строки заголовка и разделителя.
+        let section = if is_html(&section, "thead") && !header && is_empty_head(&section) {
+            renamed(&section, "tbody", table)
+        } else {
+            section
+        };
         if is_html(&section, "thead") && !header {
             has_thead = true;
             let rows = rows_of(&section);
@@ -137,6 +152,10 @@ pub(crate) fn normalize_table(table: &Handle) {
         };
         for row in rows {
             let (th, td) = cell_counts(&row);
+            // Пустую строку `htmd` пропускает, и выбор заголовка она не сдвигает.
+            if th + td == 0 {
+                continue;
+            }
             if first && !has_thead && td == 0 && th > 0 {
                 header = true;
                 has_thead = true;
@@ -148,6 +167,14 @@ pub(crate) fn normalize_table(table: &Handle) {
         kept.push(section);
     }
     *table.children.borrow_mut() = kept;
+}
+
+/// `thead` без ячеек в строке, которую `htmd` взял бы заголовком: в первой `tr`, а без строк —
+/// среди детей самого `thead`.
+fn is_empty_head(thead: &Handle) -> bool {
+    let head = rows_of(thead).into_iter().next();
+    let (th, td) = cell_counts(head.as_ref().unwrap_or(thead));
+    th + td == 0
 }
 
 /// Строки `tr` среди детей секции.
@@ -244,13 +271,14 @@ pub(crate) struct TableLayout {
 }
 
 impl TableLayout {
-    /// Обработчик с бюджетом [`TABLE_ALIGN_BUDGET`].
+    /// Обработчик с бюджетом [`TABLE_ALIGN_BUDGET`] (модульные тесты; страница получает
+    /// остаток бюджета вывода, `html::html_to_markdown`).
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_budget(TABLE_ALIGN_BUDGET)
     }
 
-    /// Обработчик со своим бюджетом (модульные тесты: 0 — ни одной выровненной таблицы с
-    /// надбавкой).
+    /// Обработчик с бюджетом `budget` (0 — ни одной выровненной таблицы с надбавкой).
     pub(crate) fn with_budget(budget: u64) -> Self {
         Self {
             budget,
@@ -275,7 +303,7 @@ impl ElementHandler for TableLayout {
         let total = spent.saturating_add(extra);
         if total <= self.budget {
             self.spent.store(total, Ordering::Relaxed);
-            return handlers.fallback(element);
+            return Some(grid.aligned(handlers, node).into());
         }
         Some(grid.plain(handlers, node).into())
     }
@@ -404,21 +432,14 @@ impl Grid {
     /// Строка `htmd` — `|`, для каждого столбца `i` ` {ячейка}{пробелы до w[i]} |`, затем `\n`.
     /// Отсутствующая ячейка — пустая. Значит, строка стоит `2 + 3n + Σw` плюс по каждой своей
     /// ячейке `bytes − min(w[i], chars)`. Разделитель — `2 + 3n + Σw`. Без дополнения:
-    /// строка — `2 + Σ(3 + bytes)` по своим ячейкам, разделитель — `2 + 6n`.
+    /// строка — `2 + Σ(3 + bytes)` по своим ячейкам, у заголовка ещё 3 байта на каждую
+    /// недостающую ячейку, разделитель — `2 + 6n`.
     fn size(&self) -> Option<GridSize> {
         let n = self.columns();
         if n == 0 {
             return None;
         }
-        let mut widths = vec![0usize; n];
-        for (i, cell) in self.headers.iter().enumerate() {
-            widths[i] = cell.raw_chars;
-        }
-        for row in &self.rows {
-            for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(cell.raw_chars);
-            }
-        }
+        let widths = self.widths();
         let n64 = n as u64;
         let base = widths
             .iter()
@@ -440,7 +461,10 @@ impl Grid {
         if !self.headers.is_empty() {
             let (aligned, plain) = line(&self.headers);
             size.aligned = aligned.saturating_add(base);
-            size.plain = plain.saturating_add(2 + 6 * n64);
+            // Недостающие ячейки заголовка без дополнения — по 3 байта (`  |`, m-1), затем
+            // разделитель.
+            let missing = (n - self.headers.len()) as u64;
+            size.plain = plain.saturating_add(3 * missing + 2 + 6 * n64);
         }
         for row in &self.rows {
             let (aligned, plain) = line(row);
@@ -450,10 +474,24 @@ impl Grid {
         Some(size)
     }
 
-    /// Таблица Markdown без дополнения: подписи (как у `htmd`), строка заголовка и разделитель
-    /// `| --- |` на каждый столбец, строки данных — только свои ячейки. Пустые строки вокруг —
-    /// как у `htmd`.
-    fn plain(&self, handlers: &dyn Handlers, table: &Handle) -> String {
+    /// Ширина столбцов `htmd` (`compute_column_widths`): самая длинная ячейка столбца в
+    /// символах Markdown до замены переводов строк и `|`.
+    fn widths(&self) -> Vec<usize> {
+        let mut widths = vec![0usize; self.columns()];
+        for (i, cell) in self.headers.iter().enumerate() {
+            widths[i] = cell.raw_chars;
+        }
+        for row in &self.rows {
+            for (i, cell) in row.iter().enumerate() {
+                widths[i] = widths[i].max(cell.raw_chars);
+            }
+        }
+        widths
+    }
+
+    /// Начало таблицы, как у `htmd`: пустая строка и подписи, каждая без пробелов по краям и
+    /// с `\n`.
+    fn head(handlers: &dyn Handlers, table: &Handle) -> String {
         let mut out = String::from("\n\n");
         for child in children(table) {
             if tag(&child) == Some("caption")
@@ -463,6 +501,52 @@ impl Grid {
                 out.push('\n');
             }
         }
+        out
+    }
+
+    /// Выровненная таблица — байт в байт вывод `htmd` 0.5.6 (`table_handler`,
+    /// `format_row_padded`, `format_separator_padded`), но из уже отрисованных ячеек: второй
+    /// отрисовки ячеек нет (m-4 повторного ревью fix-10). Строка — `|`, по каждому столбцу
+    /// ` {ячейка}{пробелы до ширины} |`, недостающая ячейка пустая; разделитель — `-` на ширину
+    /// столбца. Совпадение с `htmd` проверяет тест `aligned_size_matches_htmd`.
+    fn aligned(&self, handlers: &dyn Handlers, table: &Handle) -> String {
+        let widths = self.widths();
+        let mut out = Self::head(handlers, table);
+        let line = |out: &mut String, row: &[Cell]| {
+            out.push('|');
+            for (i, &w) in widths.iter().enumerate() {
+                let (text, chars) = row
+                    .get(i)
+                    .map_or(("", 0), |c| (c.text.as_str(), c.text_chars));
+                out.push(' ');
+                out.push_str(text);
+                out.extend(std::iter::repeat_n(' ', w.saturating_sub(chars)));
+                out.push_str(" |");
+            }
+            out.push('\n');
+        };
+        if !self.headers.is_empty() {
+            line(&mut out, &self.headers);
+            out.push('|');
+            for &w in &widths {
+                out.push(' ');
+                out.extend(std::iter::repeat_n('-', w));
+                out.push_str(" |");
+            }
+            out.push('\n');
+        }
+        for row in &self.rows {
+            line(&mut out, row);
+        }
+        out.push('\n');
+        out
+    }
+
+    /// Таблица Markdown без дополнения: подписи (как у `htmd`), строка заголовка на все столбцы
+    /// (недостающие ячейки пустые) и разделитель `| --- |` на каждый столбец, строки данных —
+    /// только свои ячейки (GFM дополняет их сам). Пустые строки вокруг — как у `htmd`.
+    fn plain(&self, handlers: &dyn Handlers, table: &Handle) -> String {
+        let mut out = Self::head(handlers, table);
         let line = |out: &mut String, row: &[Cell]| {
             out.push('|');
             for cell in row {
@@ -473,8 +557,14 @@ impl Grid {
             out.push('\n');
         };
         if !self.headers.is_empty() {
+            // GFM: ячеек в заголовке столько же, сколько в разделителе, иначе таблица не
+            // распознаётся (m-1 повторного ревью fix-10); недостающие — пустые.
             line(&mut out, &self.headers);
-            out.push('|');
+            out.pop();
+            for _ in self.headers.len()..self.columns() {
+                out.push_str("  |");
+            }
+            out.push_str("\n|");
             for _ in 0..self.columns() {
                 out.push_str(" --- |");
             }
@@ -686,11 +776,19 @@ mod tests {
                 v(&[&["th"], &["td"], &["td"]])
             )
         );
+        // Пустой `thead` до заголовка — тело (m-2 повторного ревью fix-10): первая непустая
+        // строка из одних `th` — заголовок, пустые строки выбор не сдвигают.
         assert_eq!(
             layout(
                 "<table><thead></thead><tbody><tr><th>A</th><th>B</th></tr><tr><td>1</td></tr></tbody></table>"
             ),
-            (names(&["thead", "tbody"]), v(&[&["td", "td"], &["td"]]))
+            (names(&["tbody", "tbody"]), v(&[&["th", "th"], &["td"]]))
+        );
+        assert_eq!(
+            layout(
+                "<table><thead><tr></tr><tr><th>A</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>"
+            ),
+            (names(&["tbody", "tbody"]), v(&[&[], &["th"], &["td"]]))
         );
         // Тело до `thead`: заголовок — строка `thead` (у `htmd` он и так первый в выводе).
         assert_eq!(
@@ -730,6 +828,13 @@ mod tests {
         "<table><thead></thead><tbody><tr><th>Alpha</th><th>Beta</th></tr><tr><td>one</td><td>two</td></tr></tbody></table>",
         "<table><thead><tr><th>Name</th><th>Size</th></tr><tr><th>first</th><th>bytes</th></tr></thead><tbody><tr><td>alpha</td><td>1</td></tr></tbody></table>",
         "<table><thead><tr><th>Head</th></tr></thead><tbody><tr><td>value</td></tr></tbody><thead><tr><th>Later</th></tr><tr><td>more</td></tr></thead><thead></thead></table>",
+        // m-3 повторного ревью fix-10: `th` внутри `<math>` в ячейке, таблица в подписи,
+        // вложенная таблица в ячейке заголовка.
+        "<table><tr><td>a</td></tr><tr><td>x<math><th>m</th></math></td><td>y</td></tr></table>",
+        "<table><caption>c<table><tr><th>i</th></tr><tr><td>j</td></tr></table></caption><tr><th>h</th></tr><tr><td>v</td></tr></table>",
+        "<table><tr><th>h<table><tr><th>i</th></tr><tr><td>j</td></tr></table></th><th>k</th></tr><tr><td>v</td><td>w</td></tr></table>",
+        // m-1: заголовок короче строк — без дополнения недостающие ячейки заголовка пустые.
+        "<table><tr><th>a</th></tr><tr><td>1</td><td>two</td><td>three three</td></tr></table>",
     ];
 
     /// Подготовленное дерево, как в `html_to_markdown`.
@@ -747,6 +852,8 @@ mod tests {
         predicted_plain: u64,
         /// Вывод встроенного обработчика `htmd`.
         aligned: String,
+        /// Та же таблица, построенная нами ([`Grid::aligned`]).
+        built: String,
         /// Та же таблица без дополнения ([`Grid::plain`]).
         plain: String,
     }
@@ -771,13 +878,17 @@ mod tests {
                 .sum();
             let res = handlers.fallback(element)?;
             if let Some(size) = grid.size() {
-                self.0.lock().expect("журнал зонда").push(Probed {
+                // Отрисовка подписей может снова вызвать зонд (таблица в подписи): журнал
+                // берётся только после неё.
+                let probed = Probed {
                     // "\n\n", подписи, строки таблицы, "\n".
                     predicted: 2 + captions + size.aligned + 1,
                     predicted_plain: 2 + captions + size.plain + 1,
                     aligned: res.content.clone(),
+                    built: grid.aligned(handlers, node),
                     plain: grid.plain(handlers, node),
-                });
+                };
+                self.0.lock().expect("журнал зонда").push(probed);
             }
             Some(res)
         }
@@ -813,13 +924,15 @@ mod tests {
     }
 
     /// Подсчёт размера выровненной таблицы совпадает с выводом `htmd` байт в байт (I1 ревью
-    /// задачи 10), размер без дополнения — с [`Grid::plain`]. Падение после обновления `htmd` —
-    /// повод сверить модуль с его обработчиком.
+    /// задачи 10), размер без дополнения — с [`Grid::plain`], а своя выровненная таблица
+    /// ([`Grid::aligned`], m-4 повторного ревью fix-10) — с выводом `htmd` целиком. Падение
+    /// после обновления `htmd` — повод сверить модуль с его обработчиком.
     #[test]
     fn aligned_size_matches_htmd() {
         for p in probe_all() {
             assert_eq!(p.predicted, p.aligned.len() as u64, "{}", p.aligned);
             assert_eq!(p.predicted_plain, p.plain.len() as u64, "{}", p.plain);
+            assert_eq!(p.built, p.aligned);
         }
     }
 
@@ -875,6 +988,18 @@ mod tests {
                     .map(|c| format!(" {} |", c.trim()))
                     .collect();
                 assert_eq!(line, format!("|{rebuilt}"), "{}", p.plain);
+            }
+            // GFM: в строке заголовка столько же ячеек, сколько в разделителе (m-1).
+            let lines: Vec<&str> = p.plain.lines().collect();
+            for (i, line) in lines.iter().enumerate().skip(1) {
+                if line.starts_with("| --- |") {
+                    assert_eq!(
+                        lines[i - 1].matches('|').count(),
+                        line.matches('|').count(),
+                        "{}",
+                        p.plain
+                    );
+                }
             }
         }
     }

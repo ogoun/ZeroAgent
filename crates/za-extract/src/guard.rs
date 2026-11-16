@@ -22,7 +22,10 @@
 //! - слияние соседних одинаковых строчных элементов ([`crate::merge`]). `htmd` сливает их
 //!   сам квадратично по числу и длине текста, после прохода сливаемых пар нет;
 //! - имена ячеек таблиц ([`crate::table`]): `htmd` теряет `td` строки заголовка и `th`
-//!   остальных строк (карточки «ключ — значение» Википедии).
+//!   остальных строк (карточки «ключ — значение» Википедии);
+//! - верхняя оценка размера вывода `htmd` ([`crate::bound`]): префиксы строк цитат и списков
+//!   под глубокой вложенностью растят вывод как строки × глубина (I-1 повторного ревью
+//!   fix-10). Оценка больше [`HTML_OUTPUT_BUDGET`] — линейное извлечение.
 //!
 //! Пороги — по замеру рецензента (`.tmp/review7-bench.log`), с запасом на медленный CI; на
 //! обычных страницах не срабатывают.
@@ -38,6 +41,8 @@ use html5ever::tree_builder::TreeBuilderOpts;
 use html5ever::{Attribute, ExpandedName, ParseOpts, QualName, parse_document};
 use markup5ever_rcdom::{Handle, Node, NodeData, RcDom};
 
+use crate::bound::{self, Scope, Size};
+use crate::html::HTML_OUTPUT_BUDGET;
 use crate::{merge, table};
 
 /// Куски входа для разборщика: порог проверяется после каждого (ревью задачи 7).
@@ -325,23 +330,63 @@ pub fn guarded_parse(html: &str) -> GuardResult {
     }
 }
 
-/// Подготовка готового DOM к `htmd`, один итеративный проход (стек не переполняется):
-/// точная проверка максимальной глубины, имена ячеек таблиц ([`table::normalize_table`]) и
-/// слияние соседних одинаковых строчных элементов ([`merge::merge_children`]), всё за
-/// линейное время. `Ok(())` — можно звать `htmd`: сливаемых пар в дереве нет, ячейки таблиц
-/// `htmd` не потеряет; `Err(reason)` — нужно линейное извлечение. 1–50 мс на 2 МиБ.
-pub fn prepare_dom(root: &Handle) -> Result<(), &'static str> {
-    let mut stack = vec![(Rc::clone(root), 0usize)];
-    while let Some((node, depth)) = stack.pop() {
-        if depth > MAX_DEPTH {
-            return Err("dom_depth");
-        }
-        // До обхода детей: ячейки строк таблицы заменяются новыми узлами.
-        table::normalize_table(&node);
-        merge::merge_children(&node);
-        for child in node.children.borrow().iter() {
-            stack.push((Rc::clone(child), depth + 1));
+/// Шаг итеративного обхода [`prepare_dom`]: вход в узел (глубина, наследуемое от предков) или
+/// выход из него (оценка по сумме детей).
+enum Step {
+    Enter(Handle, usize, Scope),
+    Exit(Handle, Scope),
+}
+
+/// Подготовка готового DOM к `htmd`, один итеративный проход (стек не переполняется), всё за
+/// линейное время:
+/// - точная проверка максимальной глубины;
+/// - имена ячеек таблиц ([`table::normalize_table`]) и слияние соседних одинаковых строчных
+///   элементов ([`merge::merge_children`]) — при входе в узел, до обхода его детей;
+/// - верхняя оценка размера вывода `htmd` ([`crate::bound`]) — при выходе, по сумме оценок
+///   детей.
+///
+/// `Ok(bound)` — можно звать `htmd`: сливаемых пар в дереве нет, ячейки таблиц `htmd` не
+/// потеряет, вывод без дополнения таблиц не больше `bound` и `bound` не больше
+/// [`HTML_OUTPUT_BUDGET`]. `Err(reason)` — нужно линейное извлечение: `dom_depth` или
+/// `output_bound` (оценка вывода больше бюджета). 1–50 мс на 2 МиБ.
+pub fn prepare_dom(root: &Handle) -> Result<u64, &'static str> {
+    let mut steps = vec![Step::Enter(Rc::clone(root), 0, Scope::default())];
+    // Суммы оценок детей у открытых узлов; дно — сумма для корня.
+    let mut sums = vec![Size::default()];
+    while let Some(step) = steps.pop() {
+        match step {
+            Step::Enter(node, depth, scope) => {
+                if depth > MAX_DEPTH {
+                    return Err("dom_depth");
+                }
+                if let NodeData::Text { contents } = &node.data {
+                    if let Some(sum) = sums.last_mut() {
+                        sum.add(bound::text(&contents.borrow(), scope));
+                    }
+                    continue;
+                }
+                // До обхода детей: ячейки строк таблицы заменяются новыми узлами.
+                table::normalize_table(&node);
+                merge::merge_children(&node);
+                let inner = bound::scope_of_children(&node, scope);
+                steps.push(Step::Exit(Rc::clone(&node), scope));
+                sums.push(Size::default());
+                for child in node.children.borrow().iter().rev() {
+                    steps.push(Step::Enter(Rc::clone(child), depth + 1, inner));
+                }
+            }
+            Step::Exit(node, scope) => {
+                let content = sums.pop().unwrap_or_default();
+                let size = bound::element(&node, scope, content);
+                if let Some(sum) = sums.last_mut() {
+                    sum.add(size);
+                }
+            }
         }
     }
-    Ok(())
+    let bound = sums.pop().unwrap_or_default().bytes;
+    if bound > HTML_OUTPUT_BUDGET as u64 {
+        return Err("output_bound");
+    }
+    Ok(bound)
 }

@@ -43,6 +43,10 @@ use za_jail::{CommandSpec, EnvMode, Exit, Output, Runner, RunnerError};
 pub const HTML_TIMEOUT: Duration = Duration::from_secs(10);
 /// Предел вывода `extract html`, байт (D127).
 pub const HTML_OUTPUT_MAX: usize = 4 * 1024 * 1024;
+// Бюджет вывода `htmd` в подпроцессе (верхняя оценка и надбавка выравнивания таблиц, I-1
+// повторного ревью fix-10) равен пределу вывода: страница, чей текст заведомо больше
+// предела, извлекается линейно, а не строится, чтобы затем упасть.
+const _: () = assert!(HTML_OUTPUT_MAX == za_extract::HTML_OUTPUT_BUDGET);
 /// Предел времени `extract pdf` (D113).
 pub const PDF_TIMEOUT: Duration = Duration::from_secs(30);
 /// Предел вывода `extract pdf`, байт (D113).

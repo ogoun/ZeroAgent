@@ -10,10 +10,13 @@
 //! онлайн-стражем ([`crate::guard`]): квадратичные классы `html5ever` (глубокая вложенность,
 //! реконструкция активных элементов форматирования, «Noah's Ark») прерываются до их
 //! разрастания. Соседние одинаковые строчные элементы сливаются до `htmd` за линейное время
-//! ([`crate::merge`]): у `htmd` это слияние квадратично. Выравнивание таблиц `htmd` идёт под
-//! бюджетом надбавки на страницу (`table::TableLayout`): сверх него таблица выводится
-//! без дополнения пробелами. При превышении любого порога текст извлекается линейно без DOM
-//! ([`crate::linear`]) и результат несёт признак [`Markdown::simplified`].
+//! ([`crate::merge`]): у `htmd` это слияние квадратично. Тот же проход считает верхнюю оценку
+//! вывода `htmd` ([`crate::bound`]: префиксы строк цитат и списков, ограды кода, таблицы без
+//! дополнения); больше [`HTML_OUTPUT_BUDGET`] — линейное извлечение. Выравнивание таблиц идёт
+//! под бюджетом надбавки на страницу (`table::TableLayout`) — не больше остатка бюджета вывода
+//! после оценки: сверх него таблица выводится без дополнения пробелами. При превышении любого
+//! порога текст извлекается линейно без DOM ([`crate::linear`]) и результат несёт признак
+//! [`Markdown::simplified`].
 //!
 //! Вызывается только в подпроцессе (D127, задача 10): обход DOM у `htmd` рекурсивный, и
 //! даже под стражем остаётся жёсткая граница — тайм-аут и предел вывода подпроцесса.
@@ -25,11 +28,18 @@ use htmd::{Element, HtmlToMarkdown};
 use markup5ever_rcdom::{Node, NodeData};
 use serde::{Deserialize, Serialize};
 
-use crate::table::TableLayout;
+use crate::table::{TABLE_ALIGN_BUDGET, TableLayout};
 use crate::{attrs, guard, linear};
 
 /// Предел входа: дальше HTML обрезается до разбора (D109).
 pub const HTML_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Бюджет вывода `htmd` одной страницы, байт (I-1 повторного ревью fix-10): верхняя оценка
+/// вывода ([`crate::bound`]) больше него — линейное извлечение, а сумма оценки и надбавки
+/// выравнивания таблиц ([`TABLE_ALIGN_BUDGET`]) его не превышает. Равен пределу вывода
+/// подпроцесса `zero_agent::extract::HTML_OUTPUT_MAX` (проверка при сборке там): страница,
+/// чей текст заведомо больше предела, не строится, чтобы затем упасть.
+pub const HTML_OUTPUT_BUDGET: usize = 4 * 1024 * 1024;
 
 /// Элементы, содержимое которых в текст не попадает (D109, I1 ревью задачи 7).
 /// - служебные и встраиваемые: `head`, `title`, `script`, `style`, `noscript`, `template`,
@@ -70,28 +80,35 @@ pub fn html_to_markdown(html: &str) -> Markdown {
         return linear::linear_extract(html);
     }
     // Страж прерывает квадратичный разбор на первых килобайтах; `prepare_dom` ловит глубину
-    // (рекурсия `htmd`) и сливает соседей до `htmd` за линейное время.
+    // (рекурсия `htmd`), сливает соседей до `htmd` за линейное время и оценивает вывод сверху.
     let Ok(tree) = guard::guarded_parse(html) else {
         return linear::linear_extract(html);
     };
-    if guard::prepare_dom(&tree).is_err() {
+    let Ok(bound) = guard::prepare_dom(&tree) else {
         return linear::linear_extract(html);
-    }
+    };
     Markdown {
         title: document_title(&tree),
-        text: render(&tree),
+        text: render_with(&tree, TableLayout::with_budget(align_budget(bound))),
         simplified: false,
     }
 }
 
-/// Готовое дерево в Markdown: `htmd` со списком пропуска [`SKIPPED_TAGS`], без картинок
-/// `data:` и с выравниванием таблиц под бюджетом страницы ([`TableLayout`]), серии пустых
-/// строк сжаты.
+/// Бюджет надбавки выравнивания таблиц страницы с оценкой вывода `bound` (не больше
+/// [`HTML_OUTPUT_BUDGET`]): [`TABLE_ALIGN_BUDGET`], но не больше остатка бюджета вывода.
+fn align_budget(bound: u64) -> u64 {
+    TABLE_ALIGN_BUDGET.min((HTML_OUTPUT_BUDGET as u64).saturating_sub(bound))
+}
+
+/// Готовое дерево в Markdown с полным бюджетом выравнивания таблиц (модульные тесты).
+#[cfg(test)]
 pub(crate) fn render(tree: &Rc<Node>) -> String {
     render_with(tree, TableLayout::new())
 }
 
-/// [`render`] со своим обработчиком таблиц (модульные тесты бюджета выравнивания).
+/// Готовое дерево в Markdown: `htmd` со списком пропуска [`SKIPPED_TAGS`], без картинок
+/// `data:` и с выравниванием таблиц под бюджетом страницы `tables` ([`TableLayout`]), серии
+/// пустых строк сжаты.
 pub(crate) fn render_with(tree: &Rc<Node>, tables: TableLayout) -> String {
     let converter = HtmlToMarkdown::builder()
         .skip_tags(SKIPPED_TAGS.to_vec())

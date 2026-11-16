@@ -11,6 +11,7 @@
 //! Крейт не зависит от `za-*`: связь с `za_core::extract` — JSON подкоманды той же формы.
 
 pub mod attrs;
+mod bound;
 pub mod guard;
 pub mod html;
 pub mod linear;
@@ -18,6 +19,6 @@ mod merge;
 mod pdf;
 mod table;
 
-pub use html::{HTML_MAX_BYTES, Markdown, html_to_markdown};
+pub use html::{HTML_MAX_BYTES, HTML_OUTPUT_BUDGET, Markdown, html_to_markdown};
 pub use pdf::{ExtractError, PdfText, pdf_pages};
 pub use table::TABLE_ALIGN_BUDGET;
