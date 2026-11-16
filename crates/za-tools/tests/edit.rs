@@ -1092,11 +1092,10 @@ async fn overlapping_old_is_refused_by_tool() {
 async fn read_only_file_is_refused() {
     // I2: rename обошёл бы `chmod a-w` (Unix) и упал бы на Windows; отказ на обеих ОС.
     let root = unique_dir("read_only");
-    // Под root запрет записи не действует: отказа не будет, проверять нечего (fix-8).
-    if !file_perms::write_denial_enforced(&root) {
-        eprintln!("read_only_file_is_refused: {}", file_perms::NOT_ENFORCED);
-        return;
-    }
+    // Отказ — политика самого инструмента (`writable`: бит записи владельца и владелец), а
+    // не ОС: под root и с `CAP_DAC_OVERRIDE` ОС запись разрешила бы, и тогда эта проверка —
+    // единственная преграда. Пропуска нет (I1 ревью fix-8).
+    let os = file_perms::denial_note(&root);
     write(&root, "ro.txt", "1\n");
     let p = root.join("ro.txt");
     let mut perms = std::fs::metadata(&p).unwrap().permissions();
@@ -1107,9 +1106,9 @@ async fn read_only_file_is_refused() {
     let o = k
         .edit(json!({"path": "ro.txt", "old": "1", "new": "2"}))
         .await;
-    assert!(o.is_error);
-    assert_eq!(o.content, "cannot write ro.txt: permission denied");
-    assert_eq!(bytes(&root, "ro.txt"), b"1\n");
+    assert!(o.is_error, "{os}");
+    assert_eq!(o.content, "cannot write ro.txt: permission denied", "{os}");
+    assert_eq!(bytes(&root, "ro.txt"), b"1\n", "{os}");
     assert!(std::fs::metadata(&p).unwrap().permissions().readonly());
     assert!(leftovers(&root).is_empty());
     assert!(names(&markers(&root)).is_empty());
@@ -1175,20 +1174,17 @@ async fn unix_modes_of_new_and_owner_only_files() {
             gid
         );
     }
-    // Без права записи владельца (0555) — отказ; под root запрет не действует (fix-8).
-    if file_perms::write_denial_enforced(&root) {
-        write(&root, "rx.sh", "a\n");
-        std::fs::set_permissions(root.join("rx.sh"), std::fs::Permissions::from_mode(0o555))
-            .unwrap();
-        k.read("rx.sh").await;
-        let o = k
-            .edit(json!({"path": "rx.sh", "old": "a", "new": "b"}))
-            .await;
-        assert_eq!(o.content, "cannot write rx.sh: permission denied");
-        assert_eq!(bytes(&root, "rx.sh"), b"a\n");
-    } else {
-        eprintln!("unix_modes (0555): {}", file_perms::NOT_ENFORCED);
-    }
+    // Без права записи владельца (0555) — отказ. Его даёт сам инструмент по битам режима и
+    // владельцу, поэтому и под root (I1 ревью fix-8).
+    let os = file_perms::denial_note(&root);
+    write(&root, "rx.sh", "a\n");
+    std::fs::set_permissions(root.join("rx.sh"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    k.read("rx.sh").await;
+    let o = k
+        .edit(json!({"path": "rx.sh", "old": "a", "new": "b"}))
+        .await;
+    assert_eq!(o.content, "cannot write rx.sh: permission denied", "{os}");
+    assert_eq!(bytes(&root, "rx.sh"), b"a\n", "{os}");
     // Каталог маркеров — 0700 (ревью задачи 8).
     let m = std::fs::metadata(markers(&root))
         .unwrap()

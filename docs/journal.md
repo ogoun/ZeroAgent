@@ -2,6 +2,10 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-16. R1-C2, проход fix-9: слияние соседей до `htmd`, стек линейного извлечения, raw text в подсчёте атрибутов
+
+- **I1 ревью fix-8 — пропуск под root в `za-tools/tests/edit.rs` снят.** `read_only_file_is_refused` и часть 0555 в `unix_modes_of_new_and_owner_only_files` пропускались под root с причиной «запрет записи не действует». Для инструмента правки это неверно: отказ даёт он сам, по битам режима и владельцу (`writable`, `za-tools/src/edit.rs`: `mode & 0o200 != 0 && uid == geteuid`), до любой записи. Под root ОС файл «только чтение» не защищает, и эта проверка — единственная преграда, поэтому тест обязан идти и там. Пропуск остаётся только в `za-res` (`dir_size` полагается на отказ самой ОС). `test-support/file_perms.rs`: причина исправлена, новый `denial_note` — строка для сообщения теста при падении (действует ли запрет ОС), константа `NOT_ENFORCED` удалена.
+
 ## 2026-11-16. R1-C2, проход fix-8: метка и бюджет `digest`, предел атрибутов тега, форма CI
 
 - **I1 ревью задачи 8 — метка у `digest`.** Шаг (10) слота (`za-agent/src/tools.rs`) ставит строку `[untrusted content: <origins>]` первой строкой и `content`, и `digest` — у всех помеченных инструментов, не только у веба. Прежде длинный результат с `digest` (главный путь `web_fetch(url, prompt)`) приходил в контекст без метки: `shorten` показывает `digest` и указатель выгрузки, а метка была только в `content`. Тот же класс найден у строк шагов (7) и (8): `[no checkpoint for this file: …]` и нарушенные постусловия теперь тоже дописываются к `digest` (`push_line`); у `bash` с длинным выводом теста `digest` есть. Тест рецензента перенесён как `digest_keeps_untrusted_line` (плюс случай `tool` без своего происхождения), новые `digest_with_spill_file_keeps_untrusted_line` (настоящий файл выгрузки и строка `search …`), `secret_skipped_line_kept_in_digest`.
@@ -16,7 +20,7 @@
 - **CI.** У всех шагов проверки — `if: ${{ !cancelled() }}`: упавший шаг больше не скрывает следующие. Новые шаги `cargo clippy -p za-extract --all-targets --features test-hooks` и `cargo test -p za-extract --features test-hooks --no-fail-fast` (тест падения подпроцесса).
 - **Подозрения отчёта исправления CI Linux.**
   - `restore_rescans_content_without_cache` теперь осмыслен на Linux: часы проверки на 10 минут впереди (`za-tools/test-hooks`), фильтр считает прочитанное. Предусловие — повторный чекпоинт берёт итог о файле из кэша, не читая его; затем восстановление при том же stat всё равно читает файл. Мутация «`now` берёт итог из кэша» роняет тест (`left: 1, right: 2`); прежняя форма на Linux её бы не заметила. Тест скомпилирован только с признаком.
-  - Тесты прав под root: общий помощник `test-support/file_perms.rs` проверяет прямо — файл «только чтение» открывается на запись, значит права не действуют (root или `CAP_DAC_OVERRIDE`; `geteuid` без `unsafe` недоступен, а `id -u` не видит возможностей контейнера). `read_only_file_is_refused` и часть 0555 в `unix_modes_of_new_and_owner_only_files` пропускаются с явной причиной; `za-res` `unreadable_root_is_none_and_unreadable_nested_is_incomplete` уже проверял запрет прямо — причина в выводе уточнена.
+  - Тесты прав под root: общий помощник `test-support/file_perms.rs` проверяет прямо — файл «только чтение» открывается на запись, значит запрет ОС не действует (root или `CAP_DAC_OVERRIDE`; `geteuid` возможностей контейнера не видит). `za-res` `unreadable_root_is_none_and_unreadable_nested_is_incomplete` уже проверял запрет прямо — причина в выводе уточнена. Пропуск `read_only_file_is_refused` и части 0555 в `unix_modes_of_new_and_owner_only_files` (`za-tools`) был ошибкой и снят проходом fix-9 (I1 ревью fix-8, запись выше): отказ там даёт сам инструмент, а не ОС.
   - `proxy_env_is_ignored` задаёт и строчные `http_proxy`, `https_proxy`, `all_proxy`.
 
 ## 2026-11-16. R1-C2, проход fix-7: онлайн-страж разбора HTML, элементы управления, `simplified`

@@ -5,6 +5,8 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-C2, проход fix-9 (повторное ревью fix-7, ревью fix-8):
+  - тесты: `za-tools` `read_only_file_is_refused` и часть 0555 в `unix_modes_of_new_and_owner_only_files` больше не пропускаются под root — отказ даёт сам инструмент по битам режима и владельцу (I1 ревью fix-8); `test-support/file_perms.rs` — только строка для сообщения при падении (`denial_note`).
 - R1-C2, проход fix-8 (ревью задачи 8, предел атрибутов, форма CI):
   - `za-agent`: строка `[untrusted content: …]` — первой строкой и у `digest`, у всех помеченных инструментов (I1); строки слота `[no checkpoint …]` и нарушенные постусловия тоже дописываются к `digest`;
   - `za-core`: `ToolCx.output_budget` — фактический предел результата слота на этом окне, его заполняет `tool_action` из `cut` (I2); `DIGEST_RESERVE` = 256 байт под строки слота; `escape_untrusted`, `LEFT_ANGLES`, `RIGHT_ANGLES` перенесены в `za_core::text` (в `za_agent` — реэкспорт), новые `escaped_len`, `escaped_char_len`;
@@ -12,7 +14,7 @@
   - `za-web`: «нет читаемого текста» и при доле «двоичных» управляющих символов WHATWG больше 1 % (двоичные данные под `charset=windows-1251`); пометка обрыва у этого ответа сохраняется;
   - `za-extract`: предел атрибутов тега до токенизатора (`attrs`): линейный проход по модели состояний тега WHATWG с множеством веток; больше 1024 атрибутов в теге — `simplified` (тег с сотнями тысяч атрибутов — 31 мс вместо ≈ 75 с); вход линейного извлечения закрывает теги длиннее 64 атрибутов (`sanitize`);
   - CI: шаги проверки с `if: ${{ !cancelled() }}`; `clippy` и тесты `za-extract` с признаком `test-hooks`;
-  - тесты: `restore_rescans_content_without_cache` осмыслен на Linux (подмена часов `za-tools/test-hooks`); тесты отказа по правам пропускаются с причиной, если права не действуют (root, `CAP_DAC_OVERRIDE`; `test-support/file_perms.rs`); `proxy_env_is_ignored` задаёт и строчные `http_proxy`, `https_proxy`, `all_proxy`;
+  - тесты: `restore_rescans_content_without_cache` осмыслен на Linux (подмена часов `za-tools/test-hooks`); тест `za-res` на недоступный каталог пропускается с причиной, если запрет ОС не действует (root, `CAP_DAC_OVERRIDE`) (пропуск тестов отказа `edit` был ошибкой, снят в fix-9); `proxy_env_is_ignored` задаёт и строчные `http_proxy`, `https_proxy`, `all_proxy`;
   - миграция: литералы `ToolCx {…}` получают `output_budget`; `rank_passages` меряет бюджет после экранирования (на тексте без `<`/`>` — как прежде).
 - R1-C2, проход fix-7 (ревью задачи 7 — онлайн-страж разбора HTML, элементы управления, `simplified`):
   - `za-extract`: из списка пропуска убран `form` (страница ASP.NET WebForms целиком в `<form>` теряла текст), добавлены элементы управления `input`, `select`, `option`, `button`, `textarea` (I1);
