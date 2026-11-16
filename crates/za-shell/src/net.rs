@@ -16,7 +16,7 @@
 //! хосты из URL только добавляются); хост записан не буквально (`$`, `%`, `{…}`, текст
 //! после `]`); сокет `/dev/tcp`, `/dev/udp` в слове или перенаправлении; сегмент с
 //! подстановкой или вложенной интерпретацией (`has_subst`, в том числе `ssh host команда`)
-//! или неразобран; ключ подмены адреса — `ssh -J|-S|-F|-W|-L|-R|-D`, `sftp|scp -S|-D`, `curl -x`,
+//! или неразобран; ключ подмены адреса — `ssh -J|-S|-F|-W|-w|-L|-R|-D`, `sftp|scp -S|-D`, `curl -x`,
 //! `--proxy`, `--connect-to`, `--resolve`, `-K`, `wget -e|-i|--config`, `rsync -e`,
 //! `iwr -Proxy|-WebSession`, переменные `*_proxy`, `GIT_SSH*`, `POSIXLY_CORRECT`. Белые
 //! списки (третье ревью задачи 3): ключ `-o` у `ssh`, `scp`, `sftp` и ключ `git -c` вне
@@ -160,10 +160,11 @@ const SSH_KEYS: &[&str] = &["port", "user", "identityfile", "identitiesonly", "c
 
 /// `ssh` (OpenSSH 9.x; со значением — как у вложенной интерпретации `ssh host команда`);
 /// `-S` — сокет мастер-соединения: соединение идёт к хосту мастера (проход 3c); туннели и
-/// SOCKS `-W`, `-L`, `-R`, `-D` ведут трафик к хосту не из адреса (m3 прохода fix-4).
+/// SOCKS `-W`, `-L`, `-R`, `-D` ведут трафик к хосту не из адреса (m3 прохода fix-4), туннель
+/// tun `-w` — тоже (Ruling задачи 5).
 #[rustfmt::skip]
-const SSH: Spec = Spec { flags: "1246afgknqstvxyACGKMNTVXY", vals: "bceilmopBEIOPQw",
-    bad_short: "DFJLRSW", o_keys: SSH_KEYS, ..NONE };
+const SSH: Spec = Spec { flags: "1246afgknqstvxyACGKMNTVXY", vals: "bceilmopBEIOPQ",
+    bad_short: "DFJLRSWw", o_keys: SSH_KEYS, ..NONE };
 
 /// `sftp` — свои опции (`-P port`, `-s subsystem`); `-S`, `-D` — программа вместо ssh.
 #[rustfmt::skip]

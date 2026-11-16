@@ -1731,7 +1731,7 @@ fn hosts_table_nested_assignments() {
     check_hosts(t);
 }
 
-/// m3 прохода fix-4: туннели и SOCKS у ssh (`-W`, `-L`, `-R`, `-D`) ведут трафик к хосту,
+/// m3 прохода fix-4: туннели и SOCKS у ssh (`-W`, `-w`, `-L`, `-R`, `-D`) ведут трафик к хосту,
 /// которого в адресе нет, — хост неизвестен, как у `-J`. У `sftp` и `scp` таких ключей нет:
 /// `-D` у них уже ключ подмены, `-R` и `-l` — другие опции.
 #[test]
@@ -1744,6 +1744,10 @@ fn hosts_table_ssh_forwarding() {
         ("ssh -D 1080 a.test", B, &["a.test"], true),
         ("ssh -qD1080 a.test", B, &["a.test"], true),
         ("ssh -W b.test:22 a.test", B, &["a.test"], true),
+        // Туннель tun (`-w local[:remote]`) — тот же класс, что `-W` (Ruling задачи 5).
+        ("ssh -w 0:1 a.test", B, &["a.test"], true),
+        ("ssh -w0 a.test", B, &["a.test"], true),
+        ("ssh -qw0 a.test", B, &["a.test"], true),
         // Прочие опции со значением по-прежнему без `unknown`.
         ("ssh -p 22 -l me -i k a.test", B, &["a.test"], false),
         ("ssh -E log -c aes128-ctr a.test", B, &["a.test"], false),
