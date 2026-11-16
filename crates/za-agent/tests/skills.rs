@@ -284,6 +284,48 @@ fn tdd_catalog() -> Catalog {
     ])
 }
 
+// ---- Каталог на старте run (D116, задача 14) ----
+
+/// Шаг 0 нового run пишет `skill.catalog {count, by_source, skipped, warnings}`: все
+/// четыре источника (с нулём), пропуски каталога, предупреждения скиллов, до первого хода.
+/// Без каталога (`LoopDeps::skills` — `None`) события нет.
+#[tokio::test]
+async fn catalog_event_at_start() {
+    let mut cat = tdd_catalog();
+    cat.skipped.push(za_skills::Skipped {
+        path: ".claude/skills".into(),
+        reason: "tree changed since trust".into(),
+    });
+    cat.skills[0].warnings.push("unknown field x".into());
+    let f = fx("catalog-event", cat, 32_768);
+    f.model.push(answer("ok"));
+    assert_eq!(start(&f, spec(&f, "t", Tier::Standard)).await, done("ok"));
+    let evs = events(&f.store, f.run).await;
+    let ev = of_kind(&evs, EventKind::SkillCatalog);
+    assert_eq!(ev.len(), 1);
+    let name0 = f.deps.skills.as_ref().unwrap().skills[0].name.clone();
+    assert_eq!(
+        ev[0].payload,
+        json!({
+            "count": 2,
+            "by_source": {"user": 0, "bundled": 2, "extra": 0, "project": 0},
+            "skipped": [{"path": ".claude/skills", "reason": "tree changed since trust"}],
+            "warnings": [{"name": name0, "text": "unknown field x"}],
+        })
+    );
+    // Событие — до первого хода.
+    let at = evs.iter().position(|e| e.kind == EventKind::SkillCatalog);
+    let turn = evs.iter().position(|e| e.kind == EventKind::TurnStarted);
+    assert!(at < turn, "{at:?} {turn:?}");
+
+    let mut g = fx("catalog-none", Catalog::default(), 32_768);
+    g.deps.skills = None;
+    g.deps.capabilities.clear();
+    g.model.push(answer("ok"));
+    assert_eq!(start(&g, spec(&g, "t", Tier::Standard)).await, done("ok"));
+    assert!(of_kind(&events(&g.store, g.run).await, EventKind::SkillCatalog).is_empty());
+}
+
 // ---- activate_skill (D118) ----
 
 #[tokio::test]

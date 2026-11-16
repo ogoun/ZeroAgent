@@ -41,6 +41,7 @@ use za_core::{
 use za_llm::{Message, Part, ToolSchema};
 use za_protocol::{
     Actor, BlobHash, EffectClass, EffectKey, EventKind, NewEvent, RunId, RunRole, Tier,
+    skill_source,
 };
 use za_skills::{Catalog, LoadError, SkillMeta};
 use za_store::{ProjectStore, StoreError};
@@ -623,6 +624,45 @@ pub(crate) async fn load(job: LoadJob, store: &ProjectStore) -> Result<Loaded, S
             hash: meta.hash,
             content: blob,
         }),
+    })
+}
+
+/// Payload события `skill.catalog` (D116), которое пишет шаг 0 нового run:
+/// `{count, by_source: {user, bundled, extra, project}, skipped: [{path, reason}],
+/// warnings: [{name, text}]}`. `by_source` называет все четыре источника, в том числе с
+/// нулём: «скиллов проекта нет» видно без сверки с отсутствием ключа. Пропуски вне
+/// обнаружения (недоверенное дерево проекта, `tree changed since trust`) бинарник кладёт
+/// в `Catalog::skipped` до цикла.
+pub fn catalog_payload(cat: &Catalog) -> Value {
+    let mut by_source = serde_json::Map::new();
+    for source in [
+        skill_source::USER,
+        skill_source::BUNDLED,
+        skill_source::EXTRA,
+        skill_source::PROJECT,
+    ] {
+        let n = cat.skills.iter().filter(|s| s.source == source).count();
+        by_source.insert(source.to_owned(), json!(n));
+    }
+    let skipped: Vec<Value> = cat
+        .skipped
+        .iter()
+        .map(|s| json!({ "path": s.path, "reason": s.reason }))
+        .collect();
+    let warnings: Vec<Value> = cat
+        .skills
+        .iter()
+        .flat_map(|s| {
+            s.warnings
+                .iter()
+                .map(move |w| json!({ "name": s.name, "text": w }))
+        })
+        .collect();
+    json!({
+        "count": cat.skills.len(),
+        "by_source": by_source,
+        "skipped": skipped,
+        "warnings": warnings,
     })
 }
 

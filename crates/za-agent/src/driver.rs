@@ -81,7 +81,7 @@ use crate::request::{
     FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message_with, freeze_for,
 };
 use crate::resume::state_block;
-use crate::skills::{add_active, loaded_names, skill_output_limit, user_skill};
+use crate::skills::{add_active, catalog_payload, loaded_names, skill_output_limit, user_skill};
 use crate::state::{AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools};
 use crate::turn::{
@@ -520,6 +520,20 @@ async fn step_zero(
     // D78: гранты старта run (флаг, глобальная конфигурация) — `grant.added` в журнале.
     if let Some(s) = grants_added(&deps.journal, run, &spec.grants).await? {
         last_seq = Some(s);
+    }
+    // D116: каталог скиллов run — `skill.catalog` на старте (resume каталог не пишет: он
+    // обнаруживается заново, а решает записанный эффект `skill.load`, D92).
+    if let Some(cat) = deps.skills.as_deref() {
+        last_seq = Some(
+            append(
+                &deps.journal,
+                run,
+                Actor::Runtime,
+                EventKind::SkillCatalog,
+                catalog_payload(cat),
+            )
+            .await?,
+        );
     }
 
     let registry = run_registry(deps)?;
