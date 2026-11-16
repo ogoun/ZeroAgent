@@ -35,31 +35,53 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Шаги проверки независимы: у каждого `if: ${{ !cancelled() }}`, чтобы упавший шаг
+      # не скрывал следующие (`--no-fail-fast` действует только внутри одного вызова cargo;
+      # отчёт исправления CI Linux, 2026-11-16). Отмена прогона их по-прежнему снимает.
+      - if: ${{ !cancelled() }}
+        run: cargo fmt --check
+      - if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # `--no-fail-fast`: без него cargo останавливается на первом упавшем тестовом
       # бинарнике, и остальные тесты платформы не запускаются (так Linux пять дней не
       # проверял `za-tools`, `za-web`, `zero-agent` после одного падения, 2026-11-16).
-      - run: cargo test --workspace --locked --no-fail-fast
+      - if: ${{ !cancelled() }}
+        run: cargo test --workspace --locked --no-fail-fast
       # Тесты шлюза с тестовыми подменами резолвера (R1-C2 D128): только с признаком
       # `test-hooks`, обычная сборка его не содержит. Полная проверка задачи 15 —
       # `--features za-web/test-hooks,zero-agent/test-hooks` по всему workspace.
-      - run: cargo clippy -p za-web --all-targets --features test-hooks --locked -- -D warnings
-      - run: cargo test -p za-web --features test-hooks --locked --no-fail-fast
+      - if: ${{ !cancelled() }}
+        run: cargo clippy -p za-web --all-targets --features test-hooks --locked -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo test -p za-web --features test-hooks --locked --no-fail-fast
       # Кэш проверки секретов чекпоинтов с подменой часов (D128): на Unix `ctime` в
       # прошлое не сдвинуть, и без подмены тест кэша ждал бы порог racy по таймеру.
-      - run: cargo clippy -p za-tools --all-targets --features test-hooks --locked -- -D warnings
-      - run: cargo test -p za-tools --features test-hooks --locked --no-fail-fast
+      - if: ${{ !cancelled() }}
+        run: cargo clippy -p za-tools --all-targets --features test-hooks --locked -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo test -p za-tools --features test-hooks --locked --no-fail-fast
+      # Намеренный сбой подпроцесса извлечения (D128, `tests/crash.rs`): цель теста есть
+      # только с признаком `test-hooks` (Ruling прохода fix-7, сомнение 3).
+      - if: ${{ !cancelled() }}
+        run: cargo clippy -p za-extract --all-targets --features test-hooks --locked -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo test -p za-extract --features test-hooks --locked --no-fail-fast
       # Чистые части `za-llm` без функций — так его подключает `za-core`.
-      - run: cargo test -p za-llm --no-default-features --locked --no-fail-fast
+      - if: ${{ !cancelled() }}
+        run: cargo test -p za-llm --no-default-features --locked --no-fail-fast
       # Ядро отдельно: при --workspace функции объединяются, и za-core видел бы za-llm
       # с gateway/http (ARC-011).
-      - run: cargo check -p za-core --locked
+      - if: ${{ !cancelled() }}
+        run: cargo check -p za-core --locked
       # Цикл отдельно по той же причине: za-agent подключает za-llm без функций, и тип
       # за http/gateway в нём при --workspace прошёл бы незамеченным.
-      - run: cargo check -p za-agent --locked
-      - run: cargo --locked xtask policy
+      - if: ${{ !cancelled() }}
+        run: cargo check -p za-agent --locked
+      - if: ${{ !cancelled() }}
+        run: cargo --locked xtask policy
       # Лимиты фиксированных промптов токенизаторами cl100k и o200k (PRM-007, D64); сеть
       # не нужна: словари встроены в tiktoken-rs, точный счёт `--llama` — вручную.
-      - run: cargo --locked xtask prompt-budget
-      - run: cargo deny --locked check
+      - if: ${{ !cancelled() }}
+        run: cargo --locked xtask prompt-budget
+      - if: ${{ !cancelled() }}
+        run: cargo deny --locked check
