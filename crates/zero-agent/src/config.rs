@@ -55,6 +55,14 @@ pub struct AgentConfig {
     pub llama_url_fallback: bool,
 }
 
+/// Потолок `[web] max_bytes`, байт (m8 ревью задачи 14): предел тела PDF у `web_fetch`
+/// (`za_core::extract::PDF_MAX_BYTES`, 32 МиБ, D113) — самого большого тела, которое шлюз
+/// уже читает. Больше смысла нет: HTML до разбора обрезается до 2 МиБ (`za_extract::
+/// HTML_MAX_BYTES`), результат слота — до 128 КиБ, остальное выгружается (D44), а тело
+/// держится в памяти вызова в нескольких копиях (байты, текст UTF-8, очищенный текст).
+/// Опечатка на порядок от 5 МиБ по умолчанию (50 МиБ) — ошибка конфигурации.
+pub const WEB_MAX_BYTES_CEILING: u64 = za_core::extract::PDF_MAX_BYTES as u64;
+
 /// Раздел `[web]` глобальной конфигурации (D107, D122). Значения по умолчанию — D107:
 /// веб включён, `robots.txt` соблюдается, 5 МиБ тела, 60 запросов в минуту, порты 80, 443,
 /// 8080, 8443; поиска нет.
@@ -63,7 +71,8 @@ pub struct WebSettings {
     /// `false` — `web_fetch` и `web_search` не регистрируются ни в одном run.
     pub enabled: bool,
     pub robots: bool,
-    /// Предел тела ответа, байт (у PDF — свой, 32 МиБ, D113).
+    /// Предел тела ответа, байт (у PDF — свой, 32 МиБ, D113); от 1 до
+    /// [`WEB_MAX_BYTES_CEILING`].
     pub max_bytes: u64,
     /// Запросов в минуту на процесс, не меньше 1.
     pub requests_per_minute: u32,
@@ -445,7 +454,10 @@ fn parse_web(v: toml::Value) -> Result<WebSettings, AppConfigError> {
         match key.as_str() {
             "enabled" => out.enabled = bool_at(&at, &value)?,
             "robots" => out.robots = bool_at(&at, &value)?,
-            "max_bytes" => out.max_bytes = int_at(&at, &value, 1, i64::MAX)?.unsigned_abs(),
+            "max_bytes" => {
+                let ceiling = i64::try_from(WEB_MAX_BYTES_CEILING).unwrap_or(i64::MAX);
+                out.max_bytes = int_at(&at, &value, 1, ceiling)?.unsigned_abs();
+            }
             "requests_per_minute" => {
                 out.requests_per_minute =
                     u32::try_from(int_at(&at, &value, 1, i64::from(u32::MAX))?).unwrap_or(u32::MAX);

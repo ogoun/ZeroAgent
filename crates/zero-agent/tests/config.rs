@@ -387,6 +387,9 @@ fn web_and_skills_sections_parse() {
     validate(&cfg).unwrap();
     assert!(!cfg.web.enabled && !cfg.web.robots);
     assert_eq!(cfg.web.max_bytes, 1_048_576);
+    // Потолок `max_bytes` включительно (m8 ревью задачи 14).
+    let top = parse_config("[web]\nmax_bytes = 33554432\n").unwrap();
+    assert_eq!(top.web.max_bytes, 32 * 1024 * 1024);
     assert_eq!(cfg.web.requests_per_minute, 10);
     assert_eq!(cfg.web.ports, [443]);
     let search = cfg.web.search.as_ref().unwrap();
@@ -422,6 +425,12 @@ fn web_and_skills_sections_parse() {
             "web.enabled: ожидается true или false",
         ),
         ("[web]\nmax_bytes = 0\n", "web.max_bytes"),
+        // m8 ревью задачи 14: потолок — предел тела PDF, 32 МиБ (опечатка на порядок от
+        // 5 МиБ по умолчанию — ошибка, а не 50 МиБ в памяти на вызов).
+        (
+            "[web]\nmax_bytes = 33554433\n",
+            "web.max_bytes: ожидается целое от 1 до 33554432",
+        ),
         (
             "[web]\nrequests_per_minute = 0\n",
             "web.requests_per_minute",
