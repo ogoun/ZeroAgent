@@ -395,8 +395,8 @@ mod tests {
     }
 
     /// R1-C2 D120: у каждого из 14 скиллов поставки — случай `skills/<name>` с пределом 700
-    /// и тем же текстом, что в хэше промптов (`za_agent::runtime_texts`); все в пределах
-    /// по cl100k, o200k и оценке Qwen.
+    /// и тем же текстом, что в хэше промптов (`za_agent::runtime_texts`). Что тексты в пределе,
+    /// проверяет общий `all_cases_within_limits` (m6 ревью задачи 12).
     #[test]
     fn prompt_budget_has_skill_cases() {
         let cases = all_cases();
@@ -415,8 +415,6 @@ mod tests {
         assert_eq!(skills, hashed);
         for c in cases.iter().filter(|c| c.name.starts_with("skills/")) {
             assert_eq!(c.limit, 700, "{}", c.name);
-            let n = count(&c.text);
-            assert!(!over_limit(&n, c.limit), "{}: {n:?}", c.name);
         }
     }
 
