@@ -1599,9 +1599,12 @@ fn denied_by_user(v: &Value) -> String {
 }
 
 /// Ответ пользователя на `ask_user` (D16: `{"answer": str}`); иная форма — канонический JSON.
+/// Текст ответа пользователя на `ask_user` — очищенный уровнем `Clean::Input` (SEC-051, D102;
+/// Minor 9 финального ревью скиллов), как задача run и ввод `inbox`. Чистая функция
+/// записанного ответа: реплей даёт тот же текст.
 fn answer(v: &Value) -> String {
     match v.get("answer").and_then(Value::as_str) {
-        Some(a) => a.to_owned(),
+        Some(a) => clean_invisible(a, Clean::Input).0.into_owned(),
         None => {
             tracing::warn!("ответ ask_user без строкового answer");
             canonical_json(v)

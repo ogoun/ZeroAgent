@@ -583,6 +583,29 @@ async fn ask_user_input_interrupt() {
     );
 }
 
+/// SEC-051 (Minor 9 финального ревью скиллов): ответ пользователя на `ask_user` очищается
+/// уровнем `Clean::Input`, как задача и ввод `inbox`: символы тегов, bidi и нулевой ширины
+/// удаляются, ZWJ (эмодзи, письменности) остаётся.
+#[tokio::test]
+async fn ask_user_answer_is_cleaned() {
+    let (s, j, run) = setup("ask_user_clean").await;
+    let reg = registry(builtin_tools());
+    let calls = [planned("q1", "ask_user", json!({"question": "какой?"}))];
+    let e = env(run, RunMode::Ask, true);
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let int = out.suspend.expect("вопрос");
+    let answer = "a\u{202E}b\u{E0041}c\u{200B}d \u{1F468}\u{200D}\u{1F469}";
+    s.resolve_interrupt(&int.id, json!({ "answer": answer }))
+        .await
+        .unwrap();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]),
+        ("q1", "abcd \u{1F468}\u{200D}\u{1F469}", false)
+    );
+}
+
 #[tokio::test]
 async fn tool_output_escaped_and_verbatim() {
     let (s, j, run) = setup("escaped").await;
