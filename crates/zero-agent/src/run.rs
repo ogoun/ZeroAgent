@@ -653,8 +653,39 @@ fn gateway(
     Ok(gw)
 }
 
-/// Подключения run: извлекатель в подпроцессе (`current_exe`, каталог
-/// `work_dir("tmp/<run>")` по первому вызову), шлюз и веб-инструменты, если веб не выключен
+/// Извлекатели run по пути бинарника `exe` (`current_exe`): нативным инструментам (`read`) и
+/// `web_fetch`. Путь известен — у обоих `RunExtractor` (подпроцесс `extract`, каталог
+/// `work_dir("tmp/<run>")` по первому вызову). Путь не определён (m2 ревью задачи 14):
+/// `read` без извлекателя (PDF — `binary file`), а `web_fetch` остаётся в наборе с
+/// [`za_core::extract::Unavailable`] — текст, JSON и XML читает, на HTML и PDF отвечает
+/// `html: …`/`pdf: extraction is unavailable in this session`; `web_search` извлекатель не
+/// нужен вовсе. Строка stderr называет, что не работает.
+fn extractors(
+    exe: std::io::Result<PathBuf>,
+    project: &Path,
+    run: RunId,
+) -> (Option<Arc<dyn Extractor>>, Arc<dyn Extractor>) {
+    match exe {
+        Ok(exe) => {
+            let ex: Arc<dyn Extractor> = Arc::new(RunExtractor::new(
+                Arc::new(DirectRunner),
+                exe,
+                project.to_path_buf(),
+                run,
+            ));
+            (Some(Arc::clone(&ex)), ex)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "путь бинарника не определён: PDF и HTML не извлекаются");
+            eprintln!(
+                "zero-agent: путь бинарника не определён ({e}): PDF и HTML не извлекаются — read отвечает на PDF «binary file», web_fetch читает текст, JSON и XML, а на HTML и PDF отвечает отказом"
+            );
+            (None, Arc::new(za_core::extract::Unavailable))
+        }
+    }
+}
+
+/// Подключения run: извлекатели ([`extractors`]), шлюз и веб-инструменты, если веб не выключен
 /// (`allowed` — имена из замороженного префикса при resume: только они), каталог скиллов
 /// после проверки доверия (проектные — у доверенного проекта по сверенному обходу, D116).
 async fn wire(
@@ -666,25 +697,11 @@ async fn wire(
     hooks: &RunHooks,
     allowed: Option<&BTreeSet<String>>,
 ) -> Result<Wiring, RunError> {
-    let extractor: Option<Arc<dyn Extractor>> = match std::env::current_exe() {
-        Ok(exe) => Some(Arc::new(RunExtractor::new(
-            Arc::new(DirectRunner),
-            exe,
-            project.to_path_buf(),
-            run,
-        ))),
-        Err(e) => {
-            tracing::warn!(error = %e, "путь бинарника не определён: PDF и HTML не извлекаются");
-            eprintln!(
-                "zero-agent: путь бинарника не определён ({e}): PDF и веб-страницы не читаются"
-            );
-            None
-        }
-    };
+    let (extractor, web_extractor) = extractors(std::env::current_exe(), project, run);
     let web_disabled = crate::web::web_disabled(cfg, prep.project_cfg.as_ref());
     let mut web = Vec::new();
-    if let (None, Some(ex)) = (web_disabled, &extractor) {
-        web = crate::web::web_tools(&Arc::new(gateway(cfg, hooks)?), Arc::clone(ex));
+    if web_disabled.is_none() {
+        web = crate::web::web_tools(&Arc::new(gateway(cfg, hooks)?), web_extractor);
         if let Some(names) = allowed {
             web.retain(|t| names.contains(&t.spec().schema.name));
         }
@@ -2153,6 +2170,40 @@ mod tests {
         let names = frozen_tools(&snap);
         assert!(names.contains("web_fetch") && names.contains("read"));
         assert!(frozen_tools(&json!({})).is_empty());
+    }
+
+    /// m2 ревью задачи 14: путь бинарника не определён — у `read` извлекателя нет, а
+    /// `web_fetch` остаётся с `Unavailable` (честный отказ на HTML и PDF), `web_search` тоже.
+    #[test]
+    fn extractors_without_exe_keep_web_tools() {
+        let (native, web) = extractors(
+            Err(std::io::Error::other("no path")),
+            Path::new("."),
+            RunId::new(),
+        );
+        assert!(native.is_none());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let r = rt.block_on(web.html(za_core::extract::HtmlRequest {
+            html: "<p>x</p>".into(),
+            base_url: "https://a.test/".into(),
+        }));
+        assert_eq!(r.unwrap_err(), za_core::extract::ExtractError::Unavailable);
+        let cfg =
+            crate::config::parse_config("[web.search]\nurl = \"http://127.0.0.1:8888\"\n").unwrap();
+        let gw = Arc::new(za_web::WebGateway::new(crate::web::web_config(&cfg.web)).unwrap());
+        let names: Vec<String> = crate::web::web_tools(&gw, web)
+            .iter()
+            .map(|t| t.spec().schema.name.clone())
+            .collect();
+        assert_eq!(names, ["web_fetch", "web_search"]);
+        let (native, _) = extractors(
+            Ok(PathBuf::from("zero-agent")),
+            Path::new("."),
+            RunId::new(),
+        );
+        assert!(native.is_some());
     }
 
     /// Ruling «Задача 15», находка 1: веб-инструменты префикса, которых нет в реестре resume,

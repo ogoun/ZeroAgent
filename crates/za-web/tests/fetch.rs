@@ -90,6 +90,43 @@ where
     .await
 }
 
+/// m2 ревью задачи 14: извлекателя нет (бинарник не знает своего пути) — `web_fetch` всё
+/// равно работает: текст, JSON и XML отдаёт как есть, а на HTML и PDF честно отвечает, что
+/// извлечения нет (`za_core::extract::Unavailable`, разбора в процессе агента нет, D127).
+#[tokio::test]
+async fn fetch_without_extractor_reads_text_and_refuses_html() {
+    let s = site(|p| match p {
+        "/t" => typed(200, "text/plain; charset=utf-8", b"plain words".to_vec()),
+        "/h" => typed(
+            200,
+            "text/html; charset=utf-8",
+            b"<html><body><p>Hi</p></body></html>".to_vec(),
+        ),
+        _ => typed(200, "application/pdf", b"%PDF-1.4\n%fake\n".to_vec()),
+    })
+    .await;
+    let tool = web_fetch_tool(gateway(&s), Arc::new(za_core::extract::Unavailable));
+    // Копия PDF ложится в `.zero-agent/work/tmp/<run>` проекта вызова — каталог теста.
+    let root = project("no_extractor");
+    let run = RunId::new();
+    let call = |path: &str| fetch_in(&tool, &root, run, json!({"url": page_url(&s, path)}));
+    let out = call("/t").await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.ends_with("plain words"), "{}", out.content);
+    let out = call("/h").await;
+    assert!(out.is_error);
+    assert_eq!(
+        out.content,
+        "html: extraction is unavailable in this session"
+    );
+    let out = call("/p").await;
+    assert!(out.is_error);
+    assert_eq!(
+        out.content,
+        "pdf: extraction is unavailable in this session"
+    );
+}
+
 #[tokio::test]
 async fn fetch_html_page() {
     // Страница в windows-1251: извлекатель получает её уже в UTF-8 (D109).

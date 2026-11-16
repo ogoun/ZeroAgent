@@ -236,6 +236,12 @@ impl Tool for WebFetch {
                 "runtime/web.pdf.no_start",
                 ExtractError::Failed(FAILED_START.into()),
             ),
+            // Извлекателя нет (`za_core::extract::Unavailable`, m2 ревью задачи 14).
+            (
+                "runtime/web.html.unavailable",
+                "runtime/web.pdf.unavailable",
+                ExtractError::Unavailable,
+            ),
         ] {
             t.push((html, html_error_text(&e)));
             t.push((pdf, pdf_error_text(&e)));

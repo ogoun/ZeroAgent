@@ -92,6 +92,10 @@ pub enum ExtractError {
     /// Подпроцесс упал или вернул неразбираемый ответ; строка — причина.
     #[error("extractor failed: {0}")]
     Failed(String),
+    /// Извлечения нет в этом процессе ([`Unavailable`]): например, бинарник не знает своего
+    /// пути и не может запустить подпроцесс (m2 ревью задачи 14 R1-C2).
+    #[error("extraction is unavailable in this session")]
+    Unavailable,
 }
 
 /// Извлекатель текста (D113, D127). `Send + Sync`: его держат инструменты в `Arc`.
@@ -100,6 +104,23 @@ pub trait Extractor: Send + Sync {
     fn html(&self, req: HtmlRequest) -> BoxFuture<'static, Result<Markdown, ExtractError>>;
     /// Текст страниц PDF.
     fn pdf(&self, req: PdfRequest) -> BoxFuture<'static, Result<PdfText, ExtractError>>;
+}
+
+/// Извлекатель, которого нет: любой вызов — [`ExtractError::Unavailable`]. Потребитель
+/// остаётся рабочим для содержимого без разбора (`web_fetch`: текст, JSON, XML), а на HTML и
+/// PDF честно отвечает `html: …`/`pdf: extraction is unavailable in this session`; разбора в
+/// процессе агента нет (D127).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Unavailable;
+
+impl Extractor for Unavailable {
+    fn html(&self, _req: HtmlRequest) -> BoxFuture<'static, Result<Markdown, ExtractError>> {
+        Box::pin(async { Err(ExtractError::Unavailable) })
+    }
+
+    fn pdf(&self, _req: PdfRequest) -> BoxFuture<'static, Result<PdfText, ExtractError>> {
+        Box::pin(async { Err(ExtractError::Unavailable) })
+    }
 }
 
 // ---- PDF у потребителей (задача 10): общие пределы и тексты `read` и `web_fetch` ----
