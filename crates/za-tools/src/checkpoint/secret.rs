@@ -29,8 +29,10 @@ pub const SECRET_SCAN_MAX: u64 = 1 << 20;
 /// Имя секретного файла (D103) — по последнему компоненту пути (`/` или `\`), без учёта
 /// регистра: `.env` и `.env.*` (кроме `.env.example`, `.env.sample`, `.env.template`,
 /// `.env.dist`), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.kdbx`,
-/// закрытые ключи SSH без `.pub`, `.netrc`, `_netrc`, `.npmrc`, `.pypirc`,
-/// `.git-credentials`.
+/// `*.ppk` (ключ PuTTY, финальное ревью безопасности, Minor 2), закрытые ключи SSH без
+/// `.pub`, `.netrc`, `_netrc`, `.npmrc`, `.pypirc`, `.git-credentials`. `*.gpg` в списке нет
+/// осознанно: так называют и открытые связки ключей, и просто зашифрованные данные, а
+/// ложное срабатывание лишает файл чекпоинта; закрытый ключ PGP ловит фильтр содержимого.
 pub fn secret_name(rel: &str) -> bool {
     let last = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
     let name = last.to_ascii_lowercase();
@@ -43,7 +45,16 @@ pub fn secret_name(rel: &str) -> bool {
             ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
         );
     }
-    const EXT: [&str; 7] = [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".kdbx"];
+    const EXT: [&str; 8] = [
+        ".pem",
+        ".key",
+        ".p12",
+        ".pfx",
+        ".jks",
+        ".keystore",
+        ".kdbx",
+        ".ppk",
+    ];
     const EXACT: [&str; 9] = [
         "id_rsa",
         "id_dsa",

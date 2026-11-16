@@ -21,8 +21,8 @@ use za_tools::SecretFilter;
 use crate::config::load_config;
 
 /// Версия правил фильтра секретов чекпоинтов (входит в отпечаток: смена правил — новая
-/// проверка файлов).
-const FILTER_RULES_V: &str = "zero-agent checkpoint filter v1 (values, pem)";
+/// проверка файлов). v2 — ключи PGP и PuTTY (финальное ревью безопасности, Minor 2).
+const FILTER_RULES_V: &str = "zero-agent checkpoint filter v2 (values, pem, pgp, ppk)";
 
 /// Секреты, прочитанные из хранилища при старте (D90, 1.15).
 #[derive(Clone, Default)]
@@ -61,7 +61,8 @@ impl StoreSecrets {
     }
 
     /// Фильтр секретов чекпоинтов (D103): `true`, если в байтах файла есть известное
-    /// значение хранилища (`known_values`) или блок PEM закрытого ключа. Широкие шаблоны
+    /// значение хранилища (`known_values`), блок PEM закрытого ключа или закрытого ключа
+    /// PGP ([`has_private_key_pem`]) либо файл — ключ PuTTY ([`is_putty_key`]). Широкие шаблоны
     /// [`SecretMasker`] не применяются: ложное срабатывание молча лишило бы файл
     /// чекпоинта и восстановления. Размер файла ограничивает `za-tools`
     /// (`SECRET_SCAN_MAX`).
@@ -88,7 +89,9 @@ impl StoreSecrets {
             .map(|v| memchr::memmem::Finder::new(v).into_owned())
             .collect();
         SecretFilter::new(fingerprint, move |bytes: &[u8]| {
-            finders.iter().any(|f| f.find(bytes).is_some()) || has_private_key_pem(bytes)
+            finders.iter().any(|f| f.find(bytes).is_some())
+                || has_private_key_pem(bytes)
+                || is_putty_key(bytes)
         })
     }
 
@@ -155,10 +158,13 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Блок PEM закрытого ключа: строка `-----BEGIN … PRIVATE KEY-----` (PKCS#8, RSA, EC,
-/// DSA, OpenSSH, зашифрованный), метка — в пределах одной строки.
+/// DSA, OpenSSH, зашифрованный) или брони закрытого ключа PGP `-----BEGIN PGP PRIVATE KEY
+/// BLOCK-----` (RFC 4880, финальное ревью безопасности, Minor 2), метка — в пределах одной
+/// строки. Открытые ключи, подписи и сообщения PGP — не секрет.
 fn has_private_key_pem(bytes: &[u8]) -> bool {
     const BEGIN: &[u8] = b"-----BEGIN ";
     const END: &[u8] = b"PRIVATE KEY-----";
+    const PGP_END: &[u8] = b"PRIVATE KEY BLOCK-----";
     /// Длина метки самое большее (`ENCRYPTED PRIVATE KEY-----` и подобные).
     const LABEL_MAX: usize = 64;
     let mut rest = bytes;
@@ -169,12 +175,29 @@ fn has_private_key_pem(bytes: &[u8]) -> bool {
             .position(|b| *b == b'\n' || *b == b'\r')
             .unwrap_or(after.len());
         let label = &after[..line_end.min(LABEL_MAX)];
-        if find(label, END).is_some() {
+        if find(label, END).is_some() || find(label, PGP_END).is_some() {
             return true;
         }
         rest = after;
     }
     false
+}
+
+/// Файл ключа PuTTY (`.ppk`, финальное ревью безопасности, Minor 2): строка
+/// `PuTTY-User-Key-File-<версия>:` в начале файла (после необязательной метки порядка
+/// байтов UTF-8). Формат не PEM, и имя файла может быть любым. Упоминание формата в тексте
+/// не в начале файла — не секрет.
+fn is_putty_key(bytes: &[u8]) -> bool {
+    const MAGIC: &[u8] = b"PuTTY-User-Key-File-";
+    const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+    bytes
+        .strip_prefix(BOM)
+        .unwrap_or(bytes)
+        .strip_prefix(MAGIC)
+        .is_some_and(|rest| {
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            digits > 0 && rest.get(digits) == Some(&b':')
+        })
 }
 
 /// Значение JSON, в котором замаскированы все строки и ключи объектов (D90, D100):
@@ -581,6 +604,40 @@ mod tests {
         // Без секретов в хранилище — только PEM.
         let none = env(&[]).checkpoint_filter();
         assert!(!none.matches(format!("v={value}").as_bytes()));
+    }
+
+    /// Финальное ревью безопасности, Minor 2: закрытый ключ PGP (блок брони
+    /// `PGP PRIVATE KEY BLOCK`) и ключ PuTTY (`PuTTY-User-Key-File-` в начале файла) —
+    /// секрет. Признаки точные: открытый ключ PGP, подпись, сообщение, упоминание формата
+    /// PuTTY в тексте и строка не в начале файла секретом не считаются. Фиктивные ключи
+    /// собираются из частей (сканеры репозитория их не видят целиком).
+    #[test]
+    fn pgp_and_putty_keys_are_secret() {
+        let f = env(&[]).checkpoint_filter();
+        let armor =
+            |label: &str| format!("-----BEGIN {label}-----\n\nlQOYBF\n-----END {label}-----\n");
+        let pgp = ["PGP PRIVATE", " KEY BLOCK"].concat();
+        let ppk = ["PuTTY-User-", "Key-File-3: ssh-ed25519\nEncryption: none\n"].concat();
+        for text in [
+            armor(&pgp),
+            format!("notes\n{}", armor(&pgp)),
+            ppk.clone(),
+            format!("\u{feff}{ppk}"),
+            ["PuTTY-User-", "Key-File-2: ssh-rsa\r\n"].concat(),
+        ] {
+            assert!(f.matches(text.as_bytes()), "{text:?}");
+        }
+        for text in [
+            armor("PGP PUBLIC KEY BLOCK"),
+            armor("PGP SIGNATURE"),
+            armor("PGP MESSAGE"),
+            format!("-----BEGIN {pgp}\n"),
+            format!("The file starts with {ppk}"),
+            format!("\n{ppk}"),
+            "PuTTY-User-Key-File".to_owned(),
+        ] {
+            assert!(!f.matches(text.as_bytes()), "{text:?}");
+        }
     }
 
     /// Сомнение 2 ревью задачи 2: отпечаток фильтра зависит только от набора значений —

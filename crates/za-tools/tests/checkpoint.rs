@@ -1478,6 +1478,9 @@ fn secret_names_table() {
         "db.kdbx",
         "_netrc",
         ".pypirc",
+        // Ключ PuTTY (финальное ревью безопасности, Minor 2): обычен на Windows.
+        "deploy/key.ppk",
+        "keys/Server.PPK",
     ] {
         assert!(secret_name(p), "{p}");
     }
@@ -1494,6 +1497,8 @@ fn secret_names_table() {
         "secret.env",
         ".envrc",
         ".pem/readme.md",
+        "ppk.txt",
+        "docs/ppk-format.md",
     ] {
         assert!(!secret_name(p), "{p}");
     }
