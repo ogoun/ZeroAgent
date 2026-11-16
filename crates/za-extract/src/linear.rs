@@ -5,6 +5,10 @@
 //! дерева и рекурсии `htmd`), верно разбирает сущности и raw-text и применяет тот же список
 //! пропуска [`crate::html::SKIPPED_TAGS`]. Результат — только текст и заголовок, без ссылок
 //! и разметки; потребитель помечает его как упрощённый.
+//!
+//! Квадратичная часть самого токенизатора — проверка повторов атрибутов в одном теге,
+//! поэтому вход сначала проходит [`crate::attrs::sanitize`]: ни у одного тега не остаётся
+//! больше [`crate::attrs::LINEAR_ATTRS`] атрибутов.
 
 use std::cell::{Cell, RefCell};
 
@@ -13,6 +17,7 @@ use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::states::RawKind;
 use html5ever::tokenizer::{Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts};
 
+use crate::attrs::sanitize;
 use crate::html::{Markdown, SKIPPED_TAGS, collapse_blank_lines};
 
 /// Приёмник токенов: собирает видимый текст и первый `<title>`. Содержимое элементов из
@@ -107,11 +112,13 @@ impl TokenSink for LinearSink {
 }
 
 /// Линейное извлечение: текст и заголовок без ссылок и разметки. Вход уже обрезан до
-/// предела (вызывающий, [`crate::html::html_to_markdown`]).
+/// предела (вызывающий, [`crate::html::html_to_markdown`]); теги с множеством атрибутов
+/// закрываются до токенизатора ([`sanitize`]).
 pub fn linear_extract(html: &str) -> Markdown {
+    let html = sanitize(html);
     let tok = Tokenizer::new(LinearSink::default(), TokenizerOpts::default());
     let input = BufferQueue::default();
-    input.push_back(StrTendril::from_slice(html));
+    input.push_back(StrTendril::from_slice(&html));
     let _ = tok.feed(&input);
     tok.end();
     let sink = tok.sink;

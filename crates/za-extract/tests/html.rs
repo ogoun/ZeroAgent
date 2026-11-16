@@ -305,6 +305,78 @@ fn adjacent_merge_is_simplified() {
     assert!(m.simplified);
 }
 
+// --- Атрибуты: проверка повторов `html5ever` квадратична по их числу в теге (fix-8) ---
+
+/// Тег `<div a0 a1 …>` на 2 МиБ — сотни тысяч разных атрибутов (прежде ≈ 75 с в release):
+/// подсчёт до токенизатора даёт `simplified` быстро, текст до тега сохраняется.
+#[test]
+fn huge_attribute_tag_is_simplified() {
+    let mut html = String::from("<p>before the tag</p><div");
+    let mut i = 0usize;
+    while html.len() < 2 * MIB - 64 {
+        html.push_str(&format!(" a{i}"));
+        i += 1;
+    }
+    html.push_str(">after</div>");
+    assert!(i > 200_000, "{i}");
+    let m = bounded("huge_attrs", html);
+    assert!(
+        m.simplified,
+        "тег с {i} атрибутами должен давать simplified"
+    );
+    assert!(m.text.contains("before the tag"), "{:?}", &m.text[..80]);
+}
+
+/// Много тегов ровно по пределу (1024 разных атрибута каждый) на 2 МиБ: по отдельности каждый
+/// в норме, полный разбор идёт, а квадратичная цена ограничена пределом на тег (замер —
+/// около 0,5 с в release, отчёт fix-8). Тег на один атрибут больше — `simplified`.
+#[test]
+fn attribute_limit_is_per_tag() {
+    let tag = |n: usize| {
+        let mut t = String::from("<i");
+        for k in 0..n {
+            t.push_str(&format!(" a{k}"));
+        }
+        t.push_str(">x</i>\n");
+        t
+    };
+    let m = bounded("attr_tags_at_limit", rep(&tag(1024), 2 * MIB));
+    assert!(!m.simplified, "теги по пределу разбираются полностью");
+    let m = bounded("attr_tag_over_limit", tag(1025));
+    assert!(m.simplified, "1025 атрибутов в теге — simplified");
+}
+
+/// Тысяча разных атрибутов и поток повторов в одном теге: повтор стоит прохода по уже
+/// собранным, поэтому повторы тоже считаются.
+#[test]
+fn duplicate_attribute_flood_is_simplified() {
+    let mut html = String::from("<b");
+    for k in 0..1000 {
+        html.push_str(&format!(" a{k}"));
+    }
+    while html.len() < 2 * MIB - 16 {
+        html.push_str(" x");
+    }
+    html.push_str(">text</b>");
+    let m = bounded("dup_attrs", html);
+    assert!(m.simplified);
+}
+
+/// Кавычка внутри `<script>` не прячет тег после него: подсчёт ведёт и гипотезу «вне тега»,
+/// а `>` в значениях в кавычках счёт не обнуляет.
+#[test]
+fn quoted_values_in_script_do_not_hide_attribute_flood() {
+    let mut html = String::from("<script>var s = x<a b='</script><div");
+    let mut i = 0usize;
+    while html.len() < 2 * MIB - 64 {
+        html.push_str(&format!(" a{i}=\">\""));
+        i += 1;
+    }
+    html.push_str(">tail</div>");
+    let m = bounded("quoted_attrs", html);
+    assert!(m.simplified);
+}
+
 // --- Обычные страницы не деградируют ---
 
 /// Семь синтетических страниц, по строению близких к реальным (статья, документация,
@@ -422,6 +494,40 @@ fn realistic_pages() -> Vec<(&'static str, String)> {
     }
     wiki.push_str("</body></html>");
 
+    // 8. Приложение: большие встроенные скрипты (обычный и минифицированный код со
+    // сравнениями `i<n`, стрелочными функциями и строками), JSON-LD, SVG с длинными путями,
+    // элементы с десятками атрибутов `data-*` (подсчёт атрибутов не должен давать ложного
+    // упрощения). Тег-подобный текст скрипта (`<n0; i++) { … }`) подсчёт считает тегом до
+    // ближайшего `>`: в обычном коде он есть через строку-другую (`=>`, `>`, строки HTML).
+    let mut app = String::from(
+        "<!doctype html><html><head><title>App</title>\
+         <script type=\"application/ld+json\">{\"@context\": \"https://schema.org\", \"name\": \"x\"}</script>\
+         <script>\n",
+    );
+    for i in 0..3000 {
+        app.push_str(&format!(
+            "  for (let i = 0; i<n{i}; i++) {{ total = total + values[i] * {i}; label = 'row ' + i; }}\n\
+             \x20 const pick{i} = (row) => row.id === {i} ? row : null;\n"
+        ));
+    }
+    app.push_str("</script><script>");
+    for i in 0..2000 {
+        app.push_str(&format!(
+            "function f{i}(a,b){{if(a<b){{return a}}var s=\"<div class='c{i}'>\"+b+\"</div>\";return s}}"
+        ));
+    }
+    app.push_str("</script></head><body>");
+    let mut i = 0;
+    while app.len() < 1536 * 1024 {
+        let data: String = (0..40).map(|k| format!(" data-k{k}=\"v{i}\"")).collect();
+        app.push_str(&format!(
+            "<div class=\"card\" id=\"c{i}\"{data}><h3>Card {i}</h3><p>Card body text number {i} for the reader.</p>\
+             <svg viewBox=\"0 0 24 24\"><path d=\"M12 2L2 7l10 5 10-5-10-5zm0 13l-8-4v6l8 4 8-4v-6l-8 4z\"/></svg></div>\n"
+        ));
+        i += 1;
+    }
+    app.push_str("</body></html>");
+
     vec![
         ("article", article),
         ("docs", docs),
@@ -430,5 +536,6 @@ fn realistic_pages() -> Vec<(&'static str, String)> {
         ("table", table),
         ("inline", inline),
         ("wiki", wiki),
+        ("app", app),
     ]
 }

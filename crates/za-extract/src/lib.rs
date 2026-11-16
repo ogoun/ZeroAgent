@@ -10,6 +10,7 @@
 //!
 //! Крейт не зависит от `za-*`: связь с `za_core::extract` — JSON подкоманды той же формы.
 
+pub mod attrs;
 pub mod guard;
 pub mod html;
 pub mod linear;
