@@ -588,6 +588,7 @@ async fn recorded_decision_survives_policy_change() {
                 path: None,
                 // Для bash allow действует только с `command` (Ruling C1 задачи 11).
                 command: Some("echo".into()),
+                domain: None,
             }],
             ..PolicyConfig::default()
         },
@@ -637,6 +638,7 @@ async fn recorded_decision_survives_policy_change() {
                 tool: Some("edit".into()),
                 path: None,
                 command: None,
+                domain: None,
             }],
             ..PolicyConfig::default()
         },
@@ -1341,6 +1343,7 @@ async fn policy_change_applies_at_boundary() {
                 tool: Some("bash".into()),
                 path: None,
                 command: None,
+                domain: None,
             }],
             ..PolicyConfig::default()
         },

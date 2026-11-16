@@ -246,6 +246,7 @@ impl Tool for BashStub {
             network: segs.iter().any(|s| shell::is_network(s, Dialect::Bash)),
             irreversible: Vec::new(),
             segments: segs,
+            ..Subjects::default()
         }
     }
 

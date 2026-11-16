@@ -789,6 +789,10 @@ impl Tool for BashTool {
                 s.unparsed = true;
             }
         }
+        // Хосты для правил по домену (D104, D105) — после пометки `unparsed`: неразобранный
+        // сегмент даёт неизвестный хост. Сбор и нормализация — одна функция `za-core`
+        // (D124): сырой хост, который нормализация не принимает, — тоже неизвестный.
+        let (hosts, hosts_unknown) = za_core::net::shell_hosts(&segs, d);
         Subjects {
             paths,
             cwd: cwd.map(str::to_owned),
@@ -796,6 +800,8 @@ impl Tool for BashTool {
             network,
             irreversible,
             segments: segs,
+            hosts,
+            hosts_unknown,
         }
     }
 

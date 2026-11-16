@@ -1,7 +1,8 @@
 //! Конфигурация агента: `ZA_HOME/config.toml`, разделы `[models]`, `[resources]` (D23),
 //! `[budgets.run]` (бюджет run по умолчанию, R1-B1 D19), `[context]` (пороги контекста,
 //! R1-B2 D65) и `[policy]` с `[[policy.rules]]` и `[[policy.grants]]` (политика, R1-C1
-//! D78, D80).
+//! D78, D80; правила по домену — R1-C2 D105). Проектная конфигурация — `[policy]` и
+//! `[web] enabled = false` ([`parse_project_config`]).
 //!
 //! `[policy]` разбирается вторым проходом по уже прочитанной таблице: ошибка называет
 //! путь поля (`policy.rules[0]`), а не только строку.
@@ -111,20 +112,38 @@ pub enum AppConfigError {
 /// проекта.
 pub const PROJECT_CONFIG: &str = ".zero-agent/config.toml";
 
-/// Проектная конфигурация (R1-C1 D80, ARC-041): действует только раздел `[policy]`, и в
-/// нём — правила `ask` и `deny` (проектные `allow`, `allow_bypass` и `[[policy.grants]]`
-/// отбрасывает `PolicySnapshot::build` с `warn`). Прочие разделы не действуют — `warn`.
+/// Проектная конфигурация (R1-C1 D80, ARC-041): действует раздел `[policy]`, и в нём —
+/// правила `ask` и `deny` (проектные `allow`, `allow_bypass` и `[[policy.grants]]`
+/// отбрасывает `PolicySnapshot::build` с `warn`), и `[web] enabled = false` (R1-C2 D105).
+/// Прочие разделы и ключи не действуют — `warn`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectConfig {
     pub policy: PolicyConfig,
+    /// `Some(false)` — проект выключил веб (`[web] enabled = false`): `web_search` и
+    /// `web_fetch` в run не регистрируются. Проект только ужесточает: `true` и отсутствие
+    /// ключа — `None`.
+    pub web_enabled: Option<bool>,
 }
 
 /// Разделы глобальной конфигурации, которые в проектной не действуют: их имена `warn`
 /// называет; прочие — без имени (ключ может оказаться секретом).
 const GLOBAL_ONLY_SECTIONS: &[&str] = &["models", "resources", "budgets", "context"];
 
-/// Разбор текста `.zero-agent/config.toml` (D80): `[policy]` — тем же разбором, что
-/// глобальный, прочие разделы — `warn` без ошибки. Правила проверяются (шаблоны, `..`).
+/// Ключи `[web]` и `[web.search]` глобальной конфигурации (D122): в проекте, кроме
+/// `enabled`, не действуют. Только эти имена предупреждение называет (как у
+/// [`GLOBAL_ONLY_SECTIONS`]).
+const WEB_KEYS: &[&str] = &[
+    "robots",
+    "max_bytes",
+    "requests_per_minute",
+    "ports",
+    "search",
+];
+const WEB_SEARCH_KEYS: &[&str] = &["provider", "url"];
+
+/// Разбор текста `.zero-agent/config.toml` (D80, D105): `[policy]` — тем же разбором, что
+/// глобальный, `[web] enabled` — выключение веба, прочие разделы и ключи — `warn` без
+/// ошибки. Правила проверяются (шаблоны, `..`).
 pub fn parse_project_config(src: &str) -> Result<ProjectConfig, AppConfigError> {
     let table = toml::from_str::<toml::Table>(src).map_err(|e| {
         AppConfigError::Project(
@@ -135,18 +154,20 @@ pub fn parse_project_config(src: &str) -> Result<ProjectConfig, AppConfigError> 
     for (key, value) in table {
         if key == "policy" {
             out.policy = parse_policy(value).map_err(project_error)?;
+        } else if key == "web" {
+            out.web_enabled = parse_project_web(value)?;
         } else if let Some(name) = GLOBAL_ONLY_SECTIONS.iter().find(|s| **s == key) {
             tracing::warn!(
                 section = *name,
-                "раздел проектной конфигурации не действует: только [policy] (ARC-041)"
+                "раздел проектной конфигурации не действует: только [policy] и [web] enabled (ARC-041)"
             );
             eprintln!(
-                "zero-agent: {PROJECT_CONFIG}: раздел [{name}] в проекте не действует, только [policy]"
+                "zero-agent: {PROJECT_CONFIG}: раздел [{name}] в проекте не действует, только [policy] и [web] enabled"
             );
         } else {
             tracing::warn!("незнакомый раздел проектной конфигурации не действует");
             eprintln!(
-                "zero-agent: {PROJECT_CONFIG}: незнакомый раздел не действует, только [policy]"
+                "zero-agent: {PROJECT_CONFIG}: незнакомый раздел не действует, только [policy] и [web] enabled"
             );
         }
     }
@@ -154,6 +175,58 @@ pub fn parse_project_config(src: &str) -> Result<ProjectConfig, AppConfigError> 
     // снимка run.
     PolicySnapshot::build(&out.policy, None).map_err(|e| AppConfigError::Project(e.to_string()))?;
     Ok(out)
+}
+
+/// Раздел `[web]` проектной конфигурации (D105, D122): `enabled = false` выключает веб,
+/// `true` ничего не включает; `enabled` не булево — ошибка с путём `web.enabled`. Прочие
+/// ключи `[web]` и `[web.search]` — `warn` с именем ключа (адрес поставщика поиска проект
+/// не задаёт, D126); незнакомое имя не называется. Значения в предупреждения не попадают.
+fn parse_project_web(v: toml::Value) -> Result<Option<bool>, AppConfigError> {
+    let toml::Value::Table(t) = v else {
+        return Err(AppConfigError::Project(
+            "web: ожидается таблица [web]".to_owned(),
+        ));
+    };
+    let mut enabled = None;
+    for (key, value) in t {
+        match (key.as_str(), value) {
+            ("enabled", toml::Value::Boolean(b)) => enabled = (!b).then_some(false),
+            ("enabled", _) => {
+                return Err(AppConfigError::Project(
+                    "web.enabled: ожидается true или false".to_owned(),
+                ));
+            }
+            ("search", toml::Value::Table(search)) => {
+                for k in search.keys() {
+                    warn_project_web(
+                        &format!("web.search.{k}"),
+                        WEB_SEARCH_KEYS.contains(&k.as_str()),
+                    );
+                }
+            }
+            (k, _) => warn_project_web(&format!("web.{k}"), WEB_KEYS.contains(&k)),
+        }
+    }
+    Ok(enabled)
+}
+
+/// Предупреждение о ключе `[web]` проекта, который не действует; `known` — имя ключа из
+/// белого списка, иначе имя не называется (ключ может оказаться секретом).
+fn warn_project_web(key: &str, known: bool) {
+    if known {
+        tracing::warn!(
+            key,
+            "ключ [web] проектной конфигурации не действует: только enabled = false"
+        );
+        eprintln!(
+            "zero-agent: {PROJECT_CONFIG}: ключ {key} в проекте не действует, только [web] enabled = false"
+        );
+    } else {
+        tracing::warn!("незнакомый ключ [web] проектной конфигурации не действует");
+        eprintln!(
+            "zero-agent: {PROJECT_CONFIG}: незнакомый ключ [web] в проекте не действует, только enabled = false"
+        );
+    }
 }
 
 /// Ошибка глобального разбора — как ошибка проектной конфигурации (без имени файла
@@ -231,6 +304,7 @@ const POLICY_FIELDS: &[&str] = &[
     "tool",
     "path",
     "command",
+    "domain",
     "mode",
     "reason",
 ];
@@ -311,7 +385,7 @@ fn de_reason(message: &str) -> String {
     let name = |rest: &str| rest.split('`').next().unwrap_or("").to_owned();
     if let Some(rest) = m.strip_prefix("unknown field `") {
         return format!(
-            "{}; поля правила: action, tool, path, command; поля гранта: path, mode, reason",
+            "{}; поля правила: action, tool, path, command, domain; поля гранта: path, mode, reason",
             unknown_field(&name(rest))
         );
     }
@@ -574,7 +648,7 @@ mod tests {
             ),
             (
                 "[[policy.rules]]\naction = \"deny\"\n",
-                "policy.rules[0]: нужно хотя бы одно поле tool, path или command",
+                "policy.rules[0]: нужно хотя бы одно поле tool, path, command или domain",
             ),
             (
                 "[[policy.rules]]\naction = \"deny\"\ncommand = \"[\"\n",

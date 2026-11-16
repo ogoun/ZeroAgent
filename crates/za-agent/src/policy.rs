@@ -1,6 +1,7 @@
 //! Движок политики R1-C1 (D77–D83; SEC-001…005, SEC-030…036): правила `allow`, `ask`,
-//! `deny` по инструменту, пути и разобранной команде, гранты доступа вне проекта,
-//! защищённые пути, режим `bypass`, доверие к проекту и метка недоверенного содержимого.
+//! `deny` по инструменту, пути, разобранной команде и хосту (R1-C2 D105), гранты доступа
+//! вне проекта, защищённые пути, режим `bypass`, доверие к проекту и метка недоверенного
+//! содержимого.
 //!
 //! [`decide`] — чистая функция от предметов вызова ([`Subjects`]), их разрешённых путей,
 //! режима, доверия, грантов, меток и снимка политики ([`PolicySnapshot`]). Чтений вне
@@ -14,7 +15,12 @@
 //!    `Deny("untrusted project")` (D83).
 //! 5. Причины `Ask` собираются все: `irreversible` (не снимается ничем), `outside_project`
 //!    (снимают только грант или глобальное `allow` с `path`), `rule` и `mode` (снимают
-//!    глобальное `allow` и `bypass`, кроме `Approval::Always`).
+//!    глобальное `allow` и `bypass`, кроме `Approval::Always`). `rule` даёт и правило `deny`
+//!    или `ask` с `domain`, если хост вызова неизвестен ([`Subjects::hosts_unknown`], D104).
+//!
+//! Правило с `domain` (D105) только ужесточает: `deny` — отказ по совпавшему хосту, `ask` —
+//! вопрос; `allow` с `domain` ничего не разрешает. Хосты вызова нормализованы
+//! ([`normalize_host`], D124), шаблон нормализуется при сборке снимка (`domain_pattern`).
 //!
 //! Метка недоверенного содержимого run ([`PolicyCx::taint`], D82) вопроса не даёт
 //! (решение заказчика 2026-11-11: чтение из сети на запуск команд не влияет). Она —
@@ -29,6 +35,7 @@ use std::path::{Path, PathBuf};
 use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use za_core::net::normalize_host;
 use za_core::paths::{self, ResolvedPath, Roots};
 use za_core::shell::{self, Segment};
 use za_core::{Access, Approval, Gate, RawPath, RiskClass, Subjects, ToolKind, ToolSpec, gate};
@@ -51,7 +58,11 @@ pub enum RuleAction {
 /// - `path` — путь вызова: внутри проекта относительный через `/`, абсолютный шаблон —
 ///   с абсолютным каноническим путём (glob по компонентам, на Windows без учёта регистра);
 /// - `command` — разобранная команда (D81): `deny` и `ask` — `argv0` или текст любого
-///   сегмента, `allow` — текст каждого сегмента без подстановок и перенаправлений.
+///   сегмента, `allow` — текст каждого сегмента без подстановок и перенаправлений;
+/// - `domain` — хост вызова (R1-C2 D105): glob без учёта регистра, `*` пересекает точки
+///   (`*.example.com` — поддомены, но не сам `example.com`). Действует у `deny` и `ask`:
+///   правило `allow` с `domain` ничего не разрешает. Неизвестный хост вызова при
+///   подходящем правиле — вопрос с причиной `rule` (D104).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -62,6 +73,10 @@ pub struct Rule {
     pub path: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
+    /// Шаблон хоста; в снимке — нормализованный ([`PolicySnapshot::build`]). Без поля
+    /// правило сериализуется как в R1-C1: хэш прежних политик не меняется.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 /// Грант из глобальной конфигурации `[[policy.grants]]` (D78).
@@ -111,7 +126,7 @@ pub struct PolicySnapshot {
 /// Ошибка политики. Тексты — для человека (CLI, конфигурация), на русском.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
-    #[error("policy.rules[{0}]: нужно хотя бы одно поле tool, path или command")]
+    #[error("policy.rules[{0}]: нужно хотя бы одно поле tool, path, command или domain")]
     Empty(usize),
     #[error("policy.rules[{0}].{1}: неверный шаблон: {2}")]
     Glob(usize, &'static str, String),
@@ -124,25 +139,25 @@ pub enum PolicyError {
 impl PolicySnapshot {
     /// Снимок из глобальной и проектной конфигурации (D80, ARC-041). Правило без полей
     /// и неверный шаблон — ошибка; проектные `allow` отбрасываются с `warn` и попадают в
-    /// [`PolicySnapshot::ignored`]; `allow_bypass` и гранты проекта не действуют.
+    /// [`PolicySnapshot::ignored`]; `allow_bypass` и гранты проекта не действуют. Шаблон
+    /// `domain` в снимке — нормализованный (D105).
     pub fn build(
         global: &PolicyConfig,
         project: Option<&PolicyConfig>,
     ) -> Result<Self, PolicyError> {
         let mut rules = Vec::new();
         for (i, r) in global.rules.iter().enumerate() {
-            check_rule(i, r)?;
-            rules.push((RuleSource::Global, r.clone()));
+            rules.push((RuleSource::Global, check_rule(i, r)?));
         }
         let mut ignored = Vec::new();
         if let Some(p) = project {
             for (i, r) in p.rules.iter().enumerate() {
-                check_rule(i, r)?;
+                let r = check_rule(i, r)?;
                 if r.action == RuleAction::Allow {
                     tracing::warn!(index = i, "проектное правило allow не действует (ARC-041)");
-                    ignored.push(r.clone());
+                    ignored.push(r);
                 } else {
-                    rules.push((RuleSource::Project, r.clone()));
+                    rules.push((RuleSource::Project, r));
                 }
             }
             if p.allow_bypass {
@@ -191,15 +206,18 @@ fn policy_hash(allow_bypass: bool, rules: &[(RuleSource, Rule)], grants: &[Grant
 }
 
 /// Проверка правила при сборке: хотя бы одно поле, шаблоны собираются, в `path` нет `..`.
-fn check_rule(i: usize, r: &Rule) -> Result<(), PolicyError> {
-    if r.tool.is_none() && r.path.is_none() && r.command.is_none() {
+/// Возвращает правило снимка: шаблон `domain` нормализован ([`domain_pattern`]).
+fn check_rule(i: usize, r: &Rule) -> Result<Rule, PolicyError> {
+    if r.tool.is_none() && r.path.is_none() && r.command.is_none() && r.domain.is_none() {
         return Err(PolicyError::Empty(i));
     }
     let bad = |field: &'static str, why: String| PolicyError::Glob(i, field, why);
+    let mut out = r.clone();
     for (field, pat) in [
         ("tool", &r.tool),
         ("path", &r.path),
         ("command", &r.command),
+        ("domain", &r.domain),
     ] {
         let Some(pat) = pat else { continue };
         if pat.is_empty() {
@@ -207,6 +225,12 @@ fn check_rule(i: usize, r: &Rule) -> Result<(), PolicyError> {
         }
         let built = match field {
             "path" => path_glob(pat).map(|_| ()),
+            "domain" => {
+                let norm = domain_pattern(pat).map_err(|why| bad(field, why.to_owned()))?;
+                let built = domain_glob(&norm).map(|_| ());
+                out.domain = Some(norm);
+                built
+            }
             _ => text_glob(pat, false).map(|_| ()),
         };
         built.map_err(|e| bad(field, e.to_string()))?;
@@ -228,7 +252,7 @@ fn check_rule(i: usize, r: &Rule) -> Result<(), PolicyError> {
             ));
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 // ---- Шаблоны ----
@@ -271,6 +295,63 @@ fn text_glob(pat: &str, case_insensitive: bool) -> Result<GlobMatcher, globset::
         .backslash_escape(false)
         .build()?
         .compile_matcher())
+}
+
+/// Символы шаблона glob в `domain`.
+const GLOB_META: [char; 6] = ['*', '?', '[', ']', '{', '}'];
+
+/// Разделители меток IDNA (UTS 46): точка и её полноширинные и идеографические формы.
+const LABEL_DOTS: [char; 4] = ['.', '\u{3002}', '\u{ff0e}', '\u{ff61}'];
+
+/// Нормализованный шаблон `domain` (D105, D124) — та же форма, что у хостов вызова.
+///
+/// - Шаблон без символов glob (имя хоста или IP-литерал, IPv6 — в `[…]` или без скобок)
+///   нормализуется целиком [`normalize_host`]: последняя точка, регистр, punycode,
+///   каноническая запись IP. Так `deny domain="127.1"` совпадает с хостом `127.0.0.1`.
+/// - Шаблон с символами glob — по меткам: снимается одна последняя точка; ASCII-метки
+///   только в нижний регистр (символы `*`, `?`, `[` в имени хоста недопустимы, WHATWG);
+///   метки не из ASCII — в punycode той же [`normalize_host`]. Метка не из ASCII с символом
+///   glob — ошибка: такой шаблон не совпал бы ни с одним хостом.
+///
+/// Пустой шаблон, пустая метка (`a..b`), недопустимое имя — ошибка. Результат функции —
+/// её неподвижная точка (снимок из журнала собирается тем же шаблоном).
+fn domain_pattern(pat: &str) -> Result<String, &'static str> {
+    let bracketed = pat.strip_prefix('[').and_then(|r| r.strip_suffix(']'));
+    if !bracketed.unwrap_or(pat).contains(GLOB_META) {
+        // IPv6 без скобок (так его записывает `normalize_host`) — как литерал в скобках.
+        let host = match bracketed {
+            None if pat.contains(':') => format!("[{pat}]"),
+            _ => pat.to_owned(),
+        };
+        return normalize_host(&host).ok_or("недопустимое имя хоста");
+    }
+    let s = pat.strip_suffix('.').unwrap_or(pat);
+    let mut labels = Vec::new();
+    for label in s.split(LABEL_DOTS) {
+        if label.is_empty() {
+            return Err("пустая метка");
+        }
+        if label.is_ascii() {
+            labels.push(label.to_ascii_lowercase());
+            continue;
+        }
+        if label.contains(GLOB_META) {
+            return Err("метка не из ASCII не может содержать символы шаблона");
+        }
+        // IDNA действует по меткам; служебная последняя метка `a` не даёт прочесть метку
+        // из цифр (`１２３`) как IPv4.
+        let ascii = normalize_host(&format!("{label}.a"))
+            .and_then(|n| n.strip_suffix(".a").map(str::to_owned))
+            .filter(|n| !n.is_empty() && !n.contains('.'))
+            .ok_or("метка не переводится в punycode")?;
+        labels.push(ascii);
+    }
+    Ok(labels.join("."))
+}
+
+/// Шаблон `domain` (нормализованный): `*` пересекает точки, без учёта регистра.
+fn domain_glob(norm: &str) -> Result<GlobMatcher, globset::Error> {
+    text_glob(norm, true)
 }
 
 /// Шаблон `command` для сравнения с `argv0` (D80): без регистра и `.exe`, как имя
@@ -329,6 +410,7 @@ struct Compiled<'a> {
     tool: Option<Option<GlobMatcher>>,
     path: Option<Option<(GlobMatcher, bool)>>,
     command: Option<Option<CommandMatch>>,
+    domain: Option<Option<GlobMatcher>>,
 }
 
 impl<'a> Compiled<'a> {
@@ -351,6 +433,11 @@ impl<'a> Compiled<'a> {
                     words: CommandWords::new(p)?,
                 })
             }),
+            // Снимок из `build` уже нормализован: повторная нормализация его не меняет.
+            domain: rule
+                .domain
+                .as_deref()
+                .map(|p| domain_pattern(p).ok().and_then(|n| domain_glob(&n).ok())),
         }
     }
 
@@ -358,6 +445,7 @@ impl<'a> Compiled<'a> {
         matches!(self.tool, Some(None))
             || matches!(self.path, Some(None))
             || matches!(self.command, Some(None))
+            || matches!(self.domain, Some(None))
     }
 
     /// Условия `tool` и `command`; `strict` — семантика `allow` для команды.
@@ -402,9 +490,25 @@ impl<'a> Compiled<'a> {
         }
     }
 
-    /// `deny` или `ask` сработало: все заданные поля совпали, `path` — с любым путём.
-    /// Сломанный шаблон — срабатывает.
+    /// `deny` или `ask` сработало: все заданные поля совпали, `path` — с любым путём,
+    /// `domain` — с любым хостом вызова. Сломанный шаблон — срабатывает.
     fn fires(&self, call: &Call<'_>) -> bool {
+        self.matches_call(call, false)
+    }
+
+    /// Правило `deny` или `ask` с `domain` у вызова с неизвестным хостом (D104, D105):
+    /// прочие поля совпали, а хост, который мог бы совпасть, определить нельзя — вопрос
+    /// с причиной `rule` (а не отказ: хост мог и не совпасть).
+    fn fires_unknown_host(&self, call: &Call<'_>) -> bool {
+        self.rule.action != RuleAction::Allow
+            && self.rule.domain.is_some()
+            && call.hosts_unknown
+            && self.matches_call(call, true)
+    }
+
+    /// Совпадение заданных полей для `deny` и `ask`; `any_host` — поле `domain` не
+    /// сверяется (хост неизвестен).
+    fn matches_call(&self, call: &Call<'_>, any_host: bool) -> bool {
         if self.broken() {
             return true;
         }
@@ -416,16 +520,25 @@ impl<'a> Compiled<'a> {
                         && call.words.iter().any(|p| self.path_matches(p)))
             }
         };
-        path_ok && self.tool_and_command(call, false)
+        let domain_ok = match &self.domain {
+            None => true,
+            Some(_) if any_host => true,
+            Some(m) => m
+                .as_ref()
+                .is_some_and(|m| call.hosts.iter().any(|h| m.is_match(h))),
+        };
+        path_ok && domain_ok && self.tool_and_command(call, false)
     }
 
-    /// Глобальное `allow` применимо к вызову: правило глобальное, шаблоны целы, а у
-    /// команды (`Exec`) задано поле `command` (C1 ревью: правило по `path` или `tool` не
-    /// разрешает произвольную команду).
+    /// Глобальное `allow` применимо к вызову: правило глобальное, шаблоны целы, без
+    /// `domain` (D105: правило по домену только ужесточает), а у команды (`Exec`) задано
+    /// поле `command` (C1 ревью: правило по `path` или `tool` не разрешает произвольную
+    /// команду).
     fn allow_applies(&self, call: &Call<'_>) -> bool {
         !self.broken()
             && self.source == RuleSource::Global
             && self.rule.action == RuleAction::Allow
+            && self.rule.domain.is_none()
             && (!call.exec || self.rule.command.is_some())
     }
 
@@ -485,6 +598,10 @@ struct Call<'a> {
     words: Vec<CallPath>,
     /// Разрешение не соответствует [`subject_paths`]: граница неизвестна.
     unresolved: bool,
+    /// Нормализованные хосты вызова ([`Subjects::hosts`], D124).
+    hosts: &'a [String],
+    /// Хост вызова неизвестен ([`Subjects::hosts_unknown`], D104).
+    hosts_unknown: bool,
 }
 
 /// Пути вызова, которые пакет разрешает перед решением (D77, D98) и передаёт в
@@ -544,6 +661,8 @@ fn call_of<'a>(
             Vec::new()
         },
         unresolved: raw.len() != resolved.len(),
+        hosts: &s.hosts,
+        hosts_unknown: s.hosts_unknown,
     }
 }
 
@@ -785,9 +904,11 @@ pub fn decide(
     // (I3 ревью, контракт `gate`).
     let always = spec.approval == Approval::Always;
     let want_mode = by_mode == Gate::Ask && (always || (!allowed && !bypass));
-    let want_rule = rules
-        .iter()
-        .any(|r| r.rule.action == RuleAction::Ask && r.fires(&call));
+    // Правило `ask` сработало, или правило `deny`/`ask` по домену у вызова с неизвестным
+    // хостом (D104, D105). Без правил по домену неизвестный хост вопроса не даёт.
+    let want_rule = rules.iter().any(|r| {
+        (r.rule.action == RuleAction::Ask && r.fires(&call)) || r.fires_unknown_host(&call)
+    });
     let want_outside = call.unresolved
         || call.paths.iter().any(|p| {
             p.outside
@@ -865,9 +986,48 @@ mod tests {
             tool: None,
             path: Some("/data/../**".into()),
             command: None,
+            domain: None,
         };
         let c = Compiled::new(RuleSource::Global, &allow);
         assert!(c.broken());
+    }
+
+    /// D105: нормализация шаблона `domain` — таблица и неподвижная точка (снимок из
+    /// журнала компилируется тем же шаблоном, иначе правило считалось бы сломанным).
+    #[test]
+    fn domain_pattern_table() {
+        for (pat, want) in [
+            ("Evil.Test.", "evil.test"),
+            ("пример.рф", "xn--e1afmkfd.xn--p1ai"),
+            ("*.Пример.РФ.", "*.xn--e1afmkfd.xn--p1ai"),
+            ("*.evil\u{3002}test", "*.evil.test"),
+            ("１２３.test", "123.test"),
+            ("*.１２３.test", "*.123.test"),
+            ("127.1", "127.0.0.1"),
+            ("[::1]", "::1"),
+            ("::FFFF:127.0.0.1", "::ffff:7f00:1"),
+            ("*", "*"),
+            ("api-?.example.com", "api-?.example.com"),
+            ("[ab].test", "[ab].test"),
+        ] {
+            let got = domain_pattern(pat).unwrap_or_else(|e| panic!("{pat}: {e}"));
+            assert_eq!(got, want, "{pat}");
+            assert_eq!(
+                domain_pattern(&got).as_deref(),
+                Ok(want),
+                "неподвижная точка {pat}"
+            );
+        }
+        for bad in [
+            ".",
+            "a..b",
+            "evil.test..",
+            "*.a..b",
+            "при*мер.рф",
+            "a b.test",
+        ] {
+            assert!(domain_pattern(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

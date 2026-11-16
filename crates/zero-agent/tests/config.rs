@@ -199,7 +199,145 @@ fn project_config_policy_only() {
     assert!(shown.contains("policy.rules[0]"), "{shown}");
     let e = zero_agent::config::parse_project_config("[[policy.rules]]\naction = \"deny\"\n")
         .unwrap_err();
-    assert!(e.to_string().contains("tool, path или command"), "{e}");
+    assert!(
+        e.to_string().contains("tool, path, command или domain"),
+        "{e}"
+    );
+}
+
+// ---- Правила по домену и выключение веба проектом (R1-C2 задача 4, D105, D122) ----
+
+/// Буфер записей `tracing` для проверки предупреждений.
+#[derive(Clone, Default)]
+struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `f` под подписчиком `tracing`, пишущим в буфер; второе значение — текст записей.
+fn with_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+    let logs = Logs::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer({
+            let logs = logs.clone();
+            move || logs.clone()
+        })
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let out = tracing::subscriber::with_default(sub, f);
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    (out, text)
+}
+
+#[test]
+fn project_can_disable_web() {
+    assert_eq!(
+        zero_agent::config::parse_project_config("[web]\nenabled = false\n")
+            .unwrap()
+            .web_enabled,
+        Some(false)
+    );
+    // Без раздела `[web]` проект веб не трогает.
+    assert_eq!(
+        zero_agent::config::parse_project_config("")
+            .unwrap()
+            .web_enabled,
+        None
+    );
+}
+
+/// `true` в проекте ничего не включает (только ужесточение, D105).
+#[test]
+fn project_web_true_is_ignored() {
+    assert_eq!(
+        zero_agent::config::parse_project_config("[web]\nenabled = true\n")
+            .unwrap()
+            .web_enabled,
+        None
+    );
+}
+
+/// D122: прочие ключи `[web]` и `[web.search]` в проекте не действуют — предупреждение с
+/// именем ключа, без ошибки (адрес поставщика проект не задаёт, D126).
+#[test]
+fn project_web_other_keys_warn() {
+    let (cfg, logs) =
+        with_logs(|| zero_agent::config::parse_project_config("[web]\nrobots = false\n"));
+    assert_eq!(cfg.unwrap().web_enabled, None);
+    assert!(logs.contains("web.robots"), "{logs}");
+    let (cfg, logs) = with_logs(|| {
+        zero_agent::config::parse_project_config("[web.search]\nurl = \"http://x\"\n")
+    });
+    assert_eq!(cfg.unwrap().web_enabled, None);
+    assert!(logs.contains("web.search.url"), "{logs}");
+    // Значение ключа в предупреждение не попадает.
+    assert!(!logs.contains("http://x"), "{logs}");
+    // Вместе с `enabled = false` — выключение действует.
+    let (cfg, logs) = with_logs(|| {
+        zero_agent::config::parse_project_config(
+            "[web]\nenabled = false\nmax_bytes = 1\n\n[web.search]\nprovider = \"searxng\"\n",
+        )
+    });
+    assert_eq!(cfg.unwrap().web_enabled, Some(false));
+    assert!(logs.contains("web.max_bytes"), "{logs}");
+    assert!(logs.contains("web.search.provider"), "{logs}");
+    // Незнакомое имя ключа не печатается: оно может оказаться секретом.
+    let (cfg, logs) =
+        with_logs(|| zero_agent::config::parse_project_config("[web]\nhidden-name-7f3a = 1\n"));
+    assert!(cfg.is_ok());
+    assert!(!logs.contains("hidden-name-7f3a"), "{logs}");
+    assert!(logs.contains("[web]"), "{logs}");
+}
+
+#[test]
+fn project_web_enabled_wrong_type() {
+    for src in ["[web]\nenabled = \"no\"\n", "[web]\nenabled = 0\n"] {
+        let e = zero_agent::config::parse_project_config(src).unwrap_err();
+        let shown = e.to_string();
+        assert!(
+            shown.starts_with(".zero-agent/config.toml проекта"),
+            "{shown}"
+        );
+        assert!(shown.contains("web.enabled"), "{shown}");
+    }
+    let e = zero_agent::config::parse_project_config("web = 1\n").unwrap_err();
+    assert!(e.to_string().contains("web"), "{e}");
+}
+
+/// `[[policy.rules]]` с `domain` в глобальной и проектной конфигурации (D105): правило
+/// только по домену допустимо, неверный шаблон — ошибка с путём поля.
+#[test]
+fn policy_rule_with_domain() {
+    let cfg = zero_agent::config::parse_config(
+        "[[policy.rules]]\naction = \"deny\"\ndomain = \"*.evil.test\"\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.policy.rules[0].domain.as_deref(), Some("*.evil.test"));
+    zero_agent::config::validate(&cfg).unwrap();
+    let cfg =
+        zero_agent::config::parse_config("[[policy.rules]]\naction = \"deny\"\ndomain = \"[\"\n")
+            .unwrap();
+    let e = zero_agent::config::validate(&cfg).unwrap_err().to_string();
+    assert!(e.contains("policy.rules[0].domain"), "{e}");
+    let p = zero_agent::config::parse_project_config(
+        "[[policy.rules]]\naction = \"ask\"\ndomain = \"docs.rs\"\ntool = \"web_fetch\"\n",
+    )
+    .unwrap();
+    assert_eq!(p.policy.rules[0].domain.as_deref(), Some("docs.rs"));
+    // Опечатка в имени поля называет `domain` среди полей правила.
+    let e =
+        zero_agent::config::parse_config("[[policy.rules]]\naction = \"deny\"\ndomian = \"x\"\n")
+            .unwrap_err()
+            .to_string();
+    assert!(e.contains("domain"), "{e}");
 }
 
 /// D80: `run --mode bypass` без `[policy] allow_bypass = true` глобальной конфигурации —
