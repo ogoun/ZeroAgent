@@ -161,31 +161,40 @@ pub enum RunCrash {
     /// квитанции и `tool.finished` нет (R1-C1 D92, `CrashPoint::InTool`). Resume видит
     /// намерение без квитанции: класс `NonIdempotent` даёт прерывание `unk-…`.
     InTool(u64),
+    /// `std::process::abort()` после записи эффекта границы шага N (шаги с 1), до снимка
+    /// шага (`CrashPoint::AfterBoundary`): квитанции вызовов шага N − 1 записаны, а снимка
+    /// после них нет. Resume реплеит шаг N − 1 по квитанциям — без повторного вызова
+    /// (R1-C2, приёмка: реплей `web_fetch` без сети, D112).
+    AfterBoundary(u64),
 }
 
-/// Разбор `--crash-at after-delta:N` и `--crash-at in-tool:N`.
+/// Разбор `--crash-at after-delta:N`, `in-tool:N` и `after-boundary:N`.
 pub fn parse_run_crash(s: &str) -> Result<RunCrash, String> {
-    let bad = || format!("ожидается after-delta:N или in-tool:N, получено {s:?}");
+    let bad = || format!("ожидается after-delta:N, in-tool:N или after-boundary:N, получено {s:?}");
     let (kind, n) = s.split_once(':').ok_or_else(bad)?;
     let n: u32 = n.trim().parse().map_err(|_| bad())?;
     match kind.trim() {
         "after-delta" if n >= 1 => Ok(RunCrash::AfterDelta(n)),
         "in-tool" if n >= 1 => Ok(RunCrash::InTool(u64::from(n))),
+        "after-boundary" if n >= 1 => Ok(RunCrash::AfterBoundary(u64::from(n))),
         _ => Err(bad()),
     }
 }
 
-/// Крюк сбоя цикла для `--crash-at in-tool:N`: настоящее аварийное завершение процесса
-/// (эквивалент `kill -9`) в точке `CrashPoint::InTool { step: N, after_call: true }`.
+/// Крюк сбоя цикла для `--crash-at in-tool:N` и `after-boundary:N`: настоящее аварийное
+/// завершение процесса (эквивалент `kill -9`) в точке `CrashPoint::InTool { step: N,
+/// after_call: true }` или `CrashPoint::AfterBoundary { step: N }`.
 fn crash_hook(crash: Option<RunCrash>) -> Option<za_agent::CrashHook> {
-    let Some(RunCrash::InTool(step)) = crash else {
-        return None;
-    };
-    Some(Arc::new(move |p| {
-        if p == (za_agent::CrashPoint::InTool {
+    let at = match crash? {
+        RunCrash::InTool(step) => za_agent::CrashPoint::InTool {
             step,
             after_call: true,
-        }) {
+        },
+        RunCrash::AfterBoundary(step) => za_agent::CrashPoint::AfterBoundary { step },
+        RunCrash::AfterDelta(_) => return None,
+    };
+    Some(Arc::new(move |p| {
+        if p == at {
             std::process::abort();
         }
         false
@@ -2094,6 +2103,11 @@ mod tests {
         assert!(parse_run_crash("intent:1").is_err());
         assert_eq!(parse_run_crash("in-tool:3"), Ok(RunCrash::InTool(3)));
         assert!(parse_run_crash("in-tool:0").is_err());
+        assert_eq!(
+            parse_run_crash("after-boundary:2"),
+            Ok(RunCrash::AfterBoundary(2))
+        );
+        assert!(parse_run_crash("after-boundary:0").is_err());
     }
 
     #[test]
