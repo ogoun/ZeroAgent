@@ -766,6 +766,144 @@ fn realistic_pages_are_not_simplified() {
     }
 }
 
+/// Плоская страница (m1 ревью fix-9): 100 000 строк `line<br>` прямо в `body` (200 тыс.
+/// детей), в конце таблица на 2000 строк, после каждой строки лишний `&nbsp;`. Каждый перенос
+/// текста из таблицы ищет её среди детей `body` (счётчик поиска ≈ 4·10^8), а полный разбор
+/// без стража идёт ≈ 130 мс. Такая страница — обычная кривая разметка, не атака: полный путь.
+#[test]
+fn flat_page_with_fostered_text_is_not_simplified() {
+    let mut html = String::from("<html><body>");
+    html.push_str(&"line<br>".repeat(100_000));
+    html.push_str("<table>");
+    for i in 0..2000 {
+        html.push_str(&format!("<tr><td>cell {i}</td></tr>&nbsp;"));
+    }
+    html.push_str("</table><p>after table</p></body></html>");
+    let m = bounded_within("flat fostered", html, release_second());
+    assert!(!m.simplified, "ложное упрощение плоской страницы");
+    assert!(m.text.contains("cell 1999") && m.text.contains("after table"));
+}
+
+/// Худший случай полного пути у класса «поток переноса»: счётчик поиска чуть ниже порога
+/// `MAX_SCAN` (200 тыс. детей `body` × 4900 переносов ≈ 9,8·10^8). Страница идёт полным
+/// путём и укладывается в цель ≈ 1 с в release.
+#[test]
+fn scan_just_below_threshold_is_fast() {
+    use za_extract::guard::MAX_SCAN;
+    let children = 200_000u64;
+    let moves = MAX_SCAN / children * 98 / 100;
+    let mut html = String::from("<html><body>");
+    html.push_str(&"line<br>".repeat(children as usize / 2));
+    html.push_str("<table>");
+    for i in 0..moves {
+        html.push_str(&format!("<tr><td>c{i}</td></tr>x"));
+    }
+    html.push_str("</table></body></html>");
+    let m = bounded_within("scan below threshold", html, release_second());
+    assert!(!m.simplified, "ниже порога — полный путь");
+}
+
+/// Строки «ключ — значение» (`<tr><th>…</th><td>…</td></tr>`, карточки Википедии): `htmd`
+/// 0.5.6 берёт первую строку с `th` заголовком таблицы и теряет её `td`, а в следующих строках
+/// читает только `td` и теряет `th`. После подготовки DOM ни одна ячейка не теряется.
+#[test]
+fn key_value_rows_keep_th_and_td() {
+    let html = "<table class=\"infobox\"><tbody>\
+        <tr><th colspan=\"2\">Rust</th></tr>\
+        <tr><th scope=\"row\">Paradigms</th><td>Concurrent, functional</td></tr>\
+        <tr><th scope=\"row\">Designed by</th><td>Graydon Hoare</td></tr>\
+        <tr><th colspan=\"2\">Implementations</th></tr>\
+        <tr><th scope=\"row\">License</th><td>MIT and Apache 2.0</td></tr>\
+        </tbody></table><p>after</p>";
+    let m = html_to_markdown(html);
+    assert!(!m.simplified);
+    for want in [
+        "Rust",
+        "Paradigms",
+        "Concurrent, functional",
+        "Designed by",
+        "Graydon Hoare",
+        "Implementations",
+        "License",
+        "MIT and Apache 2.0",
+        "after",
+    ] {
+        assert!(m.text.contains(want), "нет {want:?}: {:?}", m.text);
+    }
+    // Ключ и значение — в одной строке таблицы, порядок строк сохранён.
+    let line = |s: &str| m.text.lines().position(|l| l.contains(s));
+    assert_eq!(
+        line("Paradigms"),
+        line("Concurrent, functional"),
+        "{}",
+        m.text
+    );
+    assert_eq!(line("License"), line("MIT and Apache 2.0"), "{}", m.text);
+    assert!(line("Designed by") < line("Implementations"), "{}", m.text);
+    assert!(line("Implementations") < line("License"), "{}", m.text);
+}
+
+/// Матрица: пустая угловая ячейка `td` в строке заголовка и `th` строки в теле. Все ячейки
+/// на месте, столбцы не сдвинуты: строка `r1` — в одной строке со своими значениями.
+#[test]
+fn matrix_table_keeps_corner_and_row_headers() {
+    let html = "<table><thead><tr><td></td><th>A</th><th>B</th></tr></thead>\
+        <tbody><tr><th>r1</th><td>one</td><td>two</td></tr>\
+        <tr><th>r2</th><td>three</td><td>four</td></tr></tbody></table>";
+    let m = html_to_markdown(html);
+    let line = |s: &str| m.text.lines().position(|l| l.contains(s));
+    for want in ["A", "B", "r1", "one", "two", "r2", "three", "four"] {
+        assert!(m.text.contains(want), "нет {want:?}: {:?}", m.text);
+    }
+    assert_eq!(line("r1"), line("two"), "{}", m.text);
+    assert_eq!(line("r2"), line("four"), "{}", m.text);
+    // Заголовок — три столбца (пустой угол сохранён), как у строк тела.
+    let header = m.text.lines().find(|l| l.contains('A')).unwrap_or_default();
+    let row = m
+        .text
+        .lines()
+        .find(|l| l.contains("r1"))
+        .unwrap_or_default();
+    assert_eq!(
+        header.matches('|').count(),
+        row.matches('|').count(),
+        "{}",
+        m.text
+    );
+}
+
+/// Обычная таблица с заголовком (`thead` из `th`, тело из `td`) остаётся таблицей Markdown с
+/// строкой заголовка и разделителем: подготовка DOM её не трогает.
+#[test]
+fn plain_header_table_is_unchanged() {
+    let html = "<table><thead><tr><th>Name</th><th>Kind</th></tr></thead>\
+        <tbody><tr><td>alpha</td><td>first</td></tr><tr><td>beta</td><td>second</td></tr></tbody></table>";
+    let m = html_to_markdown(html);
+    let lines: Vec<&str> = m.text.lines().collect();
+    assert_eq!(lines.len(), 4, "{}", m.text);
+    assert!(lines[0].contains("Name") && lines[0].contains("Kind"));
+    assert!(lines[1].contains("---"));
+    assert!(lines[2].contains("alpha") && lines[3].contains("second"));
+    // Первая строка тела из одних `th` без `thead` — тоже заголовок, как у `htmd`.
+    let html =
+        "<table><tr><th>Name</th><th>Kind</th></tr><tr><td>alpha</td><td>first</td></tr></table>";
+    let m = html_to_markdown(html);
+    let lines: Vec<&str> = m.text.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", m.text);
+    assert!(lines[1].contains("---") && lines[2].contains("alpha"));
+}
+
+/// Страница вида Википедии: значения таблиц «ключ — значение» не теряются.
+#[test]
+fn wiki_like_keeps_table_values() {
+    let m = bounded("wiki-like", wiki_like());
+    assert!(!m.simplified);
+    for i in [0, 7, 199] {
+        assert!(m.text.contains(&format!("Key {i}")), "нет Key {i}");
+        assert!(m.text.contains(&format!("value {i}")), "нет value {i}");
+    }
+}
+
 /// Строит семь страниц с разнообразным, но обычным строением.
 fn realistic_pages() -> Vec<(&'static str, String)> {
     // 1. Длинная статья: разделы, заголовки, абзацы со ссылками и форматированием, списки.
