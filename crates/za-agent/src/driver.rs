@@ -366,7 +366,7 @@ const INBOX_EFFECT: &str = "inbox";
 /// Текст разового сбоя, вызванного [`FaultHook`] (тест, D72).
 pub(crate) const INJECTED_FAULT: &str = "сбой журнала (FaultHook)";
 /// `n_ctx`, если эндпоинт не сообщает размер контекста (D37).
-pub(crate) const DEFAULT_N_CTX: u32 = 8192;
+pub const DEFAULT_N_CTX: u32 = 8192;
 /// Пустых ходов подряд до `blocked` (D18).
 const EMPTY_TURNS_LIMIT: u32 = 3;
 /// Страница чтения ввода на границе.

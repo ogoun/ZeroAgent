@@ -293,16 +293,21 @@ async fn check_skills(home: Option<&Path>, cfg: Option<&AgentConfig>) -> Check {
 
 /// Предупреждение D169: тир standard или full на окне меньше 32k (у standard окна по
 /// умолчанию от 32k, `Tier::for_context`): набор инструментов standard превышает слот окна
-/// 16k, рабочая часть окна мала. `None` — тир small, окно 32k и больше или неизвестно.
+/// 16k, рабочая часть окна мала. Окно неизвестно (`n_ctx` — `None`) — run считает его 8192
+/// (D43), и при явном тире standard или full предупреждение то же, с пометкой (m4 ревью
+/// задачи 14). `None` — тира нет (он берётся по окну), тир small или окно 32k и больше.
 pub fn tier_window_warning(tier: Option<Tier>, n_ctx: Option<u32>) -> Option<String> {
-    let (Some(t), Some(n)) = (tier, n_ctx) else {
-        return None;
-    };
+    let t = tier?;
+    let n = n_ctx.unwrap_or(za_agent::DEFAULT_N_CTX);
     if t == Tier::Small || n >= za_agent::STANDARD_MIN_WINDOW {
         return None;
     }
+    let window = match n_ctx {
+        Some(n) => format!("окне {n} токенов"),
+        None => format!("окне {n} токенов (окно модели неизвестно — run считает его таким, D43)"),
+    };
     Some(format!(
-        "тир {} выбран на окне {n} токенов, меньше {}: описания инструментов тира не помещаются в слот окна, а на модель остаётся мало места (D169); на таком окне — тир small или модель с окном от 32k",
+        "тир {} выбран на {window}, меньше {}: описания инструментов тира не помещаются в слот окна, а на модель остаётся мало места (D169); на таком окне — тир small или модель с окном от 32k",
         t.as_str(),
         za_agent::STANDARD_MIN_WINDOW
     ))
@@ -678,7 +683,14 @@ mod tests {
         assert!(tier_window_warning(Some(Tier::Standard), Some(32_768)).is_none());
         assert!(tier_window_warning(Some(Tier::Small), Some(8192)).is_none());
         assert!(tier_window_warning(None, Some(8192)).is_none());
-        assert!(tier_window_warning(Some(Tier::Standard), None).is_none());
+        // m4 ревью задачи 14: окно неизвестно — run считает его 8192 (D43), тир явный.
+        let unknown = tier_window_warning(Some(Tier::Standard), None).unwrap();
+        assert!(
+            unknown.contains("окно модели неизвестно") && unknown.contains("8192"),
+            "{unknown}"
+        );
+        assert!(tier_window_warning(Some(Tier::Small), None).is_none());
+        assert!(tier_window_warning(None, None).is_none());
         let w = vec![("local".to_owned(), Some(16_384))];
         let c = check_window(Some(Tier::Standard), &w);
         assert!(

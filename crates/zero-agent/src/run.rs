@@ -1071,6 +1071,20 @@ fn resume_changes(
     ))
 }
 
+/// Предупреждение D169 на resume с `--model` (`model_changed`, m4 ревью задачи 14): тир run
+/// заморожен в снимке (`setup.tier`), а окно — у новой модели `n_ctx` (неизвестно — run
+/// считает его 8192, D43). Без `--model` окно то же, что при старте, — без предупреждения.
+fn resume_window_warning(snap: &Value, model_changed: bool, n_ctx: Option<u32>) -> Option<String> {
+    if !model_changed {
+        return None;
+    }
+    let tier = snap
+        .get("setup")
+        .and_then(|s| s.get("tier"))
+        .and_then(|t| serde_json::from_value::<Tier>(t.clone()).ok())?;
+    crate::doctor::tier_window_warning(Some(tier), n_ctx)
+}
+
 /// Оболочка `bash` (D85): `pwsh`/`powershell` на Windows, `bash`/`sh` иначе; не найдена —
 /// имя по умолчанию: вызов вернёт `failed to start`.
 fn shell() -> Shell {
@@ -1171,7 +1185,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 );
                 return Ok(ExitCode::from(EXIT_ERROR));
             }
-            // D169: тир standard (и full) на окне меньше 32k — только явно, с предупреждением.
+            // D169: тир standard (и full) на окне меньше 32k или на неизвестном окне (run считает
+            // его 8192, D43; m4 ревью задачи 14) — только явно, с предупреждением.
             if let Some(line) =
                 crate::doctor::tier_window_warning(n.tier.or(cfg.context.tier), view.context_tokens)
             {
@@ -1276,6 +1291,14 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             // Зонды до продолжения: размер контекста и состояние эндпоинта. Неготовый
             // эндпоинт run не останавливает — ошибка модели посреди run ставит паузу (D11).
             gateway.wait_probed(PROBE_WAIT).await;
+            // D169 (m4 ревью задачи 14): `--model` на модель с окном меньше 32k или с
+            // неизвестным окном при тире run standard или full — предупреждение.
+            let window = endpoint
+                .as_ref()
+                .and_then(|ep| za_llm::ModelPort::context_tokens(gateway.as_ref(), ep));
+            if let Some(line) = resume_window_warning(&snap, endpoint.is_some(), window) {
+                eprintln!("zero-agent: {line}");
+            }
             // Бюджет resume: без флагов — бюджет run сохраняется; с флагами — флаги поверх
             // текущего бюджета run из последнего снимка. `[budgets.run]` применён при старте
             // и не перечитывается (решение контроллера, I2 ревью задачи 16).
@@ -2170,6 +2193,25 @@ mod tests {
         let names = frozen_tools(&snap);
         assert!(names.contains("web_fetch") && names.contains("read"));
         assert!(frozen_tools(&json!({})).is_empty());
+    }
+
+    /// m4 ревью задачи 14: resume с `--model` сверяет тир run (из снимка) с окном новой
+    /// модели; без `--model` и у small — без предупреждения.
+    #[test]
+    fn resume_model_window_warning() {
+        let snap = json!({"setup": {"tier": "standard", "n_ctx": 32768}});
+        let w = resume_window_warning(&snap, true, Some(16_384)).unwrap();
+        assert!(w.contains("тир standard выбран на окне 16384"), "{w}");
+        assert!(
+            resume_window_warning(&snap, true, None)
+                .unwrap()
+                .contains("неизвестно")
+        );
+        assert!(resume_window_warning(&snap, false, Some(16_384)).is_none());
+        assert!(resume_window_warning(&snap, true, Some(32_768)).is_none());
+        let small = json!({"setup": {"tier": "small"}});
+        assert!(resume_window_warning(&small, true, Some(8192)).is_none());
+        assert!(resume_window_warning(&json!({}), true, Some(8192)).is_none());
     }
 
     /// m2 ревью задачи 14: путь бинарника не определён — у `read` извлекателя нет, а

@@ -610,6 +610,57 @@ fn standard_below_32k_warns_at_start() {
     assert!(!o.stderr.contains("выбран на окне"), "{o:?}");
 }
 
+/// Модель: шаг 1 — `glob` (чтение), затем ответ.
+fn glob_then_answer(seen: &[Value]) -> Response {
+    let called = seen.last().unwrap()["messages"]
+        .as_array()
+        .is_some_and(|m| m.iter().any(|m| m["role"] == "tool"));
+    if called {
+        text_reply(&["готово"])
+    } else {
+        call_reply("g1", "glob", "{\"pattern\":\"*.md\"}")
+    }
+}
+
+/// m4 ревью задачи 14: run начат с тиром standard на окне 32k и встал на паузу бюджета на
+/// границе шага (`--max-steps 1`); resume `--model` на модель с окном 16k — то же
+/// предупреждение D169 (тир заморожен в run), и run продолжается у новой модели. Смена модели
+/// возможна только на границе шага (`ChangeMidStep`), поэтому пауза — бюджет, а не вопрос.
+#[test]
+fn resume_with_smaller_model_warns() {
+    let big = Fake::start(N_CTX, true, glob_then_answer);
+    let small = Fake::start(16_384, true, glob_then_answer);
+    let cfg = format!(
+        "[models]
+default = \"big\"
+
+[[models.endpoints]]
+id = \"big\"
+backend = \"llama_cpp\"
+base_url = \"{}\"
+
+[[models.endpoints]]
+id = \"small\"
+backend = \"llama_cpp\"
+base_url = \"{}\"
+",
+        big.base, small.base
+    );
+    let e = env_in(GROUP, "resume-small-model", &cfg);
+    let first = e.run_cmd(&["--max-steps", "1", "Вопрос"]);
+    assert_eq!(first.code(), Some(4), "{first:?}");
+    assert!(!first.stderr.contains("выбран на окне"), "{first:?}");
+    let run = run_id(&first).to_string();
+    let r = e.run_cmd(&["--resume", &run, "--model", "small", "--max-steps", "5"]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert!(
+        r.stderr
+            .contains("zero-agent: тир standard выбран на окне 16384 токенов, меньше 32768"),
+        "{r:?}"
+    );
+    assert_eq!(small.bodies().len(), 1, "resume не дошёл до модели small");
+}
+
 // ---- Бюджет описаний standard (D117, D169) ----
 
 /// Извлекатель для описаний: не вызывается.

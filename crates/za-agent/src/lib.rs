@@ -66,8 +66,8 @@ pub use detect::{
     promise_without_action, retry_params, thinking_timeout,
 };
 pub use driver::{
-    CrashHook, CrashPoint, FaultHook, FaultPoint, LoopDeps, LoopError, LoopOutcome, RunSpec,
-    start_run,
+    CrashHook, CrashPoint, DEFAULT_N_CTX, FaultHook, FaultPoint, LoopDeps, LoopError, LoopOutcome,
+    RunSpec, start_run,
 };
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 pub use exposure::{Exposure, RuleOfTwoNotice, rule_of_two_marked};
