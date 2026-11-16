@@ -1134,6 +1134,61 @@ fn foreign_th_does_not_bring_back_padding() {
     );
 }
 
+/// Предел «около 0,1 с в release» (I1 финального ревью извлечения): в release — 100 мс ×
+/// `ZA_TEST_TIME_SCALE`, в отладочной сборке — общий предел 30 с × масштаб, только от
+/// зависания.
+fn release_tenth() -> Duration {
+    if cfg!(debug_assertions) {
+        Duration::from_secs(30) * time_scale()
+    } else {
+        Duration::from_millis(100) * time_scale()
+    }
+}
+
+/// I1 финального ревью извлечения: таблица с признаком заголовка (пустой `thead`), но без
+/// ячеек, и подпись, в которой лежит следующий такой же уровень. Встроенный обработчик
+/// таблиц `htmd` отрисовывал подписи такой таблицы дважды (сначала подписи, затем обход всех
+/// детей), и время удваивалось на каждом уровне: 23 уровня (1,2 КБ) — 23 с в release.
+/// `TableLayout` отрисовывает каждую таблицу один раз и встроенному обработчику её не отдаёт:
+/// время линейно, текст каждого уровня на месте.
+#[test]
+fn tables_in_captions_are_linear() {
+    let levels = |n| {
+        nested(
+            "<table><thead></thead><caption>x ",
+            "</caption></table>",
+            n,
+            "end",
+        )
+    };
+    let small = levels(23);
+    assert!(small.len() < 1300, "{}", small.len());
+    let m = bounded_within("captions 23", small, release_tenth());
+    assert!(!m.simplified);
+    assert_eq!(m.text.matches('x').count(), 23, "{}", m.text);
+    assert!(m.text.ends_with("end"), "{}", m.text);
+    let m = bounded_within("captions 100", levels(100), release_half_second());
+    assert!(!m.simplified);
+    assert_eq!(m.text.matches('x').count(), 100, "{}", m.text);
+    // Худший случай в пределах входа: 2 МиБ блоков по 60 уровней.
+    let block = levels(60);
+    let blocks = (HTML_MAX_BYTES - 64) / block.len();
+    let big = block.repeat(blocks);
+    let m = bounded_within("captions 2 MiB", big, release_second());
+    assert!(!m.simplified);
+    assert_eq!(m.text.matches("end").count(), blocks);
+    // Подпись с таблицей без заголовков и таблица внутри ячейки — тот же обход детей.
+    let mixed = nested(
+        "<table><caption>c <table><tr><td>d ",
+        "</td></tr></table></caption><tr><th>h</th></tr></table>",
+        40,
+        "end",
+    );
+    let m = bounded_within("captions and cells 40", mixed, release_tenth());
+    assert!(!m.simplified);
+    assert_eq!(m.text.matches('d').count(), 41, "{}", m.text);
+}
+
 // --- Префиксы строк цитат и списков (I-1 повторного ревью fix-10) ---
 
 /// `depth` уровней вложенности: открывающие теги `open`, затем `inner`, затем закрывающие.

@@ -50,9 +50,16 @@
 //! подпроцесса ещё до печати.
 //!
 //! [`TableLayout`] — свой обработчик `table` в `htmd` (вызов из `html::render_with`), он стоит
-//! перед встроенным:
+//! перед встроенным и **сам отрисовывает каждую таблицу ровно один раз**: встроенному
+//! обработчику таблица не передаётся никогда (I1 финального ревью извлечения). Встроенный
+//! у таблицы с признаком заголовка, но без ячеек, отрисовывал подписи дважды (сначала
+//! подписи, затем обход всех детей), и таблица в подписи такой же таблицы удваивала время на
+//! каждом уровне: 1,2 КБ входа — 23 с. Верхняя оценка [`crate::bound`] ограничивает размер
+//! вывода и держится, только пока каждое поддерево отрисовывается один раз.
 //! - таблицу, которую `htmd` выводит обходом детей (без явных заголовков или внутри ячейки),
-//!   сразу отдаёт встроенному обработчику;
+//!   выводит тем же обходом детей;
+//! - таблицу с признаком заголовка без единой ячейки — как `htmd`: обход детей в пустых
+//!   строках, пустой — ничего;
 //! - у остальных отрисовывает ячейки теми же обработчиками `htmd` и считает **точный** размер
 //!   выровненной таблицы за O(ячеек), не строя её. Разница с той же таблицей без дополнения —
 //!   надбавка выравнивания;
@@ -356,15 +363,18 @@ impl TableLayout {
 }
 
 impl ElementHandler for TableLayout {
+    /// Каждая таблица отрисовывается здесь и ровно один раз; встроенному обработчику `htmd`
+    /// она не передаётся (I1 финального ревью извлечения, см. документацию модуля).
     fn handle(&self, handlers: &dyn Handlers, element: Element) -> Option<HandlerResult> {
         let node = element.node;
-        // Такую таблицу `htmd` сам выводит обходом детей, без выравнивания.
+        // Такую таблицу `htmd` выводит обходом детей, без выравнивания: в режиме `Pure` его
+        // обработчик передаёт её дальше, а обработчика после него нет, и `htmd` обходит детей.
         if inside_table_cell(node) || !has_explicit_headers(node) {
-            return handlers.fallback(element);
+            return Some(handlers.walk_children(node));
         }
         let grid = Grid::extract(handlers, node);
         let Some(size) = grid.size() else {
-            return handlers.fallback(element);
+            return walked(handlers, node);
         };
         let extra = size.aligned.saturating_sub(size.plain);
         let spent = self.spent.load(Ordering::Relaxed);
@@ -375,6 +385,21 @@ impl ElementHandler for TableLayout {
         }
         Some(grid.plain(handlers, node).into())
     }
+}
+
+/// Таблица с признаком заголовка, но без единой ячейки строк: как у `htmd`
+/// (`table_handler`, ветка «нет ни строк, ни заголовка») — обход детей без `\n` по краям в
+/// пустых строках, пустой обход — ничего. Подписи отрисовывает только этот обход, один раз:
+/// встроенный обработчик сначала отрисовывал их отдельно и выбрасывал результат, поэтому
+/// таблица в подписи такой же таблицы удваивала время на каждом уровне (I1 финального
+/// ревью извлечения).
+fn walked(handlers: &dyn Handlers, table: &Handle) -> Option<HandlerResult> {
+    let content = handlers.walk_children(table).content;
+    let content = content.trim_matches('\n');
+    if content.is_empty() {
+        return None;
+    }
+    Some(format!("\n\n{content}\n\n").into())
 }
 
 /// Ячейка, как её видит `htmd`: Markdown содержимого без пробелов по краям.
@@ -1045,6 +1070,34 @@ mod tests {
                 cells
             })
             .collect()
+    }
+
+    /// Вывод страницы встроенным обработчиком таблиц `htmd`, без [`TableLayout`].
+    fn htmd_only(html: &str) -> String {
+        let converter = HtmlToMarkdown::builder()
+            .skip_tags(SKIPPED_TAGS.to_vec())
+            .build();
+        crate::html::collapse_blank_lines(&converter.tree_to_markdown(&tree(html)))
+    }
+
+    /// Таблицы, которые `htmd` выводит обходом детей (без заголовков, внутри ячейки, с
+    /// признаком заголовка без ячеек, пустые), [`TableLayout`] выводит сам — байт в байт как
+    /// встроенный обработчик (I1 финального ревью извлечения), в том числе неглубокие формы
+    /// с таблицей в подписи.
+    #[test]
+    fn walked_tables_match_htmd() {
+        for html in [
+            "<p>a</p><table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table><p>z</p>",
+            "<table><tr><td>x<table><tr><th>i</th></tr><tr><td>j</td></tr></table>y</td></tr></table>",
+            "<table><thead></thead><caption>c <b>bold</b></caption></table><p>after</p>",
+            "<p>a</p><table><thead></thead></table><p>b</p>",
+            "<table><thead><tr></tr></thead><caption></caption></table>",
+            "<table><thead></thead><caption>x <table><thead></thead><caption>y <table><thead></thead><caption>z</caption></table></caption></table></caption></table>",
+            "<table><caption>c <table><tr><td>d</td></tr></table></caption><tr><td>v</td></tr></table>",
+            "<table><caption>c<table><thead></thead><caption>in</caption></table></caption><tr><th>h</th></tr><tr><td>v</td></tr></table>",
+        ] {
+            assert_eq!(crate::html::render(&tree(html)), htmd_only(html), "{html}");
+        }
     }
 
     /// Таблица без дополнения — та же таблица: подписи и пустые строки вокруг совпадают,
