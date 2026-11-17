@@ -5,8 +5,9 @@
 //!   `/recall`: без неё сервер создаёт сессию неявно по `X-Zam-Session`
 //!   (`api/sessions.rs:197-209@v0.0.12-m6.5`), теряются только метаданные (`agent`, `solution`,
 //!   `area`, `agent_type`). Итог регистрации (I2 ревью задачи 4):
-//!   - временная ошибка со статусом (`Busy`, `Server`, `RateLimited`) — `/recall` идёт,
-//!     регистрация повторяется при следующем вызове порта, но не раньше `Retry-After`;
+//!   - временная ошибка со статусом (`Busy`, `Server`, `RateLimited`, 408 `RequestTimeout`) —
+//!     `/recall` идёт, регистрация повторяется при следующем вызове порта, но не раньше
+//!     `Retry-After`;
 //!   - срок вышел (`Timeout`) — итог `Timeout` без `/recall` (сервер молчит — второй запрос
 //!     ждал бы ещё срок), повтор при следующем вызове;
 //!   - нет соединения, обрыв, «не ZAM» — L0 и `Unavailable`, повтор после пробы;
@@ -46,7 +47,7 @@ use tokio::sync::watch;
 use za_core::BoxFuture;
 use za_core::memory::{IdeasSignal, MemoryLevel, MemoryPort, Recall, RecallReply};
 use za_protocol::RunId;
-use za_secrets::SecretMasker;
+use za_secrets::MaskCell;
 use za_store::ProjectStore;
 
 use crate::clock::Clock;
@@ -76,8 +77,9 @@ pub struct ZamParts {
     /// Обнаружение на старте команды (D136).
     pub discovery: Discovery,
     pub binding: RunBinding,
-    /// Маска процесса: ввод подсказок до отправки (D142).
-    pub masker: Arc<SecretMasker>,
+    /// Маска процесса (D142, D160): ввод подсказок до отправки. Ячейка, а не снимок: порт
+    /// берёт `current()` при каждом запросе и видит значения, раскрытые после его сборки.
+    pub masker: Arc<MaskCell>,
     /// Хранилище проекта: outbox записей (задача 7); чтениям не нужно.
     pub store: Option<ProjectStore>,
     pub clock: Arc<dyn Clock>,
@@ -279,7 +281,12 @@ impl ZamMemory {
                 self.drop_to_l0(&e);
                 Registration::Stop(Recall::Unavailable)
             }
-            ErrorKind::Busy | ErrorKind::Server | ErrorKind::RateLimited => {
+            // 408 `/problems/timeout` (тело не дошло в срок) — тоже временная: повтор безопасен
+            // (сомнение 3 fix-4, Carry в задачу 5).
+            ErrorKind::Busy
+            | ErrorKind::Server
+            | ErrorKind::RateLimited
+            | ErrorKind::RequestTimeout => {
                 tracing::warn!(error = %e, "память: сессия run не зарегистрирована, повтор при следующем запросе");
                 if let Some(d) = e.retry_after {
                     let at = self.parts.clock.now() + d;
@@ -470,7 +477,7 @@ impl MemoryPort for ZamMemory {
         ideas: Option<IdeasSignal>,
     ) -> BoxFuture<'a, RecallReply> {
         Box::pin(async move {
-            let prompt = prompt_field(&self.parts.masker, text);
+            let prompt = prompt_field(&self.parts.masker.current(), text);
             self.ask(run, Ask::prompt(prompt), budget, ideas).await
         })
     }
@@ -483,7 +490,7 @@ impl MemoryPort for ZamMemory {
         budget: u32,
     ) -> BoxFuture<'a, Recall> {
         Box::pin(async move {
-            let error = error_field(&self.parts.masker, error);
+            let error = error_field(&self.parts.masker.current(), error);
             // `post_tool` идей не несёт: режим укладки — `Wait`.
             self.ask(run, Ask::post_tool(tool, error), budget, None)
                 .await

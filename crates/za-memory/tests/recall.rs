@@ -18,7 +18,7 @@ use za_core::memory::{IdeasSignal, MemoryLevel, MemoryPort, Recall};
 use za_memory::fit::{OMITTED_HEAD, approx_tokens};
 use za_memory::{TokioClock, session_id};
 use za_protocol::RunId;
-use za_secrets::{MASK_PREFIX, SecretMasker};
+use za_secrets::{MASK_PREFIX, MaskCell};
 
 use support::{AREA, PROJECT, SOLUTION, port, port_at};
 
@@ -215,7 +215,7 @@ async fn recovery_request_shape() {
 #[tokio::test]
 async fn prompt_hint_masks_and_truncates() {
     let mut fake = FakeZam::start().await;
-    let masker = SecretMasker::new(vec![("TEST_KEY".to_owned(), secret())]);
+    let masker = Arc::new(MaskCell::new(vec![("TEST_KEY".to_owned(), secret())]));
     let client =
         za_memory::ZamClient::new(&za_memory::MemoryConfig::new(&fake.url()), None).unwrap();
     let d = za_memory::discover(&client).await;
@@ -242,7 +242,7 @@ async fn prompt_hint_masks_and_truncates() {
 #[tokio::test]
 async fn prompt_mask_before_cut_at_limit() {
     let mut fake = FakeZam::start().await;
-    let masker = SecretMasker::new(vec![("TEST_KEY".to_owned(), secret())]);
+    let masker = Arc::new(MaskCell::new(vec![("TEST_KEY".to_owned(), secret())]));
     let client =
         za_memory::ZamClient::new(&za_memory::MemoryConfig::new(&fake.url()), None).unwrap();
     let d = za_memory::discover(&client).await;
@@ -266,10 +266,34 @@ async fn prompt_mask_before_cut_at_limit() {
     assert!(!sent.contains("sk-"), "{sent}");
 }
 
+/// D160: порт берёт маску процесса из ячейки при каждом запросе — значение, раскрытое после
+/// сборки порта (ключ из Vault), в ввод подсказки уже не уходит.
+#[tokio::test]
+async fn prompt_hint_sees_values_revealed_after_build() {
+    let mut fake = FakeZam::start().await;
+    let cell = Arc::new(MaskCell::default());
+    let client =
+        za_memory::ZamClient::new(&za_memory::MemoryConfig::new(&fake.url()), None).unwrap();
+    let d = za_memory::discover(&client).await;
+    let mem = port(&fake.url(), d, Arc::new(TokioClock), cell.clone());
+    let late = ["late", "-revealed-", "value-77"].concat();
+    cell.extend(vec![("vault-key".to_owned(), late.clone())]);
+    within(
+        WAIT,
+        "prompt",
+        mem.prompt_hint(RunId::new(), &format!("ключ {late} в тексте"), 100, None),
+    )
+    .await;
+    let rec = last_recall(&mut fake);
+    let sent = rec.body["prompt"].as_str().unwrap();
+    assert!(!rec.body.to_string().contains(&late), "{sent}");
+    assert!(sent.contains("[secret masked: vault-key]"), "{sent}");
+}
+
 #[tokio::test]
 async fn tool_error_hint_masks_and_truncates() {
     let mut fake = FakeZam::start().await;
-    let masker = SecretMasker::new(vec![("TEST_KEY".to_owned(), secret())]);
+    let masker = Arc::new(MaskCell::new(vec![("TEST_KEY".to_owned(), secret())]));
     let client =
         za_memory::ZamClient::new(&za_memory::MemoryConfig::new(&fake.url()), None).unwrap();
     let d = za_memory::discover(&client).await;
@@ -543,7 +567,7 @@ async fn offline_is_unavailable_and_level_drops() {
         &fake.url(),
         discovery_m6(),
         clock.clone(),
-        SecretMasker::default(),
+        Arc::new(MaskCell::default()),
     );
     let mut level = mem.level_watch();
     assert_eq!(*level.borrow_and_update(), Level::L2);
@@ -592,7 +616,7 @@ async fn dead_host_after_three_timeouts_goes_l0() {
         za_memory::ZamClient::new(&za_memory::MemoryConfig::new(&fake.url()), None).unwrap();
     let d = za_memory::discover(&client).await;
     let clock = Arc::new(ManualClock::new());
-    let mem = port(&fake.url(), d, clock.clone(), SecretMasker::default());
+    let mem = port(&fake.url(), d, clock.clone(), Arc::new(MaskCell::default()));
     let mut level = mem.level_watch();
     let run = RunId::new();
     within(WAIT, "snapshot", mem.snapshot(run, 200, None)).await;

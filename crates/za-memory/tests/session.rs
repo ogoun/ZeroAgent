@@ -159,6 +159,31 @@ async fn temporary_registration_error_is_retried() {
     assert_eq!(routes(&mut fake), ["/api/v1/recall"]);
 }
 
+/// Сомнение 3 fix-4 (Carry в задачу 5): 408 `/problems/timeout` у регистрации — временная
+/// ошибка, как 503: `/recall` идёт, следующий вызов порта регистрирует сессию.
+#[tokio::test]
+async fn request_timeout_registration_is_retried() {
+    let mut fake = FakeZam::start().await;
+    let mem = port_at(&fake.url()).await;
+    fake.fail("/api/v1/sessions", 408, "/problems/timeout", None);
+    fake.seen();
+    let run = RunId::new();
+    within(WAIT, "snapshot", mem.snapshot(run, 200, None)).await;
+    assert_eq!(routes(&mut fake), ["/api/v1/sessions", "/api/v1/recall"]);
+    assert!(fake.sessions().is_empty());
+    assert!(
+        mem.drain_reports().iter().all(|r| r
+            .warnings
+            .iter()
+            .all(|w| !w.starts_with("session not registered"))),
+        "408 — не отказ без повтора"
+    );
+    fake.clear_fail("/api/v1/sessions");
+    within(WAIT, "prompt", mem.prompt_hint(run, "ввод", 100, None)).await;
+    assert_eq!(routes(&mut fake), ["/api/v1/sessions", "/api/v1/recall"]);
+    assert_eq!(fake.sessions().len(), 1);
+}
+
 /// I2: постоянный отказ (4xx, здесь 422) — без повтора; предупреждение — в отчёте порта
 /// (данные события `memory.recall`), `/recall` идёт.
 #[tokio::test]
@@ -194,14 +219,14 @@ async fn rate_limited_registration_waits_retry_after() {
     use std::time::Duration;
 
     use za_memory::ManualClock;
-    use za_secrets::SecretMasker;
+    use za_secrets::MaskCell;
 
     let mut fake = FakeZam::start().await;
     let client =
         za_memory::ZamClient::new(&za_memory::MemoryConfig::new(&fake.url()), None).unwrap();
     let d = za_memory::discover(&client).await;
     let clock = Arc::new(ManualClock::new());
-    let mem = support::port(&fake.url(), d, clock.clone(), SecretMasker::default());
+    let mem = support::port(&fake.url(), d, clock.clone(), Arc::new(MaskCell::default()));
     fake.fail("/api/v1/sessions", 429, "/problems/rate-limited", Some(5));
     fake.seen();
     let run = RunId::new();

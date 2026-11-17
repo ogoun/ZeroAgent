@@ -36,7 +36,16 @@
 //!   [`FakeZam::refuse_connections`] — порт остаётся за сервером, а принятое соединение
 //!   закрывается до чтения запроса; запроса в канале нет.
 //!
-//! Задачи 5–9 дополняют сервер записями, ключами идемпотентности, снимками.
+//! - **Vault** (задача 5): записи по пространству (`knowledge` или GUID решения,
+//!   [`FakeZam::add_vault`]) — список метаданных формы ZAM (`api/vault.rs@v0.0.12-m6.5`:
+//!   `id`, `scope`, `title`, `data.type`, `rev`, `space`, `agent_solution_id`, верхние
+//!   `locked` и `reason`); `?name=` и `?q=` молча игнорируются; `GET /api/v1/vault/{id}` —
+//!   метаданные, с `?reveal=1` — и `secret` (`null` у записи окружения без значения) с
+//!   `Cache-Control: no-store`; при блокировке ([`FakeZam::lock_vault`]) раскрытие — 503
+//!   `/problems/vault-locked`, метаданные — 200 с `locked: true`. Раскрытия с `X-Zam-Session`
+//!   — в [`FakeZam::reveals`]; 403 `solution-access` у Vault решения — [`FakeZam::forbid_solution`].
+//!
+//! Задачи 6–9 дополняют сервер записями, ключами идемпотентности, снимками.
 
 #![allow(dead_code)]
 
@@ -239,6 +248,40 @@ struct State {
     recall: BTreeMap<String, RecallAnswer>,
     /// Тела принятых `POST /api/v1/sessions`.
     sessions: Vec<Value>,
+    /// Записи Vault.
+    vault: Vec<VaultRow>,
+    /// Раскрытия `?reveal=1`: id записи и `X-Zam-Session`.
+    reveals: Vec<(String, Option<String>)>,
+}
+
+/// Запись Vault поддельного сервера.
+#[derive(Debug, Clone)]
+struct VaultRow {
+    id: String,
+    /// `knowledge` или GUID решения.
+    space: String,
+    title: String,
+    item_type: String,
+    secret: Option<String>,
+}
+
+impl VaultRow {
+    /// Метаданные формы `meta_json` ZAM: без значения.
+    fn meta(&self) -> Value {
+        let solution = (self.space != "knowledge").then(|| self.space.clone());
+        json!({
+            "id": self.id,
+            "scope": if solution.is_some() { "solution" } else { "knowledge" },
+            "title": self.title,
+            "data": {"type": self.item_type, "description": "synthetic"},
+            "rev": 1,
+            "author": {"kind": "user", "user_id": "u1", "token_id": null, "session_id": null, "machine": null},
+            "created_at": "2026-11-17T00:00:00Z",
+            "updated_at": "2026-11-17T00:00:00Z",
+            "space": self.space,
+            "agent_solution_id": solution,
+        })
+    }
 }
 
 /// Поля тела `POST /sessions` (`NewSession`, `api/sessions.rs@v0.0.12-m6.5`,
@@ -408,6 +451,8 @@ impl FakeZam {
             mcp_error: None,
             recall: BTreeMap::new(),
             sessions: Vec::new(),
+            vault: Vec::new(),
+            reveals: Vec::new(),
         }));
         let (held, gate) = watch::channel(false);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -498,6 +543,40 @@ impl FakeZam {
     pub fn lock_vault(&self, reason: &str) {
         let r = reason.to_owned();
         self.with(|s| s.vault_locked = Some(r));
+    }
+
+    /// Vault открыт: список — `locked: false`, раскрытие работает.
+    pub fn unlock_vault(&self) {
+        self.with(|s| s.vault_locked = None);
+    }
+
+    /// Запись Vault в пространстве `space` (`knowledge` или GUID решения): имя `title`, тип
+    /// `item_type` (`token`, `host`, …), значение `secret` (`None` — запись окружения без
+    /// значения). Итог — id записи.
+    pub fn add_vault(
+        &self,
+        space: &str,
+        title: &str,
+        item_type: &str,
+        secret: Option<&str>,
+    ) -> String {
+        self.with(|s| {
+            let id = format!("01M8SYNTHVAULT{:012}", s.vault.len() + 1);
+            s.vault.push(VaultRow {
+                id: id.clone(),
+                space: space.to_owned(),
+                title: title.to_owned(),
+                item_type: item_type.to_owned(),
+                secret: secret.map(str::to_owned),
+            });
+            id
+        })
+    }
+
+    /// Раскрытия (`GET /api/v1/vault/{id}?reveal=1`) с ответом 200: id записи и
+    /// `X-Zam-Session`.
+    pub fn reveals(&self) -> Vec<(String, Option<String>)> {
+        self.with(|s| s.reveals.clone())
     }
 
     /// Тип подсказок `kind` выключен у пользователя (`hooks.<kind> = false`).
@@ -795,15 +874,53 @@ async fn handle(
         }
         ("GET", r) if r.starts_with("/api/v1/spaces/") && r.ends_with("/vault") => {
             // `?name=` и прочие параметры молча игнорируются (CR-24).
-            let mut v = json!({"items": []});
-            match &s.vault_locked {
-                Some(reason) => {
-                    v["locked"] = json!(true);
-                    v["reason"] = json!(reason);
-                }
-                None => v["locked"] = json!(false),
+            let space = &r["/api/v1/spaces/".len()..r.len() - "/vault".len()];
+            if let Some(st) = s.forbidden.get(space) {
+                let mut v = problem_body(
+                    403,
+                    "/problems/solution-access",
+                    &format!("нет доступа к решению {space}"),
+                );
+                v["state"] = json!(st);
+                return problem_json(403, v);
             }
+            let items: Vec<Value> = s
+                .vault
+                .iter()
+                .filter(|row| row.space == space)
+                .map(VaultRow::meta)
+                .collect();
+            let mut v = json!({"items": items});
+            put_lock(&s.vault_locked, &mut v);
             json_reply(200, v)
+        }
+        ("GET", r) if r.starts_with("/api/v1/vault/") => {
+            let id = &r["/api/v1/vault/".len()..];
+            let Some(row) = s.vault.iter().find(|row| row.id == id).cloned() else {
+                return problem(404, "about:blank", "ресурс не найден");
+            };
+            let query = path.split_once('?').map_or("", |(_, q)| q);
+            let reveal = query
+                .split('&')
+                .any(|kv| kv == "reveal=1" || kv == "reveal=true");
+            let mut v = row.meta();
+            if !reveal {
+                put_lock(&s.vault_locked, &mut v);
+                return json_reply(200, v);
+            }
+            if let Some(reason) = &s.vault_locked {
+                return problem(503, "/problems/vault-locked", reason);
+            }
+            let session = headers
+                .get("x-zam-session")
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_owned);
+            s.reveals.push((row.id.clone(), session));
+            v["secret"] = json!(row.secret);
+            let mut r = json_reply(200, v);
+            r.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            r
         }
         ("POST", "/api/v1/sessions") => {
             let Some(obj) = body.as_object() else {
@@ -847,6 +964,17 @@ async fn handle(
             json_reply(200, v)
         }
         _ => problem(404, "about:blank", "ресурс не найден"),
+    }
+}
+
+/// Поля блокировки ответа метаданных Vault: `locked` и при блокировке `reason`.
+fn put_lock(locked: &Option<String>, v: &mut Value) {
+    match locked {
+        Some(reason) => {
+            v["locked"] = json!(true);
+            v["reason"] = json!(reason);
+        }
+        None => v["locked"] = json!(false),
     }
 }
 

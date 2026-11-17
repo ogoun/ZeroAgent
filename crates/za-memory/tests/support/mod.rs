@@ -10,7 +10,7 @@ use za_memory::{
     Clock, Discovery, MemoryConfig, RunBinding, TokioClock, ZamClient, ZamMemory, ZamParts,
     discover,
 };
-use za_secrets::SecretMasker;
+use za_secrets::MaskCell;
 
 /// `project_id` проекта: 16 hex (`zero-agent/src/home.rs`).
 pub const PROJECT: &str = "0123456789abcdef";
@@ -38,19 +38,20 @@ pub fn discovery_m6() -> Discovery {
     }))
 }
 
-/// Порт памяти с заданными частями; токена нет (поддельный сервер его не требует).
+/// Порт памяти с заданными частями; токена нет (поддельный сервер его не требует). `mask` —
+/// маска процесса (D160): тест может пополнить её после сборки порта.
 pub fn port(
     url: &str,
     discovery: Discovery,
     clock: Arc<dyn Clock>,
-    masker: SecretMasker,
+    mask: Arc<MaskCell>,
 ) -> ZamMemory {
     let client = ZamClient::new(&MemoryConfig::new(url), None).unwrap();
     ZamMemory::new(ZamParts {
         client: Arc::new(client),
         discovery,
         binding: binding(),
-        masker: Arc::new(masker),
+        masker: mask,
         store: None,
         clock,
     })
@@ -60,5 +61,5 @@ pub fn port(
 pub async fn port_at(url: &str) -> ZamMemory {
     let client = ZamClient::new(&MemoryConfig::new(url), None).unwrap();
     let d = discover(&client).await;
-    port(url, d, Arc::new(TokioClock), SecretMasker::default())
+    port(url, d, Arc::new(TokioClock), Arc::new(MaskCell::default()))
 }

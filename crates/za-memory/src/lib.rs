@@ -17,8 +17,14 @@
 //! - [`ideas`] — режим идей и его выбор по признакам сервера (D148, D169);
 //! - [`port`] — `ZamMemory`, порт памяти цикла `za_core::memory::MemoryPort` (D138).
 //!
-//! Vault и ключи (задача 5), шлюз записи (задача 6), outbox (задача 7), инструменты модели и
-//! операции идей (задача 8), снимок сессии (задача 9) — следующие задачи плана.
+//! Модули задачи 5:
+//! - [`vault`] — записи Vault по имени `key_ref`: Vault решения, затем личный; раскрытие с
+//!   сессией run или без неё; записи окружения — не ключи (D143, D144);
+//! - [`keys`] — ключи, нужные команде: раскрытие, кэш на процесс, маска процесса до возврата
+//!   значения (D143, D160).
+//!
+//! Шлюз записи (задача 6), outbox (задача 7), инструменты модели и операции идей (задача 8),
+//! снимок сессии (задача 9) — следующие задачи плана.
 
 pub mod clock;
 pub mod config;
@@ -26,10 +32,12 @@ pub mod discovery;
 pub mod error;
 pub mod fit;
 pub mod ideas;
+pub mod keys;
 pub mod port;
 pub mod recall;
 pub mod session;
 pub mod transport;
+pub mod vault;
 
 #[cfg(feature = "test-hooks")]
 pub use clock::ManualClock;
@@ -42,7 +50,9 @@ pub use discovery::{
 pub use error::{ErrorKind, ZamError, parse_mcp_error};
 pub use fit::{Fitted, fit_digest};
 pub use ideas::{IdeasMode, ideas_mode};
+pub use keys::{KeyState, Revealed, VaultKeys, process_mask};
 pub use port::{ZamMemory, ZamParts};
 pub use recall::{RecallReport, fetch_budget};
 pub use session::{RunBinding, session_id};
 pub use transport::{Ctx, Method, ZamClient};
+pub use vault::{SolutionVault, VaultClient, VaultError, VaultItem, VaultScope};
