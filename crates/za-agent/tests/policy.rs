@@ -851,13 +851,8 @@ fn domain_in_hash_and_old_snapshots_read() {
     assert_eq!(back, with);
 }
 
-/// M4 ревью задачи 4: хэш политики R1-C1 закреплён значением, которое дал код R1-C1
-/// (`main`, 7aac95f), — любое изменение `policy_hash` или сериализации `Rule` видно.
-/// Политика задана JSON без `domain`: тот же текст собирается и кодом R1-C1. Пути — строкой
-/// через `/`: хэш одинаков на всех ОС. Значение не перезаписывать: смена хэша — новая запись
-/// `policy.loaded` у каждой прежней конфигурации (миграция в CHANGELOG).
-#[test]
-fn r1c1_policy_hash_is_pinned() {
+/// Конфигурация R1-C1 для golden `policy_r1c1.hash`: глобальная и проектная (задача 11).
+fn r1c1_config() -> (PolicyConfig, PolicyConfig) {
     let global: PolicyConfig = serde_json::from_value(json!({
         "allow_bypass": true,
         "rules": [
@@ -879,6 +874,17 @@ fn r1c1_policy_hash_is_pinned() {
         ],
     }))
     .unwrap();
+    (global, project)
+}
+
+/// M4 ревью задачи 4: хэш политики R1-C1 закреплён значением, которое дал код R1-C1
+/// (`main`, 7aac95f), — любое изменение `policy_hash` или сериализации `Rule` видно.
+/// Политика задана JSON без `domain`: тот же текст собирается и кодом R1-C1. Пути — строкой
+/// через `/`: хэш одинаков на всех ОС. Значение не перезаписывать: смена хэша — новая запись
+/// `policy.loaded` у каждой прежней конфигурации (миграция в CHANGELOG).
+#[test]
+fn r1c1_policy_hash_is_pinned() {
+    let (global, project) = r1c1_config();
     let hash = PolicySnapshot::build(&global, Some(&project)).unwrap().hash;
     assert_eq!(hash, include_str!("golden/policy_r1c1.hash").trim());
 }
@@ -2504,27 +2510,7 @@ fn zam_false_positives_table() {
 fn policy_hash_unchanged_by_builtin_rule() {
     let empty = PolicySnapshot::build(&PolicyConfig::default(), None).unwrap();
     assert!(empty.rules.is_empty(), "{:?}", empty.rules);
-    let global: PolicyConfig = serde_json::from_value(json!({
-        "allow_bypass": true,
-        "rules": [
-            {"action": "allow", "command": "cargo test*"},
-            {"action": "ask", "tool": "edit"},
-            {"action": "deny", "path": "secrets/**"},
-            {"action": "deny", "tool": "bash", "command": "rm *", "path": "/data/**"},
-        ],
-        "grants": [
-            {"path": "/data", "mode": "ro", "reason": "r"},
-            {"path": "/srv", "mode": "rw"},
-        ],
-    }))
-    .unwrap();
-    let project: PolicyConfig = serde_json::from_value(json!({
-        "rules": [
-            {"action": "ask", "command": "git push*"},
-            {"action": "allow", "tool": "bash"},
-        ],
-    }))
-    .unwrap();
+    let (global, project) = r1c1_config();
     let s = PolicySnapshot::build(&global, Some(&project)).unwrap();
     assert_eq!(s.hash, include_str!("golden/policy_r1c1.hash").trim());
     assert_eq!(s.rules.len(), 5, "{:?}", s.rules);
