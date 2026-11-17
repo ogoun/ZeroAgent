@@ -5,6 +5,15 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-M, задача 2 — транспорт и обнаружение ZeroAIMemory (D133, D134, D136, D137, D152–D154, D165; ADR 0007, раздел «Крейт `za-memory`, каналы и транспорт»):
+  - `za-memory`: `ZamClient` — третий держатель HTTP-клиента: без прокси и редиректов (3xx — ошибка «memory server redirected; not followed»), `Authorization` чувствительным заголовком на каждый запрос, `X-Zam-Machine` всегда, `X-Zam-Session`/`X-Zam-Solution`/`X-Zam-Area` байтами UTF-8, сроки запросов; REST (`get_json`, `send_json` с `Idempotency-Key` и `If-Match`) и MCP `tools/call` (`Accept: application/json, text/event-stream`, `session_id` у `memory_search`, `memory_read`, `memory_recall`);
+  - `za-memory`: `ZamError`/`ErrorKind` — вид по коду и `type` problem+json, `parse_mcp_error` — четыре формы текста ошибок MCP; `Retry-After`;
+  - `za-memory`: `discover` — `GET /api/v1/health` без токена, уровни L0–L2 по флагам (`m6` — L2, версия только печатается; `0.0.12-m6.5` с `idea_review` — тоже L2), неизвестные флаги сохраняются; `status` — токен, решение, личный Vault, выключенные типы подсказок (`/recall` с `record: false`);
+  - `za-memory`: `MemoryConfig`, `Token` (`Debug` — `zam_…`), `TOKEN_ENV = "ZA_MEMORY_TOKEN"`; часы `Clock`/`TokioClock`, `ManualClock` под признаком `test-hooks`;
+  - `za-protocol`: события `memory.connected`, `memory.recall`, `memory.tool`, `memory.write`, `memory.snapshot_sent`, `memory.session_ended`, `secret.revealed`; константы `memory_outcome`, `snapshot_trigger`, `audit_action::SECRET_REVEALED`;
+  - `zero-agent`: раздел `[memory]` глобальной конфигурации (`url`, `machine`, `enabled`; ошибки с путём поля); проектный `[memory] enabled = false`; строка `memory` в `doctor` (версия, уровень, флаги, токен, Vault, подсказки; `http` на хост вне локальной сети — предупреждение «токен идёт открытым текстом»);
+  - `xtask policy`: направления `za-memory` (только от `za-protocol`, `za-core`, `za-store`, `za-secrets`; от него — только `zero-agent` и `xtask`), `Client::builder` — только в `za-memory/src/transport.rs`, вне него `reqwest` в крейте не упоминается, атрибут `path` и `include!` в его `src/` запрещены (`HTTP_HOLDERS`, `check_holder_includes` — общие с `za-web`);
+  - тесты: поддельный ZeroAIMemory `test-support/fake_zam.rs` (формы `0.0.11-m6` и `0.0.12-m6.5`, HTML на `/health`, 406 без `Accept`, ошибки MCP с `isError`, 3xx), `za-memory/tests/{transport,discovery}.rs`, `zero-agent/tests/doctor_memory.rs`; живой `live_stand_discovery_and_status` (`#[ignore]`, только стенд `192.168.0.210`); CI — шаги `za-memory --features test-hooks`.
 - R1-M, проход fix-1 (ревью задачи 1; ADR 0007):
   - `za-core`: `ToolCx::roots` — корни run для инструментов (обход не заходит в защищённые места); `Roots::boundary` — корни только для границы проекта (без `ZA_HOME` и защищённых мест, `protected` — только у служебных путей проекта);
   - `za-shell`: `HOME_PREFIXES`, `home_rest` — начала домашнего каталога (`~`, `$HOME`, `${HOME}`, `%USERPROFILE%`, `$env:USERPROFILE` и др.); слова с ними — пути команды (`path_words`);
@@ -256,6 +265,8 @@
 - `za-protocol`: `checkpoint_reason` — причины пропуска чекпоинта.
 
 ### Изменено
+- **`doctor` — строка `memory`, JSON — поле `memory`** (R1-M, задача 2, D152): без `[memory]` — предупреждение «память не настроена». `doctor::run` получает токен памяти параметром.
+- **Проектный `.zero-agent/config.toml`: раздел `[memory]`** (R1-M, задача 2, D134): действует только `enabled = false`; прежде раздел считался незнакомым и не назывался в предупреждении.
 - **Путь с началом домашнего каталога в команде — вне проекта** (R1-M, fix-1, Minor 2 ревью задачи 1): слова `$HOME/…`, `${HOME}/…`, `%USERPROFILE%\…`, `$env:USERPROFILE/…` теперь пути команды, как `~/…`. В режиме `auto` команда с ними спрашивает (`outside_project`) — прежде исполнялась без вопроса; грант на домашний каталог и проект, равный домашнему каталогу, вопроса не снимают. Пакет разрешает такие слова (и `~/…`) по домашнему каталогу: в вопросе и в `boundary.outside` — настоящий путь, а не `<проект>/~/…`.
 - **Правила `deny` с `path` строже** (R1-M, задача 1, D157; Minor 9 ревью задачи 1): слова команды `bash` сверяются с ними и после раскрытия `~`, `$HOME`, `${HOME}`, `%USERPROFILE%`, `$env:USERPROFILE` по домашнему каталогу, и в значениях опций (`--file=…`, `-Path:…`, `of=…`). Хэш политики не меняется.
 - **Записанное одобрение не снимает встроенный запрет** (R1-M, fix-1, Minor 3 ревью задачи 1): одобренный, но не начатый вызов с `zam` или защищённым местом — `denied: memory client` / `denied: protected path` после resume, в том числе одобрение, открытое до R1-M. `request_grant` на защищённое место — отказ без вопроса (Minor 10).

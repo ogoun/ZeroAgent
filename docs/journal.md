@@ -2,6 +2,18 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-17. R1-M, задача 2: транспорт и обнаружение ZeroAIMemory — `/api/v1/health`, уровни L0–L2, ошибки REST и MCP, `[memory]`, строка `doctor`
+
+Бриф — `.superpowers/sdd/2026-11-16-r1m-memory/task-2-brief.md`, отчёт — `task-2-report.md` рядом. Решения D133, D134, D136, D137, D152–D154, D165; ADR 0007, раздел «Крейт `za-memory`, каналы и транспорт».
+
+- **`za-memory`** — `config`, `clock`, `error`, `transport`, `discovery`. `ZamClient` — третий держатель HTTP-клиента: без прокси, редиректов, cookie и сжатия; `Authorization` чувствительным заголовком на каждый запрос; `X-Zam-*` байтами UTF-8; срок запроса покрывает и чтение тела. MCP — `tools/call` с одним `Accept: application/json, text/event-stream` и `session_id` у `memory_search`, `memory_read`, `memory_recall`. Ошибки: вид по коду и `type`, четыре формы текста MCP.
+- **Уровни — по флагам.** Номер версии ни с чем не сравнивается: `m6` — L2, и у `0.0.11-m6`, и у `0.0.12-m6.5` (стенд, `idea_review`). Неизвестные флаги сохраняются. Корневой `/health` (HTML WebUI) — L0 `not a ZeroAIMemory API`.
+- **`xtask policy`** обобщён, а не скопирован: таблица держателей `HTTP_HOLDERS` (`za-web` — `::dns::`, `::StatusCode`; `za-memory` — ничего вне `transport.rs`), общий `check_holder_includes`, направления `za-memory`.
+- **`zero-agent`**: `[memory]` (`url`, `machine`, `enabled`; путь поля в ошибке), проектный `[memory] enabled = false` (адрес проект не задаёт), строка `memory` в `doctor` с токеном параметром.
+- **Поддельный ZeroAIMemory** — `test-support/fake_zam.rs`, общий для тестов `za-memory` и `zero-agent`. Живой тест `live_stand_discovery_and_status` (`#[ignore]`, только `192.168.0.210`, только чтение) не запускался: в окружении нет `ZAM_URL`, `ZAM_TOKEN`.
+- **Две ловушки, найденные тестами.** `RequestBuilder::header` добавляет заголовок, а не заменяет его: второй `Accept` после общего `application/json` давал 406 у `/mcp`. Блокирующий сокет и `thread::join` в тесте `current_thread` вешали поддельный сервер на том же потоке: нужен `spawn_blocking`.
+- **Отложено:** `initialize` MCP при отказе сервера (форма отказа неизвестна, проверка — живой тест задачи 11); повторная проба после L0 и `watch` уровня — порт (задача 4); токен в маске процесса — задача 5.
+
 ## 2026-11-17. R1-M: тестовый стенд на ZeroAIMemory 0.0.12-m6.5 — отличия от 0.0.11-m6 и правки плана
 
 Стенд `192.168.0.210:7700` обновлён до `0.0.12-m6.5` (`4459dda`). `/api/v1/health` отдаёт 20 флагов, двадцатый — `idea_review`, и `token_counter: model`. План R1-M писался под `0.0.11-m6`. Исследование по коду ZAM, по тегам, только чтение: `docs/research/2026-11-17-zam-m6.5-delta.md`.
