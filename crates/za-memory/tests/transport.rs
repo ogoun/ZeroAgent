@@ -326,6 +326,54 @@ async fn mcp_sends_accept_and_session_arg() {
     assert_eq!(e.kind, Protocol);
 }
 
+/// `session_id` в аргументах MCP — только из `cx.session` и только у `SESSION_ARG_TOOLS`
+/// (M3 ревью задачи 2): аргумент вызывающего (с задачи 8 — модели) всегда снимается, и
+/// чтение не ляжет в чужую сессию.
+#[tokio::test]
+async fn mcp_session_arg_only_from_cx() {
+    let mut fake = FakeZam::start().await;
+    let c = client(&fake.url());
+    let ours = Ctx {
+        session: Some("za-0123456789abcdef-run"),
+        ..Ctx::default()
+    };
+    let foreign = json!({"query": "x", "session_id": "чужая"});
+    // 1. Инструмент с аргументом сессии: уходит сессия run, а не аргумент вызывающего.
+    within(
+        WAIT,
+        "search",
+        c.mcp_call("memory_search", foreign.clone(), &ours, LIMIT),
+    )
+    .await
+    .unwrap();
+    // 2. Инструмент без аргумента сессии: `session_id` не уходит вовсе.
+    within(
+        WAIT,
+        "tree",
+        c.mcp_call("memory_tree", foreign.clone(), &ours, LIMIT),
+    )
+    .await
+    .unwrap();
+    // 3. Сессии run нет: `session_id` не уходит и у инструмента с аргументом.
+    within(
+        WAIT,
+        "no session",
+        c.mcp_call("memory_read", foreign.clone(), &Ctx::default(), LIMIT),
+    )
+    .await
+    .unwrap();
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    let args = |i: usize| &seen[i].body["params"]["arguments"];
+    assert_eq!(args(0)["session_id"], "za-0123456789abcdef-run");
+    assert!(args(1).get("session_id").is_none(), "{:?}", args(1));
+    assert!(args(2).get("session_id").is_none(), "{:?}", args(2));
+    // Прочие аргументы — как есть.
+    for i in 0..3 {
+        assert_eq!(args(i)["query"], "x", "{i}");
+    }
+}
+
 /// Без нужного `Accept` поддельный сервер, как ZAM, отвечает 406 — клиент его не получает.
 #[tokio::test]
 async fn fake_rejects_mcp_without_accept() {

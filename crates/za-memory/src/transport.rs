@@ -15,7 +15,8 @@
 //!   без `Mcp-Session-Id` (MCP 2026-07-28 без сессий) — только чтение модели. У MCP —
 //!   `Accept: application/json, text/event-stream` (без него 406) и аргумент `session_id`,
 //!   равный заголовку, у [`SESSION_ARG_TOOLS`]; у `memory_tree` аргумента нет, учёт — по
-//!   заголовку.
+//!   заголовку. `session_id` вызывающего всегда снимается: сессию ставит только транспорт из
+//!   `cx.session` (без сессии run — аргумента нет).
 //! - **Сроки:** предел запроса — аргумент `limit` каждого вызова (константы ниже), он
 //!   покрывает и отправку, и чтение тела; не успели — [`ErrorKind::Timeout`]. Отмена run
 //!   бросает future — запрос обрывается.
@@ -60,6 +61,8 @@ pub const MCP_ACCEPT: &str = "application/json, text/event-stream";
 /// Инструменты MCP с аргументом `session_id` (`SESSION_ARG_TOOLS`,
 /// `crates/zam-server/src/mcp/tools.rs:531` e391440).
 pub const SESSION_ARG_TOOLS: [&str; 3] = ["memory_search", "memory_read", "memory_recall"];
+/// Аргумент сессии инструментов MCP: ставит только транспорт, из `cx.session`.
+const SESSION_ARG: &str = "session_id";
 /// Заголовок ошибки на любой 3xx (D133).
 pub const REDIRECT_TITLE: &str = "memory server redirected; not followed";
 /// Заголовок ошибки «отвечает не API ZeroAIMemory» (D136).
@@ -211,9 +214,10 @@ impl ZamClient {
         self.json_reply(req, deadline).await.map(|(_, v)| v)
     }
 
-    /// Вызов инструмента MCP `tool` (`tools/call`, D137): текст результата. У
-    /// [`SESSION_ARG_TOOLS`] аргумент `session_id` равен `cx.session`. Ошибка инструмента
-    /// (`isError`) — по таблице форм [`parse_mcp_error`], ошибка JSON-RPC — `Protocol`.
+    /// Вызов инструмента MCP `tool` (`tools/call`, D137): текст результата. Аргумент
+    /// `session_id` из `args` снимается всегда; у [`SESSION_ARG_TOOLS`] он равен `cx.session`
+    /// (нет сессии run — аргумента нет). Ошибка инструмента (`isError`) — по таблице форм
+    /// [`parse_mcp_error`], ошибка JSON-RPC — `Protocol`.
     pub async fn mcp_call(
         &self,
         tool: &str,
@@ -228,10 +232,13 @@ impl ZamClient {
                 "MCP arguments must be a JSON object",
             ));
         };
+        // Сессия — только сессия run (`cx.session`): аргумент вызывающего (с задачи 8 —
+        // модели) снимается всегда, иначе чтение легло бы в чужую сессию (M3 ревью задачи 2).
+        map.remove(SESSION_ARG);
         if SESSION_ARG_TOOLS.contains(&tool)
             && let Some(s) = cx.session
         {
-            map.insert("session_id".into(), json!(s));
+            map.insert(SESSION_ARG.into(), json!(s));
         }
         let id = RPC_ID.fetch_add(1, Ordering::Relaxed);
         let body = json!({
