@@ -2783,6 +2783,18 @@ dependencies = [
 [[package]]
 name = "za-memory"
 version = "0.0.1"
+dependencies = [
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "za-core",
+]
 
 [[package]]
 name = "za-protocol"

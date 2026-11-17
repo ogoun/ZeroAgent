@@ -4,7 +4,37 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "zero-agent: za-memory"
+description = "zero-agent: клиент памяти ZeroAIMemory"
 
 [lints]
 workspace = true
+
+[dependencies]
+# `BoxFuture` часов (D165); с задачи 3 — порт памяти `za_core::memory` (D138). `za-llm`
+# приходит транзитивно через `za-core` без функций, прямой зависимости нет (как у `za-web`).
+za-core = { path = "../za-core" }
+# Третий держатель HTTP-клиента после `za-llm` и `za-web` (D133, ADR 0007): те же функции
+# (`json`, `rustls-tls`), без сжатия, cookie, SOCKS и HTTP/2; клиент строится только в
+# `transport.rs` (`cargo xtask policy`).
+reqwest.workspace = true
+# `time` — сроки запросов и часы (D137, D165), `sync` — ручные часы тестов, `macros` —
+# `join!` проверок статуса (токен, решение, Vault, подсказки — параллельно).
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+serde.workspace = true
+serde_json.workspace = true
+# Разбор `[memory] url` (D134): схема, хост, без учётных данных.
+url.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+# Тестовые часы `ManualClock` (D165) — только с этим признаком, не под `debug_assertions`
+# (D128): обычная и release-сборка их не содержат.
+test-hooks = []
+
+[dev-dependencies]
+# Поддельный ZeroAIMemory на 127.0.0.1 (`test-support/fake_zam.rs`, D154).
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "time", "test-util", "sync"] }
+# Подписчик теста: в записях `tracing` клиента нет токена.
+tracing-subscriber.workspace = true
