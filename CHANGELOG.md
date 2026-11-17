@@ -5,6 +5,11 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-M, проход fix-2 (ревью задачи 2; ADR 0007):
+  - `za-memory`: вид ошибки `ErrorKind::Interrupted` (`interrupted`) — соединение оборвалось после отправки, ответа со статусом нет, исход неизвестен; входит в `is_unreachable`;
+  - `za-memory`: `MemoryStatus.hooks_unchecked` — причина, если подсказки проверить не удалось; `ConfigError::{field, reason}`, константы `config::{URL_FIELD, MACHINE_FIELD}`;
+  - `xtask policy`: файл, где строится клиент `reqwest` в `za-llm`, `za-web`, `za-memory`, содержит `.no_proxy()` и `.redirect(…Policy::none())` (исключение с причиной — `za-llm/src/probe.rs` без `Policy::none`); файл клиента держателя существует и не реэкспортирует `reqwest`, кроме `Method`;
+  - тесты: поддельный ZAM — `CutServer` (обрыв соединения после запроса и посреди тела), `FakeZam::reply`, `Seen::header_count`, общий `within` × `ZA_TEST_TIME_SCALE`.
 - R1-M, задача 2 — транспорт и обнаружение ZeroAIMemory (D133, D134, D136, D137, D152–D154, D165; ADR 0007, раздел «Крейт `za-memory`, каналы и транспорт»):
   - `za-memory`: `ZamClient` — третий держатель HTTP-клиента: без прокси и редиректов (3xx — ошибка «memory server redirected; not followed»), `Authorization` чувствительным заголовком на каждый запрос, `X-Zam-Machine` всегда, `X-Zam-Session`/`X-Zam-Solution`/`X-Zam-Area` байтами UTF-8, сроки запросов; REST (`get_json`, `send_json` с `Idempotency-Key` и `If-Match`) и MCP `tools/call` (`Accept: application/json, text/event-stream`, `session_id` у `memory_search`, `memory_read`, `memory_recall`);
   - `za-memory`: `ZamError`/`ErrorKind` — вид по коду и `type` problem+json, `parse_mcp_error` — четыре формы текста ошибок MCP; `Retry-After`;
@@ -270,6 +275,12 @@
 - `za-protocol`: `checkpoint_reason` — причины пропуска чекпоинта.
 
 ### Изменено
+- **Обрыв соединения с сервером памяти посреди запроса — `Interrupted`, а не `Protocol`** (R1-M, fix-2, M1 ревью задачи 2): сброс, `IncompleteMessage`, обрыв тела ответа. `Offline` — только «не соединились».
+- **`session_id` в вызовах MCP — только из сессии run** (R1-M, fix-2, M3 ревью задачи 2): аргумент вызывающего снимается всегда; у инструментов вне `memory_search`, `memory_read`, `memory_recall` и без сессии run аргумента нет.
+- **Статус памяти: «не проверено» — не «всё хорошо»** (R1-M, fix-2, M2 ревью задачи 2): ответ Vault без булева `locked` — `VaultState::Unchecked` (прежде `Unlocked`); ошибка `/recall` или ответ без `hooks` — `hooks_unchecked` (прежде пустой `hooks_off` без пометки). `doctor` печатает `Warn` «Vault: не проверено: …» и «подсказки: не проверено: …».
+- **`doctor`: «токен идёт открытым текстом» — и при L0** (R1-M, fix-2, M9 ревью задачи 2): предупреждение по адресу `http` на хост вне локальной сети печатается и когда сервер недоступен.
+- **API `za-memory`: `config::check_machine` → `check_attrib`** (R1-M, fix-2, M12 ревью задачи 2): одна проверка всех заголовков `X-Zam-*`, ошибка — причина без значения (`&'static str`); пустое имя машины — «пустое значение».
+- **`xtask policy`: `HTTP_CLIENT_ALLOWED` заменён `http_client_allowed`** (R1-M, fix-2, M6 ревью задачи 2): файл клиента держателя — только в `HTTP_HOLDERS`, крейт `za-llm` — `HTTP_CLIENT_CRATES`.
 - **`doctor` — строка `memory`, JSON — поле `memory`** (R1-M, задача 2, D152): без `[memory]` — предупреждение «память не настроена». `doctor::run` получает токен памяти параметром.
 - **Проектный `.zero-agent/config.toml`: раздел `[memory]`** (R1-M, задача 2, D134): действует только `enabled = false`; прежде раздел считался незнакомым и не назывался в предупреждении.
 - **Путь с началом домашнего каталога в команде — вне проекта** (R1-M, fix-1, Minor 2 ревью задачи 1): слова `$HOME/…`, `${HOME}/…`, `%USERPROFILE%\…`, `$env:USERPROFILE/…` теперь пути команды, как `~/…`. Команда с ними спрашивает (`outside_project`) в любом режиме, включая `bypass`, как с `~` (fix-1b, Minor 2 повторного ревью): например, `source $HOME/.cargo/env`, `export PATH=$HOME/bin:$PATH`; прежде в `auto` и `bypass` такие команды исполнялись без вопроса. Грант на домашний каталог и проект, равный домашнему каталогу, вопроса не снимают. Пакет разрешает такие слова (и `~/…`) по домашнему каталогу: в вопросе и в `boundary.outside` — настоящий путь, а не `<проект>/~/…`.
