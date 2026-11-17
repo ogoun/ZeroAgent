@@ -122,6 +122,16 @@ async fn redirect_not_followed() {
 }
 
 /// Буфер записей `tracing` теста.
+///
+/// Граница теста (M10 ревью задачи 2): подписчик ловит только события `tracing` — свои у
+/// клиента и у зависимостей, что пишут через `tracing`. Записи крейта `log` (им пишет
+/// `reqwest`) в буфер не попадают: моста `tracing-log` (`LogTracer`) в `Cargo.lock` нет, а
+/// новых крейтов R1-M не добавляет. Что `log`-записи `reqwest` без токена, тест не доказывает.
+/// Довод вместо теста: сырые байты соединения (с `Authorization`) `reqwest` 0.12 пишет только
+/// при `ClientBuilder::connection_verbose(true)` и уровне `log` `Trace` (`connect.rs`,
+/// `verbose::Wrapper`); клиент памяти его не включает (по умолчанию выключено), а логгера
+/// `log` в процессе нет — ни `set_logger`, ни `LogTracer` в `crates/` не вызываются.
+/// Прочие его записи (адрес соединения, прокси, сертификат) заголовков не содержат.
 #[derive(Clone, Default)]
 struct Logs(Arc<Mutex<Vec<u8>>>);
 
@@ -196,6 +206,10 @@ async fn headers_sent_and_no_authorization_in_log() {
 
     let seen = fake.seen();
     assert_eq!(seen.len(), 3, "{seen:?}");
+    for s in &seen {
+        assert_eq!(s.header_count("accept"), 1, "{s:?}");
+        assert_eq!(s.header_str("accept").as_deref(), Some("application/json"));
+    }
     for s in &seen[..2] {
         assert!(s.authorized, "{s:?}");
         assert_eq!(
@@ -221,10 +235,16 @@ async fn headers_sent_and_no_authorization_in_log() {
     );
     assert_eq!(seen[1].header_str("if-match").as_deref(), Some("3"));
     assert_eq!(seen[1].body, json!({"event": "prompt"}));
-    // Без сессии, решения и области — заголовков нет, машина — всегда.
+    // Без сессии, решения и области — заголовков нет, машина — всегда: без `[memory]
+    // machine` — имя хоста (`host_machine`; нет имени — и заголовка нет).
     assert!(seen[2].header("x-zam-session").is_none());
     assert!(seen[2].header("x-zam-area").is_none());
     assert!(seen[2].header("x-zam-solution").is_none());
+    assert_eq!(
+        seen[2].header_str("x-zam-machine"),
+        za_memory::config::host_machine()
+    );
+    assert!(seen[2].header_count("x-zam-machine") <= 1, "{:?}", seen[2]);
     assert!(!seen[2].authorized);
 
     let shown = format!("{c:?}");
@@ -287,6 +307,9 @@ async fn mcp_sends_accept_and_session_arg() {
     assert_eq!(seen.len(), 3);
     for s in &seen {
         assert_eq!(s.path, "/mcp");
+        // Ровно один `Accept` (M10 ревью задачи 2): второй, добавленный к общему
+        // `application/json`, сервер не читает — подделка, как ZAM, смотрит первый.
+        assert_eq!(s.header_count("accept"), 1, "{s:?}");
         assert_eq!(
             s.header_str("accept").as_deref(),
             Some("application/json, text/event-stream")

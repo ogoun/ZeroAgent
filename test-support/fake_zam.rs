@@ -186,6 +186,12 @@ impl Seen {
             .map(|(_, v)| v.as_slice())
     }
 
+    /// Сколько раз пришёл заголовок `name` (строчными): ловушка `RequestBuilder::header`
+    /// добавляет второй, а не заменяет первый.
+    pub fn header_count(&self, name: &str) -> usize {
+        self.headers.iter().filter(|(k, _)| k == name).count()
+    }
+
     /// Заголовок `name` как UTF-8.
     pub fn header_str(&self, name: &str) -> Option<String> {
         self.header(name)
