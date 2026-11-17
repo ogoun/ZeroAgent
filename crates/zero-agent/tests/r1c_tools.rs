@@ -1336,6 +1336,48 @@ fn project_inside_za_home_refused() {
     assert!(c.bodies().is_empty(), "{:?}", c.bodies());
 }
 
+/// R1-M D157, Minor 4 ревью задачи 1: проект внутри `~/.zeroaimemory/` — отказ старта run
+/// с причиной (`RunError::SealedProject`), к модели нет запросов.
+#[test]
+fn project_inside_zeroaimemory_refused() {
+    let c = Case::new("zam-sealed-zam-project", zam_model);
+    let user = unique_dir(SUITE, "zam-sealed-user");
+    let inner = user.join(".zeroaimemory").join("proj");
+    std::fs::create_dir_all(&inner).unwrap();
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let user_s = shown(&user).to_string_lossy().into_owned();
+    let c = c.var(home_var, &user_s);
+    let o = c.za(&["run", "--project", inner.to_str().unwrap(), "задача"]);
+    assert_eq!(o.code(), Some(1), "{o:?}");
+    assert!(o.stderr.contains("внутри защищённого места"), "{o:?}");
+    assert!(c.bodies().is_empty(), "{:?}", c.bodies());
+}
+
+/// R1-M, Minor 5 ревью задачи 1: домашний каталог пользователя, который не канонизируется
+/// (сетевой путь на Windows — без обращения к сети; висячая ссылка на Unix), — свой отказ
+/// старта run с путём домашнего каталога, а не «корни проекта»: защищённое место
+/// `~/.zeroaimemory/` не построить, run не стартует (fail-closed). К модели нет запросов.
+#[test]
+fn unresolvable_user_home_refused_with_its_path() {
+    let c = Case::new("zam-bad-home", zam_model);
+    #[cfg(windows)]
+    let (var, bad) = ("USERPROFILE", r"\\127.0.0.1\share\u".to_owned());
+    #[cfg(unix)]
+    let (var, bad) = {
+        let d = unique_dir(SUITE, "zam-bad-home-link");
+        let link = d.join("home");
+        std::os::unix::fs::symlink(d.join("missing"), &link).unwrap();
+        ("HOME", link.to_string_lossy().into_owned())
+    };
+    let c = c.var(var, &bad);
+    let o = c.run(&["задача"]);
+    assert_eq!(o.code(), Some(1), "{o:?}");
+    assert!(o.stderr.contains("домашний каталог пользователя"), "{o:?}");
+    assert!(o.stderr.contains(&bad), "{o:?}");
+    assert!(!o.stderr.contains("корни проекта"), "{o:?}");
+    assert!(c.bodies().is_empty(), "{:?}", c.bodies());
+}
+
 // ---- Живой llama-server ----
 
 /// Ручная проверка S4 без памяти (задача 14, шаг 3): настоящая модель чинит `calc.txt` в

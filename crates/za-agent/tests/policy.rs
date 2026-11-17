@@ -2335,6 +2335,43 @@ fn bash_words_into_sealed_denied() {
     );
 }
 
+/// R1-M D157, Minor 4 ревью задачи 1: `edit` и `multi_edit` в `~/.zeroaimemory/` (и в
+/// `ZA_HOME`), в том числе новый файл, — Deny("protected path") на уровне политики с
+/// грантом `rw` на домашний каталог, глобальным `allow` и в `bypass`; политика повторяет
+/// проверку и без отметки разрешения.
+#[test]
+fn sealed_edit_denied_even_with_grant() {
+    let r = sealed_roots();
+    let targets = [
+        slash(&abs("/home/u/.zeroaimemory/config.toml")),
+        slash(&abs("/home/u/.zeroaimemory/new.toml")),
+        slash(&r.za_home.join("config.toml")),
+    ];
+    let multi = spec("multi_edit", ToolKind::Edit, RiskClass::LocalWrite);
+    for cx in permissive() {
+        for spec in [edit_spec(), multi.clone()] {
+            for arg in &targets {
+                let (s, mut p) = one(&r, arg, Access::Write);
+                assert!(p[0].protected, "{arg}");
+                assert_eq!(
+                    cx.decide(&spec, &(s.clone(), p.clone())),
+                    Decision::Deny(deny_reason::PROTECTED_PATH),
+                    "{} {arg} {:?}",
+                    spec.schema.name,
+                    cx.mode
+                );
+                p[0].protected = false;
+                assert_eq!(
+                    cx.decide(&spec, &(s, p)),
+                    Decision::Deny(deny_reason::PROTECTED_PATH),
+                    "{} {arg}: политика повторяет проверку",
+                    spec.schema.name
+                );
+            }
+        }
+    }
+}
+
 /// R1-M D157, Minor 2 ревью задачи 1: слово с началом `$HOME`, `${HOME}`, `%USERPROFILE%`,
 /// `$env:USERPROFILE` — путь команды, как `~` (раскрытый по домашнему каталогу корней):
 /// оно задаёт границу проекта. В `auto` команда с ним спрашивает `outside_project`, а не

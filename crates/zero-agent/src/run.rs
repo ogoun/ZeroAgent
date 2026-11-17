@@ -164,6 +164,18 @@ pub enum RunError {
         display_path(.0)
     )]
     SealedProject(PathBuf),
+    /// Домашний каталог пользователя не канонизируется (R1-M D157, Minor 5 ревью задачи 1):
+    /// сетевой путь, висячая ссылка. Защищённое место `~/.zeroaimemory/` не построить —
+    /// run не стартует (fail-closed).
+    #[error(
+        "домашний каталог пользователя {} ({}): {source}; защищённое место ~/.zeroaimemory не построить — run не запускается",
+        display_path(path),
+        home::user_home_var()
+    )]
+    UserHome {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Точка аварийного завершения `--crash-at` (D33; только для тестов).
@@ -513,19 +525,29 @@ async fn prepare(
     }
     let roots = blocking("корни проекта", project, {
         let (p, h) = (project.to_path_buf(), za_home.to_path_buf());
-        let user = home::user_home();
-        move || {
-            let roots = Roots::canonical(&p, &h)?;
-            match user {
-                Some(u) => roots.with_home(&u),
-                None => {
-                    tracing::warn!("домашний каталог пользователя не задан: ~/.zeroaimemory не защищён по пути (D157)");
-                    Ok(roots)
-                }
-            }
-        }
+        move || Roots::canonical(&p, &h)
     })
     .await?;
+    // Домашний каталог — своя ошибка с его путём (Minor 5 ревью задачи 1 R1-M).
+    let roots = match home::user_home() {
+        Some(u) => {
+            let path = u.clone();
+            let user_home = |source| RunError::UserHome {
+                path: path.clone(),
+                source,
+            };
+            tokio::task::spawn_blocking(move || roots.with_home(&u))
+                .await
+                .map_err(|e| user_home(std::io::Error::other(e.to_string())))?
+                .map_err(user_home)?
+        }
+        None => {
+            tracing::warn!(
+                "домашний каталог пользователя не задан: ~/.zeroaimemory не защищён по пути (D157)"
+            );
+            roots
+        }
+    };
     // Проект внутри защищённого места (D157): любой вызов был бы отказом.
     if paths::sealed_place(&roots, &roots.project) {
         return Err(RunError::SealedProject(roots.project.clone()));

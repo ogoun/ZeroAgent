@@ -51,10 +51,20 @@ pub fn user_home() -> Option<PathBuf> {
     user_home_from(|k| std::env::var_os(k), cfg!(windows))
 }
 
+/// Переменная окружения домашнего каталога пользователя этой ОС ([`user_home`]).
+pub fn user_home_var() -> &'static str {
+    home_var(cfg!(windows))
+}
+
+fn home_var(windows: bool) -> &'static str {
+    if windows { "USERPROFILE" } else { "HOME" }
+}
+
 /// [`user_home`] с явным окружением и платформой (для тестов).
 fn user_home_from(var: impl Fn(&str) -> Option<OsString>, windows: bool) -> Option<PathBuf> {
-    let name = if windows { "USERPROFILE" } else { "HOME" };
-    var(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+    var(home_var(windows))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Идентификатор проекта: первые 16 hex-символов BLAKE3 от канонического пути

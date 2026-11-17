@@ -436,6 +436,25 @@ fn short_names_are_resolved() {
     }
 }
 
+/// R1-M D157, Minor 4 ревью задачи 1: короткое имя 8.3 защищённого места (`ZEROAI~1` у
+/// `~/.zeroaimemory`) — то же защищённое место при любом доступе: сверяется канонический
+/// путь. Если том не создаёт имена 8.3, проверка пропускается с сообщением.
+#[cfg(windows)]
+#[test]
+fn sealed_short_name_is_sealed() {
+    let s = sealed_fixture("sealed_short");
+    let Some(short) = short_name(&s.user, ".zeroaimemory") else {
+        skip_8dot3("том не создаёт короткие имена 8.3 (fsutil 8dot3name)");
+        return;
+    };
+    let zam = arg(&s.user.join(&short).join("config.toml"));
+    for access in [Access::Read, Access::Write, Access::Exec] {
+        let r = res(&s.f, &zam, access);
+        assert!(r.protected, "{short} {access:?}: {}", r.path.display());
+        assert!(sealed_place(&s.f.roots, &r.path), "{}", r.path.display());
+    }
+}
+
 #[test]
 fn within_by_components() {
     assert!(!within(Path::new("/data"), Path::new("/data2/x")));
