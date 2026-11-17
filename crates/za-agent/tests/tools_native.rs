@@ -667,6 +667,108 @@ async fn recorded_decision_survives_policy_change() {
     assert_eq!(content(&out, 0), ("denied: policy rule".into(), true));
 }
 
+/// Прерывание одобрения вызова `call_id` (`appr-{run}:{step}:0`), каким его открыл код до
+/// встроенного запрета R1-M, с решением `approved`.
+async fn approved_before_ban(b: &Bx, step: u64, call_id: &str, name: &str, paths: Value) {
+    let key = za_protocol::EffectKey::derive(b.run, step, 0);
+    let int = za_core::Interrupt::for_effect(
+        za_core::InterruptKind::Approval,
+        &key,
+        json!({"call_id": call_id, "name": name, "reasons": ["mode"], "paths": paths}),
+    );
+    za_core::interrupt::open(&b.store, b.run, &int)
+        .await
+        .unwrap();
+    b.approve(&int.id, json!({"approved": true})).await;
+}
+
+/// R1-M, Minor 3 ревью задачи 1: записанное одобрение (D92) не снимает встроенный запрет
+/// шага 1 `decide` у вызова, который ещё не исполнялся (намерения нет). Одобрение
+/// `zam search x`, открытое кодом R1-C2 (вопрос режима `ask`), после `--approve` и resume —
+/// отказ `memory client` (D158), команда не исполняется; одобренное чтение `ZA_HOME` —
+/// `protected path` (D157). Отказ — решение без следа: повторный реплей того же журнала
+/// даёт тот же текст, намерения и квитанции нет.
+#[tokio::test]
+async fn approved_call_still_hits_builtin_ban() {
+    let b = bx("approved_ban").await;
+    let bash = BashStub::new();
+    let seen = Arc::clone(&bash.seen);
+    let read = ReadStub::new();
+    let reads = Arc::clone(&read.calls);
+    let reg = registry(vec![Arc::new(bash), Arc::new(read)]);
+    let env = b.env(RunMode::Ask);
+    approved_before_ban(&b, 1, "b1", "bash", json!([])).await;
+    let cfg = b.d.roots.za_home.join("config.toml");
+    let paths = json!([{"path": s(&cfg), "access": "read", "inside": false, "protected": false}]);
+    approved_before_ban(&b, 2, "r1", "read", paths).await;
+    for _ in 0..2 {
+        let out = b
+            .batch(
+                &reg,
+                &env,
+                1,
+                &[pc("b1", "bash", json!({"cmd": "zam search x"}))],
+            )
+            .await;
+        assert!(out.suspend.is_none());
+        assert_eq!(content(&out, 0), ("denied: memory client".into(), true));
+        let out = b
+            .batch(&reg, &env, 2, &[pc("r1", "read", json!({"path": s(&cfg)}))])
+            .await;
+        assert!(out.suspend.is_none());
+        assert_eq!(content(&out, 0), ("denied: protected path".into(), true));
+    }
+    assert!(seen.lock().unwrap().is_empty(), "zam исполнен");
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "ZA_HOME прочитан");
+    for step in [1, 2] {
+        let key = za_protocol::EffectKey::derive(b.run, step, 0);
+        assert!(b.store.effect(b.run, &key).await.unwrap().is_none());
+    }
+    assert!(of_kind(&b.events().await, EventKind::ToolStarted).is_empty());
+}
+
+/// R1-M, Minor 10 ревью задачи 1: `request_grant` на защищённое место (D157: `ZA_HOME`,
+/// `~/.zeroaimemory/` и пути внутри них) — отказ `protected path` без вопроса человеку:
+/// грант там ничего не дал бы. Грант на домашний каталог над защищённым местом — вопрос,
+/// как раньше.
+#[tokio::test]
+async fn request_grant_on_sealed_place_denied_without_asking() {
+    let b = bx("grant_sealed").await;
+    let user = b.d.outside.join("user");
+    std::fs::create_dir_all(user.join(".zeroaimemory")).unwrap();
+    let mut env = b.env(RunMode::Auto);
+    env.roots = Arc::new(b.d.roots.clone().with_home(&user).unwrap());
+    let reg = registry(vec![]);
+    let za_home = b.d.roots.za_home.clone();
+    for (step, path) in [
+        user.join(".zeroaimemory"),
+        user.join(".zeroaimemory").join("config.toml"),
+        za_home.clone(),
+        za_home.join("config.toml"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let calls = [pc(
+            "g1",
+            "request_grant",
+            json!({"path": s(path), "mode": "ro", "reason": "token"}),
+        )];
+        let out = b.batch(&reg, &env, step as u64 + 1, &calls).await;
+        assert!(out.suspend.is_none(), "{}", path.display());
+        assert_eq!(
+            content(&out, 0),
+            ("denied: protected path".into(), true),
+            "{}",
+            path.display()
+        );
+    }
+    assert!(of_kind(&b.events().await, EventKind::InterruptOpened).is_empty());
+    let calls = [pc("g2", "request_grant", json!({"path": s(&user)}))];
+    let out = b.batch(&reg, &env, 10, &calls).await;
+    assert_eq!(reasons(&out), ["grant"]);
+}
+
 #[test]
 fn texts_hash_covers_tool_texts() {
     let t: Arc<dyn Tool> = Arc::new(TextStub::new("t"));

@@ -20,6 +20,9 @@
 //! - есть прерывание доверия `trust-{key}` или одобрения `appr-{key}` — решение берётся
 //!   из него (открыто — снова пауза, решено — ответ пользователя), политика не
 //!   пересчитывается: конфигурация, гранты или доверие могли измениться до resume.
+//!   Исключение — встроенные запреты шага 1 (`policy::builtin_deny`: защищённое место
+//!   D157, клиент `zam` D158, R1-M): одобренный, но не начатый вызов под ними получает
+//!   отказ, как без одобрения.
 //!
 //! Решение без следа (отказ политики, разрешённый вызов, не дошедший до намерения) ничего
 //! не записало и результата в журнал не дало: реплей принимает его заново. Решение пишется
@@ -68,7 +71,8 @@ use za_core::{
 use za_llm::{BoxFuture, Part, ToolCall, ToolSchema};
 use za_protocol::{
     Actor, EffectClass, EffectKey, EventKind, NewEvent, RunId, RunMode, RunRole, Tier,
-    approval_reason, audit_action, canonical_json, irreversible, mask_json_with, taint_origin,
+    approval_reason, audit_action, canonical_json, deny_reason, irreversible, mask_json_with,
+    taint_origin,
 };
 use za_secrets::SecretMasker;
 use za_store::{AuditNew, StoreError};
@@ -79,8 +83,8 @@ use crate::context::{
 use crate::driver::{CrashHook, CrashPoint, FaultHook, FaultPoint, INJECTED_FAULT};
 use crate::exposure::{Exposure, RULE_OF_TWO_MARK, untrusted_origin};
 use crate::policy::{
-    Decision, Grant, GrantMode, GrantSource, PolicyCx, PolicySnapshot, covers, decide,
-    subject_paths,
+    Decision, Grant, GrantMode, GrantSource, PolicyCx, PolicySnapshot, builtin_deny, covers,
+    decide, subject_paths,
 };
 use crate::prompt::escape_untrusted;
 use crate::skills::{ACTIVATE_SKILL_TOOL, Activation, LoadJob, SkillRef, plan_activation};
@@ -868,9 +872,26 @@ async fn prepare(
     }
     // Записанное одобрение (D92): решение пользователя, политика не пересчитывается.
     let row = ctx.store().interrupt(&appr).await;
+    let cx = PolicyCx {
+        policy: &env.policy,
+        mode: env.mode,
+        roots: &env.roots,
+        trusted: st.trusted,
+        trust_refused: st.trust_refused,
+        taint: &st.taint,
+        grants: &st.grants,
+    };
     let decided = match observe_store(ctx, row)? {
         Some(row) => match row.response {
             Some(v) if approved(&v) => {
+                // Кроме встроенных запретов шага 1 (защищённое место D157, клиент `zam`
+                // D158; Minor 3 ревью задачи 1 R1-M): одобрение, открытое до запрета или в
+                // run без домашнего каталога, их не снимает. Вызов не исполнялся (намерения
+                // нет), отказ — решение без следа: реплей даёт тот же текст.
+                if let Some(reason) = builtin_deny(&cx, tool.spec(), &subjects, &planned) {
+                    tracing::warn!(id = %appr, reason, "одобренный вызов под встроенным запретом");
+                    return Ok(Prep::Done(result(call, denied_text(reason), true)));
+                }
                 // Одобрен вызов с путями тех классов, что видел пользователь (D77, D98):
                 // путь, сменивший класс до ответа (ссылка наружу), — повторить вызов.
                 let seen = row.payload.as_ref().and_then(|p| p.get("paths"));
@@ -890,15 +911,6 @@ async fn prepare(
             }
         },
         None => {
-            let cx = PolicyCx {
-                policy: &env.policy,
-                mode: env.mode,
-                roots: &env.roots,
-                trusted: st.trusted,
-                trust_refused: st.trust_refused,
-                taint: &st.taint,
-                grants: &st.grants,
-            };
             let mut d = decide(&cx, tool.spec(), &subjects, &planned);
             // Слово команды, отвергнутое разбором пути (I4): граница неизвестна —
             // `Ask(outside_project)`, как у `decide` при несовпавшей длине (задача 11).
@@ -1173,6 +1185,15 @@ async fn prepare_grant(
         Ok(mut p) => p.remove(0).path,
         Err(e) => return Ok(Prep::Done(result(call, path_error_text(&e), true))),
     };
+    // Защищённое место (D157; Minor 10 ревью задачи 1 R1-M): грант там ничего не даст —
+    // отказ без вопроса человеку.
+    if paths::sealed_place(&env.roots, &path) {
+        return Ok(Prep::Done(result(
+            call,
+            denied_text(deny_reason::PROTECTED_PATH),
+            true,
+        )));
+    }
     let grant = Grant {
         path,
         mode,

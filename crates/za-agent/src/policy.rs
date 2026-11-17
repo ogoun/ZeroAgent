@@ -1028,13 +1028,9 @@ pub fn decide(
         .map(|(src, r)| Compiled::new(*src, r))
         .collect();
 
-    // 1. Встроенные запреты: защищённый путь (D79), защищённое место памяти у пути или
-    // слова команды (D157) и клиент памяти `zam` (D158). В снимок и хэш не входят.
-    if call.paths.iter().chain(&call.words).any(|p| p.protected) {
-        return Decision::Deny(deny_reason::PROTECTED_PATH);
-    }
-    if call.segments.iter().any(memory_client_segment) {
-        return Decision::Deny(deny_reason::MEMORY_CLIENT);
+    // 1. Встроенные запреты ([`builtin_deny`]). В снимок и хэш не входят.
+    if let Some(reason) = builtin_of(&call) {
+        return Decision::Deny(reason);
     }
     // 2. Правила deny.
     if rules
@@ -1098,6 +1094,30 @@ pub fn decide(
     } else {
         Decision::Ask { reasons }
     }
+}
+
+/// Встроенные запреты — шаг 1 [`decide`]: защищённый путь (D79), защищённое место памяти у
+/// пути или слова команды (D157) — `protected path`; клиент памяти `zam` в любом сегменте
+/// (D158) — `memory client`. Их не снимают ни правила, ни режим, ни гранты, ни доверие, ни
+/// записанное одобрение (D92): пакет вызовов проверяет их и у одобренного вызова, который
+/// ещё не исполнялся (Minor 3 ревью задачи 1 R1-M). `None` — встроенного запрета нет.
+pub(crate) fn builtin_deny(
+    cx: &PolicyCx<'_>,
+    spec: &ToolSpec,
+    s: &Subjects,
+    paths: &[ResolvedPath],
+) -> Option<&'static str> {
+    builtin_of(&call_of(cx, spec, s, paths))
+}
+
+fn builtin_of(call: &Call<'_>) -> Option<&'static str> {
+    if call.paths.iter().chain(&call.words).any(|p| p.protected) {
+        return Some(deny_reason::PROTECTED_PATH);
+    }
+    if call.segments.iter().any(memory_client_segment) {
+        return Some(deny_reason::MEMORY_CLIENT);
+    }
+    None
 }
 
 // ---- Тексты для модели ----
