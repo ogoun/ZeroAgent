@@ -135,12 +135,17 @@ impl Case {
     }
 
     fn za(&self, args: &[&str]) -> Out {
+        self.za_in(None, args)
+    }
+
+    /// [`Case::za`] с текущим каталогом процесса `cwd`.
+    fn za_in(&self, cwd: Option<&Path>, args: &[&str]) -> Out {
         let vars: Vec<(&str, &str)> = self
             .vars
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        self.e.run_with(args, &vars)
+        self.e.run_env_in(cwd, args, &vars, &[])
     }
 
     /// `run` с пределом чекпоинта git 20 с × `ZA_TEST_TIME_SCALE`: под нагрузкой станции
@@ -1322,6 +1327,79 @@ fn home_project_walk_and_checkpoint_skip_sealed() {
         std::fs::read_to_string(zam_dir.join("config.toml")).unwrap(),
         cfg
     );
+}
+
+/// Строка stderr о защищённом месте `place` внутри проекта (Minor 4 повторного ревью fix-1
+/// задачи 1 R1-M).
+fn sealed_in_project_line(place: &Path) -> String {
+    format!(
+        "zero-agent: в проекте лежит защищённое место {}: команды bash внутри проекта его не узнают; лучше открыть проект в подкаталоге",
+        place.display()
+    )
+}
+
+/// R1-M D157, Minor 4 повторного ревью fix-1 задачи 1: проект — домашний каталог
+/// пользователя. Команды `bash` внутри проекта (`grep -r … .`, шаблон `.zeroaimemor?`)
+/// защищённое место `~/.zeroaimemory/` лексически не узнают, поэтому `run` и `doctor`
+/// (запущенный в каталоге проекта) предупреждают одной строкой stderr — путь, без
+/// значений. Проект, в котором защищённого места нет (домашний каталог — другой), — строки
+/// нет.
+#[test]
+fn sealed_place_in_project_warned() {
+    let c = Case::new("zam-home-warn", answer_model);
+    let token = [
+        "zam",
+        "_",
+        "Wr5nTk8hVa2uEq4wRt6yUi9o",
+        "Pa1sDf3gHj7kLz0xC5vB",
+    ]
+    .concat();
+    let zam_dir = c.e.project.join(".zeroaimemory");
+    std::fs::create_dir_all(&zam_dir).unwrap();
+    std::fs::write(
+        zam_dir.join("config.toml"),
+        format!("token = \"{token}\"\n"),
+    )
+    .unwrap();
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let other = unique_dir(SUITE, "zam-home-warn-user");
+    std::fs::create_dir_all(other.join(".zeroaimemory")).unwrap();
+    let other = shown(&std::fs::canonicalize(&other).unwrap())
+        .to_string_lossy()
+        .into_owned();
+    let project = c.e.project_arg().to_owned();
+    let line = sealed_in_project_line(&zam_dir);
+    let lines = |o: &Out| {
+        o.stderr
+            .lines()
+            .filter(|l| l.contains("в проекте лежит защищённое место"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let mut c = c;
+    for (home, want) in [(project.as_str(), vec![line.clone()]), (&other, vec![])] {
+        // Переменная задаётся заново: у процесса действует последнее значение.
+        c = c.var(home_var, home);
+        let o = c.run(&["--mode", "auto", "задача"]);
+        assert_eq!(o.code(), Some(0), "{o:?}");
+        assert_eq!(
+            lines(&o),
+            want,
+            "run, домашний каталог {home}: {}",
+            o.stderr
+        );
+        let d = c.za_in(Some(&c.e.project), &["doctor"]);
+        assert_eq!(
+            lines(&d),
+            want,
+            "doctor, домашний каталог {home}: {}",
+            d.stderr
+        );
+        for out in [&o, &d] {
+            assert!(!out.stderr.contains(&token[4..]), "токен в stderr");
+            assert!(!out.stdout.contains(&token[4..]), "токен в stdout");
+        }
+    }
 }
 
 /// D157: проект внутри `ZA_HOME` — отказ старта run с причиной, к модели нет запросов.

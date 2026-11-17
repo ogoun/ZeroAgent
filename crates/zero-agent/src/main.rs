@@ -814,7 +814,12 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
 async fn cmd_doctor(json: bool) -> Result<ExitCode, AppError> {
     let url = std::env::var(LLAMA_URL_ENV).ok();
     let token = zero_agent::config::memory_token_from_env();
-    let report = doctor::run(url.as_deref(), home::za_home().ok().as_deref(), token).await;
+    let za_home = home::za_home().ok();
+    // Защищённое место в каталоге запуска — строка stderr, как у `run` (R1-M D157).
+    for line in doctor::sealed_in_cwd_lines(za_home.as_deref()).await {
+        eprintln!("{line}");
+    }
+    let report = doctor::run(url.as_deref(), za_home.as_deref(), token).await;
     if json {
         let text = serde_json::to_string_pretty(&report).map_err(AppError::Json)?;
         println!("{text}");

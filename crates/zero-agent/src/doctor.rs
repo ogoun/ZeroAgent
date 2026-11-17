@@ -23,6 +23,10 @@
 //! сети — `Warn` «токен идёт открытым текстом». Нет `[memory]` — `Warn` «память не настроена»;
 //! сервер недоступен — `Warn`: агент работает без памяти (L0). Токен — параметром, команда
 //! читает переменную один раз.
+//!
+//! R1-M (D157, Minor 4 повторного ревью fix-1 задачи 1): защищённое место (`ZA_HOME`,
+//! `~/.zeroaimemory/`) внутри каталога запуска `doctor` — строка stderr, как у `run`
+//! ([`sealed_in_cwd_lines`]): у `doctor` нет проекта, им считается текущий каталог.
 
 use std::path::Path;
 
@@ -32,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use za_core::extract::{Extractor, HtmlRequest};
+use za_core::paths::Roots;
 use za_jail::{CommandSpec, DirectRunner, EnvMode, Exit, Runner};
 use za_llm::EndpointView;
 use za_memory::{
@@ -41,6 +46,7 @@ use za_protocol::Tier;
 use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query_nvidia_smi};
 
 use crate::config::{AgentConfig, AppConfigError, LLAMA_URL_ENDPOINT, load_config};
+use crate::home::{sealed_in_project, sealed_in_project_line, with_user_home};
 use crate::models::{PROBE_WAIT, start_gateway, state_text};
 use crate::secret::{StoreSecrets, source_text};
 
@@ -230,6 +236,34 @@ pub async fn run(
         models,
         rust: rust_version(),
     }
+}
+
+/// Строки stderr о защищённых местах внутри текущего каталога (R1-M D157, Minor 4
+/// повторного ревью fix-1 задачи 1; [`crate::home::sealed_in_project`]): у `doctor` нет
+/// проекта, им считается каталог запуска — тот, что обычно передают `run --project .`.
+/// `za_home` — `ZA_HOME` (`None` — не определён: сверяется только `~/.zeroaimemory/`).
+/// Каталог или домашний каталог, который не разрешается, — строк нет: отказ старта —
+/// забота `run`.
+pub async fn sealed_in_cwd_lines(za_home: Option<&Path>) -> Vec<String> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let za = za_home.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        let roots = match &za {
+            Some(h) => Roots::canonical(&cwd, h),
+            None => Roots::boundary(&cwd),
+        };
+        let Some(roots) = roots.ok().and_then(|r| with_user_home(r).ok()) else {
+            return Vec::new();
+        };
+        sealed_in_project(&roots, za.is_some())
+            .iter()
+            .map(|p| sealed_in_project_line(p))
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Строка `memory` с проверкой сервера (D136, D152): клиент по `[memory]`, обнаружение и

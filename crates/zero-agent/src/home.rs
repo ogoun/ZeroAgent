@@ -96,6 +96,36 @@ pub fn with_user_home(roots: Roots) -> Result<Roots, UserHomeError> {
     }
 }
 
+/// Защищённые места корней `roots` (D157), которые лежат внутри проекта и есть на диске:
+/// `ZA_HOME` (при `with_za_home`) и [`Roots::sealed`] (`~/.zeroaimemory/` и цель его
+/// ссылки). Нативные инструменты их обходят, а команда `bash` внутри проекта
+/// (`grep -r … .`, `find . -exec cat …`, шаблон оболочки `.zeroaimemor?`) — путь внутри
+/// проекта, и её лексическая сверка их не узнаёт (ADR 0007, остаточные риски; Minor 4
+/// повторного ревью fix-1 задачи 1). Блокирующая.
+pub fn sealed_in_project(roots: &Roots, with_za_home: bool) -> Vec<PathBuf> {
+    let za_home = with_za_home.then_some(&roots.za_home);
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in za_home.into_iter().chain(&roots.sealed) {
+        if *p != roots.project
+            && za_core::paths::within(&roots.project, p)
+            && std::fs::symlink_metadata(p).is_ok()
+            && !out.contains(p)
+        {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+/// Строка stderr о защищённом месте `place` внутри проекта ([`sealed_in_project`]): путь,
+/// значений нет.
+pub fn sealed_in_project_line(place: &Path) -> String {
+    format!(
+        "zero-agent: в проекте лежит защищённое место {}: команды bash внутри проекта его не узнают; лучше открыть проект в подкаталоге",
+        crate::run::display_path(place)
+    )
+}
+
 /// Идентификатор проекта: первые 16 hex-символов BLAKE3 от канонического пути
 /// каталога (байты пути в кодировке ОС). Каталог должен существовать.
 pub fn project_id(dir: &Path) -> std::io::Result<String> {

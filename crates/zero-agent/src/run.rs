@@ -538,6 +538,17 @@ async fn prepare(
     if paths::sealed_place(&roots, &roots.project) {
         return Err(RunError::SealedProject(roots.project.clone()));
     }
+    // Защищённое место внутри проекта (проект — домашний каталог или предок `ZA_HOME`):
+    // команды `bash` внутри проекта его лексически не узнают (Minor 4 повторного ревью
+    // fix-1 задачи 1) — строка stderr на место.
+    let inside = blocking("защищённые места проекта", project, {
+        let r = roots.clone();
+        move || Ok(home::sealed_in_project(&r, true))
+    })
+    .await?;
+    for place in inside {
+        eprintln!("{}", home::sealed_in_project_line(&place));
+    }
     let project_id = home::project_id(project).map_err(|source| RunError::Io {
         what: "каталог проекта",
         path: project.to_path_buf(),

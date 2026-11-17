@@ -132,10 +132,25 @@ impl Env {
     /// [`Env::run_with`], а переменные `remove` процесс не наследует (`NO_PROXY` у теста
     /// прокси: исключение из прокси сделало бы проверку пустой).
     pub fn run_env(&self, args: &[&str], vars: &[(&str, &str)], remove: &[&str]) -> Out {
+        self.run_env_in(None, args, vars, remove)
+    }
+
+    /// [`Env::run_env`] с текущим каталогом процесса `cwd` (`None` — каталог теста):
+    /// команда без `--project` (`doctor`) смотрит на свой текущий каталог.
+    pub fn run_env_in(
+        &self,
+        cwd: Option<&Path>,
+        args: &[&str],
+        vars: &[(&str, &str)],
+        remove: &[&str],
+    ) -> Out {
         let caches = self.home.with_extension("caches");
         let _ = std::fs::create_dir_all(caches.join("cargo"));
         let _ = std::fs::create_dir_all(caches.join("uv"));
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_zero-agent"));
+        if let Some(d) = cwd {
+            cmd.current_dir(d);
+        }
         cmd.args(args)
             .env("CARGO_HOME", caches.join("cargo"))
             .env("UV_CACHE_DIR", caches.join("uv"))
