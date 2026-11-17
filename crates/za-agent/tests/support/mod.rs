@@ -45,6 +45,9 @@ pub async fn within_for<T>(base: Duration, what: &str, f: impl Future<Output = T
 /// Заглушки нативных инструментов с контрактом D74 (R1-C1 задача 12).
 pub mod stub;
 
+/// Память-заглушка с очередями ответов и журналом вызовов (R1-M задача 3).
+pub mod memory;
+
 #[path = "../../../../test-support/unique_dir.rs"]
 mod unique;
 

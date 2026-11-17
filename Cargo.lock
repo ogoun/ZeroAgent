@@ -2716,6 +2716,7 @@ name = "za-core"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "jiff",
  "libc",
  "same-file",
  "serde",

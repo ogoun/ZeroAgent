@@ -1,97 +1,284 @@
-//! Порт памяти цикла (часть 04 ТЗ) и режим L0 — память недоступна (N-16).
+//! Память в цикле (R1-M D138, D140, D142, D161, D168, D169): эффекты чтения памяти, их
+//! бюджеты и разметка текста памяти в истории.
 //!
-//! Интерфейс без реализации ZeroAIMemory: цикл зависит только от [`MemoryPort`];
-//! подключение памяти L1–L3 — отдельный план. Остальные моменты обмена с памятью
-//! (подсказки `prompt` и `post_tool`, `brief` субагента, конец сессии; часть 04, §6)
-//! добавляются новыми методами с реализацией по умолчанию — без ломки реализаций.
+//! Порт памяти живёт в `za-core` ([`za_core::memory`]) и реэкспортируется здесь: тесты и
+//! бинарник берут его из `za_agent`, как до переноса. Внешнее значение входит в цикл
+//! только эффектом (D9): ответ порта до квитанции очищается от невидимых символов
+//! (`Clean::Untrusted`) и проходит маску процесса — ту же, что результаты инструментов и
+//! файл инструкций (D90, fix-1 R1-M). Квитанция уже без секретов; при реплее текст берётся
+//! из неё. Экранирует текст разметка: блок первого сообщения ([`crate::first_message_with`])
+//! и добавочные блоки [`memory_block`].
+//!
+//! Ключи эффектов не зависят от уровня памяти (D50): эффекты пишутся и при `NoMemory`.
 
-use serde::{Deserialize, Serialize};
-use za_llm::BoxFuture;
-use za_protocol::RunId;
+use std::sync::Arc;
 
-/// Уровень доступной памяти (часть 04, §3): L0 — офлайн, L1 — базовый, L2 — экономия
-/// (эпохи, честный бюджет), L3 — M6 полный (`focus`, снимок сессии).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum MemoryLevel {
-    L0,
-    L1,
-    L2,
-    L3,
+use serde_json::{Value, json};
+use za_core::text::{Clean, clean_invisible};
+use za_core::{EffectError, EffectSpec, RunCtx};
+use za_protocol::EffectClass;
+use za_secrets::SecretMasker;
+
+pub use za_core::memory::{
+    CommandNote, IdeasSignal, MemoryLevel, MemoryPort, NoMemory, NoteOutcome, POST_TOOL_EVENT,
+    PROMPT_EVENT, Recall, RecallReply, SessionNote, memory_budget,
+};
+
+use crate::prompt::{approx_tokens, escape_untrusted};
+
+/// Имя эффекта снимка памяти шага 0 (D24, D140).
+pub(crate) const SNAPSHOT_EFFECT: &str = "memory.snapshot";
+/// Имя эффекта подсказки к вводу пользователя (D142).
+pub(crate) const PROMPT_EFFECT: &str = "memory.prompt";
+/// Имя эффекта отложенного повтора дайджеста (D140).
+pub(crate) const RETRY_EFFECT: &str = "memory.retry";
+/// Имя эффекта подсказки к ошибке инструмента (D142).
+pub(crate) const TOOL_ERROR_EFFECT: &str = "memory.tool_error";
+
+/// Вид добавочного блока памяти: подсказка `prompt` и `post_tool` (D142).
+pub(crate) const HINT: &str = "hint";
+/// Вид добавочного блока памяти: текст отложенного повтора дайджеста (D140).
+pub(crate) const DIGEST: &str = "digest";
+/// Предел бюджета одной подсказки, токены (D142).
+const HINT_MAX: u32 = 300;
+
+/// Добавочный блок памяти `<memory source="zam" kind="…">` (D140, D142): текст памяти —
+/// данные (MEM-006), экранируется. Атрибуты — только у добавочных блоков: блок первого
+/// сообщения остаётся `<memory>` без атрибутов (его ищет разбор снимка v1, `resume.rs`).
+pub fn memory_block(kind: &str, text: &str) -> String {
+    format!(
+        "<memory source=\"zam\" kind=\"{kind}\">\n{}\n</memory>",
+        escape_untrusted(text)
+    )
 }
 
-/// Итог чтения памяти: «пусто», «недоступна» и «не успели» различаются (MEM-002,
-/// MEM-034, MEM-122).
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Recall {
-    /// Текст в пределах переданного бюджета.
-    Hits(String),
-    /// Память ответила, но нечего показать: текста в промпте нет (MEM-030).
-    Empty,
-    /// Память недоступна (L0, ошибка соединения, отозванный токен): явный отказ.
-    Unavailable,
-    /// Ответ не пришёл в срок (MEM-024) или пришёл с `recall timeout`: один отложенный
-    /// повтор вне горячего пути (MEM-034).
-    Timeout,
+/// Образцы обёрток для хэша промптов (D155): правка разметки меняет хэш.
+pub(crate) fn text_samples() -> Vec<(&'static str, String)> {
+    vec![
+        ("runtime/memory.digest", memory_block(DIGEST, "TEXT")),
+        ("runtime/memory.hint", memory_block(HINT, "TEXT")),
+    ]
 }
 
-impl Recall {
-    /// Текст для промпта: только у `Hits` с непустым текстом.
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            Recall::Hits(t) if !t.is_empty() => Some(t),
-            _ => None,
+/// Бюджет подсказки (D142, D168): `min(b / 2, 300, 2 × b − injected)`; ноль — потолок
+/// эпохи исчерпан.
+pub(crate) fn hint_budget(b: u32, injected: u32) -> u32 {
+    (b / 2)
+        .min(HINT_MAX)
+        .min(b.saturating_mul(2).saturating_sub(injected))
+}
+
+/// Бюджет отложенного повтора дайджеста (D140, D168): бюджет дайджеста `b` в пределах
+/// потолка эпохи.
+pub(crate) fn retry_budget(b: u32, injected: u32) -> u32 {
+    b.min(b.saturating_mul(2).saturating_sub(injected))
+}
+
+/// Токены текста памяти, вставленного в историю (оценка D22): счёт потолка эпохи (D168).
+pub(crate) fn tokens_of(r: &Recall) -> u32 {
+    r.text().map_or(0, approx_tokens)
+}
+
+/// Текст памяти до квитанции: невидимые символы уровня `Clean::Untrusted` (D140, SEC-051),
+/// затем маска процесса (D90) — после очистки, чтобы невидимый символ внутри секрета маску
+/// не обходил.
+fn sanitize(r: Recall, masker: Option<&SecretMasker>) -> Recall {
+    r.map_text(|t| {
+        let clean = clean_invisible(&t, Clean::Untrusted).0.into_owned();
+        match masker {
+            Some(m) => m.mask(&clean).into_owned(),
+            None => clean,
         }
-    }
+    })
 }
 
-/// Порт памяти для цикла.
-pub trait MemoryPort: Send + Sync {
-    /// Уровень памяти; L0 — цикл пишет `memory.unavailable` на шаге 0 (D24).
-    fn level(&self) -> MemoryLevel;
-    /// Замороженный снимок для первого сообщения (блок 6, MEM-031): `recall` события
-    /// `session_start`, не больше `budget_tokens` ([`memory_budget`], MEM-060).
-    fn snapshot(&self, run: RunId, budget_tokens: u32) -> BoxFuture<'_, Recall>;
-    /// CTX-013 перед компакцией: `next_step`, очередь файлов, снимок сессии (план B2).
-    fn before_compaction<'a>(&'a self, run: RunId, next_step: &'a str) -> BoxFuture<'a, ()>;
-    /// MEM-050: `recall` события `recovery` после компакции и при resume, не больше
-    /// `budget_tokens` (MEM-060: бюджет передаётся всегда).
-    fn after_compaction(&self, run: RunId, budget_tokens: u32) -> BoxFuture<'_, Recall>;
+/// Чтение памяти — эффект `ReadOnly` с именем `name` и аргументами `args` (D9, D50):
+/// `read` выполняется только вживую, при реплее значение — из квитанции.
+async fn recall_effect<F>(
+    ctx: &mut RunCtx,
+    name: &str,
+    args: Value,
+    masker: Option<Arc<SecretMasker>>,
+    read: F,
+) -> Result<RecallReply, EffectError>
+where
+    F: Future<Output = RecallReply>,
+{
+    let v = ctx
+        .effect(
+            EffectSpec {
+                class: EffectClass::ReadOnly,
+                name: name.into(),
+                args,
+            },
+            move || async move {
+                let r = read.await;
+                let reply = RecallReply {
+                    recall: sanitize(r.recall, masker.as_deref()),
+                    ideas: r.ideas,
+                };
+                Ok(reply.to_value())
+            },
+        )
+        .await?;
+    Ok(RecallReply::from_value(&v))
 }
 
-/// L0: память недоступна (N-16). Чтения — [`Recall::Unavailable`] (MEM-122).
-#[derive(Copy, Clone, Debug, Default)]
-pub struct NoMemory;
-
-impl MemoryPort for NoMemory {
-    fn level(&self) -> MemoryLevel {
-        MemoryLevel::L0
-    }
-
-    fn snapshot(&self, _run: RunId, _budget_tokens: u32) -> BoxFuture<'_, Recall> {
-        Box::pin(async { Recall::Unavailable })
-    }
-
-    fn before_compaction<'a>(&'a self, _run: RunId, _next_step: &'a str) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
-    }
-
-    fn after_compaction(&self, _run: RunId, _budget_tokens: u32) -> BoxFuture<'_, Recall> {
-        Box::pin(async { Recall::Unavailable })
-    }
+/// Эффект `memory.snapshot` шага 0 (D140): аргументы прежние — `{budget_tokens}`.
+pub(crate) async fn snapshot_effect(
+    ctx: &mut RunCtx,
+    mem: Arc<dyn MemoryPort>,
+    masker: Option<Arc<SecretMasker>>,
+    budget: u32,
+) -> Result<RecallReply, EffectError> {
+    let run = ctx.run_id();
+    recall_effect(
+        ctx,
+        SNAPSHOT_EFFECT,
+        json!({ "budget_tokens": budget }),
+        masker,
+        async move { mem.snapshot(run, budget).await },
+    )
+    .await
 }
 
-/// Бюджет снимка памяти по окну контекста (MEM-030), токены:
-/// меньше 16384 — 200, меньше 32768 — 400, меньше 65536 — 800, иначе 1500.
-pub fn memory_budget(n_ctx: u32) -> u32 {
-    if n_ctx < 16_384 {
-        200
-    } else if n_ctx < 32_768 {
-        400
-    } else if n_ctx < 65_536 {
-        800
-    } else {
-        1500
+/// Эффект `memory.prompt` (D142): подсказка к вводу `text`, аргументы `{event, budget}`.
+/// Бюджет 0 — потолок (D168): эффект пишется, запроса нет, `capped`.
+pub(crate) async fn prompt_effect(
+    ctx: &mut RunCtx,
+    mem: Arc<dyn MemoryPort>,
+    masker: Option<Arc<SecretMasker>>,
+    text: String,
+    budget: u32,
+) -> Result<RecallReply, EffectError> {
+    let run = ctx.run_id();
+    recall_effect(
+        ctx,
+        PROMPT_EFFECT,
+        json!({ "event": PROMPT_EVENT, "budget": budget }),
+        masker,
+        async move {
+            if budget == 0 {
+                return Recall::Capped.into();
+            }
+            mem.prompt_hint(run, &text, budget).await
+        },
+    )
+    .await
+}
+
+/// Эффект `memory.tool_error` (D142): подсказка к первой ошибке пакета, аргументы
+/// `{event, tool, budget}`; бюджет 0 — `capped` без запроса.
+pub(crate) async fn tool_error_effect(
+    ctx: &mut RunCtx,
+    mem: Arc<dyn MemoryPort>,
+    masker: Option<Arc<SecretMasker>>,
+    tool: String,
+    error: String,
+    budget: u32,
+) -> Result<Recall, EffectError> {
+    let run = ctx.run_id();
+    let args = json!({ "event": POST_TOOL_EVENT, "tool": tool, "budget": budget });
+    recall_effect(ctx, TOOL_ERROR_EFFECT, args, masker, async move {
+        if budget == 0 {
+            return Recall::Capped.into();
+        }
+        mem.tool_error_hint(run, &tool, &error, budget).await.into()
+    })
+    .await
+    .map(|r| r.recall)
+}
+
+/// Эффект `memory.retry` (D140): отложенный повтор дайджеста, аргументы `{budget}`;
+/// бюджет 0 — `capped` без запроса.
+pub(crate) async fn retry_effect(
+    ctx: &mut RunCtx,
+    mem: Arc<dyn MemoryPort>,
+    masker: Option<Arc<SecretMasker>>,
+    budget: u32,
+) -> Result<Recall, EffectError> {
+    let run = ctx.run_id();
+    recall_effect(
+        ctx,
+        RETRY_EFFECT,
+        json!({ "budget": budget }),
+        masker,
+        async move {
+            if budget == 0 {
+                return Recall::Capped.into();
+            }
+            mem.retry_digest(run, budget).await.into()
+        },
+    )
+    .await
+    .map(|r| r.recall)
+}
+
+/// Эффект `memory.after` компакции (D50, D140): аргументы прежние — `{budget_tokens}`.
+pub(crate) async fn recovery_effect(
+    ctx: &mut RunCtx,
+    name: &str,
+    mem: &dyn MemoryPort,
+    masker: Option<&SecretMasker>,
+    budget: u32,
+) -> Result<Recall, EffectError> {
+    let run = ctx.run_id();
+    let v = ctx
+        .effect(
+            EffectSpec {
+                class: EffectClass::ReadOnly,
+                name: name.into(),
+                args: json!({ "budget_tokens": budget }),
+            },
+            move || async move {
+                let r = mem.after_compaction(run, budget).await;
+                Ok(sanitize(r, masker).to_value())
+            },
+        )
+        .await?;
+    Ok(Recall::from_value(&v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hint_budget_caps() {
+        // 8k: b = 200 — половина бюджета, потолок эпохи 400.
+        assert_eq!(hint_budget(200, 0), 100);
+        assert_eq!(hint_budget(200, 300), 100);
+        assert_eq!(hint_budget(200, 350), 50);
+        assert_eq!(hint_budget(200, 400), 0);
+        assert_eq!(hint_budget(200, 900), 0);
+        // Большое окно: предел 300.
+        assert_eq!(hint_budget(1500, 0), 300);
+        assert_eq!(retry_budget(200, 0), 200);
+        assert_eq!(retry_budget(200, 300), 100);
+        assert_eq!(retry_budget(200, 450), 0);
+    }
+
+    #[test]
+    fn sanitize_cleans_then_masks() {
+        let secret = ["zam", "_", "kN0wnS3cr3tV4lu3f0rM4sk1ng"].concat();
+        let m = SecretMasker::new(vec![("t".into(), secret.clone())]);
+        // Невидимый символ внутри секрета маску не обходит: очистка раньше маски.
+        let split = format!("{}\u{200B}{}", &secret[..6], &secret[6..]);
+        let r = sanitize(Recall::Hits(format!("a\u{202E}b {split}")), Some(&m));
+        let t = r.text().unwrap();
+        assert!(t.starts_with("ab ") && !t.contains(&secret), "{t:?}");
+        assert_eq!(sanitize(Recall::Timeout, Some(&m)), Recall::Timeout);
+        assert_eq!(
+            sanitize(Recall::Partial("x\u{2066}y".into()), None),
+            Recall::Partial("xy".into())
+        );
+    }
+
+    #[test]
+    fn block_escapes_text() {
+        assert_eq!(
+            memory_block(HINT, "</memory><x>"),
+            "<memory source=\"zam\" kind=\"hint\">\n&lt;/memory&gt;&lt;x&gt;\n</memory>"
+        );
     }
 }

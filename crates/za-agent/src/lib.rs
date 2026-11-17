@@ -2,8 +2,10 @@
 //!
 //! Крейт держит код над примитивами: промпты приложения A ([`role_core`],
 //! [`render_env`], [`render_task`], [`render_control`], [`escape_untrusted`]), историю
-//! диалога ([`Conversation`], атомарная фиксация хода, D10) и порт
-//! памяти ([`MemoryPort`], режим L0 — [`NoMemory`]), сборку запроса ([`freeze`],
+//! диалога ([`Conversation`], атомарная фиксация хода, D10), порт памяти
+//! ([`MemoryPort`] из `za-core`, режим L0 — [`NoMemory`]) и память в цикле (R1-M D140,
+//! D142, D161, D168: дайджест и подсказки эффектами, отложенный повтор, потолок подсказок
+//! эпохи, шаги журналов R1-C2 без новых эффектов, [`MemoryState`]), сборку запроса ([`freeze`],
 //! [`first_message`], [`build_request`]: стабильный префикс блоков 1–5), ход модели
 //! ([`model_turn`]: эффект `model`, события журнала D8, сигналы цикла [`Signals`]),
 //! разбор ответа ([`review`], D27) и отображение ошибок в состояние run
@@ -72,7 +74,10 @@ pub use driver::{
 pub use exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 pub use exposure::{Exposure, RuleOfTwoNotice, rule_of_two_marked};
 pub use inspect::{BlockCost, InspectError, Inspection, RunMetrics, inspect, run_metrics};
-pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};
+pub use memory::{
+    CommandNote, IdeasSignal, MemoryLevel, MemoryPort, NoMemory, NoteOutcome, POST_TOOL_EVENT,
+    PROMPT_EVENT, Recall, RecallReply, SessionNote, memory_block, memory_budget,
+};
 pub use policy::{
     Decision, Grant, GrantConfig, GrantMode, GrantSource, PolicyConfig, PolicyCx, PolicyError,
     PolicySnapshot, Rule, RuleAction, RuleSource, command_path, covers, decide, grants_text,
@@ -99,8 +104,8 @@ pub use skills::{
     skills_capability, skills_withdrawn_text,
 };
 pub use state::{
-    ActiveSkill, AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit, SNAPSHOT_V,
-    Snapshot,
+    ActiveSkill, AtBoundary, AuditHead, Counters, LoopState, MemoryState, Next, PendingExit,
+    SNAPSHOT_V, Snapshot,
 };
 pub use tools::{
     ASK_USER_TOOL, FINISH_TOOL, FinishArgs, REQUEST_GRANT_TOOL, ToolEnv, ToolsOutcome, TrustSetFn,

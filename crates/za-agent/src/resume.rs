@@ -29,12 +29,12 @@ use crate::context::UserInput;
 use crate::control::{ControlRx, InputMode, submit_input};
 use crate::conversation::{Conversation, LoadError};
 use crate::driver::{
-    BOUNDARY, DEFAULT_N_CTX, LoopDeps, LoopError, LoopOutcome, MODEL, STATE_EFFECT, fail,
-    n_ctx_changed, n_ctx_unknown, run_graph, run_registry, run_tools_of,
+    BOUNDARY, CONTEXT_EFFECT, DEFAULT_N_CTX, LoopDeps, LoopError, LoopOutcome, MODEL, STATE_EFFECT,
+    fail, n_ctx_changed, n_ctx_unknown, run_graph, run_registry, run_tools_of,
 };
 use crate::policy::{Grant, PolicySnapshot};
 use crate::prompt::escape_untrusted;
-use crate::state::{AtBoundary, LoopState, Next, PendingExit, SNAPSHOT_V, Snapshot};
+use crate::state::{AtBoundary, LoopState, MemoryState, Next, PendingExit, SNAPSHOT_V, Snapshot};
 use crate::turn::{COMPACT_EFFECT, MODEL_EFFECT};
 use za_llm::{Message, Part, Role};
 
@@ -66,6 +66,9 @@ const SNAPSHOT_V1: u32 = 1;
 const SNAPSHOT_V2: u32 = 2;
 /// Версия снимка R1-C1 (R1-C2 D130): читается, экспозиция и скиллы — по умолчанию.
 const SNAPSHOT_V3: u32 = 3;
+/// Версия снимка R1-C2 (R1-M D140): читается, состояние памяти — по умолчанию, шаги кода
+/// R1-C2 — без эффектов памяти R1-M (D161).
+const SNAPSHOT_V4: u32 = 4;
 /// Начало управляющего сообщения рантайма: не ввод пользователя (D66).
 pub(crate) const RUNTIME_CONTROL: &str = "<control from=\"runtime\"";
 /// Начало поправки пользователя (A.6, `prompts/control.txt`).
@@ -142,9 +145,15 @@ pub async fn resume_run(
         return Err(fail_broken(deps, run, status, generation, e).await);
     };
     let ver = v.get("v").and_then(Value::as_u64);
-    if ![SNAPSHOT_V, SNAPSHOT_V3, SNAPSHOT_V2, SNAPSHOT_V1]
-        .iter()
-        .any(|v| ver == Some(u64::from(*v)))
+    if ![
+        SNAPSHOT_V,
+        SNAPSHOT_V4,
+        SNAPSHOT_V3,
+        SNAPSHOT_V2,
+        SNAPSHOT_V1,
+    ]
+    .iter()
+    .any(|v| ver == Some(u64::from(*v)))
     {
         let shown = ver.map_or_else(|| "?".to_owned(), |n| n.to_string());
         return Err(LoopError::Snapshot(format!("версия снимка {shown}")));
@@ -268,17 +277,54 @@ pub async fn resume_run(
     run_graph(deps, &mut st, at).await
 }
 
-/// Шаг `step`, начатый до resume без блока `<state>` (Ruling I1): после `boundary`
-/// (ключ `{step}:0`) у него уже есть эффект и это не `state` — первая попытка шага шла
-/// без блока. Тогда блок встаёт в конец границы, его ключ — после записанных эффектов.
-/// Чтение журнала до цикла, как `step_has_effects` в (4).
+/// Шаг `step`, начатый до resume без блока `<state>` на его обычном месте (Ruling I1):
+/// после `boundary` (ключ `{step}:0`) у шага есть эффекты, а `state` среди них до первой
+/// оценки `context` нет — первая попытка шага шла без блока (или с поздним блоком). Тогда
+/// блок встаёт в конец границы, его ключ — после записанных эффектов.
+///
+/// Обычное место блока — после эффектов ввода (`skill.load`, `memory.prompt` R1-M), до
+/// `context`: поэтому смотрится не ключ `{step}:1`, а весь записанный префикс шага (R1-M:
+/// у ввода с подсказкой `{step}:1` — `memory.prompt`). Чтение журнала до цикла, как
+/// `step_has_effects` в (4).
 async fn state_late(
     store: &ProjectStore,
     run: RunId,
     step: u64,
 ) -> Result<Option<u64>, StoreError> {
-    let row = store.effect(run, &EffectKey::derive(run, step, 1)).await?;
-    Ok(row.filter(|r| r.name != STATE_EFFECT).map(|_| step))
+    let mut seq = 1;
+    let mut started = false;
+    while let Some(row) = store
+        .effect(run, &EffectKey::derive(run, step, seq))
+        .await?
+    {
+        if row.name == STATE_EFFECT {
+            return Ok(None);
+        }
+        if row.name == CONTEXT_EFFECT {
+            return Ok(Some(step));
+        }
+        started = true;
+        seq += 1;
+    }
+    Ok(started.then_some(step))
+}
+
+/// Последний шаг, начатый кодом со снимком ниже v5 (D161): шаг снимка (и следующий у
+/// снимка `Boundary`), а также шаги после снимка, у которых в журнале уже есть эффекты —
+/// у снимка `Model` шага `s` граница шага `s + 1` могла быть записана до сбоя. Эффекты
+/// памяти R1-M в этих шагах сдвинули бы ключи записанных эффектов.
+async fn legacy_until(
+    store: &ProjectStore,
+    run: RunId,
+    snap: &Snapshot,
+) -> Result<u64, StoreError> {
+    let mut until = snap.step + u64::from(snap.next == Next::Boundary);
+    let mut step = snap.step + 1;
+    while store.step_has_effects(run, step).await? {
+        until = until.max(step);
+        step += 1;
+    }
+    Ok(until)
 }
 
 /// Снимка нет или он испорчен: `failed` с причиной `snapshot` (D4, D11). Из `paused` и
@@ -331,6 +377,16 @@ async fn restore(
         })?;
     let registry = run_registry(deps)?;
     let (_, classes) = run_tools_of(&registry, snap.setup.role, snap.setup.tier);
+    // D161: снимок ниже v5 — шаги кода прежней версии доигрываются без эффектов памяти
+    // R1-M; у снимка v5 признак — из снимка (повторный сбой его не теряет).
+    let legacy = if snap.v < SNAPSHOT_V {
+        let until = legacy_until(&store, run, &snap).await?;
+        tracing::info!(run = %run, v = snap.v, legacy_until = until,
+            "снимок прежней версии: шаги до legacy_until — без эффектов памяти R1-M");
+        Some(until)
+    } else {
+        None
+    };
     let (task, env_text, user_inputs) = if snap.v == SNAPSHOT_V1 {
         // D66: в снимке R1-B1 полей нет — разбор истории.
         let (env_text, task) = conv
@@ -341,6 +397,13 @@ async fn restore(
         (task, env_text, inputs_of(&store, conv.messages()).await?)
     } else {
         (snap.task, snap.env_text, snap.user_inputs)
+    };
+    let memory = match legacy {
+        Some(until) => MemoryState {
+            legacy_until: Some(until),
+            ..snap.memory
+        },
+        None => snap.memory,
     };
     Ok(LoopState {
         run,
@@ -384,6 +447,7 @@ async fn restore(
         // D106: снимок до R1-C2 — без флагов; `untrusted` следует меткам (`exposure_now`).
         exposure: snap.exposure,
         skills: snap.skills,
+        memory,
         detectors: {
             // D62: кэш сервера за время паузы или на новом эндпоинте не тот, что был.
             let mut d = snap.detectors;

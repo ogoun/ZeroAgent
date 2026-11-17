@@ -153,7 +153,8 @@ const RUNTIME_TEXTS: &[(&str, &str)] = &[
 /// Тексты рантайма, уходящие модели, `(имя, текст)` в порядке имён: постоянные
 /// ([`RUNTIME_TEXTS`]) и образцы текстов, собираемых `format!`, — результат их функций
 /// рендера с фиксированными аргументами (ошибки инструментов, отказы нормализации,
-/// разметка сводки компакции; M-1 ревью задачи 5). Правка шаблона меняет образец, а
+/// разметка сводки компакции; M-1 ревью задачи 5; обёртки добавочных блоков памяти — R1-M
+/// D155). Правка шаблона меняет образец, а
 /// значит и [`prompt_texts_hash`]. Тексты core pack — под именами `skills/<name>`
 /// ([`pack_texts`], R1-C2 D120).
 pub fn runtime_texts() -> Vec<(&'static str, String)> {
@@ -161,6 +162,7 @@ pub fn runtime_texts() -> Vec<(&'static str, String)> {
         .iter()
         .map(|(n, t)| (*n, (*t).to_owned()))
         .chain(crate::context::compact_text_samples())
+        .chain(crate::memory::text_samples())
         .chain(crate::policy::text_samples())
         .chain(crate::skills::text_samples())
         .chain(crate::tools::text_samples())

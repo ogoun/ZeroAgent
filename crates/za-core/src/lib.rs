@@ -22,6 +22,9 @@
 //! и классифицирует необратимые и сетевые (D77, D81), [`Checkpointer`] — контракт чекпоинта рабочей
 //! копии (D89).
 //!
+//! Модуль [`memory`] — порт памяти цикла [`memory::MemoryPort`] и итоги чтения (R1-M D138):
+//! цикл `za-agent` и клиент `za-memory` встречаются на нём без зависимости друг от друга.
+//!
 //! Модуль [`text`] удаляет невидимые символы Unicode из результатов инструментов,
 //! ввода пользователя и `AGENTS.md` (SEC-051, D102). Модуль [`extract`] — контракт
 //! извлечения текста из HTML и PDF в отдельном процессе (D113, D127).
@@ -36,6 +39,7 @@ mod demo;
 pub mod extract;
 mod graph;
 pub mod interrupt;
+pub mod memory;
 pub mod net;
 pub mod paths;
 mod recovery;

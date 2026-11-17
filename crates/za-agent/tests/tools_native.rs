@@ -1520,7 +1520,7 @@ async fn snapshot_v2_resumes_with_defaults() {
     let o = start(&l, spec(&l, RunMode::Auto)).await.unwrap();
     assert!(matches!(o, LoopOutcome::Paused { .. }), "{o:?}");
     let (seq, mut v) = l.store.latest_snapshot(l.run).await.unwrap().unwrap();
-    assert_eq!(v["v"], 4);
+    assert_eq!(v["v"], 5);
     let obj = v.as_object_mut().unwrap();
     obj.insert("v".into(), json!(2));
     for k in [
@@ -1531,8 +1531,9 @@ async fn snapshot_v2_resumes_with_defaults() {
         "taint",
         "exposure",
         "skills",
+        "memory",
     ] {
-        assert!(obj.remove(k).is_some(), "в снимке v4 нет поля {k}");
+        assert!(obj.remove(k).is_some(), "в снимке v5 нет поля {k}");
     }
     let last = events_of(&l.store, l.run).await.last().unwrap().seq;
     assert!(last >= seq);
@@ -1544,7 +1545,7 @@ async fn snapshot_v2_resumes_with_defaults() {
     );
     let (_, v) = l.store.latest_snapshot(l.run).await.unwrap().unwrap();
     let snap: Snapshot = serde_json::from_value(v).unwrap();
-    assert_eq!(snap.v, 4);
+    assert_eq!(snap.v, za_agent::SNAPSHOT_V);
     assert!(!snap.trusted);
     assert!(snap.taint.is_empty());
     assert_eq!(snap.policy, PolicySnapshot::default());
@@ -2394,7 +2395,7 @@ async fn third_property_recorded_by_driver() {
     assert_eq!(audit[0].payload["call_id"], "w1");
     let (_, v) = l.store.latest_snapshot(l.run).await.unwrap().unwrap();
     let snap: Snapshot = serde_json::from_value(v).unwrap();
-    assert_eq!(snap.v, 4);
+    assert_eq!(snap.v, za_agent::SNAPSHOT_V);
     assert_eq!(snap.exposure, exposure(true, true, true));
     assert!(snap.skills.is_empty());
 }

@@ -17,6 +17,9 @@ za-store = { path = "../za-store" }
 # Только префикс и его хэш: без зонда и HTTP-клиента.
 za-llm = { path = "../za-llm", default-features = false }
 blake3.workspace = true
+# Время снимка сессии порта памяти (`memory::SessionNote::taken_at`, R1-M D138); крейт уже в
+# workspace.
+jiff.workspace = true
 # `ToolOutput` сериализуется в квитанцию эффекта вызова инструмента.
 serde.workspace = true
 serde_json.workspace = true

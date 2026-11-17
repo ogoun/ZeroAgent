@@ -18,9 +18,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use za_agent::{
-    ContextConfig, CrashPoint, EnvInfo, LoopDeps, LoopError, LoopOutcome, Next, NoMemory,
-    PendingExit, ResumeChange, RunSpec, Snapshot, builtin_tools, control_channel, resume_run,
-    start_run, state_block,
+    ContextConfig, Conversation, CrashPoint, EnvInfo, LoopDeps, LoopError, LoopOutcome, Next,
+    NoMemory, PendingExit, ResumeChange, RunSpec, Snapshot, builtin_tools, control_channel,
+    resume_run, start_run, state_block,
 };
 use za_core::{
     AgentEvent, Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput,
@@ -901,8 +901,9 @@ async fn resume_with_more_budget() {
             .last()
             .unwrap()
             .payload["effect_key"],
-        // Эффекты шага 4: boundary, state, context (R1-B2 D42), model.
-        EffectKey::derive(f.run, 4, 3).0
+        // Эффекты шага 4: boundary, memory.prompt ввода (R1-M D142), state, context (R1-B2
+        // D42), model.
+        EffectKey::derive(f.run, 4, 4).0
     );
 }
 
@@ -1075,12 +1076,12 @@ async fn broken_snapshot_fails_other_version_does_not() {
     // Снимок другой версии: статус не меняется, его может прочитать новая версия.
     let (f, last, _) = paused_run("other_version").await;
     f.store
-        .save_snapshot(f.run, last, json!({"v": 5}))
+        .save_snapshot(f.run, last, json!({"v": 6}))
         .await
         .unwrap();
     let err = resume(&f, ResumeChange::default()).await.unwrap_err();
     assert!(
-        matches!(&err, LoopError::Snapshot(s) if s == "версия снимка 5"),
+        matches!(&err, LoopError::Snapshot(s) if s == "версия снимка 6"),
         "{err:?}"
     );
     assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
@@ -1115,7 +1116,7 @@ async fn snapshot_v1_boundary_continues() {
     };
     assert_eq!(resume(&f, change).await.unwrap(), paused("provider"));
     let (_, snap) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(snap.v, 4);
+    assert_eq!(snap.v, za_agent::SNAPSHOT_V);
     assert_eq!(snap.next, Next::Boundary);
     assert_eq!(snap.user_inputs.len(), 1);
     let v1 = as_v1(&snap);
@@ -1128,7 +1129,7 @@ async fn snapshot_v1_boundary_continues() {
         done("ок")
     );
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 4);
+    assert_eq!(after.v, za_agent::SNAPSHOT_V);
     assert_eq!(after.task, "Задача");
     assert!(after.env_text.starts_with("<env>\n"), "{}", after.env_text);
     assert!(after.env_text.ends_with("\n</env>"), "{}", after.env_text);
@@ -1191,7 +1192,7 @@ async fn snapshot_v1_mid_step_continues() {
         EffectKey::derive(f.run, 1, 1).0
     );
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 4);
+    assert_eq!(after.v, za_agent::SNAPSHOT_V);
     assert_eq!(after.task, "Задача");
     // PRM-010 (ревью задачи 5): run R1-B1 продолжает с версией своего префикса.
     for r in &reqs {
@@ -1224,7 +1225,7 @@ async fn snapshot_v1_approval_continues() {
     assert_eq!(cs.len(), 1, "ход R1-B1 вызван заново");
     assert!(cs[0].request.max_output_tokens.is_some());
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 4);
+    assert_eq!(after.v, za_agent::SNAPSHOT_V);
     // Новый ход после обновления — с версией замороженного префикса R1-B1 (PRM-010).
     let evs = events(&f.store, f.run).await;
     let reqs = of_kind(&evs, EventKind::ModelRequest);
@@ -1416,6 +1417,7 @@ async fn snapshot_v3_reads_with_default_exposure() {
     let mut back = serde_json::to_value(&snap).unwrap();
     let o = back.as_object_mut().unwrap();
     assert!(o.remove("exposure").is_some() && o.remove("skills").is_some());
+    assert!(o.remove("memory").is_some());
     assert_eq!(back, golden, "поля снимка v3 потеряны при чтении");
 
     // (3) Resume: снимок той же формы, что фикстура, — живой run на паузе, сведённый к v3
@@ -1428,10 +1430,11 @@ async fn snapshot_v3_reads_with_default_exposure() {
     f.model.push(server_error());
     assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
     let (seq, mut v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
-    assert_eq!(v["v"], 4);
+    assert_eq!(v["v"], 5);
     let o = v.as_object_mut().unwrap();
     o.insert("v".into(), json!(3));
     assert!(o.remove("exposure").is_some() && o.remove("skills").is_some());
+    assert!(o.remove("memory").is_some());
     assert_eq!(
         keys(&v),
         keys(&golden),
@@ -1446,7 +1449,7 @@ async fn snapshot_v3_reads_with_default_exposure() {
         done("ок")
     );
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 4);
+    assert_eq!(after.v, za_agent::SNAPSHOT_V);
     assert_eq!(after.exposure, za_agent::Exposure::default());
     assert!(after.skills.is_empty());
 }
@@ -1463,6 +1466,7 @@ async fn snapshot_v3_untrusted_label_resumes_untrusted() {
     let o = v.as_object_mut().unwrap();
     o.insert("v".into(), json!(3));
     assert!(o.remove("exposure").is_some() && o.remove("skills").is_some());
+    assert!(o.remove("memory").is_some());
     o.insert("taint".into(), json!(["untrusted_project"]));
     let last = events(&f.store, f.run).await.last().unwrap().seq;
     f.store.save_snapshot(f.run, last, v).await.unwrap();
@@ -1473,7 +1477,7 @@ async fn snapshot_v3_untrusted_label_resumes_untrusted() {
         done("ок")
     );
     let (_, after) = last_snapshot(&f.store, f.run).await;
-    assert_eq!(after.v, 4);
+    assert_eq!(after.v, za_agent::SNAPSHOT_V);
     assert_eq!(
         after.exposure,
         za_agent::Exposure {
@@ -1684,53 +1688,23 @@ async fn resume_with_skills_disabled_replays_and_withdraws() {
     );
 }
 
-/// Каталог golden снимка v4 (D130): снимок живого run R1-C2 с активным скиллом и
-/// экспозицией (`snapshot.json`).
-fn golden_v4_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/r1c2_v4/snapshot.json")
-}
-
-/// Снимок для golden v4: недоверенный проект (`untrusted` с шага 0), скилл поставки-
-/// заглушки активирован моделью, run завершён.
-async fn write_golden_v4() {
-    let mut f = fx("golden_v4_write");
-    let cat = za_skills::Catalog::bundled_for_tests(&[(
-        "tdd",
-        "---\nname: tdd\ndescription: Use when testing.\n---\nWrite the test first.\n",
-    )]);
-    with_skills(&mut f.deps, cat);
-    let spec = RunSpec {
-        tier: Some(Tier::Standard),
-        trusted: false,
-        ..ask()
-    };
-    f.model.push(activate_call("c1"));
-    f.model.push(answer("ок"));
-    assert_eq!(start(&f, spec).await.unwrap(), done("ок"));
-    let (_, v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
-    let mut text = serde_json::to_string_pretty(&v).unwrap();
-    text.push('\n');
-    std::fs::create_dir_all(golden_v4_path().parent().unwrap()).unwrap();
-    std::fs::write(golden_v4_path(), text).unwrap();
+/// Golden снимка v4 (D130): снимок живого run R1-C2 с активным скиллом и экспозицией.
+/// С R1-M (снимок v5) — фикстура чтения v4: код ветки v4 больше не пишет.
+fn golden_v4() -> Value {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/r1c2_v4/snapshot.json");
+    serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
 }
 
 /// D130: golden снимка v4 с активным скиллом и экспозицией читается без потерь полей;
-/// `ZA_UPDATE_GOLDEN=1` переписывает его живым run.
+/// состояние памяти R1-M (D140) — по умолчанию.
 #[tokio::test]
 async fn snapshot_v4_golden() {
-    if std::env::var("ZA_UPDATE_GOLDEN").as_deref() == Ok("1") {
-        write_golden_v4().await;
-    }
-    let text = std::fs::read_to_string(golden_v4_path()).unwrap_or_else(|e| {
-        panic!(
-            "нет {}: {e}; эталон пишется командой ZA_UPDATE_GOLDEN=1 cargo test -p za-agent --test resume snapshot_v4_golden",
-            golden_v4_path().display()
-        )
-    });
-    let golden: Value = serde_json::from_str(&text).unwrap();
+    let golden = golden_v4();
     assert_eq!(golden["v"], 4);
+    assert!(golden.get("memory").is_none());
     let snap: Snapshot = serde_json::from_value(golden.clone()).unwrap();
-    assert_eq!(snap.v, za_agent::SNAPSHOT_V);
+    assert_eq!(snap.v, 4);
+    assert_eq!(snap.memory, za_agent::MemoryState::default());
     assert_eq!(snap.skills.len(), 1);
     let s = &snap.skills[0];
     assert_eq!(s.name, "tdd");
@@ -1741,6 +1715,364 @@ async fn snapshot_v4_golden() {
     assert_eq!(s.content.0.len(), 64);
     assert!(snap.exposure.untrusted);
     assert_eq!(snap.taint.iter().collect::<Vec<_>>(), ["untrusted_project"]);
-    // Без потерь: разбор и запись дают тот же JSON.
+    // Без потерь: разбор и запись дают тот же JSON и поле памяти R1-M.
+    let mut back = serde_json::to_value(&snap).unwrap();
+    assert!(back.as_object_mut().unwrap().remove("memory").is_some());
+    assert_eq!(back, golden);
+}
+
+// ---- R1-M, задача 3: снимок v5 и шаги журналов R1-C2 (D140, D161) ----
+
+/// Чтение `note`: результат `ok` (как в генераторе журналов R1-C2).
+struct Note {
+    spec: ToolSpec,
+}
+
+impl Tool for Note {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        Box::pin(async { ToolOutput::ok("ok") })
+    }
+}
+
+/// Чтение `fail`: результат-ошибка `fail {args}` (как в генераторе журналов R1-C2).
+struct Fail {
+    spec: ToolSpec,
+}
+
+impl Tool for Fail {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        Box::pin(async move { ToolOutput::error(format!("fail {args}")) })
+    }
+}
+
+/// Фикстура над журналом в каталоге `d` с инструментами генератора журналов R1-C2:
+/// `note`, `fail` и `incr` (мутация, счётчик — `Fx::incr`); окно 8192.
+fn fx_r1c2(d: &std::path::Path) -> Fx {
+    let mut f = fx_in(d);
+    let model =
+        Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)).with_context(8192));
+    let mut reg = ToolRegistry::default();
+    for t in builtin_tools() {
+        reg.register(t).unwrap();
+    }
+    reg.register(Arc::new(Note {
+        spec: tool_spec("note", ToolKind::Read, EffectClass::ReadOnly),
+    }))
+    .unwrap();
+    reg.register(Arc::new(Fail {
+        spec: tool_spec("fail", ToolKind::Read, EffectClass::ReadOnly),
+    }))
+    .unwrap();
+    reg.register(Arc::new(Incr {
+        spec: tool_spec("incr", ToolKind::Exec, EffectClass::NonIdempotent),
+        count: Arc::clone(&f.incr),
+    }))
+    .unwrap();
+    f.deps = LoopDeps {
+        memory: Arc::new(NoMemory),
+        ..LoopDeps::new(
+            Journal::new(f.store.clone(), f.bus.clone()),
+            model.clone(),
+            Arc::new(reg),
+        )
+    };
+    f.model = model;
+    f
+}
+
+/// Журнал run, записанный кодом R1-C2 (генератор `golden/r1c2_journal/generator.rs.txt`,
+/// D161): копия `store/journal.db` в каталог теста, run и снимок v4.
+async fn golden_r1c2(name: &str) -> (Fx, Value) {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/r1c2_journal")
+        .join(name);
+    let d = dir(&format!("r1c2_{name}"));
+    std::fs::copy(src.join("store/journal.db"), d.join("journal.db")).unwrap();
+    let mut f = fx_r1c2(&d);
+    let run = std::fs::read_to_string(src.join("run.txt")).unwrap();
+    f.run = serde_json::from_value(json!(run.trim())).unwrap();
+    let golden: Value =
+        serde_json::from_str(&std::fs::read_to_string(src.join("snapshot.json")).unwrap()).unwrap();
+    let (_, v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    assert_eq!(v, golden, "снимок журнала не совпадает с golden");
+    assert_eq!(golden["v"], 4);
+    assert!(golden.get("memory").is_none());
+    (f, golden)
+}
+
+/// Ход с вызовами `fail {n}` и `note {n}`: ошибка чтения и успешное чтение (успех сбрасывает
+/// счёт ошибок чтения, D57 — без пауз в тесте).
+fn fail_note(n: u32) -> Vec<Result<StreamEvent, ModelError>> {
+    vec![Ok(StreamEvent::Finished {
+        message: Message {
+            role: Role::Assistant,
+            parts: ["fail", "note"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    Part::ToolCall(ToolCall {
+                        id: format!("n{n}c{i}"),
+                        name: (*name).into(),
+                        arguments: json!({"n": n}),
+                        raw_arguments: None,
+                    })
+                })
+                .collect(),
+        },
+        finish: FinishReason::ToolCalls,
+        usage: Usage::default(),
+    })]
+}
+
+/// `(шаг, номер, имя)` намерений эффектов по порядку.
+fn effect_names(evs: &[Event]) -> Vec<(u64, u64, String)> {
+    evs.iter()
+        .filter(|e| e.kind == EventKind::EffectIntent)
+        .map(|e| {
+            let key = e.payload["key"].as_str().unwrap();
+            let mut it = key.rsplit(':');
+            let seq = it.next().unwrap().parse().unwrap();
+            let step = it.next().unwrap().parse().unwrap();
+            (step, seq, e.payload["name"].as_str().unwrap().to_owned())
+        })
+        .collect()
+}
+
+/// Эффекты памяти R1-M, которых нет в шагах кода R1-C2 (D161).
+const R1M_MEMORY_EFFECTS: [&str; 3] = ["memory.prompt", "memory.retry", "memory.tool_error"];
+
+/// Шаги эффектов памяти R1-M в журнале.
+fn r1m_memory_steps(names: &[(u64, u64, String)]) -> Vec<u64> {
+    names
+        .iter()
+        .filter(|(_, _, n)| R1M_MEMORY_EFFECTS.contains(&n.as_str()))
+        .map(|(s, _, _)| *s)
+        .collect()
+}
+
+/// D161, Review Focus 3: каждый журнал R1-C2 продолжается под R1-M до конца без
+/// `ReplayMismatch`; эффекты R1-C2 не переписаны (каждый ключ — одно намерение, имена
+/// прежние); эффекты памяти R1-M появляются только с шага `legacy_until + 1`.
+#[tokio::test]
+async fn r1c2_journals_resume_without_mismatch() {
+    // (журнал, legacy_until, живых ходов с ошибкой инструмента до ответа): у `compact_mid` и
+    // `inbox_mid` граница шага 2 записана кодом R1-C2 при снимке `Model` шага 1, ход шага 2
+    // идёт вживую; у `batch_error` ход шага 2 — из квитанции; у `approval` шаг 2 не начат.
+    for (name, until, live) in [
+        ("compact_mid", 2, 2),
+        ("inbox_mid", 2, 2),
+        ("batch_error", 2, 1),
+        ("approval", 1, 1),
+    ] {
+        let (f, _) = golden_r1c2(name).await;
+        let before = effect_names(&events(&f.store, f.run).await);
+        if name == "approval" {
+            let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden/r1c2_journal/approval");
+            let id = std::fs::read_to_string(src.join("interrupt.txt")).unwrap();
+            assert!(
+                f.store
+                    .resolve_interrupt(id.trim(), json!({"approved": true}))
+                    .await
+                    .unwrap()
+            );
+        }
+        // Ходы после реплея: пакеты шагов до `until` — без новых эффектов, пакет шага
+        // `until + 1` — с подсказкой `memory.tool_error`.
+        for n in 0..live {
+            f.model.push(fail_note(10 + n));
+        }
+        f.model.push(answer("готово"));
+        let out = resume(&f, ResumeChange::default()).await;
+        assert_eq!(out.unwrap(), done("готово"), "{name}");
+        let evs = events(&f.store, f.run).await;
+        let after = effect_names(&evs);
+        // Эффекты R1-C2 на месте, ни один ключ не записан дважды.
+        assert_eq!(&after[..before.len()], &before[..], "{name}");
+        let mut keys: Vec<(u64, u64)> = after.iter().map(|(s, q, _)| (*s, *q)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), after.len(), "{name}: ключ записан дважды");
+        let steps = r1m_memory_steps(&after);
+        assert!(steps.iter().all(|s| *s > until), "{name}: {after:?}");
+        assert!(steps.contains(&(until + 1)), "{name}: {after:?}");
+        let (_, snap) = last_snapshot(&f.store, f.run).await;
+        assert_eq!(snap.v, za_agent::SNAPSHOT_V);
+        assert_eq!(snap.memory.legacy_until, Some(until), "{name}");
+        if name == "approval" {
+            assert_eq!(f.incr.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+/// D161: признак шагов R1-C2 живёт в снимке v5 — повторный сбой внутри того же шага его не
+/// теряет: после второго resume пакет шага 2 по-прежнему без эффектов памяти.
+#[tokio::test]
+async fn legacy_step_survives_second_crash() {
+    let (mut f, _) = golden_r1c2("inbox_mid").await;
+    f.model.push(fail_note(5));
+    let mut deps = f.deps.clone();
+    deps.crash = crash_at(CrashPoint::AfterModelEffect { step: 2 });
+    let err = resume_with(&f, &deps, ResumeChange::default()).await;
+    assert!(matches!(err, Err(LoopError::Halted)), "{err:?}");
+    // Снимок v5 шага 2 записан кодом R1-M внутри шага R1-C2.
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!((snap.v, snap.step, snap.next), (5, 2, Next::Model));
+    assert_eq!(snap.memory.legacy_until, Some(2));
+    f.deps.crash = None;
+    f.model.push(answer("готово"));
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("готово")
+    );
+    let after = effect_names(&events(&f.store, f.run).await);
+    assert!(r1m_memory_steps(&after).iter().all(|s| *s > 2), "{after:?}");
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.memory.legacy_until, Some(2));
+}
+
+/// D161: снимок v4 (форма golden `r1c2_v4`) продолжается: память — по умолчанию,
+/// `legacy_until = step + 1` у снимка `Boundary`; ввод resume на этом шаге — без
+/// подсказки памяти.
+#[tokio::test]
+async fn r1c2_v4_snapshot_resumes() {
+    let golden = golden_v4();
+    let snap: Snapshot = serde_json::from_value(golden.clone()).unwrap();
+    assert_eq!(snap.memory, za_agent::MemoryState::default());
+    // Живой run на паузе, сведённый к v4 (без поля памяти R1-M).
+    let f = fx("v4_resume");
+    f.model.push(server_error());
+    assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+    let (seq, mut v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    assert_eq!(v["v"], 5);
+    let step = v["step"].as_u64().unwrap();
+    assert_eq!(v["next"], "boundary");
+    let o = v.as_object_mut().unwrap();
+    o.insert("v".into(), json!(4));
+    assert!(o.remove("memory").is_some());
+    assert_eq!(
+        keys(&v),
+        keys(&golden),
+        "форма снимка v4 разошлась с golden"
+    );
+    let last = events(&f.store, f.run).await.last().unwrap().seq;
+    assert!(last >= seq);
+    f.store.save_snapshot(f.run, last, v).await.unwrap();
+    f.model.push(answer("ок"));
+    let change = ResumeChange {
+        input: Some("ещё".into()),
+        ..ResumeChange::default()
+    };
+    assert_eq!(resume(&f, change).await.unwrap(), done("ок"));
+    let (_, after) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(after.v, 5);
+    assert_eq!(after.memory.legacy_until, Some(step + 1));
+    let names = effect_names(&events(&f.store, f.run).await);
+    let prompts: Vec<u64> = names
+        .iter()
+        .filter(|(_, _, n)| n == "memory.prompt")
+        .map(|(s, _, _)| *s)
+        .collect();
+    // Подсказка к задаче шага 0 есть, к вводу шага `step + 1` — нет.
+    assert_eq!(prompts, [0]);
+}
+
+/// Golden снимка v5 (`golden/r1m_v5.json`): состояние памяти run R1-M.
+fn golden_v5_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/r1m_v5.json")
+}
+
+/// Снимок для golden v5: частичный дайджест с признаком идей `review` (повтор ждёт),
+/// подсказка к задаче, пауза провайдера на шаге 1.
+async fn write_golden_v5() {
+    let mut f = fx("golden_v5_write");
+    let mem = Arc::new(support::memory::ScriptedMemory::new(
+        za_agent::MemoryLevel::L2,
+    ));
+    mem.push_snapshot(za_agent::RecallReply {
+        recall: za_agent::Recall::Partial("### Задачи\n[in_progress] A — k:1".into()),
+        ideas: Some(za_agent::IdeasSignal::Review),
+    });
+    mem.push_prompt(za_agent::Recall::Hits("hint i:2".into()));
+    f.deps.memory = mem;
+    f.model.push(server_error());
+    assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+    let (_, v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    let mut text = serde_json::to_string_pretty(&v).unwrap();
+    text.push('\n');
+    std::fs::write(golden_v5_path(), text).unwrap();
+}
+
+/// D140, D169: golden снимка v5 читается без потерь; `ZA_UPDATE_GOLDEN=1` переписывает
+/// его живым run.
+#[tokio::test]
+async fn snapshot_v5_golden() {
+    if std::env::var("ZA_UPDATE_GOLDEN").as_deref() == Ok("1") {
+        write_golden_v5().await;
+    }
+    let text = std::fs::read_to_string(golden_v5_path()).unwrap_or_else(|e| {
+        panic!(
+            "нет {}: {e}; эталон пишется командой ZA_UPDATE_GOLDEN=1 cargo test -p za-agent --test resume snapshot_v5_golden",
+            golden_v5_path().display()
+        )
+    });
+    let golden: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(golden["v"], 5);
+    let snap: Snapshot = serde_json::from_value(golden.clone()).unwrap();
+    assert_eq!(snap.v, za_agent::SNAPSHOT_V);
+    let m = &snap.memory;
+    assert!(m.retry_digest);
+    assert_eq!(m.injected, 2);
+    assert_eq!(m.ideas, Some(za_agent::IdeasSignal::Review));
+    assert_eq!(m.legacy_until, None);
+    assert_eq!(golden["memory"]["ideas"], "review");
     assert_eq!(serde_json::to_value(&snap).unwrap(), golden);
+}
+
+/// Блок `<state>` resume после ввода с подсказкой памяти (Ruling I1 R1-C1): сбой после
+/// `context` той же границы и второй resume с того же снимка — без `ReplayMismatch`
+/// (подсказка и `skill.load` ввода стоят раньше блока, блок не считается поздним).
+#[tokio::test]
+async fn resume_note_after_input_hint_replays() {
+    let mut f = fx("note_after_hint");
+    f.model.push(server_error());
+    assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let step = snap.step + 1;
+    f.deps.crash = crash_at(CrashPoint::AfterContext { step });
+    let change = ResumeChange {
+        input: Some("ещё".into()),
+        ..ResumeChange::default()
+    };
+    let err = resume(&f, change).await;
+    assert!(matches!(err, Err(LoopError::Halted)), "{err:?}");
+    let names = effect_names(&events(&f.store, f.run).await);
+    let at: Vec<&str> = names
+        .iter()
+        .filter(|(s, _, _)| *s == step)
+        .map(|(_, _, n)| n.as_str())
+        .collect();
+    assert_eq!(at, ["boundary", "memory.prompt", "state", "context"]);
+    f.deps.crash = None;
+    f.model.push(answer("ок"));
+    assert_eq!(
+        resume(&f, ResumeChange::default()).await.unwrap(),
+        done("ок")
+    );
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    let h = Conversation::load(&f.store, &snap.messages).await.unwrap();
+    let notes = h
+        .messages()
+        .iter()
+        .filter(|m| text_of(m).contains("action=\"resume\""))
+        .count();
+    assert_eq!(notes, 1);
 }

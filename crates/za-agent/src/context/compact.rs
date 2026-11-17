@@ -18,7 +18,7 @@
 //! рантайм из полей run (`task`, `user_inputs`, D47), а не из истории — вторая и
 //! следующие компакции их не теряют.
 
-use serde_json::{Value, json};
+use serde_json::json;
 use za_core::{EffectError, EffectSpec, Journal, RunCtx};
 use za_llm::{
     ChatRequest, ErrorClass, Message, ModelCall, ModelError, ModelPort, Part, PromptBlocks,
@@ -29,7 +29,7 @@ use za_store::{ProjectStore, StoreError};
 
 use super::{ContextBudget, TEMPLATE_TOKENS, UserInput, message_text, output_plan};
 use crate::conversation::{Conversation, HistoryError, cut_points, split_tail};
-use crate::memory::{MemoryPort, memory_budget};
+use crate::memory::{MemoryPort, memory_budget, recovery_effect};
 use crate::prompt::{ControlAction, ControlFrom, approx_tokens, escape_untrusted, render_control};
 use crate::request::{FrozenPrefix, RunSetup, TurnOptions, build_request};
 use crate::state::ActiveSkill;
@@ -364,22 +364,17 @@ pub async fn compact(
         }
     };
 
-    // (3) Recovery памяти (D50): при L0 эффект пишется, текста нет.
-    let budget_tokens = memory_budget(n_ctx);
-    let v = ctx
-        .effect(
-            EffectSpec {
-                class: EffectClass::ReadOnly,
-                name: MEMORY_AFTER_EFFECT.into(),
-                args: json!({ "budget_tokens": budget_tokens }),
-            },
-            move || async move {
-                let recall = mem.after_compaction(run, budget_tokens).await;
-                Ok(json!({ "text": recall.text() }))
-            },
-        )
-        .await?;
-    let recovery = v.get("text").and_then(Value::as_str);
+    // (3) Recovery памяти (D50): при L0 эффект пишется, текста нет. Значение `{text,
+    // state}`, текст очищен и замаскирован до квитанции (R1-M D140); аргументы прежние.
+    let recovery = recovery_effect(
+        ctx,
+        MEMORY_AFTER_EFFECT,
+        mem,
+        input.masker,
+        memory_budget(n_ctx),
+    )
+    .await?;
+    let recovery = recovery.text();
 
     // Новая эпоха: первое сообщение, хвост, рецитация (D46, D48).
     let shown = limit_user_messages(users.clone(), n_ctx / USER_MESSAGES_DIVISOR);

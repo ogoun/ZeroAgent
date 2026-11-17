@@ -72,7 +72,10 @@ use crate::detect::{
 };
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
 use crate::exposure::Exposure;
-use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
+use crate::memory::{
+    DIGEST, HINT, MemoryLevel, MemoryPort, hint_budget, memory_block, memory_budget, prompt_effect,
+    retry_budget, retry_effect, snapshot_effect, tokens_of, tool_error_effect,
+};
 use crate::policy::{Grant, PolicySnapshot, grants_text};
 use crate::prompt::{
     ControlAction, ControlFrom, EnvInfo, WorkMode, escape_untrusted, reasoning_for, render_control,
@@ -83,7 +86,7 @@ use crate::request::{
 };
 use crate::resume::state_block;
 use crate::skills::{add_active, catalog_payload, loaded_names, skill_output_limit, user_skill};
-use crate::state::{AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit};
+use crate::state::{AtBoundary, AuditHead, Counters, LoopState, MemoryState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools};
 use crate::turn::{
     CallVerdict, ControlFlags, LENGTH_CUT_NUDGE, PlannedCall, RequestRefs, Reviewed, Signal,
@@ -360,10 +363,8 @@ const TOOLS: NodeId = "tools";
 const BOUNDARY_EFFECT: &str = "boundary";
 /// Имя эффекта блока `<state>` сообщения `resume` (задача 15).
 pub(crate) const STATE_EFFECT: &str = "state";
-/// Имя эффекта снимка памяти шага 0 (D24).
-const MEMORY_EFFECT: &str = "memory.snapshot";
 /// Имя эффекта оценки контекста на границе шага (R1-B2 D42).
-const CONTEXT_EFFECT: &str = "context";
+pub(crate) const CONTEXT_EFFECT: &str = "context";
 /// Имя эффекта повторного чтения ввода после компакции на границе (R1-B2, Ruling I-2).
 const INBOX_EFFECT: &str = "inbox";
 /// Текст разового сбоя, вызванного [`FaultHook`] (тест, D72).
@@ -387,7 +388,8 @@ pub(crate) const EMPTY_NUDGE_SUBAGENT: &str = "Your last response made no tool c
 /// Создаёт run (role, parent, model_profile = endpoint), queued → running. Шаг 0 (без next_step):
 /// n_ctx = model.context_tokens(&endpoint), нет значения — 8192 и `context.alert {kind:
 /// "n_ctx_unknown"}` (D37, R1-B2 D43); tier = spec.tier, иначе spec.context.tier, иначе
-/// Tier::for_context(n_ctx) (R1-B2 D65); эффект memory.snapshot (ReadOnly, ключ {run}:0:0); при L0 —
+/// Tier::for_context(n_ctx) (R1-B2 D65); эффект memory.snapshot (ReadOnly, ключ {run}:0:0), затем
+/// `skill.load` задачи (D119) и `memory.prompt` к задаче (R1-M D140, D142); при L0 —
 /// memory.unavailable; freeze, блоб FrozenPrefix (put_blob), первое сообщение, persist; снимок шага 0
 /// {step: 0, next: Boundary, exit: None} на seq последнего события (D4); затем run_graph с узла boundary.
 ///
@@ -487,24 +489,18 @@ async fn step_zero(
         masked_inputs.push((input_source::AGENTS_MD, n));
     }
 
-    // Снимок памяти — эффект: внешнее значение входит в цикл только так (D9, D24).
-    let budget_tokens = memory_budget(n_ctx);
-    let memory = Arc::clone(&deps.memory);
-    let v = ctx
-        .effect(
-            EffectSpec {
-                class: EffectClass::ReadOnly,
-                name: MEMORY_EFFECT.into(),
-                args: json!({ "budget_tokens": budget_tokens }),
-            },
-            move || async move {
-                let recall = memory.snapshot(run, budget_tokens).await;
-                Ok(json!({ "text": recall.text() }))
-            },
-        )
+    // Снимок памяти — эффект: внешнее значение входит в цикл только так (D9, D24). Значение
+    // `{text, state, ideas?}` (R1-M D140, D169): `timeout` и `partial` ставят отложенный
+    // повтор, признак режима идей — в состояние памяти run.
+    let b = memory_budget(n_ctx);
+    let digest = snapshot_effect(&mut ctx, Arc::clone(&deps.memory), deps.masker.clone(), b)
         .await
         .map_err(effect_err)?;
-    let memory_text = v.get("text").and_then(Value::as_str).map(str::to_owned);
+    let mut memory = MemoryState {
+        retry_digest: digest.recall.needs_retry(),
+        ..MemoryState::default()
+    };
+    memory.observe(digest.ideas);
     // D119: `/имя` в задаче (любой тир) или карточка роутера (top small) — эффект
     // `skill.load` сразу после снимка памяти; блок дописывается к задаче в первом
     // сообщении, сама задача (цель сводки и рецитации) — без него.
@@ -519,6 +515,24 @@ async fn step_zero(
     )
     .await
     .map_err(effect_err)?;
+    // Подсказка к задаче (R1-M D142) — в остатке бюджета первого сообщения после дайджеста
+    // (D140) и в пределах потолка эпохи (D168).
+    let left = b.saturating_sub(tokens_of(&digest.recall));
+    let hint = prompt_effect(
+        &mut ctx,
+        Arc::clone(&deps.memory),
+        deps.masker.clone(),
+        spec.task.clone(),
+        hint_budget(b, memory.injected).min(left),
+    )
+    .await
+    .map_err(effect_err)?;
+    memory.observe(hint.ideas);
+    memory.inject(tokens_of(&hint.recall));
+    let memory_text = match (digest.recall.text(), hint.recall.text()) {
+        (Some(d), Some(h)) => Some(format!("{d}\n\n{h}")),
+        (d, h) => d.or(h).map(str::to_owned),
+    };
     // Ревью задачи 1, m1: события шага 0 — после квитанции памяти, снимок шага 0 стоит
     // на последнем событии run (D4).
     for (source, removed) in cleaned {
@@ -666,6 +680,7 @@ async fn step_zero(
         taint,
         audit_head: deps.audit_head.clone(),
         skills,
+        memory,
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
@@ -1174,6 +1189,9 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     if st.at_boundary.resume_note && st.at_boundary.state_late != Some(step) {
         push_resume_note(deps, st).await?;
     }
+    // (6'') Отложенный повтор дайджеста шага 0 (R1-M D140): после ввода, до `context` —
+    // оценка окна видит его текст.
+    retry_digest(deps, st, step).await?;
     boundary_tail(sh, st, step).await
 }
 
@@ -1213,10 +1231,13 @@ async fn push_inbox(
                 )
                 .await
                 .map_err(effect_err)?;
+                // R1-M D142: подсказка памяти к вводу — после `skill.load`, до `context`;
+                // шаг кода R1-C2 — без неё (D161).
+                let hint = input_hint(deps, st, &text).await?;
                 // Текст пользователя — как есть, только управляющий тег экранируется:
                 // ввод не выдаёт себя за голос рантайма (D23).
                 let text = escape_untrusted(&text);
-                let message = match skill {
+                let mut message = match skill {
                     Some((block, active)) => {
                         // Одна запись на имя: `/имя` после карточки роутера заменяет её.
                         if let Some(s) = active {
@@ -1226,6 +1247,10 @@ async fn push_inbox(
                     }
                     None => text.clone(),
                 };
+                if let Some(h) = hint {
+                    message.push_str("\n\n");
+                    message.push_str(&memory_block(HINT, &h));
+                }
                 st.conv.push_user(message)?;
                 push_input(&store_of(deps), st, &text, false).await?;
                 // Ввод пользователя сбрасывает окно повтора (Ruling I-3 ревью задачи 6).
@@ -1255,6 +1280,117 @@ async fn push_inbox(
         }
     }
     Ok(())
+}
+
+// ---- Память в цикле (R1-M D140, D142, D161, D168) ----
+
+/// Подсказка памяти к вводу `inbox` (D142): эффект `memory.prompt` в пределах потолка
+/// эпохи (D168); текст подсказки или `None`. Шаг кода R1-C2 — без эффекта (D161).
+async fn input_hint(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    text: &str,
+) -> Result<Option<String>, LoopError> {
+    if st.memory.legacy(st.ctx.step()) {
+        return Ok(None);
+    }
+    let budget = hint_budget(memory_budget(st.setup.n_ctx), st.memory.injected);
+    let r = prompt_effect(
+        &mut st.ctx,
+        Arc::clone(&deps.memory),
+        deps.masker.clone(),
+        text.to_owned(),
+        budget,
+    )
+    .await
+    .map_err(effect_err)?;
+    st.memory.observe(r.ideas);
+    st.memory.inject(tokens_of(&r.recall));
+    Ok(r.recall.text().map(str::to_owned))
+}
+
+/// Отложенный повтор дайджеста (D140, MEM-034): на границе перед вторым вызовом модели,
+/// после ввода и до `context` — эффект `memory.retry`; текст — добавочным сообщением
+/// `kind="digest"`, первое сообщение не меняется. Повтор один: признак снимается.
+async fn retry_digest(deps: &LoopDeps, st: &mut LoopState, step: u64) -> Result<(), LoopError> {
+    if !st.memory.retry_digest || st.turn == 0 || st.memory.legacy(step) {
+        return Ok(());
+    }
+    let budget = retry_budget(memory_budget(st.setup.n_ctx), st.memory.injected);
+    let r = retry_effect(
+        &mut st.ctx,
+        Arc::clone(&deps.memory),
+        deps.masker.clone(),
+        budget,
+    )
+    .await
+    .map_err(effect_err)?;
+    st.memory.retry_digest = false;
+    if let Some(t) = r.text() {
+        st.memory.inject(tokens_of(&r));
+        st.conv.push_user(memory_block(DIGEST, t))?;
+    }
+    Ok(())
+}
+
+/// Подсказка памяти к первой ошибке нативного вызова пакета (D142): эффект
+/// `memory.tool_error` после всех вызовов, текст — сообщением после результатов. Не больше
+/// одного эффекта на пакет; шаг кода R1-C2 — без эффекта (D161).
+async fn tool_error_hint(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    error: Option<(String, String)>,
+) -> Result<(), LoopError> {
+    let Some((tool, error)) = error else {
+        return Ok(());
+    };
+    if st.memory.legacy(st.ctx.step()) {
+        return Ok(());
+    }
+    let budget = hint_budget(memory_budget(st.setup.n_ctx), st.memory.injected);
+    let r = tool_error_effect(
+        &mut st.ctx,
+        Arc::clone(&deps.memory),
+        deps.masker.clone(),
+        tool,
+        error,
+        budget,
+    )
+    .await
+    .map_err(effect_err)?;
+    if let Some(t) = r.text() {
+        st.memory.inject(tokens_of(&r));
+        st.conv.push_user(memory_block(HINT, t))?;
+    }
+    Ok(())
+}
+
+/// Первая ошибка нативного вызова пакета (D142): исполненный вызов не `Control` с
+/// `is_error` — имя инструмента и текст результата (уже очищен и замаскирован слотом).
+fn first_native_error(
+    results: &[Part],
+    executed: &[String],
+    screened: &Screened,
+    calls: &[PlannedCall],
+) -> Option<(String, String)> {
+    results.iter().find_map(|p| match p {
+        Part::ToolResult {
+            call_id,
+            content,
+            is_error: true,
+        } if executed.contains(call_id)
+            && screened
+                .subjects
+                .get(call_id)
+                .is_some_and(|k| *k != ToolKind::Control) =>
+        {
+            calls
+                .iter()
+                .find(|c| &c.call.id == call_id)
+                .map(|c| (c.call.name.clone(), content.clone()))
+        }
+        _ => None,
+    })
 }
 
 /// Очистка ввода `inbox` (D102, `Clean::Input`): удалённые символы — `input.cleaned
@@ -1752,6 +1888,8 @@ async fn run_compaction(
             st.epoch += 1;
             st.meter.reset();
             st.meter.compact_pending = false;
+            // Потолок подсказок — на эпоху (R1-M D168): прежний текст уже вне контекста.
+            st.memory.injected = 0;
             // Любая компакция даёт новую эпоху: назначенная по порче JSON (D61) не нужна.
             st.detectors.compaction_done();
             tracing::info!(run = %st.run, step, epoch = st.epoch, reason, emergency = c.emergency,
@@ -2497,6 +2635,13 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         )),
         _ => None,
     };
+    // R1-M D142: первая ошибка нативного вызова пакета, дошедшего до границы.
+    let first_error = match verdict {
+        ToolsVerdict::Next { .. } | ToolsVerdict::Pause => {
+            first_native_error(&results, &executed, &screened, &rev.calls)
+        }
+        _ => None,
+    };
     st.conv.push_results(results)?;
     let (reaction, errors) = match facts {
         Some((f, e)) => (
@@ -2528,6 +2673,8 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
             if aborted {
                 st.conv.close_interrupted();
             }
+            // Подсказка памяти к ошибке — сразу после результатов пакета (D142).
+            tool_error_hint(deps, st, first_error).await?;
             // Nudge — отдельными сообщениями после результатов (D23).
             push_nudges(st, &rev.nudges)?;
             if let Some(t) = apply_detected(deps, st, &screened.nudges, reaction).await? {
@@ -2546,6 +2693,7 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         }
         ToolsVerdict::Pause => {
             st.conv.close_interrupted();
+            tool_error_hint(deps, st, first_error).await?;
             push_nudges(st, &rev.nudges)?;
             if let Some(t) = apply_detected(deps, st, &screened.nudges, reaction).await? {
                 return Ok(t);

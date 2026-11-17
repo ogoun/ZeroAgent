@@ -16,17 +16,67 @@ use crate::conversation::Conversation;
 use crate::detect::DetectorState;
 use crate::exit::LoopExit;
 use crate::exposure::Exposure;
+use crate::memory::{CommandNote, IdeasSignal};
 use crate::policy::{Grant, PolicySnapshot};
 use crate::request::{FrozenPrefix, RunSetup};
 use crate::tools::FinishArgs;
 use crate::turn::{Reviewed, Signals};
 
-/// Версия формата снимка: 4 — R1-C2 (D130: экспозиция Rule of Two и активные скиллы; обе
-/// части `#[serde(default)]`). Снимки версий 3 (R1-C1), 2 (R1-B2) и 1 (R1-B1) читаются:
-/// новые поля — по умолчанию (экспозиции и скиллов нет; у v2 и v1 ещё проект не доверен,
-/// меток и грантов нет, политика пустая), у версии 1 `resume` восстанавливает поля R1-B2
-/// разбором истории.
-pub const SNAPSHOT_V: u32 = 4;
+/// Версия формата снимка: 5 — R1-M (D140: состояние памяти run [`MemoryState`],
+/// `#[serde(default)]`). Снимки версий 4 (R1-C2), 3 (R1-C1), 2 (R1-B2) и 1 (R1-B1)
+/// читаются: новые поля — по умолчанию (памяти нет, у v3 и ниже ещё экспозиции и скиллов
+/// нет; у v2 и v1 проект не доверен, меток и грантов нет, политика пустая), у версии 1
+/// `resume` восстанавливает поля R1-B2 разбором истории. Шаги, начатые кодом со снимком
+/// ниже v5, доигрываются без эффектов памяти R1-M ([`MemoryState::legacy_until`], D161).
+pub const SNAPSHOT_V: u32 = 5;
+
+/// Состояние памяти run (R1-M D140, D161, D168, D169), часть снимка v5. Выводится только из
+/// значений эффектов и квитанций журнала: реплей даёт то же состояние.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryState {
+    /// Дайджест шага 0 — `timeout` или `partial`: ждёт один отложенный повтор (D140).
+    pub retry_digest: bool,
+    /// Файлы, изменённые run (снимок сессии, D149).
+    pub touched: Vec<String>,
+    /// Команды оболочки run (снимок сессии, D149).
+    pub commands: Vec<CommandNote>,
+    /// Задачи памяти, захваченные run (D149).
+    pub claimed: Vec<String>,
+    /// Записей в память run (D150).
+    pub wrote: u32,
+    /// Итоги run записаны (D150).
+    pub outcomes: bool,
+    /// Напоминание «итоги записаны» показано (D150).
+    pub nudged: bool,
+    /// Токены подсказок и повтора, вставленные в текущей эпохе (D168): сброс при компакции.
+    pub injected: u32,
+    /// Последний шаг, начатый кодом со снимком ниже v5 (D161): до него включительно эффекты
+    /// памяти R1-M не ставятся. Живёт в снимке: повторный сбой внутри шага его не теряет.
+    pub legacy_until: Option<u64>,
+    /// Последний признак режима идей сервера (D169): из значений эффектов `memory.snapshot`
+    /// и `memory.prompt`; значение без признака его не меняет.
+    pub ideas: Option<IdeasSignal>,
+}
+
+impl MemoryState {
+    /// Шаг `step` начат кодом со снимком ниже v5 (D161): без эффектов памяти R1-M.
+    pub fn legacy(&self, step: u64) -> bool {
+        self.legacy_until.is_some_and(|until| step <= until)
+    }
+
+    /// Признак режима идей из значения эффекта (D169): без признака — без изменений.
+    pub(crate) fn observe(&mut self, ideas: Option<IdeasSignal>) {
+        if let Some(s) = ideas {
+            self.ideas = Some(s);
+        }
+    }
+
+    /// Вставлено `tokens` токенов подсказки или повтора в текущей эпохе (D168).
+    pub(crate) fn inject(&mut self, tokens: u32) {
+        self.injected = self.injected.saturating_add(tokens);
+    }
+}
 
 /// Голова цепочки аудита журнала проекта (R1-C1 D91, m1 ревью задачи 4): последняя
 /// запись на момент старта или продолжения run. Хранится в снимке; бинарник при resume
@@ -139,6 +189,9 @@ pub struct Snapshot {
     /// Активные скиллы (R1-C2 D130; пусто до задачи 13).
     #[serde(default)]
     pub skills: Vec<ActiveSkill>,
+    /// Состояние памяти run (R1-M D140); снимок v4 и ниже — по умолчанию.
+    #[serde(default)]
+    pub memory: MemoryState,
 }
 
 /// Счётчики цикла, переживающие resume.
@@ -267,6 +320,8 @@ pub struct LoopState {
     pub exposure: Exposure,
     /// Активные скиллы (D130; пусто до задачи 13).
     pub skills: Vec<ActiveSkill>,
+    /// Состояние памяти run (R1-M D140, D161, D168, D169).
+    pub memory: MemoryState,
 }
 
 impl LoopState {
@@ -347,6 +402,7 @@ impl LoopState {
             audit_head: self.audit_head.clone(),
             exposure: self.exposure,
             skills: self.skills.clone(),
+            memory: self.memory.clone(),
         }
     }
 }
