@@ -2,6 +2,23 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-17. R1-M, проход fix-3: ревью задачи 3 — `legacy_until` один раз и событием, смена эндпоинта в начатом шаге
+
+Бриф — `.superpowers/sdd/2026-11-16-r1m-memory/fix-3-brief.md`, находки — `task-3-review.md` (I1, I2, Minor 1–7), отчёт — раздел «Исправления fix-3» в `task-3-report.md`. База — `37917a3` (после задачи 4). Уточнение D161 от 2026-11-17 — в плане.
+
+- **Находки подтверждены тестами до правок** (прогоны П1, П2 рецензента). Повторный resume снимка v4 после сбоя на первой новой границе: `approval` — `ReplayMismatch { key: …:2:1, field: "name" }`, `batch_error` — `…:3:1`, `name`. Смена эндпоинта 8k → 32k при втором resume начатой границы: `memory.prompt` — `…:2:1`, `args`; `memory.retry` — `…:2:2`, `args`. Расхождение в эффектах границы даёт не паузу `replay_mismatch`, а `failed` с причиной `effect` (`run_graph` → `fail`): run после такого сбоя не продолжить.
+- **`legacy_until` — один раз и в журнал (I1, вариант Б).** Значение вычисляется при первом resume снимка ниже v5: `max(snap.step, последний шаг после снимка с эффектами)`. Оно пишется событием `memory.legacy {until, snapshot_seq, snapshot_v}` до первого нового эффекта. Повторный resume того же снимка, пока нет снимка v5, берёт первое такое событие после `seq` снимка (с тем же `snapshot_seq`) и не пересчитывает. Событие без `until` — `failed` с причиной `snapshot`.
+  - Почему новый вид события, а не поле `run.status`: resume после сбоя процесса (статус `running`) статус не пишет, а другие события resume (`context.alert`, `grant.added`) условны.
+  - Эффект не подходит: он сдвинул бы ключи.
+- **Слагаемое `+ (next == Boundary)` снято (Minor 3).** Начатый шаг после снимка `Boundary` покрывает цикл по журналу. Шаг после снимка v4 `Boundary`, ещё не начатый, целиком идёт кодом R1-M: ввод resume на нём получает подсказку. Golden и тесты реплея прошли без правок, кроме `r1c2_v4_snapshot_resumes`: теперь `legacy_until = step`, подсказки на шагах `[0, step + 1]`.
+- **Смена эндпоинта в начатом шаге — `ChangeMidStep` (I2).** Если у шага `snap.step + 1` после снимка `Boundary` есть эффекты, смена отвергается до запуска цикла, статус не меняется. Прежде отказ был только при позднем блоке `<state>`. Аргумент `budget` у `memory.prompt` и `memory.retry` зависит от окна. Текст ошибки прежний.
+- **Тесты.** `second_resume_of_v4_snapshot_keeps_legacy_until` (П1, `approval` и `batch_error`), `endpoint_change_in_started_step_rejected` (П2, `memory.prompt` и `memory.retry`), `skill_load_before_state_replays` (Minor 1: `/tdd` на шаге R1-M и на шаге legacy — журнал формы R1-C2 под снимком v4 `Boundary`), `retry_digest_after_state_block` (Minor 2). Мутация «прежний `state_late`» роняет оба варианта Minor 1: `…:2:3` и `…:2:2`, `name`.
+- **Чистка (Minor 4–7).**
+  - `recovery_effect` идёт через общий `recall_effect`. Значение без признака идей совпадает с `Recall::to_value`, квитанции `memory.after` прежние.
+  - В документации `Recall::Capped` дописан второй случай: первое сообщение уже заполнено дайджестом.
+  - Функция драйвера `retry_digest` переименована в `digest_retry_at_boundary`.
+  - Копии `Fail`, `key_pos`, `effect_names` из тестов вынесены в `tests/support/{tools,effects}.rs`.
+
 ## 2026-11-17. R1-M, задача 4: `ZamMemory` — сессия run, `/recall` без `output_limit`, укладка в бюджет на клиенте, подсказки, режим идей
 
 Бриф — `.superpowers/sdd/2026-11-16-r1m-memory/task-4-brief.md`, отчёт — `task-4-report.md` рядом. Решения D139–D142, D148, D168, D169; правки по ZAM 0.0.12-m6.5 — П3, Δ11, П15. Формы ответа сверены с кодом ZAM по тегу `v0.0.12-m6.5`: на теге модуль `/recall` — один файл `crates/zam-server/src/api/recall.rs` (разделение на `recall/{mod,ideas,prompt}.rs` — только на `@HEAD`), `api/snapshot.rs:577`, `api/code.rs:904`, `crates/zam-search/src/recall.rs` (`render`, `hint_line`).
