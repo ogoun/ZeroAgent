@@ -19,8 +19,9 @@
 //!
 //! R1-M (D136, D152): строка `memory` — сервер ZeroAIMemory из `[memory] url`: версия, коммит,
 //! уровень (L0–L2 по флагам `/api/v1/health`), число флагов, токен `ZA_MEMORY_TOKEN` (принят
-//! или нет), личный Vault, выключенные типы подсказок; адрес `http` на хост вне локальной
-//! сети — `Warn` «токен идёт открытым текстом». Нет `[memory]` — `Warn` «память не настроена»;
+//! или нет), личный Vault, выключенные типы подсказок; не проверенные Vault и подсказки —
+//! `Warn` «не проверено: <причина>»; адрес `http` на хост вне локальной сети — `Warn` «токен
+//! идёт открытым текстом» (и при L0). Нет `[memory]` — `Warn` «память не настроена»;
 //! сервер недоступен — `Warn`: агент работает без памяти (L0). Токен — параметром, команда
 //! читает переменную один раз.
 //!
@@ -304,13 +305,20 @@ pub fn check_memory(
         return Check::Ok("память выключена ([memory] enabled = false)".to_owned());
     }
     let url = display_url(&cfg.url);
+    // Открытый текст — свойство адреса, а не ответа: виден и при L0, и без статуса (M9 ревью
+    // задачи 2).
+    let plaintext = if plaintext_outside_lan(&cfg.url) {
+        PLAINTEXT_WARNING
+    } else {
+        ""
+    };
     let Some(st) = st else {
-        return Check::Warn(format!("{url}: не проверено"));
+        return Check::Warn(format!("{url}: не проверено{plaintext}"));
     };
     let d = &st.discovery;
     let Some(info) = d.info.as_ref().filter(|_| d.level != Level::L0) else {
         return Check::Warn(format!(
-            "{url}: память недоступна ({}): работа без памяти (L0)",
+            "{url}: память недоступна ({}): работа без памяти (L0){plaintext}",
             d.reason.as_deref().unwrap_or("нет ответа")
         ));
     };
@@ -394,11 +402,9 @@ pub fn check_memory(
             st.hooks_off.join(", ")
         ));
     }
-    if plaintext_outside_lan(&cfg.url) {
+    if !plaintext.is_empty() {
         warn = true;
-        text.push_str(
-            "; токен идёт открытым текстом: http на хост вне локальной сети (нужен https)",
-        );
+        text.push_str(plaintext);
     }
     if warn {
         Check::Warn(text)
@@ -406,6 +412,10 @@ pub fn check_memory(
         Check::Ok(text)
     }
 }
+
+/// Хвост строки `memory` при [`plaintext_outside_lan`].
+const PLAINTEXT_WARNING: &str =
+    "; токен идёт открытым текстом: http на хост вне локальной сети (нужен https)";
 
 /// Схема `http`, а хост — не loopback и не частный адрес (D152, preflight 7.1.6): токен
 /// идёт открытым текстом через чужие сети. Имя хоста, кроме `localhost`, не разрешается:
