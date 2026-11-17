@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use za_core::paths::{Roots, display, remove_checked};
+use za_core::paths::{Roots, display, remove_checked, sealed_place};
 use za_core::{Checkpoint, CheckpointRequest};
 use za_jail::{CommandSpec, EnvMode, Exit, Runner, RunnerError};
 use za_protocol::{RunId, checkpoint_kind, checkpoint_reason};
@@ -943,7 +943,10 @@ impl Session {
     /// Что тронет восстановление `commit` ([`RestoreSet`]). Секрет не пишется и не
     /// удаляется (D103; ревью задачи 2: I1, I2): пропущенный чекпоинтом (трейлер), с
     /// именем секрета (и блоб чекпоинта R1-C1) и файл, который секрет сейчас по
-    /// содержимому.
+    /// содержимому. Запись дерева в защищённом месте корней проекта (R1-M D157:
+    /// `~/.zeroaimemory/` в дереве чекпоинта, сделанного до R1-M или без домашнего
+    /// каталога) отбрасывается сразу: её нет ни в наборе изменений, ни в копии «до»
+    /// (Minor 3 повторного ревью fix-1 задачи 1).
     async fn restore_set(
         &mut self,
         repo: &Repo,
@@ -959,6 +962,10 @@ impl Session {
         let files: Vec<TreeEntry> = all
             .into_iter()
             .filter(|e| {
+                if sealed_place(&repo.roots, &join_rel(&repo.top, &e.rel)) {
+                    tracing::warn!(path = %e.rel, "защищённое место: восстановление не трогает");
+                    return false;
+                }
                 let ok = e.mode == MODE_FILE || e.mode == MODE_EXEC;
                 if !ok {
                     tracing::warn!(path = %e.rel, mode = %e.mode, "ссылка или подмодуль не восстанавливается");

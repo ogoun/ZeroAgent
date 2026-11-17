@@ -14,11 +14,11 @@
 
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use za_core::paths::{
-    ResolvedPath, Roots, display, open_checked, read_dir_checked, remove_checked, within,
+    ResolvedPath, Roots, display, open_checked, read_dir_checked, remove_checked, sealed_place,
+    within,
 };
 use za_core::{Checkpoint, CheckpointRequest};
 
@@ -77,9 +77,14 @@ fn too_large(what: String) -> io::Error {
 }
 
 /// Копия файлов запроса `req` под id `<run>/<stem>`. Повтор — готовая копия остаётся.
-/// Возвращает пропущенные как секреты пути (от корня проекта, D103).
+/// Возвращает пропущенные как секреты пути (от корня проекта, D103). `roots` — корни
+/// проекта запроса с защищёнными местами run (R1-M D157): путь в защищённом месте
+/// (`ZA_HOME`, `~/.zeroaimemory/`) в копию не входит и в манифест не пишется, как путь вне
+/// проекта (Minor 3 повторного ревью fix-1 задачи 1: копия «до» восстановления старого
+/// чекпоинта не забирает файл токена в `ZA_HOME`).
 pub(super) fn copy(
     home: &AgentHome,
+    roots: &Roots,
     req: &CheckpointRequest,
     stem: &str,
     strict: bool,
@@ -91,7 +96,6 @@ pub(super) fn copy(
     if let Ok(m) = load(&manifest_path) {
         return Ok(secrets_of(&m));
     }
-    let roots = Roots::canonical(&req.project_dir, &home.za_home)?;
     let mut files = Vec::new();
     let mut seen = BTreeSet::new();
     let mut total = 0u64;
@@ -103,6 +107,10 @@ pub(super) fn copy(
         };
         if !within(&roots.project, &abs) || abs == roots.project {
             tracing::debug!(path = %abs.display(), "путь вне проекта: в копию не входит");
+            continue;
+        }
+        if sealed_place(roots, &abs) {
+            tracing::warn!(path = %abs.display(), "защищённое место: в копию не входит");
             continue;
         }
         let rel = display(&roots.project, &abs);
@@ -234,23 +242,27 @@ pub(super) fn exists(home: &AgentHome, id: &str) -> io::Result<bool> {
     Ok(load(&files_dir_existing(home, id)?.join(MANIFEST)).is_ok())
 }
 
-/// Пути (от корня проекта `top`) копии `id`, которые восстановление может изменить, —
-/// для чекпоинта «до» восстановления. Секрет сейчас (имя, содержимое) восстановление не
-/// тронет, и в набор он не входит (ревью задачи 2: I1, I2).
+/// Пути (от корня проекта `roots.project`) копии `id`, которые восстановление может
+/// изменить, — для чекпоинта «до» восстановления. Секрет сейчас (имя, содержимое)
+/// восстановление не тронет, и в набор он не входит (ревью задачи 2: I1, I2); защищённое
+/// место корней (R1-M D157, манифест до R1-M или без домашнего каталога) — тоже.
 pub(super) fn paths(
     home: &AgentHome,
     id: &str,
-    top: &Path,
+    roots: &Roots,
     scan: &SecretScan,
 ) -> io::Result<Vec<String>> {
     let m = load(&files_dir_existing(home, id)?.join(MANIFEST))?;
+    let top = roots.project.as_path();
     Ok(m.files
         .into_iter()
         .filter(|f| !untouched(&f.state))
         .filter(|f| {
             let abs = join_rel(top, &f.path);
             // Путь вне проекта в копию «до» не попадёт: его содержимое не читается.
-            !(secret_name(&f.path) || within(top, &abs) && scan.now(&f.path, &abs))
+            !(secret_name(&f.path)
+                || sealed_place(roots, &abs)
+                || within(top, &abs) && scan.now(&f.path, &abs))
         })
         .map(|f| f.path)
         .collect())

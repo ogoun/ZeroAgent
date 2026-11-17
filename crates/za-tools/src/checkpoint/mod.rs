@@ -384,10 +384,12 @@ impl GitCheckpointer {
         strict: bool,
     ) -> Checkpoint {
         let home = self.home.clone();
+        let roots = self.roots_fn(&req.project_dir);
         let req = req.clone();
         let stem2 = stem.to_owned();
         let scan = self.scan.clone();
-        match blocking(move || files::copy(&home, &req, &stem2, strict, &scan)).await {
+        let copy = move || files::copy(&home, &roots()?, &req, &stem2, strict, &scan);
+        match blocking(copy).await {
             Ok(secret_skipped) => Checkpoint {
                 secret_skipped,
                 ..files_cp(id)
@@ -554,8 +556,8 @@ pub async fn backup_before_restore(
         }
         checkpoint_kind::FILES => {
             let (home, cid) = (ck.home.clone(), cp.id.clone());
-            let (top, scan) = (project.to_path_buf(), ck.scan.clone());
-            let rels = blocking(move || files::paths(&home, &cid, &top, &scan)).await?;
+            let (roots, scan) = (ck.roots_fn(project), ck.scan.clone());
+            let rels = blocking(move || files::paths(&home, &cid, &roots()?, &scan)).await?;
             rels.iter().map(|rel| join_rel(project, rel)).collect()
         }
         _ => return Err(RestoreError::NotFound(cp.id.clone())),

@@ -479,6 +479,99 @@ async fn checkpoint_skips_sealed_places() {
     assert_eq!(c.read("AppData/zero-agent/config.toml"), b"[llama]\n");
 }
 
+/// R1-M D157, Minor 3 повторного ревью fix-1 задачи 1: проект — домашний каталог
+/// пользователя, а старый чекпоинт (сделан до R1-M или в run без домашнего каталога)
+/// содержит `.zeroaimemory/config.toml`. С тех пор токен сменился и изменён файл проекта.
+/// Восстановление с домашним каталогом не берёт защищённое место ни в набор изменений, ни
+/// в копию «до»: текущего токена нет нигде в хранилище чекпоинтов `ZA_HOME` (ни в файлах,
+/// ни в объектах своего репозитория), а сам `config.toml` не переписан и не удалён. Обе
+/// ветки: чекпоинт git и копия файлов.
+#[tokio::test]
+async fn restore_backup_skips_sealed_places() {
+    for git in [true, false] {
+        let c = case(if git {
+            "sealed-restore-git"
+        } else {
+            "sealed-restore-files"
+        });
+        if git {
+            c.init();
+        }
+        let old = format!(
+            "token = \"{}\"\n",
+            ["zam", "_", "Ol4dTk7nVa1uEq9wRt3yUi6oPa2sDf5gHj8kLz0x"].concat()
+        );
+        let now_body = ["Nw2eTk5nVa8uEq1wRt4yUi7o", "Pa3sDf6gHj9kLz0xC1vB"].concat();
+        let now = format!("token = \"{}\"\n", ["zam", "_", &now_body].concat());
+        c.write(".zeroaimemory/config.toml", &old);
+        c.write("notes.txt", "one\n");
+        // Старый чекпоинт: корни без домашнего каталога — защищённого места `~/.zeroaimemory/`
+        // у них нет, файл токена входит в чекпоинт.
+        let paths = [".zeroaimemory/config.toml", "notes.txt"];
+        let cp = if git {
+            create(&c.ck(), c.req(ToolKind::Exec, true, RunId::new(), 1)).await
+        } else {
+            create(&c.ck(), c.req_edit(&paths, false, RunId::new())).await
+        };
+        let kind = if git {
+            checkpoint_kind::GIT
+        } else {
+            checkpoint_kind::FILES
+        };
+        assert_eq!(cp.kind, kind, "{cp:?}");
+        if git {
+            let (_, names) = commit_and_tree(&c, &cp);
+            assert!(
+                names.iter().any(|n| n == ".zeroaimemory/config.toml"),
+                "предусловие: файл токена в дереве старого чекпоинта: {names:?}"
+            );
+        }
+        c.write(".zeroaimemory/config.toml", &now);
+        c.write("notes.txt", "two\n");
+
+        let ck = c.ck().with_user_home(c.project.clone());
+        let backup = within(
+            Duration::from_secs(60),
+            "чекпоинт перед восстановлением",
+            backup_before_restore(&ck, &c.root(), &cp, false, git),
+        )
+        .await
+        .expect("чекпоинт «до»");
+        let r = within(
+            Duration::from_secs(60),
+            "восстановление",
+            restore(&ck, &c.root(), &cp, false, git),
+        )
+        .await
+        .expect("восстановление");
+        assert_eq!(c.read("notes.txt"), b"one\n", "git={git}");
+        assert_eq!(
+            c.read(".zeroaimemory/config.toml"),
+            now.as_bytes(),
+            "git={git}: файл токена переписан"
+        );
+        assert_eq!(
+            r.changed,
+            vec![c.root().join("notes.txt")],
+            "git={git}: {r:?}"
+        );
+        for f in files_under(&c.home.za_home) {
+            assert!(
+                !has(&std::fs::read(&f).unwrap(), now_body.as_bytes()),
+                "git={git}: текущий токен в хранилище чекпоинтов ({backup:?}): {}",
+                f.display()
+            );
+        }
+        if git {
+            let objects = c.ours(&["cat-file", "--batch-all-objects", "--batch"]);
+            assert!(
+                !objects.contains(&now_body),
+                "текущий токен в объектах репозитория чекпоинтов"
+            );
+        }
+    }
+}
+
 // ---- git: восстановление байт в байт ----
 
 #[tokio::test]
