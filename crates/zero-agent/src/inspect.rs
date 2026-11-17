@@ -91,7 +91,9 @@ pub async fn cmd_inspect(home: &Path, args: InspectArgs) -> Result<ExitCode, Ins
 /// `inspect --raw`: тело запроса провайдеру тем же кодом `Gateway`, что и в `run`.
 async fn raw_body(home: &Path, run: RunId, i: &Inspection) -> Result<ExitCode, InspectCmdError> {
     let cfg = load_config(home).map_err(CommandError::from)?;
-    let started = start_gateway(home, &cfg, false).await?;
+    // Тело запроса ключа не требует: ключи не раскрываются (D143).
+    let secrets = std::sync::Arc::new(crate::secret::StoreSecrets::unrevealed(&cfg));
+    let started = start_gateway(home, &cfg, false, secrets).await?;
     let gateway = started.gateway;
     // Тело строится по фактам зонда: идущий зонд дожидается.
     let _ = wait_endpoint(&gateway, &i.endpoint, PROBE_WAIT).await;

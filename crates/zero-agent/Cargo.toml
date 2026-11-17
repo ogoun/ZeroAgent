@@ -86,11 +86,32 @@ required-features = ["test-hooks"]
 name = "doctor_memory"
 required-features = ["test-hooks"]
 
+# Тесты с ключами `ZA_SECRET_*` (R1-A…R1-C2): с R1-M ключи моделей — только из Vault памяти
+# (решение владельца 1, D143), `ZA_SECRET_*` читает лишь сборка с крюками без `[memory]`.
+[[test]]
+name = "r1a_models"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "r1c_tools"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "secret"
+required-features = ["test-hooks"]
+
+# Ключи из Vault памяти (R1-M задача 5): поддельные ZeroAIMemory и OpenAI-совместимый сервер на
+# 127.0.0.1, ручные часы ожидания Vault.
+[[test]]
+name = "vault_keys"
+required-features = ["test-hooks"]
+
 [dev-dependencies]
 # Жив ли подпроцесс извлекателя после тайм-аута и броска future (тест `extract`).
 sysinfo.workspace = true
-# Поддельный llama-server в процессе теста `r1a_models` (axum на многопоточном runtime).
-tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "net", "time"] }
+# Поддельный llama-server в процессе теста `r1a_models` (axum на многопоточном runtime);
+# `sync` — канал строк stderr бинарника (`support::process::Running`, задача 5 R1-M).
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "net", "time", "sync"] }
 axum.workspace = true
 # Тело ответа с обрывом посреди стрима (`Frame`) в тесте повтора `ask`.
 http-body.workspace = true

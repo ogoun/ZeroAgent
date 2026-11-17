@@ -5,7 +5,7 @@
 //! файлов проекта и доверия к нему (`trust`), чекпоинтов рабочей копии (`checkpoints`),
 //! секретов (`secret list`, R1-C1), извлекатель в отдельном процессе (`extract`), каталог
 //! скиллов и `skills list` (`skills`), веб — шлюз, инструменты и проверка поиска (`web`,
-//! R1-C2).
+//! R1-C2), память ZeroAIMemory — привязка проекта и ключи из Vault (`memory`, R1-M).
 
 pub mod audit;
 pub mod checkpoints;
@@ -15,6 +15,7 @@ pub mod extract;
 pub mod home;
 pub mod inspect;
 pub mod journal;
+pub mod memory;
 pub mod models;
 pub mod resources;
 pub mod run;

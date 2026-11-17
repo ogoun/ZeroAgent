@@ -5,8 +5,10 @@
 //! зонда, показывает версию компилятора. Внешние системы необязательны: их
 //! недоступность — предупреждение, не отказ (нет GPU, модель `inactive` или
 //! `unreachable` — `Warn`). Отказ — старая SQLite и ошибка конфигурации. Строка
-//! `secrets` называет источник секретов (R1-C1 D90): пока переменные `ZA_SECRET_*`, Vault
-//! памяти — с клиентом ZeroAIMemory. Строки `git` и `shell` (R1-C1 D96): `git` в `PATH` и
+//! `secrets` называет источник секретов (R1-M D143, D152): «Vault памяти (решение, затем
+//! личный)» или «Vault недоступен: <причина>»; без `[memory]` ключей моделей нет (в сборке
+//! с `test-hooks` без `[memory]` — переменные `ZA_SECRET_*`). Ключи `doctor` не раскрывает:
+//! модели с `key_ref` — `inactive` с причиной. Строки `git` и `shell` (R1-C1 D96): `git` в `PATH` и
 //! его версия (без git чекпоинты — копиями файлов, D89), оболочка инструмента `bash`
 //! (D85); их нет — `Warn`.
 //!
@@ -45,11 +47,13 @@ use za_memory::{
 };
 use za_protocol::Tier;
 use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query_nvidia_smi};
+use za_secrets::MaskCell;
 
 use crate::config::{AgentConfig, AppConfigError, LLAMA_URL_ENDPOINT, load_config};
 use crate::home::{sealed_in_project, sealed_in_project_line, with_user_home};
+use crate::memory::{KeyRing, KeySource};
 use crate::models::{PROBE_WAIT, start_gateway, state_text};
-use crate::secret::{StoreSecrets, source_text};
+use crate::secret::{StoreSecrets, VAULT_SOURCE, source_text};
 
 /// Переменная окружения с адресом `llama-server`.
 pub const LLAMA_URL_ENV: &str = "LLAMA_URL";
@@ -97,7 +101,7 @@ pub struct DoctorReport {
     pub llama: Check,
     /// GPU по `nvidia-smi`; недоступен — `Warn`.
     pub gpu: Check,
-    /// Источник секретов (D90); всегда `Ok`.
+    /// Источник секретов (D90, D143, D152): Vault памяти или почему его нет.
     pub secrets: Check,
     /// `git` в `PATH` и его версия (D89, D96); нет — `Warn`.
     pub git: Check,
@@ -190,13 +194,20 @@ pub async fn run(
             Some(check_llama(llama_url).await)
         }
     };
+    // Статус памяти — один на строки `memory` и `secrets` (Vault — источник ключей, D152).
     let memory = async {
         match &read {
-            Some(c) => check_memory_live(c.memory.as_ref(), memory_token).await,
-            None => no_config(),
+            Some(c) => {
+                let st = memory_status_live(c.memory.as_ref(), memory_token.clone()).await;
+                (
+                    check_memory_status(c.memory.as_ref(), memory_token, &st),
+                    check_secrets(c, st_vault(&st)),
+                )
+            }
+            None => (no_config(), check_secrets(&AgentConfig::default(), None)),
         }
     };
-    let (llama, (gpu, models, windows), git, (web, search), extractor, skills, memory) = tokio::join!(
+    let (llama, (gpu, models, windows), git, (web, search), extractor, skills, (memory, secrets)) = tokio::join!(
         llama,
         check_home(home, cfg),
         check_git(),
@@ -225,7 +236,7 @@ pub async fn run(
         sqlite: check_sqlite(za_store::sqlite_library_version(), za_store::MIN_SQLITE),
         llama,
         gpu,
-        secrets: check_secrets(&StoreSecrets::from_env().short_names()),
+        secrets,
         git,
         shell: check_shell(),
         web,
@@ -271,17 +282,50 @@ pub async fn sealed_in_cwd_lines(za_home: Option<&Path>) -> Vec<String> {
 /// статус (токен, Vault, подсказки), затем [`check_memory`]. Решение проекта `doctor` не
 /// проверяет: проекта у него нет (это делает `memory status`).
 pub async fn check_memory_live(cfg: Option<&MemoryConfig>, token: Option<Token>) -> Check {
+    let st = memory_status_live(cfg, token.clone()).await;
+    check_memory_status(cfg, token, &st)
+}
+
+/// Статус сервера памяти для `doctor`: нет или выключен `[memory]` — `Skipped`; клиент не
+/// собран — `NoClient` с причиной.
+#[derive(Debug, Clone)]
+pub enum LiveStatus {
+    Skipped,
+    NoClient(String),
+    Checked(Box<MemoryStatus>),
+}
+
+/// Статус сервера памяти по `[memory]` (D136): обнаружение и проверки токена, Vault и
+/// подсказок. Ключи не раскрываются.
+pub async fn memory_status_live(cfg: Option<&MemoryConfig>, token: Option<Token>) -> LiveStatus {
     let Some(c) = cfg.filter(|c| c.enabled) else {
-        return check_memory(cfg, token, None);
+        return LiveStatus::Skipped;
     };
-    match ZamClient::new(c, token.clone()) {
-        Ok(client) => {
-            let st = za_memory::status(&client, None).await;
-            check_memory(cfg, token, Some(&st))
-        }
-        Err(e) => Check::Warn(format!(
+    match ZamClient::new(c, token) {
+        Ok(client) => LiveStatus::Checked(Box::new(za_memory::status(&client, None).await)),
+        Err(e) => LiveStatus::NoClient(e.to_string()),
+    }
+}
+
+/// Строка `memory` по статусу [`memory_status_live`].
+fn check_memory_status(cfg: Option<&MemoryConfig>, token: Option<Token>, st: &LiveStatus) -> Check {
+    match st {
+        LiveStatus::Skipped => check_memory(cfg, token, None),
+        LiveStatus::Checked(st) => check_memory(cfg, token, Some(st)),
+        LiveStatus::NoClient(e) => Check::Warn(format!(
             "{e}: клиент памяти не собран, работа без памяти (L0)"
         )),
+    }
+}
+
+/// Личный Vault по статусу: `None` — сервер не проверялся.
+fn st_vault(st: &LiveStatus) -> Option<VaultState> {
+    match st {
+        LiveStatus::Checked(st) => Some(st.vault.clone()),
+        LiveStatus::NoClient(e) => Some(VaultState::Unchecked(format!(
+            "клиент памяти не собран: {e}"
+        ))),
+        LiveStatus::Skipped => None,
     }
 }
 
@@ -576,10 +620,37 @@ fn check_window(tier: Option<Tier>, windows: &[(String, Option<u32>)]) -> Check 
     }
 }
 
-/// Источник секретов: «источник секретов: переменные ZA_SECRET_* (Vault памяти — с
-/// клиентом ZeroAIMemory)». `short` — имена секретов со значением короче 8 символов: они
-/// не маскируются, это `Warn` с именами (значения не печатаются).
-pub fn check_secrets(short: &[String]) -> Check {
+/// Строка `secrets` (D143, D152): «источник секретов: Vault памяти (решение, затем личный)» —
+/// личный Vault открыт; «Vault недоступен: <причина>» — заблокирован или не проверен; без
+/// `[memory]` или с выключенной памятью — ключей моделей нет. `vault` — состояние личного
+/// Vault по статусу сервера (`None` — сервер не проверялся). Сборка с `test-hooks` без
+/// `[memory]` — переменные `ZA_SECRET_*` с предупреждением о значениях короче 8 символов
+/// (они не маскируются; значения не печатаются). Ключи не раскрываются.
+pub fn check_secrets(cfg: &AgentConfig, vault: Option<VaultState>) -> Check {
+    let ring = KeyRing::unrevealed(cfg);
+    match &ring.source {
+        KeySource::Env => {
+            let short = StoreSecrets::for_command(&ring, &MaskCell::default()).short_names();
+            check_env_secrets(&short)
+        }
+        KeySource::Off(why) => Check::Warn(format!(
+            "источник секретов: {VAULT_SOURCE} — {}: моделям с key_ref ключей нет",
+            why.reason()
+        )),
+        KeySource::Vault => match vault {
+            Some(VaultState::Unlocked) => Check::Ok(format!("источник секретов: {VAULT_SOURCE}")),
+            Some(VaultState::Locked(r)) => Check::Warn(format!(
+                "Vault недоступен: Vault заблокирован ({r}); модели с key_ref ждут его в run и ask"
+            )),
+            Some(VaultState::Unchecked(r)) => Check::Warn(format!("Vault недоступен: {r}")),
+            None => Check::Warn(format!("источник секретов: {VAULT_SOURCE}; не проверено")),
+        },
+    }
+}
+
+/// Строка `secrets` тестовой сборки без `[memory]`: `ZA_SECRET_*`; `short` — имена со
+/// значением короче 8 символов.
+fn check_env_secrets(short: &[String]) -> Check {
     let text = format!("источник секретов: {}", source_text("env"));
     if short.is_empty() {
         Check::Ok(text)
@@ -664,7 +735,9 @@ async fn check_home(
         if cfg.models.as_ref().is_none_or(|m| m.endpoints.is_empty()) {
             return Models::default();
         }
-        match start_gateway(home, &cfg, false).await {
+        // `doctor` ключи не раскрывает (D143): эндпоинты с `key_ref` — `inactive` с причиной.
+        let secrets = Arc::new(StoreSecrets::unrevealed(&cfg));
+        match start_gateway(home, &cfg, false, secrets).await {
             Ok(s) => {
                 s.gateway.wait_probed(PROBE_WAIT).await;
                 let view = s.gateway.view();
@@ -876,12 +949,51 @@ mod tests {
 
     #[test]
     fn short_secrets_are_a_warning() {
-        let c = check_secrets(&["pin".to_owned()]);
+        let c = check_env_secrets(&["pin".to_owned()]);
         assert!(
             matches!(&c, Check::Warn(d) if d.contains("pin") && d.contains("короче 8")),
             "{c:?}"
         );
-        assert!(matches!(check_secrets(&[]), Check::Ok(_)));
+        assert!(matches!(check_env_secrets(&[]), Check::Ok(_)));
+    }
+
+    /// R1-M D152: строка `secrets` — Vault памяти по состоянию личного Vault; без памяти —
+    /// ключей моделей нет. Ключи не раскрываются.
+    #[test]
+    fn secrets_row_follows_vault() {
+        let on = AgentConfig {
+            memory: Some(MemoryConfig::new("http://127.0.0.1:7700")),
+            ..AgentConfig::default()
+        };
+        assert_eq!(
+            check_secrets(&on, Some(VaultState::Unlocked)),
+            Check::Ok("источник секретов: Vault памяти (решение, затем личный)".to_owned())
+        );
+        let c = check_secrets(&on, Some(VaultState::Locked("ключ не задан".to_owned())));
+        assert!(
+            matches!(&c, Check::Warn(d) if d.starts_with("Vault недоступен: Vault заблокирован (ключ не задан)")),
+            "{c:?}"
+        );
+        let c = check_secrets(
+            &on,
+            Some(VaultState::Unchecked("нет соединения".to_owned())),
+        );
+        assert_eq!(
+            c,
+            Check::Warn("Vault недоступен: нет соединения".to_owned())
+        );
+        let off = AgentConfig {
+            memory: Some(MemoryConfig {
+                enabled: false,
+                ..MemoryConfig::new("http://127.0.0.1:7700")
+            }),
+            ..AgentConfig::default()
+        };
+        let c = check_secrets(&off, None);
+        assert!(
+            matches!(&c, Check::Warn(d) if d.contains("память выключена") && d.contains("ключей нет")),
+            "{c:?}"
+        );
     }
 
     #[test]
@@ -890,7 +1002,7 @@ mod tests {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
             gpu: Check::Warn("нет".to_owned()),
-            secrets: check_secrets(&[]),
+            secrets: check_env_secrets(&[]),
             git: Check::Warn("нет".to_owned()),
             shell: Check::Ok("bash".to_owned()),
             web: Check::Ok("веб".to_owned()),
@@ -966,7 +1078,7 @@ mod tests {
             sqlite: Check::Ok("3.54.1".to_owned()),
             llama: Check::Warn("нет".to_owned()),
             gpu: Check::Ok("RTX".to_owned()),
-            secrets: check_secrets(&[]),
+            secrets: check_env_secrets(&[]),
             git: Check::Ok("git version 2.47.0".to_owned()),
             shell: Check::Warn("нет".to_owned()),
             web: Check::Ok("веб включён".to_owned()),
@@ -985,7 +1097,7 @@ mod tests {
                 "sqlite": {"status": "ok", "detail": "3.54.1"},
                 "llama": {"status": "warn", "detail": "нет"},
                 "gpu": {"status": "ok", "detail": "RTX"},
-                "secrets": {"status": "ok", "detail": "источник секретов: переменные ZA_SECRET_* (Vault памяти — с клиентом ZeroAIMemory)"},
+                "secrets": {"status": "ok", "detail": "источник секретов: переменные ZA_SECRET_* (сборка с test-hooks без [memory])"},
                 "git": {"status": "ok", "detail": "git version 2.47.0"},
                 "shell": {"status": "warn", "detail": "нет"},
                 "web": {"status": "ok", "detail": "веб включён"},

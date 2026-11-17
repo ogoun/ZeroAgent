@@ -144,6 +144,73 @@ impl Env {
         vars: &[(&str, &str)],
         remove: &[&str],
     ) -> Out {
+        let mut child = self.command(cwd, args, vars, remove).spawn().unwrap();
+        let out = read_all(child.stdout.take().unwrap());
+        let err = read_all(child.stderr.take().unwrap());
+        let until = Instant::now() + process_limit();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if Instant::now() >= until {
+                let _ = child.kill();
+                let _ = child.wait();
+                let err = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
+                panic!(
+                    "zero-agent {args:?} не завершился за {:?} и убит; stderr: {err}",
+                    process_limit()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Out {
+            status,
+            stdout: String::from_utf8(out.join().unwrap()).unwrap(),
+            stderr: String::from_utf8(err.join().unwrap()).unwrap(),
+        }
+    }
+
+    /// Запуск бинарника без ожидания (R1-M задача 5): строки stderr приходят в канал по мере
+    /// вывода — тест ждёт события процесса (строку «ждёт Vault»), а не таймер. Окружение — как
+    /// у [`Env::run_with`].
+    pub fn spawn_with(&self, args: &[&str], vars: &[(&str, &str)]) -> Running {
+        let mut child = self.command(None, args, vars, &[]).spawn().unwrap();
+        let out = read_all(child.stdout.take().unwrap());
+        let err = child.stderr.take().unwrap();
+        let (tx, lines) = tokio::sync::mpsc::unbounded_channel();
+        let all = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let shared = all.clone();
+        let reader = std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(err).lines() {
+                let Ok(line) = line else { break };
+                {
+                    let mut a = shared.lock().unwrap();
+                    a.push_str(&line);
+                    a.push('\n');
+                }
+                let _ = tx.send(line);
+            }
+        });
+        Running {
+            child,
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+            lines,
+            stderr: all,
+            err_reader: Some(reader),
+            out_reader: Some(out),
+        }
+    }
+
+    /// Процесс бинарника с окружением теста: `ZA_HOME`, пустые кэши cargo и uv, без
+    /// `LLAMA_URL`, фильтров логов и личных переменных разработчика.
+    fn command(
+        &self,
+        cwd: Option<&Path>,
+        args: &[&str],
+        vars: &[(&str, &str)],
+        remove: &[&str],
+    ) -> Command {
         let caches = self.home.with_extension("caches");
         let _ = std::fs::create_dir_all(caches.join("cargo"));
         let _ = std::fs::create_dir_all(caches.join("uv"));
@@ -169,30 +236,7 @@ impl Env {
         for (k, v) in vars {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().unwrap();
-        let out = read_all(child.stdout.take().unwrap());
-        let err = read_all(child.stderr.take().unwrap());
-        let until = Instant::now() + process_limit();
-        let status = loop {
-            if let Some(s) = child.try_wait().unwrap() {
-                break s;
-            }
-            if Instant::now() >= until {
-                let _ = child.kill();
-                let _ = child.wait();
-                let err = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
-                panic!(
-                    "zero-agent {args:?} не завершился за {:?} и убит; stderr: {err}",
-                    process_limit()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        Out {
-            status,
-            stdout: String::from_utf8(out.join().unwrap()).unwrap(),
-            stderr: String::from_utf8(err.join().unwrap()).unwrap(),
-        }
+        cmd
     }
 
     /// `run --project <dir>` и аргументы.
@@ -278,6 +322,96 @@ impl Env {
             .into_iter()
             .map(|e| (e.kind, e.payload))
             .collect()
+    }
+}
+
+/// Бинарник, запущенный [`Env::spawn_with`].
+pub struct Running {
+    child: std::process::Child,
+    args: Vec<String>,
+    lines: tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// Весь stderr к этому моменту.
+    stderr: std::sync::Arc<std::sync::Mutex<String>>,
+    err_reader: Option<std::thread::JoinHandle<()>>,
+    out_reader: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+impl Running {
+    /// Ждёт строку stderr с `needle` не дольше [`process_limit`]; процесс кончился раньше —
+    /// паника со всем stderr.
+    pub async fn line_with(&mut self, needle: &str) -> String {
+        let limit = process_limit();
+        let found = tokio::time::timeout(limit, async {
+            while let Some(l) = self.lines.recv().await {
+                if l.contains(needle) {
+                    return Some(l);
+                }
+            }
+            None
+        })
+        .await;
+        match found {
+            Ok(Some(l)) => l,
+            Ok(None) => panic!(
+                "zero-agent {:?} завершился без строки {needle:?}; stderr: {}",
+                self.args,
+                self.stderr()
+            ),
+            Err(_) => panic!(
+                "строки {needle:?} нет за {limit:?}; stderr: {}",
+                self.stderr()
+            ),
+        }
+    }
+
+    /// stderr к этому моменту.
+    pub fn stderr(&self) -> String {
+        self.stderr.lock().unwrap().clone()
+    }
+
+    /// Ждёт завершения не дольше [`process_limit`] (дольше — процесс убивается, паника).
+    pub async fn wait(mut self) -> Out {
+        let until = tokio::time::Instant::now() + process_limit();
+        let status = loop {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                break s;
+            }
+            if tokio::time::Instant::now() >= until {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!(
+                    "zero-agent {:?} не завершился за {:?} и убит; stderr: {}",
+                    self.args,
+                    process_limit(),
+                    self.stderr()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        self.finish(status)
+    }
+
+    /// Снимает процесс (`Child::kill`): на Windows Ctrl+C из теста не посылается.
+    pub fn kill(mut self) -> Out {
+        let _ = self.child.kill();
+        let status = self.child.wait().unwrap();
+        self.finish(status)
+    }
+
+    fn finish(&mut self, status: ExitStatus) -> Out {
+        if let Some(r) = self.err_reader.take() {
+            let _ = r.join();
+        }
+        let stdout = self
+            .out_reader
+            .take()
+            .map(|r| String::from_utf8(r.join().unwrap()).unwrap())
+            .unwrap_or_default();
+        Out {
+            status,
+            stdout,
+            stderr: self.stderr(),
+        }
     }
 }
 

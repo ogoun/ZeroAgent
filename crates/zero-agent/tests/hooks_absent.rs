@@ -6,6 +6,9 @@
 //!
 //! Разбор аргументов отвергает флаги до любой работы: ни конфигурации, ни сети, ни
 //! журнала; `ZA_HOME` — пустой каталог теста.
+//!
+//! R1-M D143 (решение владельца 1): обычная сборка `ZA_SECRET_*` не читает — без `[memory]`
+//! облачный эндпоинт `inactive` с причиной «память не настроена», запасного источника нет.
 
 #![cfg(not(feature = "test-hooks"))]
 
@@ -75,4 +78,36 @@ fn run_web_resolve_is_unknown() {
 fn extract_hang_and_crash_are_unknown() {
     assert_rejected(&run("hang", &["extract", "--hang", "html"]), "--hang");
     assert_rejected(&run("crash", &["extract", "--crash", "html"]), "--crash");
+}
+
+/// R1-M D143: с `ZA_SECRET_X` и без `[memory]` облачный эндпоинт — `inactive` с причиной
+/// «память не настроена»; до провайдера (несуществующий порт) дело не доходит.
+#[test]
+fn env_secret_not_read_without_test_hooks() {
+    let home = home("no-env-secret");
+    std::fs::write(
+        home.join("config.toml"),
+        "[models]\n[[models.endpoints]]\nid = \"cloud\"\nbackend = \"anthropic\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"m\"\nkey_ref = \"x\"\n",
+    )
+    .unwrap();
+    let value = ["env", "-value-", "0123456789abcdef"].concat();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zero-agent"));
+    support::process::strip_private_env(&mut cmd);
+    let out = cmd
+        .args(["models", "probe", "cloud", "--json"])
+        .env("ZA_HOME", &home)
+        .env("ZA_SECRET_X", &value)
+        .env_remove("LLAMA_URL")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["state"], "inactive", "{v}");
+    assert_eq!(
+        v["reason"], "ключ x недоступен: память не настроена ([memory] url)",
+        "{v}"
+    );
+    assert!(!stdout.contains(&value));
 }

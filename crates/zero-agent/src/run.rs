@@ -44,6 +44,17 @@
 //! R1-M (задача 1): корни run знают домашний каталог пользователя (`Roots::with_home` по
 //! [`crate::home::user_home`]) — `ZA_HOME` и `~/.zeroaimemory/` защищены от любого доступа
 //! инструментов модели (D157); проект внутри защищённого места — [`RunError::SealedProject`].
+//!
+//! R1-M (задача 5, D143, D160): ключи моделей — из Vault памяти, порядок `cmd_run`:
+//! конфигурация → план ключей ([`KeyPlan`], порядок D24) → журнал проекта: доверие и
+//! привязка к решению (D135), журнал закрывается → память ([`memory_runtime`]: обнаружение,
+//! привязка) → ожидание и раскрытие ([`wait_for_keys`]) → маска процесса
+//! ([`za_secrets::MaskCell`]) →
+//! [`StoreSecrets`] (кэш, фильтр чекпоинтов) → `start_gateway` → `select` → журнал проекта
+//! снова (блокировка `journal.lock` на run) → `start_run`. На время ожидания журнал не
+//! держится. Ctrl+C во время ожидания — код 130, run не создаётся. Раскрытия — записи
+//! аудита `secret.revealed` и события `secret.revealed` шага 0 (или первые события resume),
+//! значений нет.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -67,6 +78,7 @@ use za_core::{
 };
 use za_jail::DirectRunner;
 use za_llm::{EndpointId, SelectError, Selection};
+use za_memory::{TokioClock, process_mask, session_id};
 use za_protocol::{
     Actor, Budget, BudgetKind, EventKind, Priority, RunId, RunMode, RunRole, RunStatus, Seq, Tier,
     audit_action, pause_reason,
@@ -83,7 +95,12 @@ use crate::config::{
 use crate::extract::RunExtractor;
 use crate::home;
 use crate::journal::open_retrying;
+use crate::memory::{
+    KeyPlan, KeyRing, WaitError, memory_runtime, project_binding, revealed_audit, revealed_event,
+    wait_for_keys,
+};
 use crate::models::{CommandError, PROBE_WAIT, start_gateway, state_text, wait_endpoint};
+use crate::secret::StoreSecrets;
 use crate::trust::{
     TrustSet, current_set, project_instructions, read_trusted, trust_check, trust_set,
 };
@@ -100,6 +117,8 @@ pub const EXIT_PAUSED: u8 = 4;
 pub const EXIT_BLOCKED: u8 = 5;
 /// Код выхода: `cancelled`.
 pub const EXIT_CANCELLED: u8 = 6;
+/// Код выхода: ожидание Vault памяти отменено (Ctrl+C) — run не создан (R1-M D143).
+pub const EXIT_INTERRUPTED: u8 = 130;
 /// Имя файла журнала в каталоге журнала проекта.
 pub const JOURNAL_FILE: &str = "journal.db";
 /// Поле payload прерывания доверия с хэшем показанного набора (`TrustSet::hash`).
@@ -828,6 +847,7 @@ async fn wire(
 /// записи [`policy_loaded`] не пишет), `grant.added` на каждый новый грант run (источник
 /// `cli` — actor `user`, `config` — `runtime`); затем голова цепочки — якорь снимка (после
 /// всех записей, m3 ревью задачи 13).
+#[allow(clippy::too_many_arguments)]
 async fn record_start(
     store: &ProjectStore,
     project: &Path,
@@ -835,9 +855,16 @@ async fn record_start(
     policy: &PolicySnapshot,
     web: &Wiring,
     grants: &[Grant],
+    keys: &KeyRing,
+    session: Option<&str>,
 ) -> Result<Option<AuditHead>, RunError> {
     policy_loaded(store, project, policy, web).await?;
     grants_audit(store, run, grants).await?;
+    // D143: каждое раскрытие с сервера — запись аудита без значения (из кэша — нет: запроса
+    // к Vault не было).
+    for r in keys.revealed.iter().filter(|r| !r.cached) {
+        store.append_audit(revealed_audit(r, session)).await?;
+    }
     Ok(store
         .audit_head()
         .await?
@@ -1202,13 +1229,19 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
         RunAction::New(_) => RunId::new(),
     };
     announce(run);
-    let resume_store = match &args.action {
+    // Resume: run есть в журнале, эндпоинт run — из последнего снимка (ключ, нужный без
+    // `--model`). Журнал закрывается до ожидания Vault (D160).
+    let resume_endpoint = match &args.action {
         RunAction::Resume(r) => {
             let store = open_existing(home, &project)?;
             if store.get_run(r.run).await?.is_none() {
                 return Err(StoreError::UnknownRun(r.run).into());
             }
-            Some(store)
+            let ep = store.latest_snapshot(r.run).await?.and_then(|(_, v)| {
+                serde_json::from_value::<EndpointId>(v["setup"]["endpoint"].clone()).ok()
+            });
+            drop(store);
+            ep
         }
         RunAction::New(_) => None,
     };
@@ -1221,10 +1254,40 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
     if cfg.models.as_ref().is_none_or(|m| m.endpoints.is_empty()) {
         return Err(CommandError::NoModels.into());
     }
-    let started = start_gateway(home, &cfg, true).await?;
-    // Маска печати ответа — по секретам, прочитанным при старте вместе с ключами (D90).
-    let masker = started.secrets.masker();
-    let secret_filter = started.secrets.checkpoint_filter();
+    // D160: план ключей (D24) → доверие и привязка (журнал закрыт) → память → ожидание и
+    // раскрытие → маска → ключи → `Gateway`.
+    let plan = match &args.action {
+        RunAction::New(n) => KeyPlan::for_selection(
+            cfg.models.as_ref(),
+            n.model.clone().map(EndpointId).as_ref(),
+            Some(RunRole::Top),
+        ),
+        RunAction::Resume(r) => match r.model.clone().map(EndpointId).or(resume_endpoint) {
+            Some(ep) => KeyPlan::for_endpoint(cfg.models.as_ref(), &ep),
+            None => KeyPlan::default(),
+        },
+    };
+    let bound = project_binding(home, &project).await?;
+    let token = crate::config::memory_token_from_env();
+    let cell = Arc::new(process_mask(token.as_ref()));
+    let mem = memory_runtime(&cfg, bound.binding, token, &cell).await;
+    let session = mem
+        .runtime()
+        .map(|rt| session_id(&rt.binding.project_id, run));
+    let keys = match wait_for_keys(&mem, &plan, session.as_deref(), &TokioClock, ctrl_c()).await {
+        Ok(k) => k,
+        Err(WaitError::Cancelled) => {
+            eprintln!("zero-agent: ожидание Vault памяти отменено: run не создан");
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
+        }
+    };
+    let secrets = Arc::new(StoreSecrets::for_command(&keys, &cell));
+    let started = start_gateway(home, &cfg, true, Arc::clone(&secrets)).await?;
+    // Маска печати ответа, цикла и инструментов — снимок маски процесса после раскрытия
+    // (D160): раскрытий внутри run нет, снимок полон.
+    let masker: SecretMasker = (*cell.current()).clone();
+    let secret_filter = secrets.checkpoint_filter();
+    let revealed: Vec<Value> = keys.revealed.iter().map(revealed_event).collect();
     let gateway = Arc::new(started.gateway);
     let select = |model: Option<String>| -> Result<EndpointId, SelectError> {
         gateway.select(&Selection {
@@ -1290,11 +1353,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             })
             .await?;
             let spec = RunSpec {
-                project_id: prep.project_id.clone(),
-                project_dir: project.clone(),
                 role: RunRole::Top,
                 parent: None,
-                endpoint,
                 run_mode: n.run_mode,
                 work_mode: n.work_mode,
                 // Порядок тира (D65): `--tier` > `[context].tier` > по окну; выбирает
@@ -1303,13 +1363,13 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 budget,
                 priority: Priority::Top,
                 max_wait: n.max_wait,
-                task: n.task,
                 agents_md,
                 env,
                 context: cfg.context.clone(),
                 trusted: prep.trusted,
                 grants: prep.grants.clone(),
-                secrets_revealed: Vec::new(),
+                secrets_revealed: revealed,
+                ..RunSpec::new(prep.project_id.clone(), project.clone(), endpoint, n.task)
             };
             let (mut deps, bus) = deps(
                 &store,
@@ -1322,8 +1382,17 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 args.checkpoint_timeout,
             );
             deps.crash = crash_hook(args.crash);
-            deps.audit_head =
-                record_start(&store, &project, run, &prep.policy, &wiring, &prep.grants).await?;
+            deps.audit_head = record_start(
+                &store,
+                &project,
+                run,
+                &prep.policy,
+                &wiring,
+                &prep.grants,
+                &keys,
+                session.as_deref(),
+            )
+            .await?;
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
             let outcome = drive(&store, &bus, fut, &ctl, args.crash, masker.clone()).await;
@@ -1331,9 +1400,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             report(&store, &project, run, outcome, &masker).await
         }
         RunAction::Resume(r) => {
-            let Some(store) = resume_store else {
-                return Err(RunError::NoJournal(journal_dir(home, &project)?));
-            };
+            // Журнал снова — после ожидания Vault (D160).
+            let store = open_existing(home, &project)?;
             // D91: якорь аудита прошлого запуска — до любых новых записей.
             let snap = store
                 .latest_snapshot(r.run)
@@ -1399,6 +1467,8 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 &policy,
                 &wiring,
                 &change.grants_add,
+                &keys,
+                session.as_deref(),
             )
             .await?;
             // Новый канал управления на каждый resume: `start_run` и `resume_run` забирают
@@ -1407,6 +1477,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             change.endpoint = endpoint;
             change.budget = budget;
             change.input = r.input;
+            change.secrets_revealed = revealed;
             let fut = resume_run(&deps, r.run, change, rx);
             let outcome = drive(&store, &bus, fut, &ctl, args.crash, masker.clone()).await;
             cleanup_run_tmp(&project, r.run).await;
@@ -1682,7 +1753,7 @@ impl Printer {
 }
 
 /// Ctrl+C; если обработчик не ставится — никогда.
-async fn ctrl_c() {
+pub(crate) async fn ctrl_c() {
     if let Err(e) = tokio::signal::ctrl_c().await {
         tracing::warn!(error = %e, "обработчик Ctrl+C не установлен");
         std::future::pending::<()>().await;

@@ -467,8 +467,8 @@ fn run_args(r: RunCli) -> RunArgs {
 
 #[derive(Debug, Subcommand)]
 enum JournalCmd {
-    /// События run в JSONL по порядку `seq`, секреты замаскированы (значения
-    /// `ZA_SECRET_*` и шаблоны ключей).
+    /// События run в JSONL по порядку `seq`, секреты замаскированы шаблонами ключей
+    /// (журнал маскировался при записи).
     Export {
         /// Каталог проекта.
         #[arg(long)]
@@ -493,9 +493,15 @@ enum SkillsCmd {
 
 #[derive(Debug, Subcommand)]
 enum SecretCmd {
-    /// Имена секретов (`key_ref` из config.toml и переменные `ZA_SECRET_*`), отметка
-    /// «задан»; значения не печатаются.
-    List,
+    /// `key_ref` из config.toml: где найден в Vault памяти (решения, затем личном), тип,
+    /// «Vault заблокирован»; число записей окружения. Значения не раскрываются и не
+    /// печатаются.
+    List {
+        /// Каталог проекта: Vault его решения (только у доверенного проекта); по умолчанию —
+        /// текущий каталог.
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -768,7 +774,9 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             json,
         } => {
             let home = home::za_home()?;
-            let masker = StoreSecrets::from_env().masker();
+            // D144: журнал маскировался при записи (D100) — выгрузка маскирует шаблонами,
+            // ключи Vault не раскрываются.
+            let masker = StoreSecrets::patterns_only().masker();
             Ok(audit_cmd::cmd_audit(&home, &project, verify, json, &masker).await?)
         }
         Cmd::Checkpoints { action } => {
@@ -789,7 +797,8 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             action: JournalCmd::Export { project, run },
         } => {
             let home = home::za_home()?;
-            let masker = StoreSecrets::from_env().masker();
+            // D144: только шаблоны, как у `audit`.
+            let masker = StoreSecrets::patterns_only().masker();
             Ok(audit_cmd::cmd_journal_export(&home, &project, run, &masker).await?)
         }
         Cmd::Trust { project, revoke } => {
@@ -797,10 +806,10 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             Ok(cmd_trust(&home, &project, revoke).await?)
         }
         Cmd::Secret {
-            action: SecretCmd::List,
+            action: SecretCmd::List { project },
         } => {
             let home = home::za_home()?;
-            Ok(cmd_secret_list(&home))
+            Ok(cmd_secret_list(&home, project.as_deref()).await)
         }
         Cmd::Skills {
             action: SkillsCmd::List { project },

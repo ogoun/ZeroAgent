@@ -1,11 +1,14 @@
-//! Секреты бинарника (R1-C1 D90): кэш [`StoreSecrets`] для `Gateway` и маскировки,
-//! маска значений JSON, фильтр секретов чекпоинтов (R1-C2 D103), команда
+//! Секреты бинарника (R1-C1 D90; R1-M D143, D144, D160): кэш [`StoreSecrets`] для `Gateway`
+//! и маскировки, маска значений JSON, фильтр секретов чекпоинтов (R1-C2 D103), команда
 //! `zero-agent secret list`.
 //!
-//! Источник — [`za_secrets::SecretStore`]; до клиента памяти ZeroAIMemory это
-//! [`EnvStore`] (`ZA_SECRET_<KEY_REF>`), для пользователя поведение прежнее. Значения
-//! читаются один раз при старте команды и дальше отдаются из кэша: `Gateway` берёт
-//! ключи, маскировщик — известные значения (`known_values`).
+//! Источник ключей — Vault памяти ZeroAIMemory (решение владельца 1): команда раскрывает
+//! только нужные ей ключи ([`crate::memory::wait_for_keys`]), [`StoreSecrets::for_command`]
+//! кладёт их в кэш, маска — снимок маски процесса после раскрытия (D160). Команды без
+//! раскрытия — [`StoreSecrets::unrevealed`] (`models`, `doctor`, `inspect`, `resources`) и
+//! [`StoreSecrets::patterns_only`] (`audit`, `journal export`, `checkpoints restore`: журнал
+//! маскировался при записи, D100, D144). `ZA_SECRET_*` читает только сборка с признаком
+//! `test-hooks` без `[memory]` (тесты R1-A…R1-C2); обычная и release-сборка — нет.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -15,26 +18,45 @@ use std::process::ExitCode;
 use serde_json::Value;
 use za_llm::config::secret_env_name;
 use za_llm::{Secret, SecretSource};
-use za_secrets::{EnvStore, MIN_SECRET_LEN, SecretMasker, SecretStore, known_values};
+use za_memory::{SolutionVault, VaultScope};
+use za_secrets::{MIN_SECRET_LEN, MaskCell, SecretMasker, SecretStore, known_values};
 use za_tools::SecretFilter;
 
-use crate::config::load_config;
+use crate::config::{AgentConfig, load_config};
+use crate::memory::{KeyRing, KeySource, Memory, command_memory, fallback_reason};
 
 /// Версия правил фильтра секретов чекпоинтов (входит в отпечаток: смена правил — новая
 /// проверка файлов). v2 — ключи PGP и PuTTY (финальное ревью безопасности, Minor 2).
 const FILTER_RULES_V: &str = "zero-agent checkpoint filter v2 (values, pem, pgp, ppk)";
 
-/// Секреты, прочитанные из хранилища при старте (D90, 1.15).
-#[derive(Clone, Default)]
+/// Описание Vault как источника секретов (`secret list`, `doctor`, D152).
+pub const VAULT_SOURCE: &str = "Vault памяти (решение, затем личный)";
+
+/// Секреты команды: значения, причины «нет ключа», маска (D90, D143, D160).
+#[derive(Clone)]
 pub struct StoreSecrets {
-    /// Вид исходного хранилища (`env`).
+    /// Вид источника: `vault`, `env` (тестовая сборка), `none` (памяти нет), `patterns`.
     kind: &'static str,
     /// Имя → значение; пустые значения не хранятся.
     cache: BTreeMap<String, String>,
+    /// `key_ref` → причина «нет ключа», которую назвала фаза раскрытия.
+    missing: BTreeMap<String, String>,
+    /// Источник кольца: причина для прочих `key_ref`; `None` — подсказка `ZA_SECRET_*`.
+    source: Option<KeySource>,
+    /// Маска команды: снимок маски процесса после раскрытия (D160).
+    masker: SecretMasker,
+}
+
+impl Default for StoreSecrets {
+    /// Без секретов, маска — только шаблоны.
+    fn default() -> Self {
+        Self::patterns_only()
+    }
 }
 
 impl StoreSecrets {
-    /// Читает все секреты `store` один раз: `names()` и `get` на каждое имя.
+    /// Читает все секреты `store` один раз: `names()` и `get` на каждое имя; маска — по
+    /// известным значениям и шаблонам D90.
     pub fn from_store(store: &dyn SecretStore) -> Self {
         let cache = store
             .names()
@@ -44,20 +66,68 @@ impl StoreSecrets {
                 Some((n, v))
             })
             .collect();
-        Self {
+        let mut s = Self {
             kind: store.kind(),
             cache,
+            missing: BTreeMap::new(),
+            source: None,
+            masker: SecretMasker::default(),
+        };
+        s.masker = SecretMasker::new(known_values(&s));
+        s
+    }
+
+    /// Ключи команды после фазы раскрытия (D143, D160): значения и причины кольца `ring`;
+    /// значения кольца — в маске процесса `cell` (у Vault они там уже есть, у `ZA_SECRET_*`
+    /// тестовой сборки добавляются здесь), маска команды — её снимок после этого.
+    pub fn for_command(ring: &KeyRing, cell: &MaskCell) -> Self {
+        cell.extend(
+            ring.values()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
+        let kind = match ring.source {
+            KeySource::Vault => "vault",
+            KeySource::Env => "env",
+            KeySource::Off(_) => "none",
+        };
+        Self {
+            kind,
+            cache: ring
+                .values()
+                .iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            missing: ring.missing().clone(),
+            source: Some(ring.source.clone()),
+            masker: (*cell.current()).clone(),
         }
     }
 
-    /// Секреты из переменных окружения процесса `ZA_SECRET_*` ([`EnvStore`]).
-    pub fn from_env() -> Self {
-        Self::from_store(&EnvStore::from_vars(std::env::vars_os()))
+    /// Команда без раскрытия ключей (`models`, `doctor`, `inspect`, `resources`, D143):
+    /// эндпоинты с `key_ref` — `Inactive` с причиной; в тестовой сборке без `[memory]` —
+    /// `ZA_SECRET_*`.
+    pub fn unrevealed(cfg: &AgentConfig) -> Self {
+        Self::for_command(&KeyRing::unrevealed(cfg), &MaskCell::default())
     }
 
-    /// Маскировщик по известным значениям кэша и шаблонам D90.
+    /// Только шаблоны (D144): `audit`, `journal export` и `checkpoints restore` ключи не
+    /// раскрывают — журнал маскировался при записи (D100), фильтр чекпоинтов — только PEM.
+    pub fn patterns_only() -> Self {
+        Self {
+            kind: "patterns",
+            cache: BTreeMap::new(),
+            missing: BTreeMap::new(),
+            source: None,
+            masker: SecretMasker::default(),
+        }
+    }
+
+    /// Маскировщик команды: известные значения (раскрытые, токен памяти) и шаблоны D90.
     pub fn masker(&self) -> SecretMasker {
-        SecretMasker::new(known_values(self))
+        self.masker.clone()
     }
 
     /// Фильтр секретов чекпоинтов (D103): `true`, если в байтах файла есть известное
@@ -122,6 +192,19 @@ impl StoreSecrets {
 impl SecretSource for StoreSecrets {
     fn get(&self, key_ref: &str) -> Option<Secret> {
         self.lookup(key_ref).map(|v| Secret::new(v.clone()))
+    }
+
+    /// Причина источника (D143): «ждёт Vault памяти», «не найден в Vault», «память не
+    /// настроена», «не раскрыт этой командой»; у `ZA_SECRET_*` тестовой сборки — подсказка о
+    /// переменной.
+    fn missing_reason(&self, key_ref: &str) -> String {
+        if let Some(r) = self.missing.get(key_ref) {
+            return r.clone();
+        }
+        match &self.source {
+            Some(src) => fallback_reason(src, key_ref),
+            None => za_llm::http::missing_key_reason(key_ref),
+        }
     }
 }
 
@@ -289,38 +372,112 @@ const SHORT_NOTE: &str = "  (короче 8 символов — не маски
 /// Описание источника секретов для `secret list` и `doctor`.
 pub fn source_text(kind: &str) -> String {
     match kind {
-        "env" => "переменные ZA_SECRET_* (Vault памяти — с клиентом ZeroAIMemory)".to_owned(),
+        "env" => "переменные ZA_SECRET_* (сборка с test-hooks без [memory])".to_owned(),
+        "vault" => VAULT_SOURCE.to_owned(),
         other => other.to_owned(),
     }
 }
 
-/// `zero-agent secret list`. Ошибка конфигурации не мешает списку переменных:
-/// предупреждение в stderr, список — по `ZA_SECRET_*`.
-pub fn cmd_secret_list(home: &Path) -> ExitCode {
-    let key_refs = match load_config(home) {
-        Ok(cfg) => cfg
-            .models
-            .map(|m| {
-                m.endpoints
-                    .into_iter()
-                    .filter_map(|e| e.key_ref)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
+/// `zero-agent secret list [--project P]` (D144): `key_ref` конфигурации — где найден в Vault
+/// (решения, затем личном), тип записи, «Vault заблокирован»; отдельной строкой — число
+/// записей окружения. Значения не раскрываются. Vault решения — у доверенного проекта
+/// `project` (по умолчанию — текущий каталог). Нет `[memory]` — ключей моделей нет; в
+/// тестовой сборке без `[memory]` — список `ZA_SECRET_*`. Ошибка конфигурации не мешает
+/// списку: предупреждение в stderr.
+pub async fn cmd_secret_list(home: &Path, project: Option<&Path>) -> ExitCode {
+    let cfg = match load_config(home) {
+        Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("zero-agent: config.toml не прочитан, key_ref не показаны: {e}");
-            Vec::new()
+            AgentConfig::default()
         }
     };
-    let secrets = StoreSecrets::from_env();
-    print!(
-        "{}",
-        render_list(
-            &list_entries(&key_refs, &secrets),
-            SecretStore::kind(&secrets)
-        )
-    );
+    let key_refs: Vec<String> = cfg
+        .models
+        .as_ref()
+        .map(|m| {
+            m.endpoints
+                .iter()
+                .filter_map(|e| e.key_ref.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let ring = KeyRing::unrevealed(&cfg);
+    match &ring.source {
+        KeySource::Env => {
+            let secrets = StoreSecrets::for_command(&ring, &MaskCell::default());
+            print!(
+                "{}",
+                render_list(
+                    &list_entries(&key_refs, &secrets),
+                    SecretStore::kind(&secrets)
+                )
+            );
+        }
+        KeySource::Off(why) => print!("{}", render_unavailable(&key_refs, &why.reason())),
+        KeySource::Vault => {
+            let (mem, _) = command_memory(home, &cfg, project).await;
+            print!("{}", vault_list(&mem, &key_refs).await);
+        }
+    }
     ExitCode::SUCCESS
+}
+
+/// `secret list` без памяти: ключей моделей нет.
+fn render_unavailable(key_refs: &[String], why: &str) -> String {
+    let mut out = format!(
+        "источник секретов: {VAULT_SOURCE} — {why}: ключей моделей нет (ZA_SECRET_* не читаются)\n"
+    );
+    for k in key_refs {
+        out.push_str(&format!("  {k:<20} недоступен\n"));
+    }
+    out
+}
+
+/// `secret list` по Vault памяти: поиск без раскрытия (D144).
+async fn vault_list(mem: &Memory, key_refs: &[String]) -> String {
+    let mut out = format!("источник секретов: {VAULT_SOURCE}\n");
+    let Some(rt) = mem.runtime() else {
+        return out;
+    };
+    if !rt.client.has_token() {
+        out.push_str("  токен памяти не задан (ZA_MEMORY_TOKEN): Vault не проверен\n");
+        return out;
+    }
+    let vault = rt.keys.vault();
+    let solution = rt.keys.solution();
+    let mut refs: Vec<&String> = key_refs.iter().collect();
+    refs.sort();
+    refs.dedup();
+    for k in refs {
+        let line = match vault.locate(k, solution).await {
+            Ok((item, locked)) => {
+                let place = match item.scope {
+                    VaultScope::Solution(_) => "в Vault решения",
+                    VaultScope::Knowledge => "в личном Vault",
+                };
+                let lock = match locked {
+                    Some(r) if r.trim().is_empty() => "  (Vault заблокирован)".to_owned(),
+                    Some(r) => format!("  (Vault заблокирован: {r})"),
+                    None => String::new(),
+                };
+                format!("  {k:<20} {place}  {}{lock}\n", item.item_type)
+            }
+            Err(e) => format!("  {k:<20} {e}\n"),
+        };
+        out.push_str(&line);
+    }
+    if let SolutionVault::Untrusted = solution {
+        out.push_str("  Vault решения не читается: проект не доверен (zero-agent trust)\n");
+    }
+    match vault.environment(solution).await {
+        Ok(env) => out.push_str(&format!(
+            "записей окружения в Vault: {} (host, environment — не ключи, не раскрываются)\n",
+            env.len()
+        )),
+        Err(e) => out.push_str(&format!("записи окружения не проверены: {e}\n")),
+    }
+    out
 }
 
 #[cfg(test)]
@@ -329,6 +486,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::json;
+    use za_secrets::EnvStore;
 
     use super::*;
 

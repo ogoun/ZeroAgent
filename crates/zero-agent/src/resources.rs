@@ -33,7 +33,9 @@ fn complete(s: &ResourceSnapshot) -> bool {
 /// `zero-agent resources [--json] [--watch]`.
 pub async fn cmd_resources(home: &Path, json: bool, watch: bool) -> Result<ExitCode, CommandError> {
     let cfg = load_config(home)?;
-    let s = start_gateway(home, &cfg, true).await?;
+    // Ресурсам ключи не нужны (D143).
+    let secrets = std::sync::Arc::new(crate::secret::StoreSecrets::unrevealed(&cfg));
+    let s = start_gateway(home, &cfg, true, secrets).await?;
     let started = tokio::time::Instant::now();
     tokio::time::sleep(FIRST_CPU).await;
     while started.elapsed() < FIRST_SAMPLE_WAIT

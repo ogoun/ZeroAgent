@@ -111,7 +111,9 @@ fn open(
             source,
         })
         .and_then(|r| home::with_user_home(r).map_err(CheckpointsCmdError::UserHome))?;
-    // Чекпоинт «до» восстановления тоже не сохраняет секреты (D103).
+    // Чекпоинт «до» восстановления тоже не сохраняет секреты (D103). Ключи Vault команда не
+    // раскрывает (D144): фильтр — PEM, PGP, PuTTY и имена секретных файлов; проверка
+    // содержимого слабее, чем у run, — принятый риск (ADR 0007).
     let ck = GitCheckpointer::new(
         Arc::new(DirectRunner),
         AgentHome {
@@ -120,7 +122,7 @@ fn open(
         },
         Arc::new(roots),
     )
-    .with_secret_filter(StoreSecrets::from_env().checkpoint_filter());
+    .with_secret_filter(StoreSecrets::patterns_only().checkpoint_filter());
     Ok((project, store, ck))
 }
 

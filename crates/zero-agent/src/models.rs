@@ -5,8 +5,12 @@
 //! [`PROBE_WAIT`] и печатают состояние с причиной: `probing` (зонд не уложился),
 //! `inactive` (нет ключа, ключ отвергнут, нет модели), `unreachable`, `open`, `disabled`.
 //!
+//! Ключи (R1-M D143): `ask` и `models probe` раскрывают из Vault памяти только ключ выбранной
+//! модели, `ask` ждёт заблокированный или недоступный Vault (Ctrl+C — отмена, код 130),
+//! `models probe` — нет; `models` ключи не раскрывает.
+//!
 //! Коды выхода: `0` — успех; `1` — ошибка, в том числе ошибка модели, неготовая модель
-//! (`ask`, `models probe`) и ошибка конфигурации. Список `models` — успех при любом
+//! (`ask`, `models probe`) и ошибка конфигурации; `130` — ожидание Vault отменено (`ask`). Список `models` — успех при любом
 //! состоянии эндпоинтов. `ask` журнал не пишет: это проверочная команда. Вывод `ask`:
 //! на терминале — текст по мере стрима, при повторе (D20) — пометка в stderr и ответ
 //! заново с новой строки; вне терминала — только итог последней попытки.
@@ -29,6 +33,8 @@ use za_protocol::{Priority, RunId};
 use za_res::{Admission, MonitorConfig, ResourceMonitor};
 
 use crate::config::{AgentConfig, AppConfigError, load_config};
+use crate::memory::{KeyPlan, WaitError, command_memory, reveal_once, wait_for_keys};
+use crate::run::{EXIT_INTERRUPTED, ctrl_c};
 use crate::secret::StoreSecrets;
 
 /// Сколько команды ждут первых зондов: предел одного зонда и запас.
@@ -67,18 +73,20 @@ pub enum CommandError {
 pub struct Started {
     pub gateway: Gateway,
     pub monitor: Option<ResourceMonitor>,
-    /// Секреты, прочитанные при старте: из них же ключи `Gateway` и маска (D90).
+    /// Секреты команды: из них же ключи `Gateway` и маска (D90, D160).
     pub secrets: Arc<StoreSecrets>,
 }
 
 /// Запускает `Gateway` по конфигурации. `with_resources` — монитор ресурсов узла и
 /// допуск заявок (D10): для `ask` и `resources`. Нет `[models]` — пустой список
-/// эндпоинтов. Ключи — из `ZA_SECRET_<KEY_REF>` (D4): [`StoreSecrets`] читает их один раз
-/// при старте (R1-C1 D90).
+/// эндпоинтов. Ключи — `secrets` команды (R1-M D143, D160): раскрытые из Vault до запуска
+/// ([`StoreSecrets::for_command`]) или без раскрытия ([`StoreSecrets::unrevealed`]); эндпоинт
+/// без ключа — `Inactive` с причиной источника.
 pub async fn start_gateway(
     home: &Path,
     cfg: &AgentConfig,
     with_resources: bool,
+    secrets: Arc<StoreSecrets>,
 ) -> Result<Started, CommandError> {
     let dir = home.join(MODELS_DIR);
     let store = ProfileStore::open(&dir).map_err(|source| CommandError::Io {
@@ -95,7 +103,6 @@ pub async fn start_gateway(
     } else {
         (None, None)
     };
-    let secrets = Arc::new(StoreSecrets::from_env());
     let gateway = Gateway::start(
         cfg.models.clone().unwrap_or_default(),
         Arc::clone(&secrets) as Arc<dyn za_llm::SecretSource>,
@@ -198,7 +205,9 @@ fn models_of(cfg: &AgentConfig) -> Option<&ModelsConfig> {
 pub async fn cmd_models(home: &Path, json: bool) -> Result<ExitCode, CommandError> {
     let cfg = load_config(home)?;
     let (views, warnings) = if models_of(&cfg).is_some() {
-        let s = start_gateway(home, &cfg, false).await?;
+        // `models` ключи не раскрывает (D143): эндпоинты с `key_ref` — `inactive` с причиной.
+        let secrets = Arc::new(StoreSecrets::unrevealed(&cfg));
+        let s = start_gateway(home, &cfg, false, secrets).await?;
         s.gateway.wait_probed(PROBE_WAIT).await;
         let view = s.gateway.view();
         (view.endpoints, view.warnings)
@@ -215,7 +224,9 @@ pub async fn cmd_models(home: &Path, json: bool) -> Result<ExitCode, CommandErro
 }
 
 /// `zero-agent models probe <id>`: повторный зонд; профиль связки и факты эндпоинта
-/// сохраняет `Gateway` в `ZA_HOME/models` (D13). Код 0 — эндпоинт готов.
+/// сохраняет `Gateway` в `ZA_HOME/models` (D13). Код 0 — эндпоинт готов. Ключ этого
+/// эндпоинта раскрывается из Vault памяти без сессии и без ожидания (D143): Vault
+/// заблокирован — `inactive` «ждёт Vault памяти».
 pub async fn cmd_probe(home: &Path, id: &str, json: bool) -> Result<ExitCode, CommandError> {
     let cfg = load_config(home)?;
     let models = models_of(&cfg).ok_or(CommandError::NoModels)?;
@@ -223,7 +234,11 @@ pub async fn cmd_probe(home: &Path, id: &str, json: bool) -> Result<ExitCode, Co
     if models.endpoint(&id).is_none() {
         return Err(SelectError::Unknown(id).into());
     }
-    let s = start_gateway(home, &cfg, false).await?;
+    let plan = KeyPlan::for_endpoint(Some(models), &id);
+    let (mem, cell) = command_memory(home, &cfg, None).await;
+    let ring = reveal_once(&mem, &plan, None).await;
+    let secrets = Arc::new(StoreSecrets::for_command(&ring, &cell));
+    let s = start_gateway(home, &cfg, false, secrets).await?;
     let state = s.gateway.probe(&id).await;
     if json {
         println!(
@@ -307,17 +322,30 @@ pub struct AskArgs {
 }
 
 /// `zero-agent ask`: текст ответа — в stdout по мере стрима, `usage` и итог — в stderr.
-/// Облачный эндпоинт без ключа — `inactive` без сетевого запроса (MDL-021).
+/// Облачный эндпоинт без ключа — `inactive` без сетевого запроса (MDL-021). Ключ выбранной
+/// модели — из Vault памяти без сессии (D143); Vault заблокирован или недоступен — `ask`
+/// ждёт (Ctrl+C — код 130).
 pub async fn cmd_ask(home: &Path, args: AskArgs) -> Result<ExitCode, CommandError> {
     let cfg = load_config(home)?;
-    models_of(&cfg).ok_or(CommandError::NoModels)?;
-    let s = start_gateway(home, &cfg, true).await?;
+    let models = models_of(&cfg).ok_or(CommandError::NoModels)?;
+    let choice = args.model.clone().map(EndpointId);
+    let plan = KeyPlan::for_selection(Some(models), choice.as_ref(), None);
+    let (mem, cell) = command_memory(home, &cfg, None).await;
+    let ring = match wait_for_keys(&mem, &plan, None, &za_memory::TokioClock, ctrl_c()).await {
+        Ok(r) => r,
+        Err(WaitError::Cancelled) => {
+            eprintln!("zero-agent: ожидание Vault памяти отменено");
+            return Ok(ExitCode::from(EXIT_INTERRUPTED));
+        }
+    };
+    let secrets = Arc::new(StoreSecrets::for_command(&ring, &cell));
+    let s = start_gateway(home, &cfg, true, secrets).await?;
     // Ответ печатается через маску секретов (D90, ревью задачи 10, m7): дельты — по
-    // отдельности, итог вне терминала — целиком.
+    // отдельности, итог вне терминала — целиком. Маска — после раскрытия ключей (D160).
     let masker = s.secrets.masker();
     let g = &s.gateway;
     let id = g.select(&Selection {
-        run_choice: args.model.map(EndpointId),
+        run_choice: choice,
         ..Selection::default()
     })?;
     let Some(view) = wait_endpoint(g, &id, PROBE_WAIT).await else {

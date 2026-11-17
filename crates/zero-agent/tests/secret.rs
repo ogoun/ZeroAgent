@@ -1,5 +1,8 @@
 //! `zero-agent secret list` и источник секретов в `doctor` (R1-C1 D90) из отдельного
 //! процесса: имена и «задан», значений в выводе нет.
+//!
+//! R1-M D143: `ZA_SECRET_*` читает только сборка с признаком `test-hooks` без `[memory]` —
+//! тест собирается только с ним (`required-features`). Vault памяти — `vault_keys.rs`.
 
 mod support;
 use support::process::env_in;
@@ -39,7 +42,7 @@ fn secret_list_prints_names_not_values() {
     assert!(line("extra").contains("нет в config.toml"), "{}", o.stdout);
     assert!(
         o.stdout
-            .contains("переменные ZA_SECRET_* (Vault памяти — с клиентом ZeroAIMemory)"),
+            .contains("переменные ZA_SECRET_* (сборка с test-hooks без [memory])"),
         "{}",
         o.stdout
     );
@@ -67,7 +70,7 @@ fn doctor_names_secret_source() {
     let o = e.run_with(&["doctor"], &[("ZA_SECRET_ANTHROPIC", VALUE_A)]);
     assert!(
         o.stdout.contains(
-            "источник секретов: переменные ZA_SECRET_* (Vault памяти — с клиентом ZeroAIMemory)"
+            "источник секретов: переменные ZA_SECRET_* (сборка с test-hooks без [memory])"
         ),
         "{}",
         o.stdout

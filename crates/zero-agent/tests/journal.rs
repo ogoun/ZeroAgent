@@ -95,17 +95,23 @@ fn open_gives_up_after_bounded_retries() {
     assert!(spent < Duration::from_secs(20), "{spent:?}");
 }
 
-/// Значение секрета, переданное процессу через `ZA_SECRET_T`, не попадает в выгрузку.
-const SECRET: &str = "s3cr3t-Value-0123456789";
+/// Токен памяти в событии, записанном мимо маски run, — выгрузка маскирует его шаблоном
+/// `zam_` (R1-M D144: `journal export` маскирует только шаблонами — журнал маскировался при
+/// записи, известных значений у выгрузки нет). Тело — из частей (GitHub push protection).
+fn token() -> String {
+    ["zam", "_", "Qe4Rt8Yu2Io6Pa1Sd5Fg", "9Hj3Kl7Zx0Cv4Bn8Mq2W"].concat()
+}
 
 #[test]
 fn journal_export_prints_masked_jsonl() {
     let e = env("export");
-    let (run, n_events) = with_run(&e, async |s, run| {
-        s.append(event(run, json!({"text": format!("token {SECRET} end")})))
+    let secret = token();
+    let s2 = secret.clone();
+    let (run, n_events) = with_run(&e, async move |s, run| {
+        s.append(event(run, json!({"text": format!("token {s2} end")})))
             .await
             .unwrap();
-        s.append(event(run, json!({"args": {"key": SECRET}})))
+        s.append(event(run, json!({"args": {"key": s2}})))
             .await
             .unwrap();
         // Событие другого run в выгрузку не попадает.
@@ -113,17 +119,14 @@ fn journal_export_prints_masked_jsonl() {
         s.append(event(other, json!({"x": 1}))).await.unwrap();
         s.read_run(run, Seq(0), usize::MAX).await.unwrap().len()
     });
-    let o = e.run_with(
-        &[
-            "journal",
-            "export",
-            "--project",
-            e.project_arg(),
-            "--run",
-            &run.to_string(),
-        ],
-        &[("ZA_SECRET_T", SECRET)],
-    );
+    let o = e.run(&[
+        "journal",
+        "export",
+        "--project",
+        e.project_arg(),
+        "--run",
+        &run.to_string(),
+    ]);
     assert_eq!(o.code(), Some(0), "{o:?}");
     let lines: Vec<&str> = o.stdout.lines().collect();
     assert_eq!(lines.len(), n_events, "{}", o.stdout);
@@ -131,10 +134,11 @@ fn journal_export_prints_masked_jsonl() {
         let v: Value = serde_json::from_str(l).unwrap_or_else(|err| panic!("{err}: {l}"));
         assert_eq!(v["run_id"], json!(run.to_string()), "{l}");
     }
-    assert!(!o.stdout.contains(SECRET), "{}", o.stdout);
-    assert!(!o.stderr.contains(SECRET), "{}", o.stderr);
+    let tail = &secret[4..];
+    assert!(!o.stdout.contains(tail), "{}", o.stdout);
+    assert!(!o.stderr.contains(tail), "{}", o.stderr);
     assert_eq!(
-        o.stdout.matches("[secret masked: t]").count(),
+        o.stdout.matches("[secret masked: zam_token]").count(),
         2,
         "{}",
         o.stdout

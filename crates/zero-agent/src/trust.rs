@@ -54,8 +54,18 @@ use crate::run::{RunError, canonical_project, display_path};
 
 pub use za_skills::{EXTERNAL_LINK, LINK_PREFIX};
 
-/// Доверенные файлы в корне проекта.
-pub const TRUSTED_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".zero-agent/config.toml"];
+/// Доверенные файлы проекта. `.zeroaimemory/solution.toml` и `.zeroaimemory/area.toml` —
+/// привязка к решению памяти и область (R1-M D135): их читает поиск ключей в Vault решения,
+/// поэтому привязка — только у доверенного проекта, а правка файла снимает доверие.
+/// Отсутствующий файл в набор не входит: доверие проектов без них не меняется. Это не список
+/// файлов инструкций ([`INSTRUCTION_FILES`]).
+pub const TRUSTED_FILES: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".zero-agent/config.toml",
+    crate::memory::SOLUTION_FILE,
+    crate::memory::AREA_FILE,
+];
 /// Доверенные деревья (скиллы): деревья скиллов проекта по старшинству (D114).
 pub const TRUSTED_TREES: &[&str] = za_skills::PROJECT_TREES;
 

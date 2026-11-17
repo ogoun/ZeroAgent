@@ -223,6 +223,47 @@ fn unc_links_are_not_touched() {
     assert_eq!(s.files["AGENTS.md"], EXTERNAL_LINK);
 }
 
+/// R1-M D135: привязка к решению памяти и область (`.zeroaimemory/solution.toml`,
+/// `.zeroaimemory/area.toml`) — в наборе доверия: правка снимает доверие с перечнем
+/// изменений. Проект без этих файлов набора не меняет (доверие прежних проектов в силе).
+#[test]
+fn solution_toml_in_trust_set() {
+    let (project, _) = fixture("zeroaimemory");
+    std::fs::write(project.join("AGENTS.md"), "инструкции").unwrap();
+    let before = trust_set(&project).unwrap();
+    assert_eq!(
+        before.files.keys().collect::<Vec<_>>(),
+        ["AGENTS.md"],
+        "без .zeroaimemory набор прежний"
+    );
+    let dir = project.join(".zeroaimemory");
+    std::fs::create_dir_all(&dir).unwrap();
+    let solution = "agent_solution_id = \"0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e77\"\nname = \"x\"\n";
+    std::fs::write(dir.join("solution.toml"), solution).unwrap();
+    std::fs::write(dir.join("area.toml"), "area = \"ядро\"\n").unwrap();
+    let granted = trust_set(&project).unwrap();
+    assert_eq!(
+        granted.files.get(".zeroaimemory/solution.toml"),
+        Some(&hex(solution.as_bytes()))
+    );
+    assert!(granted.files.contains_key(".zeroaimemory/area.toml"));
+    assert_eq!(
+        TrustDiff::between(&before, &granted).describe(),
+        "новые: .zeroaimemory/area.toml, .zeroaimemory/solution.toml"
+    );
+    // Чужое решение в файле после доверия — доверие снято, файл назван.
+    std::fs::write(
+        dir.join("solution.toml"),
+        "agent_solution_id = \"0192f1c4-7a1e-7c3b-9a55-000000000000\"\n",
+    )
+    .unwrap();
+    let now = trust_set(&project).unwrap();
+    assert_eq!(
+        TrustDiff::between(&granted, &now).describe(),
+        "изменены: .zeroaimemory/solution.toml"
+    );
+}
+
 // ---- Доверие в run (задача 13) ----
 
 /// Окно `/props` сценариев доверия.
