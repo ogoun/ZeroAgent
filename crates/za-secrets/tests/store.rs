@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 
-use za_secrets::{EnvStore, SecretStore, env_var_name, known_values};
+use za_secrets::{EnvStore, MaskCell, SecretStore, env_var_name, known_values};
 
 fn vars(list: &[(&str, &str)]) -> impl Iterator<Item = (OsString, OsString)> {
     list.iter()
@@ -126,4 +126,44 @@ fn known_values_keep_long_ones_only() {
         known_values(&s),
         vec![("long".to_string(), "abcdefgh".to_string())]
     );
+}
+
+/// R1-M D160: `MaskCell` пересобирает маску после каждого `extend`; снимок, взятый раньше,
+/// маскирует только прежний набор. Значения — из частей во время выполнения.
+#[test]
+fn mask_cell_rebuilt_after_each_extend() {
+    let a = ["cell", "-value-", "alpha-0001"].concat();
+    let b = ["cell", "-value-", "bravo-0002"].concat();
+    let text = format!("a={a} b={b}");
+    let cell = MaskCell::new(Vec::new());
+    let before = cell.current();
+    assert_eq!(
+        before.mask(&text),
+        text.as_str(),
+        "до extend маскировать нечего"
+    );
+
+    cell.extend(vec![("ka".to_owned(), a.clone())]);
+    let only_a = cell.current();
+    let m = only_a.mask(&text).into_owned();
+    assert!(!m.contains(&a) && m.contains(&b), "{m}");
+    assert!(m.contains("[secret masked: ka]"), "{m}");
+
+    cell.extend(vec![("kb".to_owned(), b.clone())]);
+    let both = cell.current().mask(&text).into_owned();
+    assert!(!both.contains(&a) && !both.contains(&b), "{both}");
+    // Прежние снимки не меняются.
+    let old = only_a.mask(&text).into_owned();
+    assert!(!old.contains(&a) && old.contains(&b), "{old}");
+    assert_eq!(before.mask(&text), text.as_str());
+
+    // Повтор известной пары снимок не пересобирает.
+    let same = cell.current();
+    cell.extend(vec![("ka".to_owned(), a.clone())]);
+    assert!(std::sync::Arc::ptr_eq(&same, &cell.current()));
+
+    // `Debug` — имена без значений.
+    let d = format!("{cell:?}");
+    assert!(d.contains("ka") && d.contains("kb"), "{d}");
+    assert!(!d.contains(&a) && !d.contains(&b), "{d}");
 }

@@ -1,9 +1,11 @@
 //! Хранилище секретов (D90): трейт [`SecretStore`] и [`EnvStore`] поверх `ZA_SECRET_*`.
 //!
-//! Целевая реализация — `VaultStore` поверх раздела Vault ZeroAIMemory (CR-21
-//! `docs/memory_upgrade.md`); она появится с клиентом памяти. До него работает только
-//! [`EnvStore`]: значения переменных `ZA_SECRET_<KEY_REF>` по правилу `secret_env_name`
-//! R1-A D4. Запись секретов агентом не предусмотрена: хранилища только читают.
+//! Продуктовая реализация — `za_memory::keys::VaultKeys` поверх Vault ZeroAIMemory (R1-M
+//! D143): только раскрытые командой ключи. [`EnvStore`] — значения переменных
+//! `ZA_SECRET_<KEY_REF>` по правилу `secret_env_name` R1-A D4 — только для тестов и CI:
+//! тесты `za-secrets` и `za-llm`, бинарник с признаком `test-hooks` без `[memory]`. Запасным
+//! источником ключей в продукте он не служит (решение владельца 1). Запись секретов агентом
+//! не предусмотрена: хранилища только читают.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -22,7 +24,7 @@ pub trait SecretStore: Send + Sync {
     fn get(&self, name: &str) -> Option<String>;
     /// Имена заданных секретов по возрастанию.
     fn names(&self) -> Vec<String>;
-    /// Вид хранилища: `"env"`, позже `"vault"`.
+    /// Вид хранилища: `"env"` (тесты), `"vault"` (Vault памяти).
     fn kind(&self) -> &'static str;
 }
 
