@@ -7,7 +7,7 @@ mod fake_zam;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fake_zam::FakeZam;
+use fake_zam::{FakeZam, WAIT, within};
 use serde_json::json;
 use za_memory::ErrorKind::*;
 use za_memory::{
@@ -15,12 +15,6 @@ use za_memory::{
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
-
-async fn within<F: std::future::Future>(what: &str, f: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(30), f)
-        .await
-        .unwrap_or_else(|_| panic!("{what}: не завершилось за 30 с"))
-}
 
 /// Хвост фиктивного токена: его не должно быть в `Debug` и логах.
 const TAIL: &str = "Tr4nsp0rtTa1lQw8Er5Ty2Ui9Op3As6Df1Gh7";
@@ -98,12 +92,17 @@ async fn redirect_not_followed() {
     let mut b = FakeZam::start().await;
     a.redirect_to(&b.url());
     let c = client(&a.url());
-    let e = within("get", c.get_json("/api/v1/spaces", &Ctx::default(), LIMIT))
-        .await
-        .unwrap_err();
+    let e = within(
+        WAIT,
+        "get",
+        c.get_json("/api/v1/spaces", &Ctx::default(), LIMIT),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(e.kind, Protocol);
     assert_eq!(e.title, "memory server redirected; not followed");
     let e = within(
+        WAIT,
         "post",
         c.send_json(
             Method::POST,
@@ -161,10 +160,11 @@ async fn headers_sent_and_no_authorization_in_log() {
         solution: Some("01a1e164-0ff6-77dc-b4cb-84f08cc1f69e"),
         area: Some("core"),
     };
-    within("get", c.get_json("/api/v1/spaces", &cx, LIMIT))
+    within(WAIT, "get", c.get_json("/api/v1/spaces", &cx, LIMIT))
         .await
         .unwrap();
     let (status, _) = within(
+        WAIT,
         "send",
         c.send_json(
             Method::POST,
@@ -185,6 +185,7 @@ async fn headers_sent_and_no_authorization_in_log() {
         Some(Token::new(["zam", "_", "wrong", TAIL].concat())),
     );
     let e = within(
+        WAIT,
         "401",
         wrong.get_json("/api/v1/spaces", &Ctx::default(), LIMIT),
     )
@@ -245,7 +246,7 @@ async fn area_and_machine_utf8_headers() {
         area: Some("модуль-ядро"),
         ..Ctx::default()
     };
-    within("get", c.get_json("/api/v1/spaces", &cx, LIMIT))
+    within(WAIT, "get", c.get_json("/api/v1/spaces", &cx, LIMIT))
         .await
         .unwrap();
     let seen = fake.seen();
@@ -256,7 +257,7 @@ async fn area_and_machine_utf8_headers() {
         area: Some("a\nb"),
         ..Ctx::default()
     };
-    let e = within("bad", c.get_json("/api/v1/spaces", &bad, LIMIT))
+    let e = within(WAIT, "bad", c.get_json("/api/v1/spaces", &bad, LIMIT))
         .await
         .unwrap_err();
     assert_eq!(e.kind, BadRequest);
@@ -273,9 +274,13 @@ async fn mcp_sends_accept_and_session_arg() {
         ..Ctx::default()
     };
     for tool in ["memory_search", "memory_read", "memory_tree"] {
-        let text = within(tool, c.mcp_call(tool, json!({"query": "x"}), &cx, LIMIT))
-            .await
-            .unwrap_or_else(|e| panic!("{tool}: {e}"));
+        let text = within(
+            WAIT,
+            tool,
+            c.mcp_call(tool, json!({"query": "x"}), &cx, LIMIT),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tool}: {e}"));
         assert!(text.contains(tool), "{text}");
     }
     let seen = fake.seen();
@@ -302,6 +307,7 @@ async fn mcp_sends_accept_and_session_arg() {
     // Ошибка инструмента — HTTP 200 с `isError`: разбор по таблице форм.
     fake.mcp_error("Ошибка 404 Not Found: ресурс не найден\n~6 tok");
     let e = within(
+        WAIT,
         "err",
         c.mcp_call("memory_read", json!({"ids": ["n:1"]}), &cx, LIMIT),
     )
@@ -310,9 +316,13 @@ async fn mcp_sends_accept_and_session_arg() {
     assert_eq!(e.kind, NotFound);
     assert_eq!(e.status, Some(404));
     // Неизвестный инструмент — ошибка JSON-RPC.
-    let e = within("rpc", c.mcp_call("memory_nosuch", json!({}), &cx, LIMIT))
-        .await
-        .unwrap_err();
+    let e = within(
+        WAIT,
+        "rpc",
+        c.mcp_call("memory_nosuch", json!({}), &cx, LIMIT),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(e.kind, Protocol);
 }
 
@@ -337,7 +347,7 @@ async fn fake_rejects_mcp_without_accept() {
         s.read_to_string(&mut out).unwrap();
         out
     });
-    let r = within("raw 406", raw).await.unwrap();
+    let r = within(WAIT, "raw 406", raw).await.unwrap();
     assert!(r.starts_with("HTTP/1.1 406"), "{r}");
 }
 
@@ -386,9 +396,13 @@ async fn rate_limited_carries_retry_after() {
     let fake = FakeZam::start().await;
     fake.fail("/api/v1/spaces", 429, "/problems/rate-limited", Some(7));
     let c = client(&fake.url());
-    let e = within("429", c.get_json("/api/v1/spaces", &Ctx::default(), LIMIT))
-        .await
-        .unwrap_err();
+    let e = within(
+        WAIT,
+        "429",
+        c.get_json("/api/v1/spaces", &Ctx::default(), LIMIT),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(e.kind, RateLimited);
     assert_eq!(e.retry_after, Some(Duration::from_secs(7)));
     assert_eq!(e.status, Some(429));
@@ -399,6 +413,7 @@ async fn rate_limited_carries_retry_after() {
 async fn offline_timeout_and_not_json() {
     let c = client(&fake_zam::closed_port_url());
     let e = within(
+        WAIT,
         "offline",
         c.get_json("/api/v1/spaces", &Ctx::default(), LIMIT),
     )
@@ -410,6 +425,7 @@ async fn offline_timeout_and_not_json() {
     let url = format!("http://{}", silent.local_addr().unwrap());
     let c = client(&url);
     let e = within(
+        WAIT,
         "timeout",
         c.get_json(
             "/api/v1/spaces",
@@ -425,13 +441,14 @@ async fn offline_timeout_and_not_json() {
     let fake = FakeZam::start().await;
     let c = client(&fake.url());
     let e = within(
+        WAIT,
         "html",
         c.get_json("/api/v2/nothing-here", &Ctx::default(), LIMIT),
     )
     .await
     .unwrap_err();
     assert_eq!(e.kind, NotFound, "{e:?}");
-    let e = within("html", c.get_json("/health", &Ctx::default(), LIMIT))
+    let e = within(WAIT, "html", c.get_json("/health", &Ctx::default(), LIMIT))
         .await
         .unwrap_err();
     assert_eq!(e.kind, NotZam);
@@ -492,13 +509,13 @@ async fn manual_clock_wakes_on_advance() {
     let t0 = clock.now();
     let c2 = clock.clone();
     let sleeper = tokio::spawn(async move { c2.sleep(Duration::from_secs(30)).await });
-    within("sleeper", clock.wait_sleepers(1)).await;
+    within(WAIT, "sleeper", clock.wait_sleepers(1)).await;
     clock.advance(Duration::from_secs(29));
     assert!(!sleeper.is_finished());
     assert_eq!(clock.sleepers(), 1);
     clock.advance(Duration::from_secs(1));
-    within("wake", sleeper).await.unwrap();
+    within(WAIT, "wake", sleeper).await.unwrap();
     assert_eq!(clock.now() - t0, Duration::from_secs(30));
     // Нулевой сон — сразу.
-    within("zero", clock.sleep(Duration::ZERO)).await;
+    within(WAIT, "zero", clock.sleep(Duration::ZERO)).await;
 }

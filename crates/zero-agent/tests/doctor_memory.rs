@@ -5,17 +5,9 @@
 #[path = "../../../test-support/fake_zam.rs"]
 mod fake_zam;
 
-use std::time::Duration;
-
-use fake_zam::{FakeZam, Health};
+use fake_zam::{FakeZam, Health, WAIT, within};
 use za_memory::{MemoryConfig, Token, ZamClient};
 use zero_agent::doctor::{Check, check_memory, check_memory_live};
-
-async fn within<F: std::future::Future>(what: &str, f: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(30), f)
-        .await
-        .unwrap_or_else(|_| panic!("{what}: не завершилось за 30 с"))
-}
 
 /// Хвост фиктивного токена (в тексте строки его нет).
 const TAIL: &str = "D0ct0rTa1lQw8Er5Ty2Ui9Op3As6Df1Gh7Jk4";
@@ -36,7 +28,7 @@ async fn doctor_memory_line() {
     let cfg = MemoryConfig::new(&fake.url());
 
     // L2 (m6) и принятый токен — `Ok` с версией, коммитом, уровнем и числом флагов.
-    let c = within("live", check_memory_live(Some(&cfg), token())).await;
+    let c = within(WAIT, "live", check_memory_live(Some(&cfg), token())).await;
     let Check::Ok(text) = &c else {
         panic!("{c:?}");
     };
@@ -52,7 +44,7 @@ async fn doctor_memory_line() {
 
     // Форма m6.5 (тестовый стенд): тоже L2, версия только печатается.
     fake.set_health(Health::M65);
-    let c = within("m65", check_memory_live(Some(&cfg), token())).await;
+    let c = within(WAIT, "m65", check_memory_live(Some(&cfg), token())).await;
     assert!(
         matches!(&c, Check::Ok(t) if t.contains(fake_zam::VERSION_M65) && t.contains("L2")),
         "{c:?}"
@@ -69,7 +61,7 @@ async fn doctor_memory_line() {
         enabled: false,
         ..MemoryConfig::new("http://example.org:7700")
     };
-    let c = within("off", check_memory_live(Some(&off), token())).await;
+    let c = within(WAIT, "off", check_memory_live(Some(&off), token())).await;
     assert!(
         matches!(&c, Check::Ok(t) if t.contains("выключена")),
         "{c:?}"
@@ -78,7 +70,7 @@ async fn doctor_memory_line() {
     // Статус с поддельного сервера, адрес конфигурации — другой: частный адрес по http —
     // `Ok`, внешний хост по http — `Warn` «токен идёт открытым текстом».
     let client = ZamClient::new(&cfg, token()).unwrap();
-    let st = within("status", za_memory::status(&client, None)).await;
+    let st = within(WAIT, "status", za_memory::status(&client, None)).await;
     let private = MemoryConfig::new("http://10.0.0.5:7700");
     assert!(
         matches!(
@@ -100,14 +92,14 @@ async fn doctor_memory_line() {
     ));
 
     // Без токена — `Warn`; Vault заблокирован, подсказки выключены — `Warn` с причинами.
-    let c = within("no token", check_memory_live(Some(&cfg), None)).await;
+    let c = within(WAIT, "no token", check_memory_live(Some(&cfg), None)).await;
     assert!(
         matches!(&c, Check::Warn(t) if t.contains("ZA_MEMORY_TOKEN")),
         "{c:?}"
     );
     fake.lock_vault("no master key");
     fake.hook_off("post_tool");
-    let c = within("locked", check_memory_live(Some(&cfg), token())).await;
+    let c = within(WAIT, "locked", check_memory_live(Some(&cfg), token())).await;
     assert!(
         matches!(&c, Check::Warn(t) if t.contains("Vault заблокирован: no master key") && t.contains("post_tool")),
         "{c:?}"
@@ -118,7 +110,7 @@ async fn doctor_memory_line() {
 #[tokio::test]
 async fn doctor_memory_unreachable_is_warn() {
     let cfg = MemoryConfig::new(&fake_zam::closed_port_url());
-    let c = within("offline", check_memory_live(Some(&cfg), token())).await;
+    let c = within(WAIT, "offline", check_memory_live(Some(&cfg), token())).await;
     assert!(
         matches!(&c, Check::Warn(t) if t.contains("память недоступна") && t.contains("L0")),
         "{c:?}"
@@ -126,6 +118,7 @@ async fn doctor_memory_unreachable_is_warn() {
     let fake = FakeZam::start().await;
     fake.set_health(Health::Html);
     let c = within(
+        WAIT,
         "html",
         check_memory_live(Some(&MemoryConfig::new(&fake.url())), token()),
     )

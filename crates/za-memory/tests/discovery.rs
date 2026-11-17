@@ -6,19 +6,11 @@ mod fake_zam;
 
 use std::time::Duration;
 
-use fake_zam::{FakeZam, Health};
+use fake_zam::{FakeZam, Health, WAIT, within};
 use za_memory::{
     ErrorKind, Level, MemoryConfig, SolutionState, Token, TokenState, VaultState, ZamClient,
     discover, status,
 };
-
-/// Ожидание под пределом с понятной паникой (сетевой вызов на 127.0.0.1 не виснет дольше
-/// своих сроков, предел — страховка).
-async fn within<F: std::future::Future>(what: &str, f: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(30), f)
-        .await
-        .unwrap_or_else(|_| panic!("{what}: не завершилось за 30 с"))
-}
 
 /// Фиктивный токен — из частей во время выполнения (GitHub push protection).
 fn token_raw() -> String {
@@ -43,7 +35,7 @@ fn client(url: &str, token: Option<Token>) -> ZamClient {
 async fn root_health_html_is_not_zam() {
     let mut fake = FakeZam::start().await;
     fake.set_health(Health::Html);
-    let d = within("discover", discover(&client(&fake.url(), None))).await;
+    let d = within(WAIT, "discover", discover(&client(&fake.url(), None))).await;
     assert_eq!(d.level, Level::L0);
     assert_eq!(d.reason.as_deref(), Some("not a ZeroAIMemory API"));
     assert_eq!(d.error, Some(ErrorKind::NotZam));
@@ -59,7 +51,12 @@ async fn root_health_html_is_not_zam() {
 async fn health_without_features_is_l1() {
     let fake = FakeZam::start().await;
     fake.set_health(Health::NoFeatures);
-    let d = within("discover", discover(&client(&fake.url(), Some(token())))).await;
+    let d = within(
+        WAIT,
+        "discover",
+        discover(&client(&fake.url(), Some(token()))),
+    )
+    .await;
     assert_eq!(d.level, Level::L1);
     let info = d.info.unwrap();
     assert_eq!(info.version, "0.0.10-m5.7");
@@ -83,7 +80,12 @@ async fn health_with_m6_is_l2_and_unknown_flags_kept() {
         "zz_new_field": {"a": [1, 2]},
     })));
     let mut fake = fake;
-    let d = within("discover", discover(&client(&fake.url(), Some(token())))).await;
+    let d = within(
+        WAIT,
+        "discover",
+        discover(&client(&fake.url(), Some(token()))),
+    )
+    .await;
     assert_eq!(d.level, Level::L2);
     let info = d.info.unwrap();
     assert!(info.features.contains("zz_future"), "{:?}", info.features);
@@ -103,7 +105,7 @@ async fn health_with_m6_is_l2_and_unknown_flags_kept() {
 async fn health_m65_is_l2_with_idea_review() {
     let fake = FakeZam::start().await;
     fake.set_health(Health::M65);
-    let d = within("discover", discover(&client(&fake.url(), None))).await;
+    let d = within(WAIT, "discover", discover(&client(&fake.url(), None))).await;
     assert_eq!(d.level, Level::L2);
     let info = d.info.unwrap();
     assert_eq!(info.version, fake_zam::VERSION_M65);
@@ -117,11 +119,11 @@ async fn health_without_version_or_5xx_is_l0() {
     let fake = FakeZam::start().await;
     fake.set_health(Health::Json(serde_json::json!({"status": "ok"})));
     let c = client(&fake.url(), None);
-    let d = within("discover", discover(&c)).await;
+    let d = within(WAIT, "discover", discover(&c)).await;
     assert_eq!(d.level, Level::L0);
     assert_eq!(d.error, Some(ErrorKind::NotZam));
     fake.set_health(Health::Status(503));
-    let d = within("discover", discover(&c)).await;
+    let d = within(WAIT, "discover", discover(&c)).await;
     assert_eq!(d.level, Level::L0);
     assert_eq!(d.error, Some(ErrorKind::Server));
     assert!(d.reason.unwrap().contains("503"));
@@ -130,7 +132,7 @@ async fn health_without_version_or_5xx_is_l0() {
 #[tokio::test]
 async fn connection_refused_is_l0_offline() {
     let c = client(&fake_zam::closed_port_url(), Some(token()));
-    let d = within("discover", discover(&c)).await;
+    let d = within(WAIT, "discover", discover(&c)).await;
     assert_eq!(d.level, Level::L0);
     assert_eq!(d.error, Some(ErrorKind::Offline));
     assert!(d.reason.is_some());
@@ -143,6 +145,7 @@ async fn status_reports_token_solution_vault_hooks() {
     // Токен не тот — 401 на `/spaces`.
     fake.require_token("other");
     let st = within(
+        WAIT,
         "status",
         status(&client(&fake.url(), Some(token())), Some(GUID)),
     )
@@ -159,6 +162,7 @@ async fn status_reports_token_solution_vault_hooks() {
     fake.lock_vault("no master key");
     fake.hook_off("prompt");
     let st = within(
+        WAIT,
         "status",
         status(&client(&fake.url(), Some(token())), Some(GUID)),
     )
@@ -189,7 +193,7 @@ async fn status_reports_token_solution_vault_hooks() {
     let fake = FakeZam::start().await;
     fake.add_solution(GUID, "ZeroAgent", "owner", "rw");
     let c = client(&fake.url(), Some(token()));
-    let st = within("status", status(&c, Some(GUID))).await;
+    let st = within(WAIT, "status", status(&c, Some(GUID))).await;
     assert_eq!(
         st.solution,
         SolutionState::Bound {
@@ -200,10 +204,11 @@ async fn status_reports_token_solution_vault_hooks() {
     );
     assert_eq!(st.vault, VaultState::Unlocked);
     assert!(st.hooks_off.is_empty());
-    let st = within("status", status(&c, None)).await;
+    let st = within(WAIT, "status", status(&c, None)).await;
     assert_eq!(st.solution, SolutionState::NotBound);
     // Решения нет на сервере — 404.
     let st = within(
+        WAIT,
         "status",
         status(&c, Some("01a1e164-0000-7000-8000-000000000000")),
     )
@@ -215,7 +220,7 @@ async fn status_reports_token_solution_vault_hooks() {
 #[tokio::test]
 async fn status_without_token_or_server() {
     let mut fake = FakeZam::start().await;
-    let st = within("status", status(&client(&fake.url(), None), None)).await;
+    let st = within(WAIT, "status", status(&client(&fake.url(), None), None)).await;
     assert_eq!(st.discovery.level, Level::L2);
     assert_eq!(st.token, TokenState::NotSet);
     assert!(matches!(st.vault, VaultState::Unchecked(_)));
@@ -223,6 +228,7 @@ async fn status_without_token_or_server() {
     assert_eq!(seen.len(), 1, "{seen:?}");
 
     let st = within(
+        WAIT,
         "status",
         status(&client(&fake_zam::closed_port_url(), Some(token())), None),
     )
@@ -236,7 +242,12 @@ async fn status_without_token_or_server() {
 async fn status_rate_limited_token() {
     let fake = FakeZam::start().await;
     fake.fail("/api/v1/spaces", 429, "/problems/rate-limited", Some(9));
-    let st = within("status", status(&client(&fake.url(), Some(token())), None)).await;
+    let st = within(
+        WAIT,
+        "status",
+        status(&client(&fake.url(), Some(token())), None),
+    )
+    .await;
     assert_eq!(
         st.token,
         TokenState::RateLimited(Some(Duration::from_secs(9)))
@@ -266,7 +277,7 @@ async fn live_stand_discovery_and_status() {
     assert!(no_proxy.contains(STAND), "нужен NO_PROXY={STAND}");
     let token = Token::from_env_value(std::env::var("ZAM_TOKEN").ok()).expect("ZAM_TOKEN");
     let c = client(&url, Some(token));
-    let st = within("live status", status(&c, None)).await;
+    let st = within(WAIT, "live status", status(&c, None)).await;
     assert_eq!(st.discovery.level, Level::L2, "{:?}", st.discovery);
     let info = st.discovery.info.as_ref().unwrap();
     assert!(info.has("m6"), "{:?}", info.features);

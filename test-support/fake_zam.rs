@@ -7,8 +7,10 @@
 //! mod fake_zam;
 //! ```
 //!
-//! Нужны dev-зависимости `axum`, `tokio` (`net`, `rt`, `sync`) и `serde_json`.
+//! Нужны dev-зависимости `axum`, `tokio` (`net`, `rt`, `sync`, `time`) и `serde_json`.
 //!
+//! - **Ожидание** — [`within`] × [`time_scale`] (`ZA_TEST_TIME_SCALE`, целое 1–6; образец —
+//!   `crates/za-web/tests/support/mod.rs`): один помощник у всех тестов памяти.
 //! - **Адрес** — только `127.0.0.1` со свободным портом: тесты не ходят ни на рабочий, ни
 //!   на тестовый сервер памяти.
 //! - **Канал.** Каждый принятый запрос уходит в `mpsc` ([`Seen`]: метод, путь с запросом,
@@ -29,8 +31,10 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -39,6 +43,35 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+
+/// Предел ожидания вызова клиента на `127.0.0.1` (до множителя): больше сроков запросов
+/// тестов (10 с), так что паника [`within`] значит зависание, а не медленный ответ.
+pub const WAIT: Duration = Duration::from_secs(30);
+
+/// Множитель времени тестов в реальном времени: `ZA_TEST_TIME_SCALE` (целое 1–6, по
+/// умолчанию 1; в CI — 4).
+pub fn time_scale() -> u32 {
+    static SCALE: OnceLock<u32> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("ZA_TEST_TIME_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(1, |n| n.clamp(1, 6))
+    })
+}
+
+/// Длительность с множителем [`time_scale`].
+pub fn scaled(d: Duration) -> Duration {
+    d * time_scale()
+}
+
+/// Ожидание под пределом `d` × [`time_scale`] с понятной паникой.
+pub async fn within<F: Future>(d: Duration, what: &str, f: F) -> F::Output {
+    let d = scaled(d);
+    tokio::time::timeout(d, f)
+        .await
+        .unwrap_or_else(|_| panic!("{what}: не завершилось за {d:?}"))
+}
 
 /// Версия и коммит рабочего выпуска ZAM `0.0.11-m6`.
 pub const VERSION_M6: &str = "0.0.11-m6";
