@@ -2350,3 +2350,78 @@ async fn retry_digest_after_state_block() {
     let (_, snap) = last_snapshot(&f.store, f.run).await;
     assert!(!snap.memory.retry_digest);
 }
+
+// ---- R1-M fix-4, пункт 13: расхождение реплея на эффекте границы шага (D11) ----
+
+/// D11 R1-B1 (`exit_for_effect_error`): `ReplayMismatch` — пауза `replay_mismatch`, а не
+/// `failed`, и на эффектах границы шага, а не только узла `model` (сомнение 2 fix-3 R1-M).
+/// Шаг после снимка `Boundary` начат (`boundary`, `memory.prompt`, `state`, `context`), снимок
+/// затем испорчен так, что реплей расходится с журналом:
+/// - `args`: `memory.injected` 350 — бюджет подсказки `memory.prompt` 50 вместо 100;
+/// - `name`: шаг помечен шагом R1-C2 (`legacy_until`) — на месте `memory.prompt` реплей ставит
+///   `state`.
+///
+/// Ожидание: пауза `replay_mismatch` статусом и событием `run.status`, снимок прежний (пауза
+/// без снимка), новых эффектов и вызовов модели нет; со снимком без порчи resume доводит run.
+#[tokio::test]
+async fn boundary_replay_mismatch_pauses() {
+    for variant in ["args", "name"] {
+        let f = fx(&format!("boundary_mismatch_{variant}"));
+        f.model.push(server_error());
+        assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+        let (_, snap) = last_snapshot(&f.store, f.run).await;
+        assert_eq!(snap.next, Next::Boundary);
+        let step = snap.step + 1;
+        let mut deps = f.deps.clone();
+        deps.crash = crash_at(CrashPoint::AfterContext { step });
+        let change = ResumeChange {
+            input: Some("ещё".into()),
+            ..ResumeChange::default()
+        };
+        let err = resume_with(&f, &deps, change).await;
+        assert!(matches!(err, Err(LoopError::Halted)), "{variant}: {err:?}");
+        let names = effect_names(&events(&f.store, f.run).await);
+        assert_eq!(
+            names_at(&names, step),
+            ["boundary", "memory.prompt", "state", "context"]
+        );
+        let (seq, original) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+        rewrite_snapshot(&f, |o| match variant {
+            "args" => o["memory"]["injected"] = json!(350),
+            _ => o["memory"]["legacy_until"] = json!(step),
+        })
+        .await;
+        let (_, tampered) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+        let model_calls = f.model.calls().len();
+        let out = resume(&f, ResumeChange::default()).await;
+        assert_eq!(
+            out.as_ref().ok(),
+            Some(&paused("replay_mismatch")),
+            "{variant}: {out:?}"
+        );
+        assert_eq!(status(&f.store, f.run).await, RunStatus::Paused);
+        let evs = events(&f.store, f.run).await;
+        let last = of_kind(&evs, EventKind::RunStatus).pop().unwrap();
+        assert_eq!(last.payload["to"], "paused", "{variant}");
+        assert_eq!(last.payload["reason"], "replay_mismatch", "{variant}");
+        // Пауза без снимка: последний снимок — тот же, новых эффектов и ходов нет.
+        assert_eq!(
+            f.store.latest_snapshot(f.run).await.unwrap().unwrap(),
+            (seq, tampered),
+            "{variant}"
+        );
+        assert_eq!(effect_names(&evs), names, "{variant}");
+        assert_eq!(f.model.calls().len(), model_calls, "{variant}");
+        // Run не потерян: со снимком без порчи шаг доигрывается по журналу.
+        f.store
+            .save_snapshot(f.run, seq, original.clone())
+            .await
+            .unwrap();
+        f.model.push(answer("ок"));
+        assert_eq!(
+            resume(&f, ResumeChange::default()).await.unwrap(),
+            done("ок"),
+            "{variant}"
+        );
+    }
+}

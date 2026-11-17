@@ -768,12 +768,39 @@ impl Node<LoopState, LoopError> for LoopNode {
 
     fn run<'a>(&'a self, st: &'a mut LoopState) -> BoxFuture<'a, Result<Transition, LoopError>> {
         Box::pin(async move {
-            match self.id {
+            let r = match self.id {
                 BOUNDARY => boundary(&self.sh, st).await,
                 MODEL => model_node(&self.sh, st).await,
                 _ => tools_node(&self.sh, st).await,
-            }
+            };
+            node_exit(st, r)
         })
+    }
+}
+
+/// Ошибка эффекта, которую узел вернул ошибкой цикла (`effect_err`: эффекты границы шага —
+/// `boundary`, `skill.load`, `memory.*`, `state`, `context`, `inbox`; подсказка к ошибке
+/// пакета), проходит таблицу D11 (`exit_for_effect_error`), как ошибки эффектов хода модели и
+/// пакета ([`effect_exit`]): расхождение реплея — пауза `replay_mismatch`, неизвестный исход —
+/// `needs_decision`. Пауза — без снимка: resume реплеит шаг с последнего (fix-4 R1-M, пункт 13).
+/// Временный сбой журнала остаётся паузой `store` статусом ([`store_pause`], D72), прочие
+/// ошибки (журнал, `Poisoned`, нарушенные инварианты) — `failed`.
+fn node_exit(
+    st: &mut LoopState,
+    r: Result<Transition, LoopError>,
+) -> Result<Transition, LoopError> {
+    match r {
+        Err(LoopError::Effect(e)) if !matches!(e, EffectError::Transient(_)) => {
+            match exit_for_effect_error(&e) {
+                Some(exit) => {
+                    tracing::warn!(run = %st.run, error = %e, "ошибка эффекта шага: выход D11");
+                    st.exit = Some(exit);
+                    Ok(Transition::Done)
+                }
+                None => Err(LoopError::Effect(e)),
+            }
+        }
+        r => r,
     }
 }
 
