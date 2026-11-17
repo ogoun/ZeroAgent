@@ -131,10 +131,11 @@ pub struct GitCheckpointer {
     lock: Arc<tokio::sync::Mutex<()>>,
     /// Проверка секретов (D103): имя и фильтр по содержимому с кэшем итогов.
     scan: SecretScan,
-    /// Домашний каталог пользователя (R1-M D157, [`GitCheckpointer::with_user_home`]):
-    /// его защищённое место `~/.zeroaimemory/` обход чекпоинта пропускает, а
-    /// восстановление не трогает, как и `ZA_HOME`. `None` — защищён только `ZA_HOME`.
-    user_home: Option<PathBuf>,
+    /// Корни run (R1-M D157): их домашний каталог и защищённые места (`~/.zeroaimemory/`)
+    /// обход чекпоинта пропускает, а восстановление и копия «до» не трогают, как и
+    /// `ZA_HOME` хранилища. Обязательны — по умолчанию закрыто (Minor 5 повторного ревью
+    /// fix-1 задачи 1).
+    run_roots: Arc<Roots>,
 }
 
 impl std::fmt::Debug for GitCheckpointer {
@@ -142,20 +143,31 @@ impl std::fmt::Debug for GitCheckpointer {
         f.debug_struct("GitCheckpointer")
             .field("git", &self.git)
             .field("home", &self.home)
-            .field("user_home", &self.user_home)
+            .field("run_roots", &self.run_roots)
             .finish_non_exhaustive()
     }
 }
 
 impl GitCheckpointer {
     /// git ищется в `PATH` процесса (Windows — `git.exe`); нет — чекпоинты git
-    /// пропускаются (`git_not_found`).
-    pub fn new(runner: Arc<dyn Runner>, home: AgentHome) -> Self {
-        Self::with_git(runner, home, find_git())
+    /// пропускаются (`git_not_found`). `run_roots` — корни run (D157): корни чекпоинтов и
+    /// восстановления — свой проект запроса и `ZA_HOME` хранилища с домашним каталогом и
+    /// защищёнными местами `run_roots` ([`Roots::with_sealed_of`]). Обход файлов проекта
+    /// (проект — домашний каталог или предок `ZA_HOME`) пропускает защищённые места,
+    /// восстановление и копия «до» их не пишут, не удаляют и не копируют. Бинарник передаёт
+    /// корни run (`Roots::with_home`), тест — `Roots::boundary` или корни с домашним
+    /// каталогом.
+    pub fn new(runner: Arc<dyn Runner>, home: AgentHome, run_roots: Arc<Roots>) -> Self {
+        Self::with_git(runner, home, find_git(), run_roots)
     }
 
     /// Явный путь git; `None` — git нет.
-    pub fn with_git(runner: Arc<dyn Runner>, home: AgentHome, git: Option<PathBuf>) -> Self {
+    pub fn with_git(
+        runner: Arc<dyn Runner>,
+        home: AgentHome,
+        git: Option<PathBuf>,
+        run_roots: Arc<Roots>,
+    ) -> Self {
         Self {
             runner,
             git,
@@ -167,17 +179,8 @@ impl GitCheckpointer {
             slow: Arc::new(Mutex::new(HashSet::new())),
             lock: Arc::new(tokio::sync::Mutex::new(())),
             scan: SecretScan::default(),
-            user_home: None,
+            run_roots,
         }
-    }
-
-    /// Домашний каталог пользователя (R1-M D157): корни чекпоинтов и восстановления —
-    /// `Roots::with_home(home)`, как у run. Обход файлов проекта (проект — домашний каталог
-    /// или предок `ZA_HOME`) пропускает защищённые места, восстановление их не пишет и не
-    /// удаляет. Бинарник передаёт тот же каталог, что и корням run.
-    pub fn with_user_home(mut self, home: PathBuf) -> Self {
-        self.user_home = Some(home);
-        self
     }
 
     /// Фильтр секретов по содержимому (D103): и для чекпоинта git, и для копии файлов.
@@ -240,21 +243,15 @@ impl GitCheckpointer {
             .insert(run);
     }
 
-    /// Канонические корни проекта `project` (блокирующая): `ZA_HOME` и, если задан,
-    /// домашний каталог пользователя с его защищёнными местами (D157).
+    /// Канонические корни проекта `project` (блокирующая): `ZA_HOME` хранилища и
+    /// домашний каталог с защищёнными местами корней run (D157).
     fn roots_fn(&self, project: &Path) -> impl FnOnce() -> io::Result<Roots> + Send + 'static {
-        let (p, h, user) = (
+        let (p, h, run) = (
             project.to_path_buf(),
             self.home.za_home.clone(),
-            self.user_home.clone(),
+            Arc::clone(&self.run_roots),
         );
-        move || {
-            let roots = Roots::canonical(&p, &h)?;
-            match user {
-                Some(u) => roots.with_home(&u),
-                None => Ok(roots),
-            }
-        }
+        move || Ok(Roots::canonical(&p, &h)?.with_sealed_of(&run))
     }
 
     /// Проект для чекпоинтов git: у корня есть `.git` (только признак режима, его

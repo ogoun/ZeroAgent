@@ -18,6 +18,7 @@ use support::{
 };
 use tokio::time::Instant;
 use url::Url;
+use za_core::paths::Roots;
 use za_core::text::escaped_len;
 use za_core::{
     Approval, DIGEST_RESERVE, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, call_deadline,
@@ -83,7 +84,8 @@ fn cx_with(deadline: std::time::Instant, budget: Option<usize>) -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 0, 0),
         paths: Vec::new(),
-        roots: None,
+        // Корни run обязательны (по умолчанию закрыто): граница каталога теста.
+        roots: Arc::new(Roots::boundary(std::path::Path::new(".")).unwrap()),
         deadline: Some(deadline),
         output_budget: budget,
     }

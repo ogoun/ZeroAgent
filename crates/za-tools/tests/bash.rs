@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use za_core::paths::Roots;
 use za_core::shell::Dialect;
 use za_core::{Access, Approval, BoxFuture, RiskClass, Tool, ToolCx, ToolKind, ToolOutput};
 use za_jail::{CommandSpec, DirectRunner, Exit, Output, Runner, RunnerError};
@@ -54,7 +55,8 @@ fn cx(root: &Path, run: RunId) -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 1, 1),
         paths: Vec::new(),
-        roots: None,
+        // Корни run обязательны (по умолчанию закрыто): граница проекта теста.
+        roots: Arc::new(Roots::boundary(root).unwrap()),
         deadline: None,
         output_budget: None,
     }

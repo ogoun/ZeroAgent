@@ -96,11 +96,32 @@ impl Case {
         std::fs::read(self.project.join(rel)).unwrap()
     }
 
-    /// Чекпоинтер на настоящем git с потолком поиска репозитория.
+    /// Корни run теста без домашнего каталога (граница проекта): защищён только `ZA_HOME`
+    /// хранилища — как в run без домашнего каталога или до R1-M.
+    fn run_roots(&self) -> Arc<Roots> {
+        Arc::new(Roots::boundary(&self.project).unwrap())
+    }
+
+    /// Чекпоинтер на настоящем git с потолком поиска репозитория, корни run —
+    /// [`Case::run_roots`].
+    fn ck(&self) -> GitCheckpointer {
+        self.ck_with(self.run_roots())
+    }
+
+    /// [`Case::ck`] с домашним каталогом пользователя `user` в корнях run (R1-M D157):
+    /// `<user>/.zeroaimemory/` — защищённое место.
+    fn ck_home(&self, user: &Path) -> GitCheckpointer {
+        let roots = Roots::boundary(&self.project)
+            .unwrap()
+            .with_home(user)
+            .unwrap();
+        self.ck_with(Arc::new(roots))
+    }
+
     /// Предел чекпоинта — 120 с × `ZA_TEST_TIME_SCALE`: 20 тестов параллельно запускают
     /// git на Windows, а `CHECKPOINT_TIMEOUT` (20 с) проверяет отдельный тест на заглушке.
-    fn ck(&self) -> GitCheckpointer {
-        GitCheckpointer::new(Arc::new(DirectRunner), self.home.clone())
+    fn ck_with(&self, roots: Arc<Roots>) -> GitCheckpointer {
+        GitCheckpointer::new(Arc::new(DirectRunner), self.home.clone(), roots)
             .with_base_env(vec![("GIT_CEILING_DIRECTORIES".into(), ceiling())])
             .with_create_timeout_for_tests(Duration::from_secs(120) * scale())
     }
@@ -438,7 +459,7 @@ async fn repo_hooks_fsmonitor_filters_not_executed() {
 }
 
 /// R1-M D157, Ruling I1 ревью задачи 1: проект — домашний каталог пользователя
-/// (`with_user_home`), `ZA_HOME` лежит в нём (как `%LOCALAPPDATA%\zero-agent` на Windows).
+/// (корни run с ним), `ZA_HOME` лежит в нём (как `%LOCALAPPDATA%\zero-agent` на Windows).
 /// Чекпоинт git не берёт ни `~/.zeroaimemory/config.toml`, ни файлы `ZA_HOME` (там и сам
 /// репозиторий чекпоинтов); восстановление с удалением новых файлов их не трогает.
 #[tokio::test]
@@ -452,7 +473,7 @@ async fn checkpoint_skips_sealed_places() {
     c.write("AppData/zero-agent/config.toml", "[llama]\n");
     c.git(&["add", "notes.txt"]);
     c.git(&["commit", "-q", "-m", "init"]);
-    let ck = c.ck().with_user_home(c.project.clone());
+    let ck = c.ck_home(&c.project);
     let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
     assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
     let names = c.ours(&[
@@ -529,7 +550,7 @@ async fn restore_backup_skips_sealed_places() {
         c.write(".zeroaimemory/config.toml", &now);
         c.write("notes.txt", "two\n");
 
-        let ck = c.ck().with_user_home(c.project.clone());
+        let ck = c.ck_home(&c.project);
         let backup = within(
             Duration::from_secs(60),
             "чекпоинт перед восстановлением",
@@ -649,7 +670,7 @@ async fn same_effect_key_reuses_checkpoint() {
     // Повтор после сбоя: файлы уже другие, но чекпоинт тот же, ссылка не переписана.
     c.write("a.txt", "two\n");
     let again = create(
-        &GitCheckpointer::new(Arc::new(DirectRunner), c.home.clone())
+        &GitCheckpointer::new(Arc::new(DirectRunner), c.home.clone(), c.run_roots())
             .with_base_env(vec![("GIT_CEILING_DIRECTORIES".into(), ceiling())]),
         c.req(ToolKind::Exec, true, run, 2),
     )
@@ -740,7 +761,12 @@ async fn untrusted_or_non_git_uses_files() {
     c.init();
     c.write("a.txt", "before\r\n");
     let stub = StubRunner::new(false);
-    let ck = GitCheckpointer::with_git(stub.clone(), c.home.clone(), Some("git".into()));
+    let ck = GitCheckpointer::with_git(
+        stub.clone(),
+        c.home.clone(),
+        Some("git".into()),
+        c.run_roots(),
+    );
     let cp = create(&ck, c.req_edit(&["a.txt", "new.txt"], false, RunId::new())).await;
     assert_eq!(cp.kind, checkpoint_kind::FILES, "{cp:?}");
     assert!(cp.git_ref.is_none() && cp.commit.is_none());
@@ -803,7 +829,12 @@ async fn untrusted_or_non_git_uses_files() {
     assert_eq!(f.kind, checkpoint_kind::FILES, "{f:?}");
     // Недоверенный `Exec` — тоже `no_git`, без git.
     let stub = StubRunner::new(false);
-    let ck = GitCheckpointer::with_git(stub.clone(), n.home.clone(), Some("git".into()));
+    let ck = GitCheckpointer::with_git(
+        stub.clone(),
+        n.home.clone(),
+        Some("git".into()),
+        n.run_roots(),
+    );
     let s = create(&ck, n.req(ToolKind::Exec, false, RunId::new(), 1)).await;
     assert_eq!(s.reason.as_deref(), Some(checkpoint_reason::NO_GIT));
     assert_eq!(stub.calls(), 0);
@@ -815,7 +846,7 @@ async fn no_git_binary_skips() {
     c.init();
     c.write("a.txt", "x");
     let stub = StubRunner::new(false);
-    let ck = GitCheckpointer::with_git(stub.clone(), c.home.clone(), None);
+    let ck = GitCheckpointer::with_git(stub.clone(), c.home.clone(), None, c.run_roots());
     let s = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
     assert_eq!(
         (s.kind.as_str(), s.reason.as_deref()),
@@ -832,7 +863,12 @@ async fn slow_git_skips_then_stays_skipped() {
     let c = case("slow");
     c.init();
     let stub = StubRunner::new(true);
-    let ck = GitCheckpointer::with_git(stub.clone(), c.home.clone(), Some("git".into()));
+    let ck = GitCheckpointer::with_git(
+        stub.clone(),
+        c.home.clone(),
+        Some("git".into()),
+        c.run_roots(),
+    );
     let run = RunId::new();
     let started = tokio::time::Instant::now();
     let first = ck.create(c.req(ToolKind::Exec, true, run, 1)).await;
@@ -1261,7 +1297,12 @@ async fn untrusted_never_reads_git_checkpoints() {
     let g = create(&c.ck(), c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
     assert_eq!(g.kind, checkpoint_kind::GIT);
     let stub = StubRunner::new(false);
-    let ck = GitCheckpointer::with_git(stub.clone(), c.home.clone(), Some("git".into()));
+    let ck = GitCheckpointer::with_git(
+        stub.clone(),
+        c.home.clone(),
+        Some("git".into()),
+        c.run_roots(),
+    );
     let root = c.root();
     let all = within(Duration::from_secs(60), "список", ck.list(&root, false))
         .await

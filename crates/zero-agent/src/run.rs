@@ -529,25 +529,11 @@ async fn prepare(
     })
     .await?;
     // Домашний каталог — своя ошибка с его путём (Minor 5 ревью задачи 1 R1-M).
-    let roots = match home::user_home() {
-        Some(u) => {
-            let path = u.clone();
-            let user_home = |source| RunError::UserHome {
-                path: path.clone(),
-                source,
-            };
-            tokio::task::spawn_blocking(move || roots.with_home(&u))
-                .await
-                .map_err(|e| user_home(std::io::Error::other(e.to_string())))?
-                .map_err(user_home)?
-        }
-        None => {
-            tracing::warn!(
-                "домашний каталог пользователя не задан: ~/.zeroaimemory не защищён по пути (D157)"
-            );
-            roots
-        }
-    };
+    let roots = blocking("корни проекта", project, move || {
+        Ok(home::with_user_home(roots))
+    })
+    .await?
+    .map_err(|home::UserHomeError { path, source }| RunError::UserHome { path, source })?;
     // Проект внутри защищённого места (D157): любой вызов был бы отказом.
     if paths::sealed_place(&roots, &roots.project) {
         return Err(RunError::SealedProject(roots.project.clone()));
@@ -1516,14 +1502,11 @@ fn deps(
         deps.capabilities.extend(skills_capability_of(cat));
         deps.skills = Some(Arc::clone(cat));
     }
-    // D103: секретные файлы (имя, известные значения, PEM) в чекпоинты не входят.
-    let mut checkpointer =
-        GitCheckpointer::new(runner, agent_home).with_secret_filter(secret_filter);
-    // D157: обход файлов проекта для чекпоинта не заходит в `~/.zeroaimemory/` (проект —
-    // домашний каталог) — тот же домашний каталог, что у корней run.
-    if let Some(h) = &prep.roots.home {
-        checkpointer = checkpointer.with_user_home(h.clone());
-    }
+    // D103: секретные файлы (имя, известные значения, PEM) в чекпоинты не входят. D157:
+    // обход файлов проекта для чекпоинта не заходит в `~/.zeroaimemory/` (проект — домашний
+    // каталог) — защищённые места корней run.
+    let mut checkpointer = GitCheckpointer::new(runner, agent_home, Arc::new(prep.roots.clone()))
+        .with_secret_filter(secret_filter);
     if let Some(t) = checkpoint_timeout {
         checkpointer = checkpointer.with_create_timeout_for_tests(t);
     }

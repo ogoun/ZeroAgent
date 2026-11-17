@@ -30,13 +30,14 @@ use std::sync::Arc;
 
 use serde_json::json;
 use za_core::Checkpoint;
+use za_core::paths::Roots;
 use za_jail::DirectRunner;
 use za_protocol::{audit_action, canonical_json};
 use za_store::{AuditNew, ProjectStore, StoreError};
 use za_tools::{AgentHome, GitCheckpointer, RestoreError, backup_before_restore, restore};
 
 use crate::home;
-use crate::run::{RunError, canonical_project, open_existing};
+use crate::run::{RunError, canonical_project, display_path, open_existing};
 use crate::secret::StoreSecrets;
 use crate::trust::trust_state;
 
@@ -62,6 +63,15 @@ pub enum CheckpointsCmdError {
     },
     #[error("вывод в JSON: {0}")]
     Json(serde_json::Error),
+    /// Домашний каталог пользователя не канонизируется (R1-M D157): защищённое место
+    /// `~/.zeroaimemory/` не построить — чекпоинты не читаются и не восстанавливаются.
+    #[error(
+        "домашний каталог пользователя {} ({}): {}; защищённое место ~/.zeroaimemory не построить — чекпоинты недоступны",
+        display_path(&.0.path),
+        home::user_home_var(),
+        .0.source
+    )]
+    UserHome(home::UserHomeError),
 }
 
 impl From<StoreError> for CheckpointsCmdError {
@@ -93,19 +103,24 @@ fn open(
         path: project.clone(),
         source,
     })?;
+    // D157: обход, восстановление и копия «до» не трогают `ZA_HOME` и `~/.zeroaimemory/` —
+    // корни те же, что у run.
+    let roots = Roots::canonical(&project, za_home)
+        .map_err(|source| CheckpointsCmdError::Project {
+            path: project.clone(),
+            source,
+        })
+        .and_then(|r| home::with_user_home(r).map_err(CheckpointsCmdError::UserHome))?;
     // Чекпоинт «до» восстановления тоже не сохраняет секреты (D103).
-    let mut ck = GitCheckpointer::new(
+    let ck = GitCheckpointer::new(
         Arc::new(DirectRunner),
         AgentHome {
             za_home: za_home.to_path_buf(),
             project_id,
         },
+        Arc::new(roots),
     )
     .with_secret_filter(StoreSecrets::from_env().checkpoint_filter());
-    // D157: обход и восстановление не трогают `~/.zeroaimemory/` — как у чекпоинтов run.
-    if let Some(h) = home::user_home() {
-        ck = ck.with_user_home(h);
-    }
     Ok((project, store, ck))
 }
 

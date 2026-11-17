@@ -1570,7 +1570,7 @@ fn tool_action(
             effect_key: key.clone(),
             paths: planned.clone(),
             // Обход не заходит в защищённые места корней run (D157).
-            roots: Some(Arc::clone(&env.roots)),
+            roots: Arc::clone(&env.roots),
             // Ставит слот от старта вызова (D107).
             deadline: None,
             // Предел слота на этом окне, а не `output_limit` инструмента (I2 ревью задачи 8).

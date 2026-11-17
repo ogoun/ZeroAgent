@@ -90,13 +90,14 @@ fn scale() -> u32 {
         .clamp(1, 6)
 }
 
-/// Run, корень и ключ эффекта одного вызова; корни run (`ToolCx::roots`) — по желанию.
+/// Run, корень и ключ эффекта одного вызова; корни run (`ToolCx::roots`, обязательны) —
+/// граница проекта, тест с защищёнными местами подменяет их.
 #[derive(Clone)]
 struct Cx {
     root: PathBuf,
     run: RunId,
     step: u64,
-    roots: Option<Arc<Roots>>,
+    roots: Arc<Roots>,
 }
 
 impl Cx {
@@ -105,7 +106,7 @@ impl Cx {
             root: root.to_path_buf(),
             run: RunId::new(),
             step: 0,
-            roots: None,
+            roots: Arc::new(Roots::boundary(root).unwrap()),
         }
     }
 
@@ -715,8 +716,7 @@ async fn protected_places_are_denied() {
 
 /// R1-M D157, защита в глубину (ревью задачи 1): с корнями run в `ToolCx::roots` `edit` и
 /// `multi_edit` в защищённом месте (`~/.zeroaimemory/`) отвечают `denied: protected path`
-/// и файл не меняют, даже если вызов дошёл до инструмента мимо политики. Без корней run
-/// (вызов вне пакета) — прежнее поведение: защищён только `ZA_HOME` инструмента.
+/// и файл не меняют, даже если вызов дошёл до инструмента мимо политики.
 #[tokio::test]
 async fn edit_in_sealed_place_is_denied() {
     let root = unique_dir("sealed_edit");
@@ -731,7 +731,7 @@ async fn edit_in_sealed_place_is_denied() {
         .to_string_lossy()
         .replace('\\', "/");
     let mut k = Kit::new(&root);
-    k.cx.roots = Some(Arc::new(roots));
+    k.cx.roots = Arc::new(roots);
     let o = k
         .edit(json!({"path": target, "old": "\"t\"", "new": "\"x\""}))
         .await;

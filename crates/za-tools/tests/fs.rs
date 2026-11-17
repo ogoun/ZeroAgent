@@ -88,7 +88,8 @@ fn cx(root: &Path, run: RunId) -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 1, 1),
         paths: Vec::new(),
-        roots: None,
+        // Корни run обязательны (по умолчанию закрыто): граница проекта теста.
+        roots: Arc::new(Roots::boundary(root).unwrap()),
         deadline: None,
         output_budget: None,
     }
@@ -787,12 +788,12 @@ async fn search_stops_at_deadline() {
     let r = roots(&root);
     // Дедлайн уже прошёл: обход останавливается сразу, без порогов времени.
     let limits = WalkLimits::new(Instant::now());
-    let o = search_in(&r.project, &base, "hit", None, &limits, None);
+    let o = search_in(&r.project, &base, "hit", None, &limits, &r);
     assert_eq!(o.content, "no matches\n... search stopped after 0 s");
     // Флаг отмены тоже останавливает обход.
     let limits = WalkLimits::new(Instant::now() + Duration::from_secs(3600));
     limits.cancel();
-    let o = search_in(&r.project, &base, "hit", None, &limits, None);
+    let o = search_in(&r.project, &base, "hit", None, &limits, &r);
     assert!(o.content.contains("search stopped"), "{}", o.content);
 }
 
@@ -826,7 +827,7 @@ async fn walk_does_not_follow_dir_links() {
 async fn call_rooted(tool: &Arc<dyn Tool>, root: &Path, roots: &Roots, args: Value) -> ToolOutput {
     let limit = Duration::from_secs(60 * u64::from(scale()));
     let cx = ToolCx {
-        roots: Some(Arc::new(roots.clone())),
+        roots: Arc::new(roots.clone()),
         ..cx(root, RunId::new())
     };
     tokio::time::timeout(limit, tool.call(args, cx))
@@ -1056,7 +1057,8 @@ async fn search_line_limit_and_cancel_inside_file() {
     let file = resolved(&root, "many.txt");
     let limits = WalkLimits::new(Instant::now() + Duration::from_secs(3600));
     limits.cancel();
-    let o = search_in(&roots(&root).project, &file, "hit", None, &limits, None);
+    let r = roots(&root);
+    let o = search_in(&r.project, &file, "hit", None, &limits, &r);
     assert_eq!(o.content, "no matches\n... search stopped after 0 s");
     assert!(!o.is_error);
 }

@@ -23,6 +23,7 @@ use axum::http::StatusCode;
 use za_core::extract::{
     ExtractError, Extractor, HtmlRequest, Markdown, PDF_MAX_BYTES, PdfRequest, PdfText,
 };
+use za_core::paths::Roots;
 use za_core::{BoxFuture, ToolCx, call_deadline};
 use za_jail::{CommandSpec, DirectRunner, Output, Runner, RunnerError};
 use za_protocol::{EffectKey, RunId};
@@ -371,7 +372,7 @@ fn web_fetch_of_backslash_page_returns_text() {
             call_id: "c1".into(),
             effect_key: EffectKey::derive(run, 0, 0),
             paths: Vec::new(),
-            roots: None,
+            roots: Arc::new(Roots::boundary(&tmp).unwrap()),
             deadline: Some(call_deadline(
                 std::time::Instant::now(),
                 scaled(Duration::from_secs(60)),

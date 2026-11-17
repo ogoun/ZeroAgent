@@ -73,7 +73,8 @@ fn rt() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Чекпоинт git проекта, как его сделал бы run.
+/// Чекпоинт git проекта, как его сделал бы run (корни run — граница проекта, без
+/// домашнего каталога).
 fn checkpoint(e: &Env) -> za_core::Checkpoint {
     let ck = GitCheckpointer::new(
         Arc::new(DirectRunner),
@@ -81,6 +82,7 @@ fn checkpoint(e: &Env) -> za_core::Checkpoint {
             za_home: e.home.clone(),
             project_id: project_id(&e.project).unwrap(),
         },
+        Arc::new(za_core::paths::Roots::boundary(&e.project).unwrap()),
     );
     let run = RunId::new();
     let cp = rt().block_on(ck.create(CheckpointRequest {

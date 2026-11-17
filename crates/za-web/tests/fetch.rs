@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use support::extractor::StubExtractor;
 use support::{Server, drip, redirect, scaled, serve, text, typed, within};
 use za_core::extract::{ExtractError, Extractor};
+use za_core::paths::Roots;
 use za_core::{
     Approval, DIGEST_RESERVE, NetRequest, RiskClass, Tool, ToolCx, ToolKind, ToolOutput,
     call_deadline,
@@ -51,7 +52,8 @@ fn cx(deadline: Option<std::time::Instant>) -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 0, 0),
         paths: Vec::new(),
-        roots: None,
+        // Корни run обязательны (по умолчанию закрыто): граница каталога теста.
+        roots: Arc::new(Roots::boundary(Path::new(".")).unwrap()),
         deadline,
         output_budget: None,
     }

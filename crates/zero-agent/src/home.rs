@@ -6,6 +6,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use za_core::paths::Roots;
+
 /// Переменная окружения, переопределяющая каталог данных.
 pub const ZA_HOME_ENV: &str = "ZA_HOME";
 /// Имя каталога агента внутри платформенного каталога данных.
@@ -65,6 +67,33 @@ fn user_home_from(var: impl Fn(&str) -> Option<OsString>, windows: bool) -> Opti
     var(home_var(windows))
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+/// Домашний каталог пользователя `path` не канонизируется (R1-M D157): сетевой путь,
+/// висячая ссылка. Защищённое место `~/.zeroaimemory/` не построить — команда не идёт
+/// (fail-closed).
+#[derive(Debug)]
+pub struct UserHomeError {
+    pub path: PathBuf,
+    pub source: std::io::Error,
+}
+
+/// Корни `roots` с домашним каталогом пользователя ([`user_home`], D157; блокирующая):
+/// `~/.zeroaimemory/` — защищённое место ([`Roots::with_home`]). Одни для `run` и
+/// `checkpoints`. Домашний каталог не задан — корни как есть и `warn`: защищён только
+/// `ZA_HOME`, клиенту `zam` свой файл тоже не найти.
+pub fn with_user_home(roots: Roots) -> Result<Roots, UserHomeError> {
+    match user_home() {
+        Some(path) => roots
+            .with_home(&path)
+            .map_err(|source| UserHomeError { path, source }),
+        None => {
+            tracing::warn!(
+                "домашний каталог пользователя не задан: ~/.zeroaimemory не защищён по пути (D157)"
+            );
+            Ok(roots)
+        }
+    }
 }
 
 /// Идентификатор проекта: первые 16 hex-символов BLAKE3 от канонического пути
