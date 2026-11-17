@@ -2380,10 +2380,11 @@ fn sealed_edit_denied_even_with_grant() {
 
 /// R1-M D157, Minor 2 ревью задачи 1: слово с началом `$HOME`, `${HOME}`, `%USERPROFILE%`,
 /// `$env:USERPROFILE` — путь команды, как `~` (раскрытый по домашнему каталогу корней):
-/// оно задаёт границу проекта. В `auto` команда с ним спрашивает `outside_project`, а не
-/// исполняется молча; грант на домашний каталог и проект, равный домашнему каталогу, этого
-/// не меняют — как у `~`, оболочка раскрывает начало сама. Без домашнего каталога корней
-/// — тоже вопрос.
+/// оно задаёт границу проекта. В `auto` и `bypass` команда с ним спрашивает
+/// `outside_project`, а не исполняется молча (Minor 2 повторного ревью fix-1: вопрос в
+/// любом режиме, как у `~`); грант на домашний каталог и проект, равный домашнему каталогу,
+/// этого не меняют — оболочка раскрывает начало сама. Без домашнего каталога корней — тоже
+/// вопрос.
 #[test]
 fn home_words_set_project_boundary() {
     let pwsh = Dialect::PowerShell;
@@ -2392,6 +2393,7 @@ fn home_words_set_project_boundary() {
         ("cat $HOME/notes.txt", Dialect::Bash),
         ("cat ${HOME}/notes.txt", Dialect::Bash),
         ("cp a.txt $HOME/b.txt", Dialect::Bash),
+        ("source $HOME/.cargo/env", Dialect::Bash),
         (r"type %USERPROFILE%\notes.txt", pwsh),
         ("Get-Content $env:USERPROFILE/notes.txt", pwsh),
         (r"Get-Content $env:USERPROFILE\notes.txt", pwsh),
@@ -2407,8 +2409,12 @@ fn home_words_set_project_boundary() {
             roots: r.clone(),
             ..Cx::new(RunMode::Auto).grants(vec![grant("/home/u", GrantMode::Rw)])
         };
+        let bypass = Cx {
+            roots: r.clone(),
+            ..Cx::new(RunMode::Bypass).grants(vec![grant("/home/u", GrantMode::Rw)])
+        };
         for (cmd, d) in table {
-            for cx in [&auto, &granted] {
+            for cx in [&auto, &granted, &bypass] {
                 assert_eq!(
                     cx.decide(&bash_spec(), &bash_in(&r, cmd, d)),
                     ask(&[ar::OUTSIDE_PROJECT]),
@@ -2504,15 +2510,31 @@ fn zam_false_positives_table() {
     }
 }
 
-/// D158: встроенный запрет не входит в снимок политики и её хэш — golden хэш R1-C1
-/// прежний, правил о `zam` в снимке нет, снимок пустой конфигурации пуст.
+/// D158: встроенный запрет не входит в снимок политики и её хэш. Снимок пустой
+/// конфигурации пуст, а его хэш — хэш канонического JSON без правил и грантов (правило о
+/// `zam` в хэш не подмешано), и запрет при этом действует; в снимке R1-C1 правил о `zam`
+/// нет. Golden хэш R1-C1 сверяет `r1c1_policy_hash_is_pinned` (Minor 7 повторного ревью
+/// fix-1: без повтора той же сверки).
 #[test]
 fn policy_hash_unchanged_by_builtin_rule() {
     let empty = PolicySnapshot::build(&PolicyConfig::default(), None).unwrap();
     assert!(empty.rules.is_empty(), "{:?}", empty.rules);
+    let bare = json!({"allow_bypass": false, "rules": [], "grants": []});
+    let bare = blake3::hash(za_protocol::canonical_json(&bare).as_bytes())
+        .to_hex()
+        .to_string();
+    assert_eq!(empty.hash, bare, "встроенное правило подмешано в хэш");
+    let r = sealed_roots();
+    let cx = Cx {
+        roots: r.clone(),
+        ..Cx::new(RunMode::Auto).policy(empty)
+    };
+    assert_eq!(
+        cx.decide(&bash_spec(), &bash(&r, "zam search x")),
+        Decision::Deny(deny_reason::MEMORY_CLIENT)
+    );
     let (global, project) = r1c1_config();
     let s = PolicySnapshot::build(&global, Some(&project)).unwrap();
-    assert_eq!(s.hash, include_str!("golden/policy_r1c1.hash").trim());
     assert_eq!(s.rules.len(), 5, "{:?}", s.rules);
     assert!(
         s.rules
