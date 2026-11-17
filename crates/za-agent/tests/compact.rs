@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use support::memory::{MemCall, ScriptedMemory};
+use support::tools::Fail;
 use support::*;
 
 use serde_json::{Value, json};
@@ -1970,21 +1971,6 @@ async fn compaction_recall_fits_headroom() {
 }
 
 // ---- R1-M, задача 3: потолок подсказок эпохи (D168), текст recovery (D140) ----
-
-/// Чтение `fail`: результат-ошибка `fail {args}`.
-struct Fail {
-    spec: ToolSpec,
-}
-
-impl Tool for Fail {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
-        Box::pin(async move { ToolOutput::error(format!("fail {args}")) })
-    }
-}
 
 /// Фикстура с инструментом `fail` рядом с `note` и `hang`.
 fn fx_fail(d: &Path, model: ScriptedModel, memory: Arc<dyn MemoryPort>) -> Fx {

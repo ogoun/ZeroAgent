@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use support::effects::effect_names;
+use support::tools::Fail;
 use support::*;
 
 use serde_json::{Value, json};
@@ -1738,21 +1740,6 @@ impl Tool for Note {
     }
 }
 
-/// Чтение `fail`: результат-ошибка `fail {args}` (как в генераторе журналов R1-C2).
-struct Fail {
-    spec: ToolSpec,
-}
-
-impl Tool for Fail {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
-        Box::pin(async move { ToolOutput::error(format!("fail {args}")) })
-    }
-}
-
 /// Фикстура над журналом в каталоге `d` с инструментами генератора журналов R1-C2:
 /// `note`, `fail` и `incr` (мутация, счётчик — `Fx::incr`); окно 8192.
 fn fx_r1c2(d: &std::path::Path) -> Fx {
@@ -1830,20 +1817,6 @@ fn fail_note(n: u32) -> Vec<Result<StreamEvent, ModelError>> {
         finish: FinishReason::ToolCalls,
         usage: Usage::default(),
     })]
-}
-
-/// `(шаг, номер, имя)` намерений эффектов по порядку.
-fn effect_names(evs: &[Event]) -> Vec<(u64, u64, String)> {
-    evs.iter()
-        .filter(|e| e.kind == EventKind::EffectIntent)
-        .map(|e| {
-            let key = e.payload["key"].as_str().unwrap();
-            let mut it = key.rsplit(':');
-            let seq = it.next().unwrap().parse().unwrap();
-            let step = it.next().unwrap().parse().unwrap();
-            (step, seq, e.payload["name"].as_str().unwrap().to_owned())
-        })
-        .collect()
 }
 
 /// Эффекты памяти R1-M, которых нет в шагах кода R1-C2 (D161).

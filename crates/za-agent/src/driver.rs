@@ -1191,7 +1191,7 @@ async fn boundary(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopErr
     }
     // (6'') Отложенный повтор дайджеста шага 0 (R1-M D140): после ввода, до `context` —
     // оценка окна видит его текст.
-    retry_digest(deps, st, step).await?;
+    digest_retry_at_boundary(deps, st, step).await?;
     boundary_tail(sh, st, step).await
 }
 
@@ -1312,7 +1312,11 @@ async fn input_hint(
 /// Отложенный повтор дайджеста (D140, MEM-034): на границе перед вторым вызовом модели,
 /// после ввода и до `context` — эффект `memory.retry`; текст — добавочным сообщением
 /// `kind="digest"`, первое сообщение не меняется. Повтор один: признак снимается.
-async fn retry_digest(deps: &LoopDeps, st: &mut LoopState, step: u64) -> Result<(), LoopError> {
+async fn digest_retry_at_boundary(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    step: u64,
+) -> Result<(), LoopError> {
     if !st.memory.retry_digest || st.turn == 0 || st.memory.legacy(step) {
         return Ok(());
     }

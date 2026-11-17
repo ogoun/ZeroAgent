@@ -93,12 +93,14 @@ fn sanitize(r: Recall, masker: Option<&SecretMasker>) -> Recall {
 }
 
 /// Чтение памяти — эффект `ReadOnly` с именем `name` и аргументами `args` (D9, D50):
-/// `read` выполняется только вживую, при реплее значение — из квитанции.
+/// `read` выполняется только вживую, при реплее значение — из квитанции. Значение
+/// `{text, state, ideas?}`; без признака идей оно совпадает с `Recall::to_value` (квитанции
+/// `memory.after` прежние).
 async fn recall_effect<F>(
     ctx: &mut RunCtx,
     name: &str,
     args: Value,
-    masker: Option<Arc<SecretMasker>>,
+    masker: Option<&SecretMasker>,
     read: F,
 ) -> Result<RecallReply, EffectError>
 where
@@ -114,7 +116,7 @@ where
             move || async move {
                 let r = read.await;
                 let reply = RecallReply {
-                    recall: sanitize(r.recall, masker.as_deref()),
+                    recall: sanitize(r.recall, masker),
                     ideas: r.ideas,
                 };
                 Ok(reply.to_value())
@@ -136,7 +138,7 @@ pub(crate) async fn snapshot_effect(
         ctx,
         SNAPSHOT_EFFECT,
         json!({ "budget_tokens": budget }),
-        masker,
+        masker.as_deref(),
         async move { mem.snapshot(run, budget).await },
     )
     .await
@@ -156,7 +158,7 @@ pub(crate) async fn prompt_effect(
         ctx,
         PROMPT_EFFECT,
         json!({ "event": PROMPT_EVENT, "budget": budget }),
-        masker,
+        masker.as_deref(),
         async move {
             if budget == 0 {
                 return Recall::Capped.into();
@@ -179,12 +181,18 @@ pub(crate) async fn tool_error_effect(
 ) -> Result<Recall, EffectError> {
     let run = ctx.run_id();
     let args = json!({ "event": POST_TOOL_EVENT, "tool": tool, "budget": budget });
-    recall_effect(ctx, TOOL_ERROR_EFFECT, args, masker, async move {
-        if budget == 0 {
-            return Recall::Capped.into();
-        }
-        mem.tool_error_hint(run, &tool, &error, budget).await.into()
-    })
+    recall_effect(
+        ctx,
+        TOOL_ERROR_EFFECT,
+        args,
+        masker.as_deref(),
+        async move {
+            if budget == 0 {
+                return Recall::Capped.into();
+            }
+            mem.tool_error_hint(run, &tool, &error, budget).await.into()
+        },
+    )
     .await
     .map(|r| r.recall)
 }
@@ -202,7 +210,7 @@ pub(crate) async fn retry_effect(
         ctx,
         RETRY_EFFECT,
         json!({ "budget": budget }),
-        masker,
+        masker.as_deref(),
         async move {
             if budget == 0 {
                 return Recall::Capped.into();
@@ -223,20 +231,12 @@ pub(crate) async fn recovery_effect(
     budget: u32,
 ) -> Result<Recall, EffectError> {
     let run = ctx.run_id();
-    let v = ctx
-        .effect(
-            EffectSpec {
-                class: EffectClass::ReadOnly,
-                name: name.into(),
-                args: json!({ "budget_tokens": budget }),
-            },
-            move || async move {
-                let r = mem.after_compaction(run, budget).await;
-                Ok(sanitize(r, masker).to_value())
-            },
-        )
-        .await?;
-    Ok(Recall::from_value(&v))
+    let args = json!({ "budget_tokens": budget });
+    recall_effect(ctx, name, args, masker, async move {
+        mem.after_compaction(run, budget).await.into()
+    })
+    .await
+    .map(|r| r.recall)
 }
 
 #[cfg(test)]

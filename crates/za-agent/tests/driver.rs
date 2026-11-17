@@ -6,7 +6,9 @@ mod support;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use support::effects::{effect_names, key_pos};
 use support::memory::{MemCall, ScriptedMemory};
+use support::tools::Fail;
 use support::*;
 
 use serde_json::{Value, json};
@@ -1436,21 +1438,6 @@ async fn inbox_input_is_cleaned() {
 
 // ---- R1-M, задача 3: память в цикле (D140, D142, D161, D168, D169) ----
 
-/// Чтение `fail`: результат-ошибка `fail {args}`.
-struct Fail {
-    spec: ToolSpec,
-}
-
-impl Tool for Fail {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
-        Box::pin(async move { ToolOutput::error(format!("fail {args}")) })
-    }
-}
-
 fn fail_tool() -> Arc<dyn Tool> {
     Arc::new(Fail {
         spec: tool_spec("fail", ToolKind::Read, EffectClass::ReadOnly),
@@ -1489,26 +1476,6 @@ fn receipt_value(evs: &[Event], intent: &Event) -> Value {
         .unwrap_or_else(|| panic!("нет квитанции {}", intent.payload))
         .payload["result"]["value"]
         .clone()
-}
-
-/// `(шаг, номер)` ключа эффекта `{run}:{step}:{seq}`.
-fn key_pos(e: &Event) -> (u64, u64) {
-    let key = e.payload["key"].as_str().unwrap();
-    let mut it = key.rsplit(':');
-    let seq = it.next().unwrap().parse().unwrap();
-    let step = it.next().unwrap().parse().unwrap();
-    (step, seq)
-}
-
-/// Все эффекты run как `(шаг, номер, имя)` по порядку намерений.
-fn effect_names(evs: &[Event]) -> Vec<(u64, u64, String)> {
-    evs.iter()
-        .filter(|e| e.kind == EventKind::EffectIntent)
-        .map(|e| {
-            let (s, q) = key_pos(e);
-            (s, q, e.payload["name"].as_str().unwrap().to_owned())
-        })
-        .collect()
 }
 
 /// Номер эффекта `context` первой оценки (`pass: 0`) шага `step`.
