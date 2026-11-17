@@ -9,14 +9,26 @@
 //! - [`discovery`] — `/api/v1/health`, уровни L0–L2 по флагам, статус токена, решения,
 //!   Vault и подсказок (D136).
 //!
-//! Сессия, `/recall`, укладка в бюджет и порт памяти (задача 4), Vault и ключи (задача 5),
-//! шлюз записи (задача 6), outbox (задача 7), инструменты модели (задача 8), снимок сессии
-//! (задача 9) — следующие задачи плана.
+//! Модули задачи 4:
+//! - [`session`] — сессия run `za-<project_id>-<run>` и её регистрация (D139);
+//! - [`recall`] — запросы `/recall` без `output_limit`, запас бюджета, разбор ответа и данные
+//!   события `memory.recall` (D140, D142, D168);
+//! - [`fit`] — укладка ответа в бюджет на клиенте, чистая функция (D141);
+//! - [`ideas`] — режим идей и его выбор по признакам сервера (D148, D169);
+//! - [`port`] — `ZamMemory`, порт памяти цикла `za_core::memory::MemoryPort` (D138).
+//!
+//! Vault и ключи (задача 5), шлюз записи (задача 6), outbox (задача 7), инструменты модели и
+//! операции идей (задача 8), снимок сессии (задача 9) — следующие задачи плана.
 
 pub mod clock;
 pub mod config;
 pub mod discovery;
 pub mod error;
+pub mod fit;
+pub mod ideas;
+pub mod port;
+pub mod recall;
+pub mod session;
 pub mod transport;
 
 #[cfg(feature = "test-hooks")]
@@ -28,4 +40,9 @@ pub use discovery::{
     status,
 };
 pub use error::{ErrorKind, ZamError, parse_mcp_error};
+pub use fit::{Fitted, fit_digest};
+pub use ideas::{IdeasMode, ideas_mode};
+pub use port::{ZamMemory, ZamParts};
+pub use recall::{RecallReport, fetch_budget};
+pub use session::{RunBinding, session_id};
 pub use transport::{Ctx, Method, ZamClient};

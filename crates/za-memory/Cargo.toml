@@ -13,6 +13,12 @@ workspace = true
 # `BoxFuture` часов (D165); с задачи 3 — порт памяти `za_core::memory` (D138). `za-llm`
 # приходит транзитивно через `za-core` без функций, прямой зависимости нет (как у `za-web`).
 za-core = { path = "../za-core" }
+# `RunId` — id сессии run `za-<project_id>-<run>` (D139).
+za-protocol = { path = "../za-protocol" }
+# Маска ввода подсказок до отправки (`SecretMasker`, D142).
+za-secrets = { path = "../za-secrets" }
+# Хранилище проекта в частях порта (`ZamParts::store`): outbox записей — задача 7 (D165).
+za-store = { path = "../za-store" }
 # Третий держатель HTTP-клиента после `za-llm` и `za-web` (D133, ADR 0007): те же функции
 # (`json`, `rustls-tls`), без сжатия, cookie, SOCKS и HTTP/2; клиент строится только в
 # `transport.rs` (`cargo xtask policy`).

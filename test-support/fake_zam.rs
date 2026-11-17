@@ -26,8 +26,14 @@
 //!   ([`Health`]), требуемый токен, 3xx на другой сервер, ответ-ошибка или иное тело по
 //!   пути, решение и отказ в доступе к нему, блокировка Vault, выключенные типы подсказок,
 //!   ошибка MCP; обрыв соединения — отдельный [`CutServer`].
+//! - **Сессии и `/recall`** (задача 4): `POST /api/v1/sessions` со строгим телом, как
+//!   `NewSession` ZAM (`deny_unknown_fields`, `api/sessions.rs@v0.0.12-m6.5`) — лишнее поле
+//!   даёт 400; ответ `/recall` по событию задаёт тест ([`RecallAnswer`]: текст, `items`,
+//!   `warnings`, `tokens`); выключенный тип подсказок — пустой `text` без сбора, `hooks` — только
+//!   у `session_start`; задержка ответа `/recall` — до [`FakeZam::release_recall`] (ворота, а не
+//!   таймер); дайджест формы `0.0.12-m6.5` в режиме `review` — [`digest_m65_review`].
 //!
-//! Задачи 4–9 дополняют сервер сессиями, записями, ключами идемпотентности, снимками.
+//! Задачи 5–9 дополняют сервер записями, ключами идемпотентности, снимками.
 
 #![allow(dead_code)]
 
@@ -43,7 +49,7 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Предел ожидания вызова клиента на `127.0.0.1` (до множителя): больше сроков запросов
 /// тестов (10 с), так что паника [`within`] значит зависание, а не медленный ответ.
@@ -225,6 +231,118 @@ struct State {
     failures: BTreeMap<String, Failure>,
     replies: BTreeMap<String, Value>,
     mcp_error: Option<String>,
+    /// Ответы `/recall` по событию (`session_start`, `prompt`, …).
+    recall: BTreeMap<String, RecallAnswer>,
+    /// Тела принятых `POST /api/v1/sessions`.
+    sessions: Vec<Value>,
+}
+
+/// Поля тела `POST /sessions` (`NewSession`, `api/sessions.rs@v0.0.12-m6.5`,
+/// `deny_unknown_fields`): прочие — 400.
+pub const SESSION_FIELDS: &[&str] = &[
+    "id",
+    "agent",
+    "solution",
+    "area",
+    "parent_id",
+    "agent_type",
+    "tokens",
+    "new_epoch",
+    "holdout",
+];
+
+/// Ответ `/recall` события, заданный тестом: `text`, `items`, `warnings`, `tokens`,
+/// `rules_tokens`. Прочие поля (`timings`, `hooks` у `session_start`) сервер добавляет сам.
+#[derive(Debug, Clone, Default)]
+pub struct RecallAnswer {
+    pub text: String,
+    pub items: Vec<Value>,
+    pub warnings: Vec<String>,
+    /// `tokens` ответа; `None` — `ceil(байты / 4)` текста.
+    pub tokens: Option<u32>,
+    pub rules_tokens: u32,
+}
+
+impl RecallAnswer {
+    /// Ответ с текстом `text`.
+    pub fn text(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    /// С элементами `items[]` ([`recall_item`]).
+    pub fn items(mut self, items: Vec<Value>) -> Self {
+        self.items = items;
+        self
+    }
+
+    /// С предупреждением `w` (`recall timeout`, `solution unavailable`, …).
+    pub fn warning(mut self, w: &str) -> Self {
+        self.warnings.push(w.to_owned());
+        self
+    }
+
+    /// С полем `tokens` — счётом сервера своим токенизатором.
+    pub fn tokens(mut self, n: u32) -> Self {
+        self.tokens = Some(n);
+        self
+    }
+}
+
+/// Элемент `items[]` ответа `/recall` (`api/recall.rs@v0.0.12-m6.5`): ссылка, вид, заголовок,
+/// надёжность и `reason`.
+pub fn recall_item(id: &str, kind: &str, reason: &str) -> Value {
+    json!({"id": id, "kind": kind, "title": "synthetic", "certainty": null, "reason": reason})
+}
+
+/// Синтетические ссылки дайджеста формы `@m6.5` ([`digest_m65_review`]).
+pub const M65_TASK: &str = "k:01M8SYNTH00000000000000K01";
+pub const M65_PLAN_NEXT: &str = "k:01M8SYNTH00000000000000K09";
+pub const M65_IDEA_NEW: &str = "w:01M8SYNTH00000000000000W01";
+pub const M65_IDEA_DEFERRED: &str = "w:01M8SYNTH00000000000000W02";
+pub const M65_RULE: &str = "n:01M8SYNTH00000000000000R01";
+
+/// Дайджест `session_start` формы `0.0.12-m6.5` в режиме `review` (П15; строки — по
+/// `api/recall.rs@v0.0.12-m6.5`: `task_block`, `PLAN_LINE`, `IDEAS_REVIEW_HINT`, `idea_line`,
+/// `idea_tail_line`, `rule_head`). Синтетический: записей рабочей памяти нет. Строка плана —
+/// сразу за задачами без пустой строки; очередь разбора — `items[].reason: idea_review`,
+/// хвост предложения — `reason: idea`.
+pub fn digest_m65_review() -> RecallAnswer {
+    let text = format!(
+        "### Задачи\n\
+         ZeroAIMemory: [in_progress] Синтетическая задача — далее: write test — {M65_TASK}\n\
+         План из идей: 2 открытых, следующая — {M65_PLAN_NEXT} «Синтетический пункт плана» [high]\n\
+         \n\
+         ### Идеи на разбор\n\
+         Непросмотренных идей: 1. Разбери, когда закончишь текущий шаг: memory_recall event=idea_review → memory_update_entry action=review.\n\
+         ZeroAIMemory: идея «Синтетическая идея человека» [normal] — {M65_IDEA_NEW}\n\
+         ZeroAIMemory: идея «Отложенная синтетическая идея» [low] — срок отсрочки вышел — {M65_IDEA_DEFERRED} (предложи человеку: action=propose — вопрос «начать / отложить / отказаться»; без ответа «начать» не начинай)\n\
+         \n\
+         ### Правила\n\
+         proc/synthetic-rule [th] {M65_RULE}\n\
+         \x20 Синтетическое правило: проверяй укладку дайджеста тестом.\n"
+    );
+    RecallAnswer::text(&text).items(vec![
+        recall_item(M65_TASK, "task", "task"),
+        recall_item(M65_IDEA_NEW, "idea", "idea_review"),
+        recall_item(M65_IDEA_DEFERRED, "idea", "idea"),
+    ])
+}
+
+/// Подсказка к `prompt` формы `0.0.12-m6.5` в режиме `review` (Δ11, `idea_review_prompt_line`):
+/// строка идеи на разбор (`reason: idea_review`) и строка insight (`reason: hint`).
+pub fn prompt_m65_review() -> RecallAnswer {
+    let insight = "i:01M8SYNTH00000000000000I01";
+    let text = format!(
+        "ZeroAIMemory: к задаче подходит идея на разбор {M65_IDEA_NEW} «Синтетическая идея человека» — разбери, когда закончишь текущий шаг (memory_recall event=idea_review)\n\
+         ZeroAIMemory: синтетическая ловушка укладки [th] {insight}\n"
+    );
+    RecallAnswer::text(&text).items(vec![
+        recall_item(M65_IDEA_NEW, "idea", "idea_review"),
+        recall_item(insight, "insight", "hint"),
+    ])
 }
 
 /// Запущенный поддельный ZAM.
@@ -232,11 +350,26 @@ pub struct FakeZam {
     pub addr: SocketAddr,
     pub rx: mpsc::UnboundedReceiver<Seen>,
     state: Arc<Mutex<State>>,
+    /// Ворота ответа `/recall`: `true` — ответ ждёт [`FakeZam::release_recall`].
+    held: watch::Sender<bool>,
 }
 
 impl FakeZam {
     /// Сервер на `127.0.0.1:0` с формой `0.0.11-m6`, без требуемого токена.
     pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::serve(listener)
+    }
+
+    /// Сервер на заданном адресе `127.0.0.1:<порт>` — например, на порту
+    /// [`closed_port_url`], когда тест «поднимает» недоступный сервер.
+    pub async fn start_at(addr: SocketAddr) -> Self {
+        assert!(addr.ip().is_loopback(), "поддельный ZAM — только 127.0.0.1");
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        Self::serve(listener)
+    }
+
+    fn serve(listener: tokio::net::TcpListener) -> Self {
         let state = Arc::new(Mutex::new(State {
             health: Health::M6,
             token: None,
@@ -248,20 +381,28 @@ impl FakeZam {
             failures: BTreeMap::new(),
             replies: BTreeMap::new(),
             mcp_error: None,
+            recall: BTreeMap::new(),
+            sessions: Vec::new(),
         }));
+        let (held, gate) = watch::channel(false);
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = state.clone();
         let app = Router::new().fallback(move |req: Request| {
             let tx = tx.clone();
             let state = shared.clone();
-            async move { handle(req, &tx, &state).await }
+            let gate = gate.clone();
+            async move { handle(req, &tx, &state, gate).await }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        Self { addr, rx, state }
+        Self {
+            addr,
+            rx,
+            state,
+            held,
+        }
     }
 
     /// Базовый адрес `http://127.0.0.1:<порт>`.
@@ -354,6 +495,30 @@ impl FakeZam {
     pub fn mcp_error(&self, text: &str) {
         let t = text.to_owned();
         self.with(|s| s.mcp_error = Some(t));
+    }
+
+    /// `/recall` события `event` отвечает `answer` (до замены).
+    pub fn answer_recall(&self, event: &str, answer: RecallAnswer) {
+        let e = event.to_owned();
+        self.with(|s| {
+            s.recall.insert(e, answer);
+        });
+    }
+
+    /// Ответы `/recall` ждут [`FakeZam::release_recall`]: запрос принят (он уже в канале), ответа
+    /// нет — клиент упирается в свой срок.
+    pub fn hold_recall(&self) {
+        self.held.send_replace(true);
+    }
+
+    /// Отпускает задержанные ответы `/recall`.
+    pub fn release_recall(&self) {
+        self.held.send_replace(false);
+    }
+
+    /// Тела принятых `POST /api/v1/sessions` (с верным телом).
+    pub fn sessions(&self) -> Vec<Value> {
+        self.with(|s| s.sessions.clone())
     }
 
     /// Все принятые к этому моменту запросы (канал опустошается).
@@ -458,7 +623,12 @@ pub fn closed_port_url() -> String {
     format!("http://{addr}")
 }
 
-async fn handle(req: Request, tx: &mpsc::UnboundedSender<Seen>, state: &Mutex<State>) -> Response {
+async fn handle(
+    req: Request,
+    tx: &mpsc::UnboundedSender<Seen>,
+    state: &Mutex<State>,
+    mut gate: watch::Receiver<bool>,
+) -> Response {
     let method = req.method().as_str().to_owned();
     let path = req
         .uri()
@@ -548,7 +718,11 @@ async fn handle(req: Request, tx: &mpsc::UnboundedSender<Seen>, state: &Mutex<St
     if route == "/mcp" {
         return mcp(&headers, &body, state);
     }
-    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if method == "POST" && route == "/api/v1/recall" {
+        // Задержка — воротами теста, а не таймером: запрос уже в канале.
+        let _ = gate.wait_for(|held| !*held).await;
+    }
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     match (method.as_str(), route.as_str()) {
         ("GET", "/api/v1/spaces") => json_reply(
             200,
@@ -586,16 +760,39 @@ async fn handle(req: Request, tx: &mpsc::UnboundedSender<Seen>, state: &Mutex<St
             }
             json_reply(200, v)
         }
+        ("POST", "/api/v1/sessions") => {
+            let Some(obj) = body.as_object() else {
+                return problem(400, "about:blank", "тело — объект JSON");
+            };
+            if let Some(k) = obj.keys().find(|k| !SESSION_FIELDS.contains(&k.as_str())) {
+                return problem(400, "about:blank", &format!("unknown field `{k}`"));
+            }
+            let id = body["id"].as_str().unwrap_or("generated").to_owned();
+            s.sessions.push(body.clone());
+            json_reply(201, json!({"id": id}))
+        }
         ("POST", "/api/v1/recall") => {
+            let event = body["event"].as_str().unwrap_or("").to_owned();
+            let answer = s.recall.get(&event).cloned().unwrap_or_default();
+            // Тип подсказок выключен у пользователя — пустой `text` без сбора.
+            let off = s.hooks_off.contains(&event);
+            let (text, items) = if off {
+                (String::new(), Vec::new())
+            } else {
+                (answer.text.clone(), answer.items.clone())
+            };
+            let tokens = answer
+                .tokens
+                .unwrap_or_else(|| u32::try_from(text.len().div_ceil(4)).unwrap());
             let mut v = json!({
-                "text": "",
-                "items": [],
-                "tokens": 0,
-                "rules_tokens": 0,
+                "text": text,
+                "items": items,
+                "tokens": if off { 0 } else { tokens },
+                "rules_tokens": answer.rules_tokens,
                 "timings": {"collect_ms": 0, "record_ms": null, "total_ms": 0},
-                "warnings": [],
+                "warnings": answer.warnings,
             });
-            if body["event"] == "session_start" {
+            if event == "session_start" {
                 let hooks: serde_json::Map<String, Value> = HOOK_KINDS
                     .iter()
                     .map(|k| ((*k).to_owned(), json!(!s.hooks_off.iter().any(|o| o == k))))

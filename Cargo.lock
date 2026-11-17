@@ -2795,6 +2795,9 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "za-core",
+ "za-protocol",
+ "za-secrets",
+ "za-store",
 ]
 
 [[package]]
