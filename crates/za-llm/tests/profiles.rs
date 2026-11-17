@@ -394,6 +394,42 @@ async fn cloud_without_key_is_inactive_and_silent() {
     assert_eq!(srv.total_requests(), 0);
 }
 
+/// Источник ключей сам называет причину «нет ключа» (R1-M D143): Vault памяти отдаёт свою
+/// причину вместо подсказки о переменной `ZA_SECRET_*`; по умолчанию — прежний текст.
+struct ReasonedSecrets;
+
+impl SecretSource for ReasonedSecrets {
+    fn get(&self, _key_ref: &str) -> Option<Secret> {
+        None
+    }
+
+    fn missing_reason(&self, key_ref: &str) -> String {
+        format!("ключ {key_ref} ждёт Vault памяти: Vault заблокирован")
+    }
+}
+
+#[tokio::test]
+async fn missing_reason_comes_from_source() {
+    let srv = FakeServer::start(vec![]).await;
+    let e = ep(
+        json!({"id": "claude", "backend": "anthropic", "base_url": srv.url("/v1"),
+                      "model": "claude-opus-5-5", "key_ref": "anthropic"}),
+    );
+    let st = probe_endpoint(&e, &http(), &ReasonedSecrets).await;
+    assert_eq!(
+        st,
+        EndpointState::Inactive {
+            reason: "ключ anthropic ждёт Vault памяти: Vault заблокирован".into()
+        }
+    );
+    assert_eq!(srv.total_requests(), 0);
+    // Умолчание трейта — прежний текст `missing_key_reason`.
+    assert_eq!(
+        MapSecrets::default().missing_reason("anthropic"),
+        "ключ anthropic не настроен: задайте переменную ZA_SECRET_ANTHROPIC"
+    );
+}
+
 #[tokio::test]
 async fn unreachable_server() {
     let port = {

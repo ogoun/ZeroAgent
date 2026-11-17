@@ -209,10 +209,11 @@ fn endpoint_secret(
             "key_ref эндпоинта {} недопустим: ожидается имя ключа",
             ep.id
         )),
+        // Причина — от источника ключей (R1-M D143): у Vault памяти — своя.
         Some(k) => secrets
             .get(k)
             .map(Some)
-            .ok_or_else(|| crate::http::missing_key_reason(k)),
+            .ok_or_else(|| secrets.missing_reason(k)),
         None if ep.pool() == PoolKind::Cloud => Err(format!(
             "ключ не настроен: у облачного эндпоинта {} нет key_ref",
             ep.id

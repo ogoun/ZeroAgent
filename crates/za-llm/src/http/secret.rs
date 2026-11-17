@@ -49,6 +49,14 @@ impl std::fmt::Debug for Secret {
 pub trait SecretSource: Send + Sync {
     /// Ключ по ссылке; `None` — ключ не настроен.
     fn get(&self, key_ref: &str) -> Option<Secret>;
+
+    /// Причина `Inactive`, когда [`SecretSource::get`] ключа не дал (R1-M D143): источник
+    /// знает её лучше шлюза — Vault памяти называет «ждёт Vault», «не найден», «память не
+    /// настроена». По умолчанию — [`missing_key_reason`] с именем переменной окружения.
+    /// Значения ключа в тексте нет.
+    fn missing_reason(&self, key_ref: &str) -> String {
+        missing_key_reason(key_ref)
+    }
 }
 
 /// Ключи из переменных окружения `ZA_SECRET_<KEY_REF>` (D4), читаемые при каждом `get`.

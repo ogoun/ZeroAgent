@@ -1181,7 +1181,8 @@ impl Inner {
         }
     }
 
-    /// Ключ эндпоинта на момент запроса; `key_ref` без ключа — `Inactive`.
+    /// Ключ эндпоинта на момент запроса; `key_ref` без ключа — `Inactive` с причиной
+    /// источника ключей (`SecretSource::missing_reason`, R1-M D143).
     fn secret(&self, ep: &Endpoint) -> Result<Option<Secret>, ModelError> {
         match &ep.cfg.key_ref {
             None => Ok(None),
@@ -1189,7 +1190,7 @@ impl Inner {
                 .secrets
                 .get(k)
                 .map(Some)
-                .ok_or_else(|| inactive(&ep.cfg.id, &crate::http::missing_key_reason(k))),
+                .ok_or_else(|| inactive(&ep.cfg.id, &self.secrets.missing_reason(k))),
         }
     }
 
