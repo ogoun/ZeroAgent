@@ -20,6 +20,9 @@ use za_tools::{
 #[path = "../../../test-support/unique_dir.rs"]
 mod shared_dir;
 
+#[path = "../../../test-support/file_perms.rs"]
+mod file_perms;
+
 /// Корень проекта теста `CARGO_TARGET_TMPDIR/za-tools-edit/<name>-<pid>-<n>/p`; рядом —
 /// `ZA_HOME` теста `../h` (маркеры правок, m11).
 fn unique_dir(name: &str) -> PathBuf {
@@ -118,6 +121,8 @@ impl Cx {
             call_id: format!("c{}", self.step),
             effect_key: EffectKey::derive(self.run, self.step, 1),
             paths: Vec::new(),
+            deadline: None,
+            output_budget: None,
         }
     }
 }
@@ -143,7 +148,7 @@ impl Kit {
         let t = ReadTracker::new();
         Self {
             cx: Cx::new(root),
-            read: read_tool(t.clone()),
+            read: read_tool(t.clone(), None),
             edit: edit_tool(t.clone(), home(root)),
             multi: multi_edit_tool(t, home(root)),
         }
@@ -430,7 +435,7 @@ async fn edit_keeps_bom_permissions_refuses_cp1251() {
     // Не UTF-8: отказ, байты целы; трекер такой файл не отмечает (Carry задачи 6).
     let tracker = ReadTracker::new();
     let o = call_cx(
-        &read_tool(tracker.clone()),
+        &read_tool(tracker.clone(), None),
         k.cx.next(),
         json!({"path": "ru.txt"}),
     )
@@ -878,7 +883,7 @@ async fn swap_before_rename_is_refused() {
     let tracker = ReadTracker::new();
     let mut cx = Cx::new(&root);
     let r = call_cx(
-        &read_tool(tracker.clone()),
+        &read_tool(tracker.clone(), None),
         cx.next(),
         json!({"path": "a.rs"}),
     )
@@ -918,7 +923,7 @@ async fn link_swapped_in_before_rename_is_refused() {
     let tracker = ReadTracker::new();
     let mut cx = Cx::new(&root);
     let r = call_cx(
-        &read_tool(tracker.clone()),
+        &read_tool(tracker.clone(), None),
         cx.next(),
         json!({"path": "a.rs"}),
     )
@@ -960,7 +965,7 @@ async fn crash_before_rename_keeps_file_and_retry_completes() {
     let tracker = ReadTracker::new();
     let mut cx = Cx::new(&root);
     let r = call_cx(
-        &read_tool(tracker.clone()),
+        &read_tool(tracker.clone(), None),
         cx.next(),
         json!({"path": "a.rs"}),
     )
@@ -1087,6 +1092,10 @@ async fn overlapping_old_is_refused_by_tool() {
 async fn read_only_file_is_refused() {
     // I2: rename обошёл бы `chmod a-w` (Unix) и упал бы на Windows; отказ на обеих ОС.
     let root = unique_dir("read_only");
+    // Отказ — политика самого инструмента (`writable`: бит записи владельца и владелец), а
+    // не ОС: под root и с `CAP_DAC_OVERRIDE` ОС запись разрешила бы, и тогда эта проверка —
+    // единственная преграда. Пропуска нет (I1 ревью fix-8).
+    let os = file_perms::denial_note(&root);
     write(&root, "ro.txt", "1\n");
     let p = root.join("ro.txt");
     let mut perms = std::fs::metadata(&p).unwrap().permissions();
@@ -1097,9 +1106,9 @@ async fn read_only_file_is_refused() {
     let o = k
         .edit(json!({"path": "ro.txt", "old": "1", "new": "2"}))
         .await;
-    assert!(o.is_error);
-    assert_eq!(o.content, "cannot write ro.txt: permission denied");
-    assert_eq!(bytes(&root, "ro.txt"), b"1\n");
+    assert!(o.is_error, "{os}");
+    assert_eq!(o.content, "cannot write ro.txt: permission denied", "{os}");
+    assert_eq!(bytes(&root, "ro.txt"), b"1\n", "{os}");
     assert!(std::fs::metadata(&p).unwrap().permissions().readonly());
     assert!(leftovers(&root).is_empty());
     assert!(names(&markers(&root)).is_empty());
@@ -1165,15 +1174,17 @@ async fn unix_modes_of_new_and_owner_only_files() {
             gid
         );
     }
-    // Без права записи владельца (0555) — отказ.
+    // Без права записи владельца (0555) — отказ. Его даёт сам инструмент по битам режима и
+    // владельцу, поэтому и под root (I1 ревью fix-8).
+    let os = file_perms::denial_note(&root);
     write(&root, "rx.sh", "a\n");
     std::fs::set_permissions(root.join("rx.sh"), std::fs::Permissions::from_mode(0o555)).unwrap();
     k.read("rx.sh").await;
     let o = k
         .edit(json!({"path": "rx.sh", "old": "a", "new": "b"}))
         .await;
-    assert_eq!(o.content, "cannot write rx.sh: permission denied");
-    assert_eq!(bytes(&root, "rx.sh"), b"a\n");
+    assert_eq!(o.content, "cannot write rx.sh: permission denied", "{os}");
+    assert_eq!(bytes(&root, "rx.sh"), b"a\n", "{os}");
     // Каталог маркеров — 0700 (ревью задачи 8).
     let m = std::fs::metadata(markers(&root))
         .unwrap()

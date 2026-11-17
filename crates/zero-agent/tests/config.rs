@@ -132,6 +132,41 @@ fn readme_context_example_is_valid() {
     assert_eq!(cfg.context.tier, Some(za_protocol::Tier::Standard));
 }
 
+/// Примеры разделов `[web]` и `[skills]` в README (R1-C2, задача 14) проходят разбор и
+/// проверку: путь `dirs` — абсолютный на Windows (`D:/skills`), на прочих ОС пример
+/// проверяется без него.
+#[test]
+fn readme_web_and_skills_examples_are_valid() {
+    let readme = include_str!("../../../README.md");
+    for head in ["```toml\n[web]", "```toml\n[skills]"] {
+        let start = readme
+            .find(head)
+            .unwrap_or_else(|| panic!("пример {head} в README"));
+        let body = &readme[start + "```toml\n".len()..];
+        let end = body.find("```").expect("конец примера");
+        let mut text = body[..end].to_owned();
+        if !cfg!(windows) {
+            text = text.replace("\"D:/skills\"", "\"/srv/skills\"");
+        }
+        let cfg = zero_agent::config::parse_config(&text).unwrap();
+        zero_agent::config::validate(&cfg).unwrap();
+        if head.ends_with("[web]") {
+            assert!(cfg.web.search.is_some());
+            // Пример повторяет значения по умолчанию, кроме адреса поставщика.
+            assert_eq!(
+                cfg.web,
+                zero_agent::config::WebSettings {
+                    search: cfg.web.search.clone(),
+                    ..Default::default()
+                }
+            );
+        } else {
+            assert_eq!(cfg.skills.max_entries, 1000);
+            assert_eq!(cfg.skills.dirs.len(), 1);
+        }
+    }
+}
+
 /// R1-B2 D65: раздел `[context]` — значения, диапазоны и опечатка ключа.
 #[test]
 fn context_section_is_parsed_and_validated() {
@@ -199,7 +234,353 @@ fn project_config_policy_only() {
     assert!(shown.contains("policy.rules[0]"), "{shown}");
     let e = zero_agent::config::parse_project_config("[[policy.rules]]\naction = \"deny\"\n")
         .unwrap_err();
-    assert!(e.to_string().contains("tool, path или command"), "{e}");
+    assert!(
+        e.to_string().contains("tool, path, command или domain"),
+        "{e}"
+    );
+}
+
+// ---- Правила по домену и выключение веба проектом (R1-C2 задача 4, D105, D122) ----
+
+/// Буфер записей `tracing` для проверки предупреждений.
+#[derive(Clone, Default)]
+struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `f` под подписчиком `tracing`, пишущим в буфер; второе значение — текст записей.
+fn with_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+    let logs = Logs::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer({
+            let logs = logs.clone();
+            move || logs.clone()
+        })
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let out = tracing::subscriber::with_default(sub, f);
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    (out, text)
+}
+
+#[test]
+fn project_can_disable_web() {
+    assert_eq!(
+        zero_agent::config::parse_project_config("[web]\nenabled = false\n")
+            .unwrap()
+            .web_enabled,
+        Some(false)
+    );
+    // Без раздела `[web]` проект веб не трогает.
+    assert_eq!(
+        zero_agent::config::parse_project_config("")
+            .unwrap()
+            .web_enabled,
+        None
+    );
+}
+
+/// `true` в проекте ничего не включает (только ужесточение, D105).
+#[test]
+fn project_web_true_is_ignored() {
+    assert_eq!(
+        zero_agent::config::parse_project_config("[web]\nenabled = true\n")
+            .unwrap()
+            .web_enabled,
+        None
+    );
+}
+
+/// D122: прочие ключи `[web]` и `[web.search]` в проекте не действуют — предупреждение с
+/// именем ключа, без ошибки (адрес поставщика проект не задаёт, D126).
+#[test]
+fn project_web_other_keys_warn() {
+    let (cfg, logs) =
+        with_logs(|| zero_agent::config::parse_project_config("[web]\nrobots = false\n"));
+    assert_eq!(cfg.unwrap().web_enabled, None);
+    assert!(logs.contains("web.robots"), "{logs}");
+    let (cfg, logs) = with_logs(|| {
+        zero_agent::config::parse_project_config("[web.search]\nurl = \"http://x\"\n")
+    });
+    assert_eq!(cfg.unwrap().web_enabled, None);
+    assert!(logs.contains("web.search.url"), "{logs}");
+    // Значение ключа в предупреждение не попадает.
+    assert!(!logs.contains("http://x"), "{logs}");
+    // Вместе с `enabled = false` — выключение действует.
+    let (cfg, logs) = with_logs(|| {
+        zero_agent::config::parse_project_config(
+            "[web]\nenabled = false\nmax_bytes = 1\n\n[web.search]\nprovider = \"searxng\"\n",
+        )
+    });
+    assert_eq!(cfg.unwrap().web_enabled, Some(false));
+    assert!(logs.contains("web.max_bytes"), "{logs}");
+    assert!(logs.contains("web.search.provider"), "{logs}");
+    // Незнакомое имя ключа не печатается: оно может оказаться секретом.
+    let (cfg, logs) =
+        with_logs(|| zero_agent::config::parse_project_config("[web]\nhidden-name-7f3a = 1\n"));
+    assert!(cfg.is_ok());
+    assert!(!logs.contains("hidden-name-7f3a"), "{logs}");
+    assert!(logs.contains("[web]"), "{logs}");
+}
+
+#[test]
+fn project_web_enabled_wrong_type() {
+    for src in ["[web]\nenabled = \"no\"\n", "[web]\nenabled = 0\n"] {
+        let e = zero_agent::config::parse_project_config(src).unwrap_err();
+        let shown = e.to_string();
+        assert!(
+            shown.starts_with(".zero-agent/config.toml проекта"),
+            "{shown}"
+        );
+        assert!(shown.contains("web.enabled"), "{shown}");
+    }
+    let e = zero_agent::config::parse_project_config("web = 1\n").unwrap_err();
+    assert!(e.to_string().contains("web"), "{e}");
+}
+
+// ---- Разделы [web] и [skills] глобальной конфигурации (R1-C2 задача 14, D122) ----
+
+/// D122: значения по умолчанию, полный раздел и ошибки с путём поля.
+#[test]
+fn web_and_skills_sections_parse() {
+    use zero_agent::config::{SkillsSettings, WebSettings, parse_config, validate};
+    let cfg = parse_config("").unwrap();
+    assert_eq!(
+        cfg.web,
+        WebSettings {
+            enabled: true,
+            robots: true,
+            max_bytes: 5_242_880,
+            requests_per_minute: 60,
+            ports: vec![80, 443, 8080, 8443],
+            search: None,
+        }
+    );
+    assert_eq!(
+        cfg.skills,
+        SkillsSettings {
+            enabled: true,
+            dirs: Vec::new(),
+            max_entries: 1000,
+        }
+    );
+    let extra = if cfg!(windows) {
+        "D:/skills"
+    } else {
+        "/srv/skills"
+    };
+    let src = format!(
+        "[web]\nenabled = false\nrobots = false\nmax_bytes = 1048576\nrequests_per_minute = 10\nports = [443]\n\n\
+         [web.search]\nprovider = \"searxng\"\nurl = \"http://127.0.0.1:8888\"\n\n\
+         [skills]\nenabled = false\ndirs = [\"{extra}\"]\nmax_entries = 5000\n"
+    );
+    let cfg = parse_config(&src).unwrap();
+    validate(&cfg).unwrap();
+    assert!(!cfg.web.enabled && !cfg.web.robots);
+    assert_eq!(cfg.web.max_bytes, 1_048_576);
+    // Потолок `max_bytes` включительно (m8 ревью задачи 14).
+    let top = parse_config("[web]\nmax_bytes = 33554432\n").unwrap();
+    assert_eq!(top.web.max_bytes, 32 * 1024 * 1024);
+    assert_eq!(cfg.web.requests_per_minute, 10);
+    assert_eq!(cfg.web.ports, [443]);
+    let search = cfg.web.search.as_ref().unwrap();
+    assert_eq!(search.provider, "searxng");
+    assert_eq!(search.url.as_str(), "http://127.0.0.1:8888/");
+    assert!(!cfg.skills.enabled);
+    assert_eq!(cfg.skills.dirs, [PathBuf::from(extra)]);
+    assert_eq!(cfg.skills.max_entries, 5000);
+    // Незнакомый ключ — ошибка с путём поля.
+    for (src, at) in [
+        ("[web]\nx = 1\n", "web.x"),
+        (
+            "[web.search]\nurl = \"http://127.0.0.1:8888\"\nkey = 1\n",
+            "web.search.key",
+        ),
+        ("[skills]\nroots = []\n", "skills.roots"),
+    ] {
+        let e = parse_config(src).unwrap_err().to_string();
+        assert!(e.starts_with(CONFIG_FILE), "{e}");
+        assert!(e.contains(&format!("{at}: неизвестное поле")), "{src}: {e}");
+    }
+    // Имя, похожее на секрет, не печатается (SEC-044).
+    let key = ["sk", "webtest", "0123456789"].join("-");
+    let e = parse_config(&format!("[web]\n\"{key}\" = 1\n"))
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains(&key), "{e}");
+    assert!(e.contains("web: неизвестное поле"), "{e}");
+    // Неверные значения — путь поля, без значения.
+    for (src, want) in [
+        (
+            "[web]\nenabled = \"no\"\n",
+            "web.enabled: ожидается true или false",
+        ),
+        ("[web]\nmax_bytes = 0\n", "web.max_bytes"),
+        // m8 ревью задачи 14: потолок — предел тела PDF, 32 МиБ (опечатка на порядок от
+        // 5 МиБ по умолчанию — ошибка, а не 50 МиБ в памяти на вызов).
+        (
+            "[web]\nmax_bytes = 33554433\n",
+            "web.max_bytes: ожидается целое от 1 до 33554432",
+        ),
+        (
+            "[web]\nrequests_per_minute = 0\n",
+            "web.requests_per_minute",
+        ),
+        ("[web]\nports = []\n", "web.ports"),
+        ("[web]\nports = [80, 70000]\n", "web.ports[1]"),
+        (
+            "[web.search]\nurl = \"ftp://127.0.0.1/\"\n",
+            "web.search.url",
+        ),
+        (
+            "[web.search]\nurl = \"http://u:pw@127.0.0.1/\"\n",
+            "web.search.url",
+        ),
+        ("[web.search]\nurl = \"not a url\"\n", "web.search.url"),
+        ("[skills]\nenabled = 1\n", "skills.enabled"),
+        (
+            "[skills]\ndirs = [\"rel/dir\"]\n",
+            "skills.dirs[0]: нужен абсолютный путь",
+        ),
+        (
+            "[skills]\ndirs = [\"~/.claude/skills\"]\n",
+            "skills.dirs[0]: `~`",
+        ),
+        ("[skills]\nmax_entries = 0\n", "skills.max_entries"),
+        ("web = 1\n", "web: ожидается таблица"),
+    ] {
+        let e = match parse_config(src).and_then(|c| validate(&c)) {
+            Ok(()) => panic!("ожидалась ошибка: {src}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains(want), "{src}: {e}");
+        assert!(!e.contains("u:pw"), "{e}");
+    }
+}
+
+/// D125: `provider` по умолчанию — `searxng`.
+#[test]
+fn search_provider_defaults_to_searxng() {
+    let cfg = zero_agent::config::parse_config("[web.search]\nurl = \"http://127.0.0.1:8888\"\n")
+        .unwrap();
+    assert_eq!(cfg.web.search.unwrap().provider, "searxng");
+}
+
+/// D122: поставщик, кроме `searxng`, — ошибка `unknown search provider <x>` с путём поля.
+#[test]
+fn unknown_search_provider_rejected() {
+    let e = zero_agent::config::parse_config(
+        "[web.search]\nprovider = \"brave\"\nurl = \"http://127.0.0.1:8888\"\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.contains("web.search.provider: unknown search provider brave"),
+        "{e}"
+    );
+}
+
+/// D111: `[web.search]` без `url` — поиска нет, предупреждение.
+#[test]
+fn search_without_url_is_absent() {
+    let (cfg, logs) =
+        with_logs(|| zero_agent::config::parse_config("[web.search]\nprovider = \"searxng\"\n"));
+    let cfg = cfg.unwrap();
+    assert_eq!(cfg.web.search, None);
+    assert!(cfg.web.enabled);
+    assert!(logs.contains("[web.search] url is required"), "{logs}");
+}
+
+/// D122, D126: адрес поставщика задаёт только глобальная конфигурация. Проектный
+/// `[web.search] url` — предупреждение; адрес шлюза — из глобальной, проект веб только
+/// выключает.
+#[tokio::test]
+async fn project_cannot_set_search_url() {
+    let global =
+        zero_agent::config::parse_config("[web.search]\nurl = \"http://127.0.0.1:8888\"\n")
+            .unwrap();
+    let (project, logs) = with_logs(|| {
+        zero_agent::config::parse_project_config(
+            "[web.search]\nurl = \"http://127.0.0.1:9999\"\nprovider = \"searxng\"\n",
+        )
+    });
+    let project = project.unwrap();
+    assert!(logs.contains("web.search.url"), "{logs}");
+    assert!(!logs.contains("9999"), "{logs}");
+    assert_eq!(zero_agent::web::web_disabled(&global, Some(&project)), None);
+    let gw = za_web::WebGateway::new(zero_agent::web::web_config(&global.web)).unwrap();
+    assert_eq!(
+        gw.search_endpoint().map(url::Url::as_str),
+        Some("http://127.0.0.1:8888/")
+    );
+    // Без глобального `[web.search] url` поиска нет, что бы ни писал проект.
+    let none = zero_agent::config::parse_config("").unwrap();
+    let gw = za_web::WebGateway::new(zero_agent::web::web_config(&none.web)).unwrap();
+    assert_eq!(gw.search_endpoint(), None);
+    // Проект только выключает веб.
+    let off = zero_agent::config::parse_project_config("[web]\nenabled = false\n").unwrap();
+    assert_eq!(
+        zero_agent::web::web_disabled(&global, Some(&off)),
+        Some("project")
+    );
+    let global_off = zero_agent::config::parse_config("[web]\nenabled = false\n").unwrap();
+    assert_eq!(
+        zero_agent::web::web_disabled(&global_off, None),
+        Some("config")
+    );
+}
+
+/// `[[policy.rules]]` с `domain` в глобальной и проектной конфигурации (D105): правило
+/// только по домену допустимо, неверный шаблон — ошибка с путём поля.
+#[test]
+fn policy_rule_with_domain() {
+    let cfg = zero_agent::config::parse_config(
+        "[[policy.rules]]\naction = \"deny\"\ndomain = \"*.evil.test\"\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.policy.rules[0].domain.as_deref(), Some("*.evil.test"));
+    zero_agent::config::validate(&cfg).unwrap();
+    let cfg =
+        zero_agent::config::parse_config("[[policy.rules]]\naction = \"deny\"\ndomain = \"[\"\n")
+            .unwrap();
+    let e = zero_agent::config::validate(&cfg).unwrap_err().to_string();
+    assert!(e.contains("policy.rules[0].domain"), "{e}");
+    let p = zero_agent::config::parse_project_config(
+        "[[policy.rules]]\naction = \"ask\"\ndomain = \"docs.rs\"\ntool = \"web_fetch\"\n",
+    )
+    .unwrap();
+    assert_eq!(p.policy.rules[0].domain.as_deref(), Some("docs.rs"));
+    // M3 ревью задачи 4: глобальное `allow` с `domain` ничего не разрешает — загрузка
+    // предупреждает, правило без `domain` предупреждения не даёт.
+    let cfg = zero_agent::config::parse_config(
+        "[[policy.rules]]\naction = \"allow\"\ndomain = \"x.test\"\ncommand = \"curl *\"\n",
+    )
+    .unwrap();
+    let (r, logs) = with_logs(|| zero_agent::config::validate(&cfg));
+    r.unwrap();
+    assert!(logs.contains("WARN") && logs.contains("domain"), "{logs}");
+    let cfg = zero_agent::config::parse_config(
+        "[[policy.rules]]\naction = \"allow\"\ncommand = \"curl *\"\n",
+    )
+    .unwrap();
+    let (r, logs) = with_logs(|| zero_agent::config::validate(&cfg));
+    r.unwrap();
+    assert!(!logs.contains("WARN"), "{logs}");
+    // Опечатка в имени поля называет `domain` среди полей правила.
+    let e =
+        zero_agent::config::parse_config("[[policy.rules]]\naction = \"deny\"\ndomian = \"x\"\n")
+            .unwrap_err()
+            .to_string();
+    assert!(e.contains("domain"), "{e}");
 }
 
 /// D80: `run --mode bypass` без `[policy] allow_bypass = true` глобальной конфигурации —

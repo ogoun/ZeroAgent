@@ -119,13 +119,13 @@
     }
   },
   {
-    "description": "Read a text file. Returns numbered lines: line number, tab, text.",
+    "description": "Read a text file. Returns numbered lines: line number, tab, text. A PDF file is read by pages: start is the first page, limit the number of pages (default 10, at most 50).",
     "name": "read",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "limit": {
-          "description": "Number of lines (default 500)",
+          "description": "Number of lines (default 500), or of PDF pages (default 10)",
           "minimum": 1,
           "type": "integer"
         },
@@ -134,7 +134,7 @@
           "type": "string"
         },
         "start": {
-          "description": "First line (default 1)",
+          "description": "First line, or first page of a PDF (default 1)",
           "minimum": 1,
           "type": "integer"
         }

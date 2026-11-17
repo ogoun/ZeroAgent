@@ -230,7 +230,7 @@ fn wrapper_code(name: &str, args: &[String]) -> Option<Inner> {
         "ssh" => {
             const SSH_VALS: &[&str] = &[
                 "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o",
-                "-p", "-Q", "-R", "-S", "-W", "-w", "-B",
+                "-p", "-P", "-Q", "-R", "-S", "-W", "-w", "-B",
             ];
             let i = skip_opts(args, 0, SSH_VALS);
             let rest = args.get(i + 1..).filter(|r| !r.is_empty())?;
@@ -270,7 +270,7 @@ fn env_skip(w: &[String], mut i: usize) -> Result<usize, String> {
 }
 
 /// `NAME=…` или `NAME+=…` перед командой.
-fn is_assignment(w: &str) -> bool {
+pub(crate) fn is_assignment(w: &str) -> bool {
     let Some(pos) = w.find('=') else { return false };
     let name = w[..pos].strip_suffix('+').unwrap_or(&w[..pos]);
     let mut cs = name.chars();

@@ -312,8 +312,13 @@ fn unreadable_root_is_none_and_unreadable_nested_is_incomplete() {
     let got = dir_size(&root, 100, &[]);
     restore();
     if readable {
-        // Запрет не действует (например, Unix под root) — проверять нечего.
-        eprintln!("запрет чтения не подействовал, тест пропущен");
+        // Запрет не действует: процесс обходит права (Unix под root или с
+        // CAP_DAC_OVERRIDE, например в контейнере) — проверять нечего. Проверка прямая,
+        // а не по uid: `geteuid` без `unsafe` недоступен, а uid ≠ 0 не исключает обхода.
+        eprintln!(
+            "запрет чтения не подействовал: права доступа не действуют для процесса \
+             (root или CAP_DAC_OVERRIDE), тест пропущен"
+        );
         return;
     }
     assert_eq!(got, (None, false));

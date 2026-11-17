@@ -1,0 +1,45 @@
+[package]
+name = "za-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-extract"
+
+[lints]
+workspace = true
+
+# Разборщики враждебного содержимого (R1-C2 D113, D127): вызываются только в подпроцессе
+# `zero-agent extract` через `za_jail::Runner`. Крейтов workspace здесь нет ни в каком виде,
+# от `za-extract` зависит только `zero-agent` (`cargo xtask policy`).
+[dependencies]
+# HTML в Markdown (D109): только здесь, `za-web` его не подключает (D127).
+htmd.workspace = true
+# Тип узлов дерева `htmd` — заголовок `<title>` отдельным полем.
+markup5ever_rcdom.workspace = true
+# Онлайн-страж разбора (`TreeSink` поверх `RcDom`) и линейное извлечение токенизатором
+# без построителя дерева (ревью задачи 7, D127).
+html5ever.workspace = true
+# Текст страниц PDF (D113): `lopdf` разбирает документ, `pdf-extract` — текст страницы.
+pdf-extract.workspace = true
+# `Markdown` и `PdfText` уходят из подпроцесса JSON-ом той же формы, что
+# `za_core::extract::{Markdown, PdfText}`.
+serde.workspace = true
+# Ошибка разбора PDF (`ExtractError`).
+thiserror.workspace = true
+
+[dev-dependencies]
+# Хэши закреплённого корпуса `tests/corpus.rs` (m4 финального ревью извлечения).
+blake3.workspace = true
+
+[features]
+# Намеренный сбой подпроцесса для теста `deep_nesting_kills_only_child` (D128): в продукте
+# крюка нет. Сквозной тест падения подпроцесса через `za_jail::Runner` — у бинарника
+# (`zero-agent/tests/extract.rs`, крюки `extract --crash` и `extract --hang`).
+test-hooks = []
+
+# Тест падения подпроцесса компилируется только с крюком (D128). Обычный `cargo test`
+# его пропускает (как `za-web`/`gateway`), не ломаясь.
+[[test]]
+name = "crash"
+required-features = ["test-hooks"]

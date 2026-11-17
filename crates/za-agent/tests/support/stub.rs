@@ -246,6 +246,7 @@ impl Tool for BashStub {
             network: segs.iter().any(|s| shell::is_network(s, Dialect::Bash)),
             irreversible: Vec::new(),
             segments: segs,
+            ..Subjects::default()
         }
     }
 
@@ -258,7 +259,7 @@ impl Tool for BashStub {
 }
 
 /// Инструмент с текстами для хэша промптов (D94) и выводом по аргументу `out` с
-/// необязательным `digest`.
+/// необязательными `digest` и меткой результата `taint` (`ToolOutput.taint`).
 pub struct TextStub {
     pub spec: ToolSpec,
 }
@@ -280,6 +281,7 @@ impl Tool for TextStub {
         Box::pin(async move {
             ToolOutput {
                 digest: args["digest"].as_str().map(str::to_owned),
+                taint: args["taint"].as_str().map(str::to_owned),
                 ..ToolOutput::ok(args["out"].as_str().unwrap_or_default())
             }
         })
@@ -290,10 +292,83 @@ impl Tool for TextStub {
     }
 }
 
-/// Чекпоинт-заглушка: запоминает запросы, отвечает видом `files`.
+/// Сетевое чтение с контрактом `web_fetch` таблицы D123 (R1-C2): `kind = Read`,
+/// `risk = Network`, `tainted`, тайм-аут 60 с, вывод 128 КиБ; результат — `page <url>` с
+/// меткой `web`. Настоящий `web_fetch` — в `za-web` (задача 8). `calls` — число вызовов;
+/// `hold` — вызов не завершается (отмена посреди вызова).
+pub struct WebStub {
+    pub spec: ToolSpec,
+    pub calls: Arc<AtomicUsize>,
+    pub hold: bool,
+}
+
+impl WebStub {
+    /// Вызов, который держится, пока future не брошен (тест отмены).
+    pub fn holding() -> Self {
+        Self {
+            hold: true,
+            ..Self::new()
+        }
+    }
+
+    pub fn new() -> Self {
+        Self {
+            spec: ToolSpec {
+                schema: ToolSchema {
+                    name: "web_fetch".into(),
+                    description: "stub web_fetch".into(),
+                    parameters: json!({"type": "object"}),
+                },
+                class: EffectClass::ReadOnly,
+                kind: ToolKind::Read,
+                approval: Approval::Mode,
+                risk: RiskClass::Network,
+                roles: vec![RunRole::Top, RunRole::Orchestrator, RunRole::Worker],
+                min_tier: Tier::Standard,
+                timeout: Duration::from_secs(60),
+                output_limit: Some(128 * 1024),
+                tainted: true,
+            },
+            calls: Arc::default(),
+            hold: false,
+        }
+    }
+}
+
+impl Tool for WebStub {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn subjects(&self, _args: &Value) -> Subjects {
+        Subjects {
+            network: true,
+            ..Subjects::default()
+        }
+    }
+
+    fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let url = args["url"].as_str().unwrap_or_default().to_owned();
+        let hold = self.hold;
+        Box::pin(async move {
+            if hold {
+                std::future::pending::<()>().await;
+            }
+            ToolOutput {
+                taint: Some(za_protocol::taint_origin::WEB.to_owned()),
+                ..ToolOutput::ok(format!("page {url}"))
+            }
+        })
+    }
+}
+
+/// Чекпоинт-заглушка: запоминает запросы, отвечает видом `files` и пропущенными как
+/// секреты путями `secret_skipped` (D103).
 #[derive(Default)]
 pub struct CheckpointStub {
     pub requests: Mutex<Vec<CheckpointRequest>>,
+    pub secret_skipped: Vec<String>,
 }
 
 impl Checkpointer for CheckpointStub {
@@ -308,6 +383,7 @@ impl Checkpointer for CheckpointStub {
                 .unwrap_or_default()
         );
         self.requests.lock().unwrap().push(req);
+        let secret_skipped = self.secret_skipped.clone();
         Box::pin(async move {
             Checkpoint {
                 id,
@@ -315,6 +391,7 @@ impl Checkpointer for CheckpointStub {
                 git_ref: None,
                 commit: None,
                 reason: None,
+                secret_skipped,
             }
         })
     }

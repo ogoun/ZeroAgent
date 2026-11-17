@@ -1,6 +1,7 @@
 //! Бинарник `zero-agent`: `doctor`, `demo-run`, `replay` (R0), `models`, `ask`,
 //! `resources` (R1-A), `run`, `answer` (R1-B1), `inspect`, `stats` (R1-B2), `audit`,
-//! `journal export`, `checkpoints`, `secret list`, `trust` (R1-C1).
+//! `journal export`, `checkpoints`, `secret list`, `trust` (R1-C1), `skills list` и скрытая
+//! `extract` (R1-C2).
 //!
 //! Коды выхода: 0 — готово, 1 — ошибка (в том числе неверные аргументы, ошибка
 //! конфигурации, ошибка или неготовность модели), 3 — нужно решение пользователя;
@@ -36,9 +37,10 @@ use zero_agent::models::{self, AskArgs, CommandError};
 use zero_agent::resources;
 use zero_agent::run::{
     self as agent_run, Answer, BudgetFlags, EXIT_NEEDS_DECISION, JOURNAL_FILE, NewRunArgs,
-    ResumeArgs, RunAction, RunArgs, RunCrash, RunError, parse_run_crash, parse_usd,
+    ResumeArgs, RunAction, RunArgs, RunCrash, RunError, RunHooks, parse_run_crash, parse_usd,
 };
 use zero_agent::secret::{StoreSecrets, cmd_secret_list};
+use zero_agent::skills::{SkillsCmdError, cmd_skills_list};
 use zero_agent::trust::{TrustCmdError, cmd_trust};
 /// Переменная окружения с фильтром логов; без неё читается `RUST_LOG`.
 const LOG_ENV: &str = "ZA_LOG";
@@ -195,6 +197,11 @@ enum Cmd {
         #[command(subcommand)]
         action: SecretCmd,
     },
+    /// Скиллы: каталог по источникам (user, bundled, extra, project) и пропущенные.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsCmd,
+    },
     /// Запрос хода к модели по журналу: блоки с байтами, токенами и хэшем, расход,
     /// предсказание следующего хода; `--raw` — тело запроса провайдеру.
     Inspect(InspectCli),
@@ -211,6 +218,64 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Разбор враждебного HTML или PDF в отдельном процессе (R1-C2 D113, D127): запускает
+    /// только сам агент (`ProcessExtractor` через `za_jail::Runner`). Ответ — JSON в stdout.
+    #[command(hide = true)]
+    Extract(ExtractCli),
+}
+
+/// `zero-agent extract [--hang|--crash] <html|pdf>` (скрытая).
+#[derive(Debug, clap::Args)]
+struct ExtractCli {
+    /// Тест (D128): не завершаться — проверка тайм-аута и броска future.
+    #[cfg(feature = "test-hooks")]
+    #[arg(long)]
+    hang: bool,
+    /// Тест (D128): аварийно завершиться — проверка падения подпроцесса.
+    #[cfg(feature = "test-hooks")]
+    #[arg(long)]
+    crash: bool,
+    #[command(subcommand)]
+    what: ExtractCmd,
+}
+
+#[derive(Debug, Subcommand)]
+enum ExtractCmd {
+    /// HTML (UTF-8) на stdin → JSON `{"ok": {title, text, simplified}}`.
+    Html,
+    /// Текст страниц PDF → JSON `{"ok": {pages_total, pages}}`.
+    Pdf {
+        /// Файл PDF (копия в рабочем каталоге run), не больше 32 МиБ.
+        path: PathBuf,
+        /// Первая страница, с 1.
+        first: u32,
+        /// Сколько страниц.
+        count: u32,
+        /// Предел текста всех страниц, символов.
+        max_chars: usize,
+    },
+}
+
+/// Подкоманда `extract` — синхронно, без рантайма tokio: подпроцесс только разбирает вход.
+fn cmd_extract(e: ExtractCli) -> ExitCode {
+    #[cfg(feature = "test-hooks")]
+    {
+        if e.hang {
+            zero_agent::extract::hooks::hang();
+        }
+        if e.crash {
+            zero_agent::extract::hooks::crash();
+        }
+    }
+    match e.what {
+        ExtractCmd::Html => zero_agent::extract::cmd_html(),
+        ExtractCmd::Pdf {
+            path,
+            first,
+            count,
+            max_chars,
+        } => zero_agent::extract::cmd_pdf(&path, first, count, max_chars),
+    }
 }
 
 /// Аргументы `inspect`.
@@ -282,13 +347,19 @@ struct RunCli {
     /// Ввод пользователя для продолжаемого run.
     #[arg(long, requires = "resume")]
     input: Option<String>,
-    /// Аварийно завершить процесс: `after-delta:N` или `in-tool:N` (тесты, D33, D92).
+    /// Аварийно завершить процесс: `after-delta:N`, `in-tool:N` или `after-boundary:N`
+    /// (тесты, D33, D92).
     #[arg(long, hide = true, value_parser = parse_run_crash)]
     crash_at: Option<RunCrash>,
     /// Предел чекпоинта git при вызове инструмента, с (тесты под нагрузкой; по умолчанию
     /// 20 с).
     #[arg(long, hide = true, value_name = "СЕК")]
     checkpoint_timeout: Option<u64>,
+    /// Тест (D128): `host=ip:port` — шлюз разрешает имя в этот адрес мимо фильтра; можно
+    /// повторять. Флага нет без признака `test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    #[arg(long = "web-resolve", hide = true, value_parser = agent_run::parse_web_resolve)]
+    web_resolve: Vec<(String, std::net::SocketAddr)>,
     /// Текст задачи.
     #[arg(required_unless_present = "resume", conflicts_with = "resume")]
     task: Option<String>,
@@ -387,6 +458,10 @@ fn run_args(r: RunCli) -> RunArgs {
         grants: r.grants,
         crash: r.crash_at,
         checkpoint_timeout: r.checkpoint_timeout.map(Duration::from_secs),
+        hooks: RunHooks {
+            #[cfg(feature = "test-hooks")]
+            web_resolve: r.web_resolve,
+        },
     }
 }
 
@@ -401,6 +476,18 @@ enum JournalCmd {
         /// id run.
         #[arg(long, value_parser = parse_run)]
         run: RunId,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsCmd {
+    /// Скиллы каталога: имя, источник, путь, предупреждения; затем пропущенные с причинами.
+    /// Скиллы проекта — только у доверенного проекта (`zero-agent trust`).
+    List {
+        /// Каталог проекта: с ним — и скиллы проекта (`.zero-agent/skills`,
+        /// `.agents/skills`, `.claude/skills`).
+        #[arg(long)]
+        project: Option<PathBuf>,
     },
 }
 
@@ -501,6 +588,8 @@ enum AppError {
     Checkpoints(#[from] CheckpointsCmdError),
     #[error(transparent)]
     Trust(#[from] TrustCmdError),
+    #[error(transparent)]
+    Skills(#[from] SkillsCmdError),
 }
 
 fn parse_run(s: &str) -> Result<RunId, String> {
@@ -575,6 +664,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode, AppError> {
+    if let Cmd::Extract(e) = cli.cmd {
+        return Ok(cmd_extract(e));
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -668,6 +760,8 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
             let home = home::za_home()?;
             Ok(inspector::cmd_stats(&home, &project, run, json).await?)
         }
+        // `run` вызывает `extract` до рантайма; здесь — тот же разбор.
+        Cmd::Extract(e) => Ok(cmd_extract(e)),
         Cmd::Audit {
             project,
             verify,
@@ -707,6 +801,12 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
         } => {
             let home = home::za_home()?;
             Ok(cmd_secret_list(&home))
+        }
+        Cmd::Skills {
+            action: SkillsCmd::List { project },
+        } => {
+            let home = home::za_home()?;
+            Ok(cmd_skills_list(&home, project.as_deref()).await?)
         }
     }
 }

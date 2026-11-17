@@ -53,7 +53,7 @@ use za_llm::{
 use za_protocol::{
     Actor, BlobHash, Budget, BudgetKind, EffectClass, EventKind, NewEvent, Priority, RunId,
     RunMode, RunRole, RunStatus, Seq, Tier, alert_kind, canonical_json, detector, detector_action,
-    fail_reason, pause_reason, taint_origin,
+    fail_reason, input_source, pause_reason, taint_origin,
 };
 use za_store::{NewRun, ProjectStore, StoreError, UsageTotals};
 
@@ -70,6 +70,7 @@ use crate::detect::{
     promise_without_action, retry_params, thinking_timeout,
 };
 use crate::exit::{LoopExit, exit_for_effect_error, exit_for_model_error};
+use crate::exposure::Exposure;
 use crate::memory::{MemoryLevel, MemoryPort, memory_budget};
 use crate::policy::{Grant, PolicySnapshot, grants_text};
 use crate::prompt::{
@@ -80,6 +81,7 @@ use crate::request::{
     FrozenPrefix, PrefixError, RunSetup, TurnOptions, build_request, first_message_with, freeze_for,
 };
 use crate::resume::state_block;
+use crate::skills::{add_active, catalog_payload, loaded_names, skill_output_limit, user_skill};
 use crate::state::{AtBoundary, AuditHead, Counters, LoopState, Next, PendingExit};
 use crate::tools::{FINISH_TOOL, FinishArgs, ToolEnv, ToolsOutcome, TrustSetFn, run_tools};
 use crate::turn::{
@@ -88,6 +90,7 @@ use crate::turn::{
 };
 use za_core::Checkpointer;
 use za_core::paths::Roots;
+use za_core::text::{Clean, clean_invisible};
 use za_secrets::SecretMasker;
 
 /// Точки «сбоя» для тестов и --crash-at (D33).
@@ -129,6 +132,10 @@ pub enum FaultPoint {
     BeforeToolFinished { step: u64 },
     /// внутри замыкания слота `request_grant` шага: запись аудита гранта не удалась
     GrantAudit { step: u64 },
+    /// внутри замыкания слота вызова шага с внешней связью, исполняемого при всех трёх
+    /// свойствах Rule of Two: запись аудита `rule_of_two` не удалась (R1-C2, Ruling m1
+    /// ревью задачи 5)
+    RuleOfTwoAudit { step: u64 },
     /// эффект `boundary` шага записан: следующая запись журнала не удалась (Ruling I1)
     AfterBoundary { step: u64 },
     /// эффект `context` первой оценки шага записан: следующая запись не удалась
@@ -139,7 +146,7 @@ pub enum FaultPoint {
 
 /// true — в точке случается сбой журнала: замыкание `boundary` возвращает
 /// `EffectFailure::Transient`, слот вызова — ошибку записи `tool.finished` (`GrantAudit` —
-/// записи аудита гранта), точки
+/// записи аудита гранта, `RuleOfTwoAudit` — записи аудита `rule_of_two`), точки
 /// `After*` — ошибку записи журнала после эффекта (`StoreError::Io`), как настоящая (D72).
 pub type FaultHook = Arc<dyn Fn(FaultPoint) -> bool + Send + Sync>;
 
@@ -170,6 +177,10 @@ pub struct LoopDeps {
     /// Голова цепочки аудита на момент старта или продолжения (D91): пишется в снимок,
     /// бинарник сверяет её при resume; `None` — без якоря.
     pub audit_head: Option<AuditHead>,
+    /// Каталог скиллов run (R1-C2 D114–D119): `activate_skill`, `/имя` и роутер small.
+    /// Каталог для модели — инструкции capability `za_agent::skills_capability` того же
+    /// каталога; `None` — скиллов нет.
+    pub skills: Option<Arc<za_skills::Catalog>>,
 }
 
 impl LoopDeps {
@@ -193,6 +204,7 @@ impl LoopDeps {
             masker: None,
             trust_set: None,
             audit_head: None,
+            skills: None,
         }
     }
 
@@ -354,7 +366,7 @@ const INBOX_EFFECT: &str = "inbox";
 /// Текст разового сбоя, вызванного [`FaultHook`] (тест, D72).
 pub(crate) const INJECTED_FAULT: &str = "сбой журнала (FaultHook)";
 /// `n_ctx`, если эндпоинт не сообщает размер контекста (D37).
-pub(crate) const DEFAULT_N_CTX: u32 = 8192;
+pub const DEFAULT_N_CTX: u32 = 8192;
 /// Пустых ходов подряд до `blocked` (D18).
 const EMPTY_TURNS_LIMIT: u32 = 3;
 /// Страница чтения ввода на границе.
@@ -410,7 +422,7 @@ pub async fn start_run(
 async fn step_zero(
     deps: &LoopDeps,
     run: RunId,
-    spec: RunSpec,
+    mut spec: RunSpec,
     ctl: ControlRx,
     generation: u64,
 ) -> Result<LoopState, LoopError> {
@@ -437,6 +449,19 @@ async fn step_zero(
     };
     let mut ctx = RunCtx::new(store.clone(), run);
     let mut last_seq = None;
+    // D102, SEC-051: задача — без невидимых символов до первого сообщения, снимка и
+    // разбора `/имя`; число удалённых — `input.cleaned` (после эффекта памяти, D4).
+    let mut cleaned = Vec::new();
+    if let Some((task, removed)) = clean_input(&spec.task) {
+        spec.task = task;
+        cleaned.push((input_source::TASK, removed));
+    }
+    // Текст `AGENTS.md` (или `CLAUDE.md`) — до `fit_agents_md` и замороженного префикса.
+    // Чистит драйвер, а не бинарник: событие пишется в журнал уже созданного run.
+    if let Some((md, removed)) = spec.agents_md.as_deref().and_then(clean_input) {
+        spec.agents_md = Some(md);
+        cleaned.push((input_source::AGENTS_MD, removed));
+    }
 
     // Снимок памяти — эффект: внешнее значение входит в цикл только так (D9, D24).
     let budget_tokens = memory_budget(n_ctx);
@@ -456,6 +481,25 @@ async fn step_zero(
         .await
         .map_err(effect_err)?;
     let memory_text = v.get("text").and_then(Value::as_str).map(str::to_owned);
+    // D119: `/имя` в задаче (любой тир) или карточка роутера (top small) — эффект
+    // `skill.load` сразу после снимка памяти; блок дописывается к задаче в первом
+    // сообщении, сама задача (цель сводки и рецитации) — без него.
+    let task_skill = user_skill(
+        &mut ctx,
+        &deps.journal,
+        deps.skills.as_deref(),
+        &[],
+        &spec.task,
+        router_on(spec.role, tier),
+        skill_output_limit(n_ctx),
+    )
+    .await
+    .map_err(effect_err)?;
+    // Ревью задачи 1, m1: события шага 0 — после квитанции памяти, снимок шага 0 стоит
+    // на последнем событии run (D4).
+    for (source, removed) in cleaned {
+        last_seq = Some(input_cleaned(&deps.journal, run, source, removed, None).await?);
+    }
     if deps.memory.level() == MemoryLevel::L0 {
         last_seq = Some(
             append(
@@ -476,6 +520,20 @@ async fn step_zero(
     // D78: гранты старта run (флаг, глобальная конфигурация) — `grant.added` в журнале.
     if let Some(s) = grants_added(&deps.journal, run, &spec.grants).await? {
         last_seq = Some(s);
+    }
+    // D116: каталог скиллов run — `skill.catalog` на старте (resume каталог не пишет: он
+    // обнаруживается заново, а решает записанный эффект `skill.load`, D92).
+    if let Some(cat) = deps.skills.as_deref() {
+        last_seq = Some(
+            append(
+                &deps.journal,
+                run,
+                Actor::Runtime,
+                EventKind::SkillCatalog,
+                catalog_payload(cat),
+            )
+            .await?,
+        );
     }
 
     let registry = run_registry(deps)?;
@@ -498,11 +556,21 @@ async fn step_zero(
     // D78: top получает `<grants>` после `<env>`; субагент — в слоте своего `<task>`.
     let grants = (spec.role == RunRole::Top).then(|| grants_text(&spec.grants, &roots.project));
     let mut conv = Conversation::default();
+    let mut skills = Vec::new();
+    let task_text = match task_skill {
+        Some((block, active)) => {
+            if let Some(s) = active {
+                add_active(&mut skills, s);
+            }
+            format!("{}\n\n{block}", spec.task)
+        }
+        None => spec.task.clone(),
+    };
     conv.push_user(first_message_with(
         &env,
         grants.as_deref(),
         memory_text.as_deref(),
-        &spec.task,
+        &task_text,
     ))?;
     let refs = conv.persist(&store).await?.refs;
 
@@ -511,6 +579,11 @@ async fn step_zero(
         // Событий драйвера на шаге 0 нет (память не L0): снимок — на последнем
         // событии run. Шаг 0 не реплеится, поэтому это чтение — вход цикла, а не его ход.
         None => last_event_seq(&store, run).await?,
+    };
+    let taint = if spec.trusted {
+        BTreeSet::new()
+    } else {
+        BTreeSet::from([taint_origin::UNTRUSTED_PROJECT.to_owned()])
     };
     let st = LoopState {
         run,
@@ -548,16 +621,23 @@ async fn step_zero(
         trusted: spec.trusted,
         trust_refused: false,
         grants: spec.grants,
-        // D82, Ruling 7.20: недоверенный проект помечен с шага 0.
-        taint: if spec.trusted {
-            BTreeSet::new()
-        } else {
-            BTreeSet::from([taint_origin::UNTRUSTED_PROJECT.to_owned()])
+        // D106: недоверенный проект — `untrusted` с шага 0.
+        exposure: Exposure {
+            untrusted: Exposure::untrusted_from(&taint),
+            ..Exposure::default()
         },
+        // D82, Ruling 7.20: недоверенный проект помечен с шага 0.
+        taint,
         audit_head: deps.audit_head.clone(),
+        skills,
     };
     save_snapshot(&store, &st, Next::Boundary, None).await?;
     Ok(st)
+}
+
+/// Роутер карточек — только у top small (D119).
+fn router_on(role: RunRole, tier: Tier) -> bool {
+    role == RunRole::Top && tier == Tier::Small
 }
 
 /// Реестр run: `deps.tools` и инструменты capability. Повтор имени — ошибка префикса.
@@ -1074,22 +1154,57 @@ async fn push_inbox(
                     tracing::warn!(seq, "пустой ввод пользователя пропущен");
                     continue;
                 }
+                // D102: невидимые символы — до истории и до разбора `/имя`.
+                let text = clean_inbox(deps, st, *seq, text).await?;
+                if text.is_empty() {
+                    tracing::warn!(
+                        seq,
+                        "ввод пользователя из одних невидимых символов пропущен"
+                    );
+                    continue;
+                }
+                // D119: `/имя` (любой тир) или карточка роутера (top small) — после
+                // очистки, до истории; блок дописывается к сообщению, а в `user_inputs`
+                // (сводка компакции) идёт только текст пользователя.
+                let skill = user_skill(
+                    &mut st.ctx,
+                    &deps.journal,
+                    deps.skills.as_deref(),
+                    &st.skills,
+                    &text,
+                    router_on(st.setup.role, st.setup.tier),
+                    skill_output_limit(st.setup.n_ctx),
+                )
+                .await
+                .map_err(effect_err)?;
                 // Текст пользователя — как есть, только управляющий тег экранируется:
                 // ввод не выдаёт себя за голос рантайма (D23).
-                let text = escape_untrusted(text);
-                st.conv.push_user(text.clone())?;
+                let text = escape_untrusted(&text);
+                let message = match skill {
+                    Some((block, active)) => {
+                        // Одна запись на имя: `/имя` после карточки роутера заменяет её.
+                        if let Some(s) = active {
+                            add_active(&mut st.skills, s);
+                        }
+                        format!("{text}\n\n{block}")
+                    }
+                    None => text.clone(),
+                };
+                st.conv.push_user(message)?;
                 push_input(&store_of(deps), st, &text, false).await?;
                 // Ввод пользователя сбрасывает окно повтора (Ruling I-3 ревью задачи 6).
                 st.detectors.on_user_input();
             }
-            Inbox::Correct { note, command, .. } => {
+            Inbox::Correct { seq, note, command } => {
+                // D102: поправка — тоже ввод пользователя.
+                let note = clean_inbox(deps, st, *seq, note).await?;
                 st.conv.push_user(render_control(
                     ControlFrom::User,
                     ControlAction::Correct,
                     command,
-                    note,
+                    &note,
                 ))?;
-                push_input(&store_of(deps), st, &escape_untrusted(note), true).await?;
+                push_input(&store_of(deps), st, &escape_untrusted(&note), true).await?;
                 st.detectors.on_user_input();
                 // D36: тот же `command`, что в `control.requested`.
                 st.last_seq = append(
@@ -1104,6 +1219,56 @@ async fn push_inbox(
         }
     }
     Ok(())
+}
+
+/// Очистка ввода `inbox` (D102, `Clean::Input`): удалённые символы — `input.cleaned
+/// {source: "input", seq}`, `seq` — событие исходного ввода (`turn.input` или
+/// `control.requested`). Реплей границы повторяет событие, как `control.applied`;
+/// по `seq` повтор отличается от нового ввода (ревью задачи 1, m2).
+async fn clean_inbox(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    seq: u64,
+    text: &str,
+) -> Result<String, LoopError> {
+    match clean_input(text) {
+        Some((clean, removed)) => {
+            st.last_seq = input_cleaned(
+                &deps.journal,
+                st.run,
+                input_source::INPUT,
+                removed,
+                Some(seq),
+            )
+            .await?;
+            Ok(clean)
+        }
+        None => Ok(text.to_owned()),
+    }
+}
+
+/// Текст без невидимых символов уровня `Clean::Input` и их число; `None` — текст чист.
+fn clean_input(text: &str) -> Option<(String, usize)> {
+    match clean_invisible(text, Clean::Input) {
+        (_, 0) => None,
+        (clean, removed) => Some((clean.into_owned(), removed)),
+    }
+}
+
+/// Событие `input.cleaned {source, removed, seq?}` (D102); `seq` — событие исходного
+/// ввода `inbox`, у задачи и `AGENTS.md` его нет.
+async fn input_cleaned(
+    j: &Journal,
+    run: RunId,
+    source: &str,
+    removed: usize,
+    seq: Option<u64>,
+) -> Result<Seq, StoreError> {
+    let mut payload = json!({ "source": source, "removed": removed });
+    if let Some(seq) = seq {
+        payload["seq"] = json!(seq);
+    }
+    append(j, run, Actor::Runtime, EventKind::InputCleaned, payload).await
 }
 
 /// Повторное чтение ввода после компакции на границе (Ruling I-2): эффект `inbox`
@@ -1531,6 +1696,7 @@ async fn run_compaction(
             emergency,
             grants: recite_grants.as_deref(),
             masker: deps.masker.as_deref(),
+            skills: &st.skills,
         },
         st.turn,
         &mut st.sig,
@@ -1546,6 +1712,7 @@ async fn run_compaction(
             st.conv = c.conv;
             st.user_inputs = c.user_inputs;
             st.last_next_step = c.next_step;
+            st.skills = c.skills;
             st.epoch += 1;
             st.meter.reset();
             st.meter.compact_pending = false;
@@ -1636,8 +1803,10 @@ async fn prune_results(
     before: Estimate,
 ) -> Result<Estimate, LoopError> {
     let (conv, run, dir) = (st.conv.clone(), st.run, st.setup.project_dir.clone());
+    // Результаты активных скиллов не удаляются (R1-C2 D118).
+    let keep: BTreeSet<String> = st.skills.iter().filter_map(|s| s.call_id.clone()).collect();
     let pruned = match tokio::task::spawn_blocking(move || {
-        prune(&conv, run, &dir, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES)
+        prune(&conv, run, &dir, PRUNE_KEEP_TURNS, PRUNE_MIN_BYTES, &keep)
     })
     .await
     {
@@ -2193,6 +2362,9 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
         fault: deps.fault.clone(),
         step: st.ctx.step(),
         trust_set: deps.trust_set.clone(),
+        exposure: st.exposure_now(),
+        skills: deps.skills.clone(),
+        active_skills: loaded_names(&st.skills),
     };
     // Флаги наблюдаются рядом с пакетом (D26): `pausing`/`cancelling` пишутся сразу,
     // не дожидаясь конца идущего инструмента. На сигналы пакет реагирует сам.
@@ -2251,17 +2423,29 @@ async fn tools_node(sh: &Shared, st: &mut LoopState) -> Result<Transition, LoopE
     if out.halted {
         return Err(LoopError::Halted);
     }
-    // Состояние пакета (D78, D82, D83): метки, гранты, доверие.
+    // Состояние пакета (D78, D82, D83, D106, D118): метки, гранты, доверие, экспозиция,
+    // загруженные скиллы.
     st.taint.append(&mut out.taint);
     st.grants.append(&mut out.grants);
+    for s in out.skills.drain(..) {
+        add_active(&mut st.skills, s);
+    }
     match out.trusted {
         Some(true) => st.trust_granted(),
         Some(false) => st.trust_refused = true,
         None => {}
     }
+    let before = env.exposure;
+    st.exposure = before.union(out.exposure);
+    st.exposure.untrusted |= Exposure::untrusted_from(&st.taint);
     // `ToolsOutcome` не различает Pause и Input: решают флаги (Carry к задаче 12/14).
     let flags = *st.sig.flags().borrow();
     let verdict = tools_verdict(&out, flags)?;
+    // D106: пакет, остановленный на прерывании, доигрывается при resume по квитанциям —
+    // событие пишет тот проход, что дошёл до конца пакета (без дублей).
+    if verdict != ToolsVerdict::Suspend && st.exposure != before {
+        exposure_changed(deps, st, &out.exposure_calls, &out.rule_of_two).await?;
+    }
     let ToolsOutcome {
         results,
         suspend,
@@ -2622,6 +2806,35 @@ async fn backoff(deps: &LoopDeps, st: &mut LoopState, d: Duration) -> Result<(),
             }
         }
     }
+}
+
+/// `exposure.changed {untrusted, private, external, calls, rule_of_two}` (D106): флаги run
+/// после пакета, вызовы с новым флагом и вызовы пакета с внешней связью, исполненные при
+/// всех трёх свойствах (о них — записи аудита `rule_of_two`). Пишется, только если флаги изменились;
+/// вызовы при трёх свойствах в следующих пакетах видны по аудиту и отметке `rule_of_two`
+/// в `tool.started`/`tool.finished` (по ней бинарник печатает строку SEC-052).
+async fn exposure_changed(
+    deps: &LoopDeps,
+    st: &mut LoopState,
+    calls: &[String],
+    rule_of_two: &[String],
+) -> Result<(), StoreError> {
+    let e = st.exposure;
+    st.last_seq = append(
+        &deps.journal,
+        st.run,
+        Actor::Runtime,
+        EventKind::ExposureChanged,
+        json!({
+            "untrusted": e.untrusted,
+            "private": e.private,
+            "external": e.external,
+            "calls": calls,
+            "rule_of_two": rule_of_two,
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// `loop.detected {detector, action, turn}` (D63).

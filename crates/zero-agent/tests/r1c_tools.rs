@@ -926,6 +926,124 @@ fn secrets_never_in_journal_or_spill() {
     assert!(x.stdout.contains("[secret masked: "), "{}", x.stdout.len());
 }
 
+// ---- Секреты в чекпоинтах (R1-C2 D103) ----
+
+/// Модель: чтение `.env` и `config.txt`, затем правка обоих, затем ответ.
+fn secret_edit_model(seen: &[Value]) -> Response {
+    match tool_results(seen.last()) {
+        0 => calls_reply(&[
+            call("r1", "read", json!({"path": ".env"})),
+            call("r2", "read", json!({"path": "config.txt"})),
+        ]),
+        2 => calls_reply(&[
+            call(
+                "e1",
+                "edit",
+                json!({"path": ".env", "old": "MODE=dev", "new": "MODE=prod"}),
+            ),
+            call(
+                "e2",
+                "edit",
+                json!({"path": "config.txt", "old": "level = 1", "new": "level = 2"}),
+            ),
+        ]),
+        _ => text_reply(&["готово"]),
+    }
+}
+
+#[test]
+fn edit_of_env_reports_no_checkpoint() {
+    // `config.txt` — секрет по содержимому: в нём значение `ZA_SECRET_T` (фильтр бинарника).
+    let c = Case::new("secret-edit", secret_edit_model).var("ZA_SECRET_T", SECRET);
+    c.write(".env", "MODE=dev\n");
+    c.write("config.txt", &format!("level = 1\ntoken = {SECRET}\n"));
+    c.write("a.txt", "plain\n");
+    git(&c.e.project, &["add", "a.txt"]);
+    git(&c.e.project, &["commit", "-q", "-m", "init"]);
+    c.trust();
+
+    let o = c.run(&["--mode", "auto", "Поправь .env и config.txt"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert_eq!(o.stdout, "готово\n", "{o:?}");
+    assert_eq!(c.read(".env"), "MODE=prod\n");
+
+    let bodies = c.bodies();
+    for id in ["e1", "e2"] {
+        let r = result_of(&bodies, id);
+        assert!(
+            r.contains("[no checkpoint for this file: it looks like a secret]"),
+            "{id}: {r}"
+        );
+    }
+    let events = c.e.events(run_id(&o));
+    for (id, path) in [("e1", ".env"), ("e2", "config.txt")] {
+        let cps = of_call(&events, EventKind::CheckpointCreated, id);
+        assert_eq!(cps.len(), 1, "{id}: {events:?}");
+        assert_eq!(cps[0]["kind"], "git", "{id}: {}", cps[0]);
+        assert_eq!(cps[0]["secret_skipped"], json!([path]), "{id}: {}", cps[0]);
+    }
+    // Значения секрета нет в каталоге чекпоинтов (свой репозиторий, кэш stat, индексы) и
+    // в маркерах повтора правок `edits/*.json` (ревью задачи 2, сомнение 1: diff маскируется).
+    let cps: Vec<PathBuf> = files_under(&c.e.home)
+        .into_iter()
+        .filter(|f| {
+            f.components()
+                .any(|p| p.as_os_str() == "checkpoints" || p.as_os_str() == "edits")
+        })
+        .collect();
+    assert!(
+        cps.iter().any(|f| f.ends_with("stat.json")),
+        "нет каталога чекпоинтов: {cps:?}"
+    );
+    assert!(
+        cps.iter()
+            .any(|f| f.parent().is_some_and(|d| d.ends_with("edits"))
+                && f.extension().is_some_and(|e| e == "json")),
+        "нет маркеров правок: {cps:?}"
+    );
+    for f in &cps {
+        let data = std::fs::read(f).unwrap();
+        assert!(
+            !contains(&data, SECRET.as_bytes()),
+            "секрет в {}",
+            f.display()
+        );
+    }
+    // Восстановление чекпоинта перед правкой `config.txt`: секреты не тронуты и названы
+    // (ревью задачи 2, I2): `--json`, stderr и аудит.
+    let id = of_call(&events, EventKind::CheckpointCreated, "e2")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = c.za(&[
+        "checkpoints",
+        "restore",
+        "--project",
+        c.e.project_arg(),
+        &id,
+        "--delete-new",
+        "--json",
+    ]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    let v: Value = serde_json::from_str(r.stdout.trim()).unwrap();
+    assert_eq!(v["secret_untouched"], json!([".env", "config.txt"]), "{v}");
+    assert_eq!(c.read(".env"), "MODE=prod\n");
+    assert!(c.read("config.txt").contains("level = 2"), "{r:?}");
+    let r = c.za(&[
+        "checkpoints",
+        "restore",
+        "--project",
+        c.e.project_arg(),
+        &id,
+    ]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert!(
+        r.stderr
+            .contains("не тронуты как секреты: .env, config.txt"),
+        "{r:?}"
+    );
+}
+
 // ---- Сетевой путь ----
 
 /// Модель: `read \\192.0.2.1\x`, затем ответ.

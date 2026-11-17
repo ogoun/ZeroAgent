@@ -29,14 +29,22 @@
 //! маскированными аргументами; повторное разрешение путей — смена класса даёт ошибку
 //! `path changed since planning; call again` (D98); `boundary.outside`; чекпоинт `Edit` и
 //! `Exec` и `checkpoint.created` (D89); точка сбоя [`CrashPoint::InTool`] до и после
-//! вызова; вызов; постусловия (TOOL-004); `file.changed`; метки происхождения и очистка
+//! вызова; вызов с дедлайном `ToolCx::deadline` (R1-C2 D107); события `web.request` из
+//! журнала обращений вызова (D112, маска секретов; в квитанцию записи не попадают);
+//! постусловия (TOOL-004); `file.changed`; метки происхождения и очистка
 //! невидимых символов (D82, SEC-051); маскировка секретов (D90); выгрузка или обрезка по
 //! `output_limit` с `digest` (D44, D75, D86); `tool.finished` с `tainted`.
 //!
 //! Квитанция эффекта — [`ToolOutput`] с признаками пакета ([`Receipt`]); в результат для
 //! модели текст идёт через [`escape_untrusted`] (D23, D94).
+//!
+//! **`activate_skill`** (R1-C2 D118) — встроенный, как `request_grant`: решение и
+//! дедупликация — `crate::skills::plan_activation`, исполнение — эффект `skill.load`
+//! (`ReadOnly`) мимо `tool_action`, выгрузки и шагов (2)–(12) слота; события `tool.*` и
+//! `skill.activated` пишет слот. Результат собран рантаймом (тело экранировано внутри
+//! обёртки `<skill_content>`) и повторно не экранируется. Записанный под ключом вызова
+//! `skill.load` реплеится с его аргументами (D92).
 
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -51,15 +59,16 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use za_core::interrupt::{self, InterruptState};
 use za_core::paths::{self, PathError, ResolvedPath, Roots};
+use za_core::text::{Clean, clean_invisible};
 use za_core::{
     Access, Approval, CheckpointRequest, Checkpointer, EffectError, EffectSlot, EffectSpec, Gate,
-    Interrupt, InterruptKind, Journal, Postcondition, RawPath, RiskClass, RunCtx, Subjects, Tool,
-    ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
+    Interrupt, InterruptKind, Journal, NetRequest, Postcondition, RawPath, RiskClass, RunCtx,
+    Subjects, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, call_deadline, gate,
 };
 use za_llm::{BoxFuture, Part, ToolCall, ToolSchema};
 use za_protocol::{
     Actor, EffectClass, EffectKey, EventKind, NewEvent, RunId, RunMode, RunRole, Tier,
-    approval_reason, audit_action, canonical_json, mask_json_with, taint_origin,
+    approval_reason, audit_action, canonical_json, irreversible, mask_json_with, taint_origin,
 };
 use za_secrets::SecretMasker;
 use za_store::{AuditNew, StoreError};
@@ -68,11 +77,14 @@ use crate::context::{
     SPILL_NOT_SAVED, SpillCfg, spill, spill_cut, spill_digest, spill_limit_bytes, spill_name,
 };
 use crate::driver::{CrashHook, CrashPoint, FaultHook, FaultPoint, INJECTED_FAULT};
+use crate::exposure::{Exposure, RULE_OF_TWO_MARK, untrusted_origin};
 use crate::policy::{
     Decision, Grant, GrantMode, GrantSource, PolicyCx, PolicySnapshot, covers, decide,
     subject_paths,
 };
 use crate::prompt::escape_untrusted;
+use crate::skills::{ACTIVATE_SKILL_TOOL, Activation, LoadJob, SkillRef, plan_activation};
+use crate::state::ActiveSkill;
 use crate::turn::{CallVerdict, PlannedCall, Signal, Signals};
 
 /// Имя встроенного инструмента завершения (D17).
@@ -94,6 +106,10 @@ pub(crate) const OUTPUT_LOST: &str = "internal error: tool output lost";
 pub(crate) const AFTER_FINISH: &str = "not executed: run finished by finish";
 /// Путь вызова сменил класс между решением и слотом (D98).
 pub(crate) const PATH_CHANGED: &str = "path changed since planning; call again";
+/// Строка результата вызова, затронутый файл которого не вошёл в чекпоинт как секрет
+/// (R1-C2 D103).
+pub(crate) const SECRET_NO_CHECKPOINT: &str =
+    "[no checkpoint for this file: it looks like a secret]";
 /// Начало строки о нарушенном постусловии (TOOL-004).
 const POSTCONDITION_FAILED: &str = "[postcondition failed: ";
 /// Действующее лицо записей аудита пакета.
@@ -142,6 +158,20 @@ pub struct ToolsOutcome {
     /// Точка сбоя [`CrashPoint::InTool`] сработала: future слота брошен (D92), драйвер
     /// возвращает `LoopError::Halted`.
     pub halted: bool,
+    /// Флаги экспозиции исполненных вызовов (D106; вживую и по квитанции): драйвер
+    /// объединяет их с флагами run. Отклонённый вызов флаг не ставит.
+    pub exposure: Exposure,
+    /// `call_id` исполненных вызовов с внешней связью, исполненных при всех трёх свойствах
+    /// — снимок начала пакета ([`ToolEnv::exposure`]) плюс вклад самого вызова (Ruling I1
+    /// ревью задачи 5, Ruling сомнения 1 прохода fix-5).
+    /// О каждом есть запись аудита `rule_of_two`: её пишет слот, признак — в квитанции.
+    pub rule_of_two: Vec<String>,
+    /// `call_id` исполненных вызовов, поставивших флаг, которого в снимке начала пакета не
+    /// было (`calls` события `exposure.changed`).
+    pub exposure_calls: Vec<String>,
+    /// Скиллы, загруженные в пакете вызовами `activate_skill` (R1-C2 D118; вживую и по
+    /// квитанции): драйвер дописывает их в `LoopState.skills`.
+    pub skills: Vec<ActiveSkill>,
 }
 
 /// Набор доверенных файлов проекта для payload прерывания `Trust` (D83): по корню
@@ -184,6 +214,16 @@ pub struct ToolEnv {
     pub step: u64,
     /// Набор доверенных файлов для прерывания `Trust`; `None` — пустой набор.
     pub trust_set: Option<TrustSetFn>,
+    /// Экспозиция run на начало пакета (D106): вызов исполняется при всех трёх свойствах,
+    /// если их дают она и вклад самого вызова, — аргументы вызовов пакета выбраны до их
+    /// результатов. Запись `rule_of_two` — только у вызова с внешней связью.
+    pub exposure: Exposure,
+    /// Каталог скиллов run для `activate_skill` (R1-C2 D118); `None` — скиллов нет.
+    pub skills: Option<Arc<za_skills::Catalog>>,
+    /// Имена скиллов run с загруженным полным текстом на начало пакета: повтор без `file`
+    /// — без эффекта. Скилл только с карточкой роутера сюда не входит (Ruling I1 ревью
+    /// задачи 13).
+    pub active_skills: BTreeSet<String>,
 }
 
 impl fmt::Debug for ToolEnv {
@@ -202,6 +242,9 @@ impl fmt::Debug for ToolEnv {
             .field("checkpointer", &self.checkpointer.is_some())
             .field("masker", &self.masker.is_some())
             .field("step", &self.step)
+            .field("exposure", &self.exposure)
+            .field("skills", &self.skills.as_ref().map(|c| c.skills.len()))
+            .field("active_skills", &self.active_skills)
             .finish_non_exhaustive()
     }
 }
@@ -239,6 +282,9 @@ impl ToolEnv {
             fault: None,
             step: 0,
             trust_set: None,
+            exposure: Exposure::default(),
+            skills: None,
+            active_skills: BTreeSet::new(),
         }
     }
 }
@@ -253,12 +299,16 @@ pub(crate) fn fallback_roots(project: &Path) -> Roots {
     }
 }
 
-/// Состояние пакета: доверие, гранты и метки, которые меняют вызовы пакета.
+/// Состояние пакета: доверие, гранты и метки, которые меняют вызовы пакета, и
+/// неизменный снимок экспозиции на начало пакета.
 struct BatchState {
     trusted: bool,
     trust_refused: bool,
     taint: BTreeSet<String>,
     grants: Vec<Grant>,
+    exposure: Exposure,
+    /// Активные скиллы: начала пакета и загруженные в нём (дедупликация D118).
+    skills: BTreeSet<String>,
 }
 
 /// Квитанция вызова: результат инструмента и признаки пакета. Поля пакета
@@ -273,6 +323,37 @@ struct Receipt {
     /// Выданный грант (`request_grant`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grant: Option<Grant>,
+    /// Нативный вызов дошёл до инструмента с путём вне проекта (D106: `private`). Флаги
+    /// в квитанции: реплей даёт их без инструмента и диска; квитанции R1-C1 — без флагов.
+    #[serde(default, skip_serializing_if = "is_false")]
+    private: bool,
+    /// Нативный сетевой вызов дошёл до инструмента (D106: `external`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    external: bool,
+    /// Вызов с внешней связью исполнен при всех трёх свойствах, запись аудита
+    /// `rule_of_two` о нём есть (Ruling I1, m2 ревью задачи 5): реплей квитанции даёт
+    /// `ToolsOutcome.rule_of_two` без повторной записи.
+    #[serde(default, skip_serializing_if = "is_false")]
+    rule_of_two: bool,
+    /// Скилл, загруженный `activate_skill` (R1-C2 D118): реплей квитанции восстанавливает
+    /// его в списке активных без файла скилла и каталога.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skill: Option<SkillRef>,
+}
+
+impl Receipt {
+    /// Флаги экспозиции вызова; `untrusted` — по происхождениям результата.
+    fn exposure(&self) -> Exposure {
+        Exposure {
+            untrusted: untrusted_origin(&self.origins),
+            private: self.private,
+            external: self.external,
+        }
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Выгрузка вывода одного вызова (D44): файл `<project>/.zero-agent/work/spill/{name}.txt`.
@@ -290,6 +371,18 @@ enum Cut {
     Limit(usize),
     /// Без предела.
     None,
+}
+
+impl Cut {
+    /// Фактический предел результата в контексте, байт после экранирования: его получает
+    /// инструмент как `ToolCx::output_budget` (R1-C2 D110, I2 ревью задачи 8).
+    fn limit(&self) -> Option<usize> {
+        match self {
+            Cut::Spill(job) => Some(job.limit),
+            Cut::Limit(n) => Some(*n),
+            Cut::None => None,
+        }
+    }
 }
 
 /// Вызов инструмента в слоте: всё, что нужно замыканию.
@@ -312,6 +405,55 @@ struct ToolJob {
     decision: Value,
 }
 
+impl ToolJob {
+    /// Флаги вызова, известные до инструмента (D106, Ruling m2 ревью задачи 5): `private`
+    /// и `external` — по путям решения и спецификации, как в [`Live::tool`] (смена класса
+    /// пути после решения — отказ вызова); `untrusted` — по происхождениям без метки
+    /// самого результата: её даёт только инструмент.
+    fn exposure_before(&self) -> Exposure {
+        let spec = self.tool.spec();
+        let native = spec.kind != ToolKind::Exec;
+        let origins = origins_of(
+            spec,
+            &self.subjects,
+            &self.raw,
+            &self.planned,
+            &self.roots,
+            None,
+        );
+        Exposure {
+            untrusted: untrusted_origin(&origins),
+            private: native && self.planned.iter().any(|p| !p.inside),
+            external: native && spec.risk == RiskClass::Network,
+        }
+    }
+
+    /// Вызов с внешней связью (Ruling сомнения 1 прохода fix-5): только он получает запись
+    /// `rule_of_two` при всех трёх свойствах. Это `risk = Network`, инструмент `web_*` и
+    /// команда (`Exec`), классифицированная как сетевая или неопределённая: сегмент
+    /// неразобран, метка `unparsed` или команды в предметах нет. Чтение и правка в
+    /// проекте, локальная команда, `finish`, `ask_user`, `request_grant` — без внешней
+    /// связи. Свойства экспозиции это не меняет: `bash` в них по-прежнему не входит.
+    fn external_link(&self) -> bool {
+        external_link(self.tool.spec(), &self.subjects)
+    }
+}
+
+/// Условие [`ToolJob::external_link`] по спецификации и предметам вызова.
+fn external_link(spec: &ToolSpec, s: &Subjects) -> bool {
+    spec.risk == RiskClass::Network
+        || spec.schema.name.starts_with(WEB_TOOL_PREFIX)
+        || (spec.kind == ToolKind::Exec
+            && (s.command.is_none()
+                || s.network
+                || s.segments.iter().any(|g| g.unparsed)
+                || s.irreversible.contains(&irreversible::UNPARSED)))
+}
+
+/// Префикс имён веб-инструментов (`web_fetch`, `web_search`): вызов с внешней связью
+/// независимо от класса риска.
+const WEB_TOOL_PREFIX: &str = "web_";
+
 /// Что делает слот вызова вживую.
 enum Action {
     Tool(Box<ToolJob>),
@@ -321,6 +463,8 @@ enum Action {
     Finish,
     /// Одобренный `request_grant` (D78).
     Grant(Grant),
+    /// `activate_skill`: эффект `skill.load` (R1-C2 D118), мимо `tool_action` и выгрузки.
+    Skill(Box<LoadJob>),
 }
 
 /// Подготовленный к запуску слот.
@@ -328,6 +472,8 @@ struct Job {
     slot: EffectSlot,
     spec: EffectSpec,
     call_id: String,
+    /// Имя инструмента для событий `tool.*` (у `activate_skill` имя эффекта другое).
+    tool: String,
     action: Action,
     journal: Journal,
     run: RunId,
@@ -338,6 +484,9 @@ struct Job {
     crash: Option<CrashHook>,
     /// Аргументы `finish` принятого вызова.
     finish: Option<FinishArgs>,
+    /// Экспозиция на начало пакета (D106): вызов с внешней связью при всех трёх свойствах
+    /// пишет запись аудита.
+    exposure: Exposure,
 }
 
 /// Итог запуска слота.
@@ -388,6 +537,8 @@ pub async fn run_tools(
         trust_refused: env.trust_refused,
         taint: env.taint.clone(),
         grants: env.grants.as_ref().clone(),
+        exposure: env.exposure,
+        skills: env.active_skills.clone(),
     };
     let mut out = ToolsOutcome::default();
     batch(ctx, j, reg, env, calls, sig, &mut slots, &mut st, &mut out).await?;
@@ -559,7 +710,10 @@ fn is_read(reg: &ToolRegistry, pc: &PlannedCall) -> bool {
 
 /// Встроенные инструменты, которые исполняет сам пакет.
 fn is_runtime_tool(name: &str) -> bool {
-    matches!(name, FINISH_TOOL | ASK_USER_TOOL | REQUEST_GRANT_TOOL)
+    matches!(
+        name,
+        FINISH_TOOL | ASK_USER_TOOL | REQUEST_GRANT_TOOL | ACTIVATE_SKILL_TOOL
+    )
 }
 
 /// Подготовка вызова `i`: записанное решение, иначе политика (D92, D98).
@@ -581,17 +735,35 @@ async fn prepare(
         CallVerdict::Reuse(text) => return Ok(Prep::Done(result(call, text.clone(), false))),
         CallVerdict::Run => {}
     }
-    let Some(tool) = reg.get(&call.name) else {
-        return Ok(Prep::Done(result(
-            call,
-            unknown_tool_text(&call.name),
-            true,
-        )));
-    };
     let key = slot_ref(slots, i)?.key().clone();
     let run = |slots: &mut [Option<EffectSlot>], action, finish| -> Result<Prep, EffectError> {
         let slot = take(slots, i)?;
         Ok(Prep::Run(Box::new(job(slot, call, action, j, env, finish))))
+    };
+    let Some(tool) = reg.get(&call.name) else {
+        // Квитанция `skill.load` под ключом вызова реплеится и тогда, когда скиллы
+        // выключены после старта run (D92, Minor 4 финального ревью скиллов): итог вызова уже
+        // записан, и реплей не зависит от реестра.
+        if call.name == ACTIVATE_SKILL_TOOL
+            && let Some(recorded) = recorded_skill_load(ctx, &key, true).await?
+        {
+            return match plan_activation(
+                env.skills.as_deref(),
+                &st.skills,
+                &call.arguments,
+                Some(&recorded),
+                activation_limit(env),
+            ) {
+                Activation::Done { text, is_error } => Ok(Prep::Done(result(call, text, is_error))),
+                Activation::Load(job) => run(slots, Action::Skill(job), None),
+            };
+        }
+        // Снятый с исполнения инструмент замороженного префикса (выключен конфигурацией
+        // после старта run) — текст причины от того, кто его снял; иначе `unknown tool`.
+        let text = reg
+            .withdrawn(&call.name)
+            .map_or_else(|| unknown_tool_text(&call.name), str::to_owned);
+        return Ok(Prep::Done(result(call, text, true)));
     };
     match call.name.as_str() {
         FINISH_TOOL | ASK_USER_TOOL => {
@@ -619,6 +791,24 @@ async fn prepare(
             };
         }
         REQUEST_GRANT_TOOL => return prepare_grant(ctx, env, call, &key, slots, i, j).await,
+        ACTIVATE_SKILL_TOOL => {
+            if let Gate::Deny(reason) = gate(env.mode, tool.spec()) {
+                return Ok(Prep::Done(result(call, denied_text(reason), true)));
+            }
+            // Записанный `skill.load` под ключом вызова реплеится (D92), что бы ни стало с
+            // каталогом с тех пор.
+            let recorded = recorded_skill_load(ctx, &key, false).await?;
+            return match plan_activation(
+                env.skills.as_deref(),
+                &st.skills,
+                &call.arguments,
+                recorded.as_ref(),
+                activation_limit(env),
+            ) {
+                Activation::Done { text, is_error } => Ok(Prep::Done(result(call, text, is_error))),
+                Activation::Load(job) => run(slots, Action::Skill(job), None),
+            };
+        }
         _ => {}
     }
 
@@ -845,6 +1035,27 @@ async fn started_paths(
 /// Сколько событий после намерения просматривается в поисках `tool.started`: слот пишет
 /// его сразу после намерения, между ними — только события соседних слотов группы чтений.
 const STARTED_SCAN: usize = 1024;
+
+/// Аргументы эффекта `skill.load`, записанного под ключом вызова `activate_skill` (D92);
+/// `receipt` — только с квитанцией (итог вызова записан).
+async fn recorded_skill_load(
+    ctx: &mut RunCtx,
+    key: &EffectKey,
+    receipt: bool,
+) -> Result<Option<Value>, EffectError> {
+    let row = ctx.store().effect(ctx.run_id(), key).await;
+    Ok(observe_store(ctx, row)?
+        .filter(|r| r.name == crate::skills::SKILL_LOAD_EFFECT && (!receipt || r.result.is_some()))
+        .map(|r| r.args))
+}
+
+/// Предел блока `activate_skill` — по окну run (D169), как предел слота у прочих
+/// инструментов; без окна — `output_limit` инструмента.
+fn activation_limit(env: &ToolEnv) -> usize {
+    env.spill.map_or(crate::skills::SKILL_OUTPUT_LIMIT, |c| {
+        crate::skills::skill_output_limit(c.n_ctx)
+    })
+}
 
 /// Записанный ответ на прерывание доверия вызова (D83, D92): `Some` — исход вызова
 /// (пауза или отказ), `None` — решать дальше (доверие дано или прерывания нет). Ответ
@@ -1178,6 +1389,22 @@ fn untrusted_line(origins: &[String]) -> String {
     format!("{UNTRUSTED_MARK}{}]", origins.join(", "))
 }
 
+/// Дописать строку слота отдельной строкой к `content` и к `digest`, если он есть: длинный
+/// результат пакет показывает через `digest` (D86), и строка слота не должна теряться
+/// (I1 ревью задачи 8).
+fn push_line(out: &mut ToolOutput, line: &str) {
+    let push = |s: &mut String| {
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(line);
+    };
+    push(&mut out.content);
+    if let Some(d) = out.digest.as_mut() {
+        push(d);
+    }
+}
+
 /// Строка о нарушенном постусловии (TOOL-004).
 fn postcondition_text(what: &str) -> String {
     format!("{POSTCONDITION_FAILED}{what}]")
@@ -1224,6 +1451,10 @@ pub(crate) fn text_samples() -> Vec<(&'static str, String)> {
         ("runtime/tools.path_changed", PATH_CHANGED.to_owned()),
         ("runtime/tools.postcondition", postcondition_text("p")),
         ("runtime/tools.runtime_only", runtime_only_text("t")),
+        (
+            "runtime/tools.secret_no_checkpoint",
+            SECRET_NO_CHECKPOINT.to_owned(),
+        ),
         (
             "runtime/tools.timeout",
             timeout_text(Duration::from_millis(1500)),
@@ -1282,6 +1513,10 @@ fn tool_action(
             call_id: call.id.clone(),
             effect_key: key.clone(),
             paths: planned.clone(),
+            // Ставит слот от старта вызова (D107).
+            deadline: None,
+            // Предел слота на этом окне, а не `output_limit` инструмента (I2 ревью задачи 8).
+            output_budget: cut.limit(),
         },
         timeout: spec.timeout,
         cut,
@@ -1305,18 +1540,24 @@ fn job(
     env: &ToolEnv,
     finish: Option<FinishArgs>,
 ) -> Job {
-    let class = match &action {
-        Action::Tool(t) => t.tool.spec().class,
-        Action::Answer(_) | Action::Finish | Action::Grant(_) => EffectClass::Pure,
-    };
-    Job {
-        slot,
-        spec: EffectSpec {
-            class,
+    let spec = match &action {
+        Action::Skill(l) => l.spec(),
+        Action::Tool(t) => EffectSpec {
+            class: t.tool.spec().class,
             name: call.name.clone(),
             args: call.arguments.clone(),
         },
+        Action::Answer(_) | Action::Finish | Action::Grant(_) => EffectSpec {
+            class: EffectClass::Pure,
+            name: call.name.clone(),
+            args: call.arguments.clone(),
+        },
+    };
+    Job {
+        slot,
+        spec,
         call_id: call.id.clone(),
+        tool: call.name.clone(),
         action,
         journal: j.clone(),
         run: env.run,
@@ -1324,6 +1565,7 @@ fn job(
         fault: env.fault.clone(),
         crash: env.crash.clone(),
         finish,
+        exposure: env.exposure,
     }
 }
 
@@ -1348,21 +1590,32 @@ async fn read_or_open(ctx: &RunCtx, int: &Interrupt) -> Result<Option<Value>, St
     }
 }
 
-/// Результат отказа пользователя (D16): `denied by user: {note}`, заметка экранируется.
+/// Результат отказа пользователя (D16): `denied by user: {note}`. Заметка — ввод
+/// пользователя: очищается уровнем `Clean::Input` (SEC-051, D102; Minor 3 повторного ревью
+/// финального прохода), как ответ `ask_user`, и экранируется.
 fn denied_by_user(v: &Value) -> String {
     match v.get("note").and_then(Value::as_str) {
-        Some(note) if !note.is_empty() => format!("denied by user: {}", escape_untrusted(note)),
+        Some(note) if !note.is_empty() => format!(
+            "denied by user: {}",
+            escape_untrusted(&clean_invisible(note, Clean::Input).0)
+        ),
         _ => "denied by user".to_owned(),
     }
 }
 
 /// Ответ пользователя на `ask_user` (D16: `{"answer": str}`); иная форма — канонический JSON.
+/// Текст ответа пользователя на `ask_user` — очищенный уровнем `Clean::Input` (SEC-051, D102;
+/// Minor 9 финального ревью скиллов), как задача run и ввод `inbox`; запасная форма тоже
+/// (Minor 3 повторного ревью финального прохода): `serde_json` не экранирует bidi и нулевую
+/// ширину. Чистая функция записанного ответа: реплей даёт тот же текст.
 fn answer(v: &Value) -> String {
     match v.get("answer").and_then(Value::as_str) {
-        Some(a) => a.to_owned(),
+        Some(a) => clean_invisible(a, Clean::Input).0.into_owned(),
         None => {
             tracing::warn!("ответ ask_user без строкового answer");
-            canonical_json(v)
+            clean_invisible(&canonical_json(v), Clean::Input)
+                .0
+                .into_owned()
         }
     }
 }
@@ -1393,12 +1646,25 @@ fn finish_part(
     match ex.result {
         Ok(v) => Ok(match serde_json::from_value::<Receipt>(v.clone()) {
             Ok(r) => {
+                note_exposure(call, &r, st, out);
                 st.taint.extend(r.origins);
                 if let Some(g) = r.grant {
                     st.grants.push(g.clone());
                     out.grants.push(g);
                 }
-                result(call, escape_untrusted(&r.out.content), r.out.is_error)
+                if let Some(s) = r.skill {
+                    st.skills.insert(s.name.clone());
+                    out.skills
+                        .push(s.active(Some(call.id.clone()), za_protocol::skill_by::MODEL));
+                }
+                // Результат `activate_skill` собран рантаймом: тело и атрибуты в нём уже
+                // экранированы, а обёртка `<skill_content>` — разметка рантайма (D118).
+                let content = if call.name == ACTIVATE_SKILL_TOOL {
+                    r.out.content
+                } else {
+                    escape_untrusted(&r.out.content)
+                };
+                result(call, content, r.out.is_error)
             }
             // Значение другой формы — решение `unknown_outcome` (D16).
             Err(_) => result(call, escape_untrusted(&canonical_json(&v)), false),
@@ -1406,6 +1672,20 @@ fn finish_part(
         Err(EffectError::Failed(m)) => Ok(result(call, escape_untrusted(&m), true)),
         Err(e) => Err(e),
     }
+}
+
+/// Флаги исполненного вызова в итог пакета (D106): объединение флагов, вызов с новым
+/// флагом (по снимку начала пакета) и вызов с записью аудита `rule_of_two` — по
+/// квитанции, вживую и при реплее одинаково.
+fn note_exposure(call: &ToolCall, r: &Receipt, st: &BatchState, out: &mut ToolsOutcome) {
+    let f = r.exposure();
+    if st.exposure.adds(f) {
+        out.exposure_calls.push(call.id.clone());
+    }
+    if r.rule_of_two {
+        out.rule_of_two.push(call.id.clone());
+    }
+    out.exposure = out.exposure.union(f);
 }
 
 /// Сигнал, уже ждущий в канале, без ожидания.
@@ -1500,6 +1780,7 @@ async fn execute(jb: Job) -> Executed {
         slot,
         spec,
         call_id,
+        tool,
         action,
         journal,
         run,
@@ -1507,9 +1788,10 @@ async fn execute(jb: Job) -> Executed {
         fault,
         crash,
         finish: _,
+        exposure,
     } = jb;
     let key = slot.key().0.clone();
-    let name = spec.name.clone();
+    let name = tool;
     let (halt_tx, mut halt_rx) = oneshot::channel::<()>();
     let mut failure: Option<StoreError> = None;
     let fref = &mut failure;
@@ -1522,6 +1804,7 @@ async fn execute(jb: Job) -> Executed {
         key,
         fault,
         crash,
+        exposure,
     };
     let result = {
         let fut = slot.run(spec, move || async move {
@@ -1553,6 +1836,8 @@ struct Live {
     key: String,
     fault: Option<FaultHook>,
     crash: Option<CrashHook>,
+    /// Экспозиция на начало пакета (D106).
+    exposure: Exposure,
 }
 
 impl Live {
@@ -1603,23 +1888,45 @@ impl Live {
     ) -> Result<Value, String> {
         let started = Instant::now();
         let mut halt = Some(halt);
-        let (args, decision, paths) = match &action {
+        let (args, decision, paths, before, link) = match &action {
             Action::Tool(t) => (
                 mask_value(t.masker.as_deref(), &t.args),
                 t.decision.clone(),
                 path_classes(&t.raw, &t.planned),
+                t.exposure_before(),
+                t.external_link(),
             ),
-            _ => (Value::Null, Value::Null, Value::Null),
+            _ => (
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Exposure::default(),
+                false,
+            ),
         };
+        // D106, Ruling I1, m1, m2 ревью задачи 5, Ruling сомнения 1 fix-5: вызов с внешней
+        // связью, исполняемый при всех трёх свойствах (снимок начала пакета плюс вклад
+        // вызова), — запись аудита до вызова, вместе с `tool.started`: отмена посреди вызова
+        // её не теряет, а повтор замыкания после сбоя процесса не дублирует (одна запись на
+        // ключ эффекта). Реплей квитанции замыкание не запускает. Без записи вызов не
+        // исполняется — как грант (SEC-090).
+        let at_start = self.exposure.union(before);
+        let marked = link && at_start.all();
+        if marked && !self.rule_of_two(at_start, fref).await {
+            return Err(JOURNAL_FAILED.to_owned());
+        }
         let mut payload =
             json!({ "call_id": self.call_id, "name": self.name, "effect_key": self.key });
-        if let Some(o) = payload.as_object_mut()
-            && !args.is_null()
-        {
-            o.insert("arguments".into(), args);
-            o.insert("decision".into(), decision);
-            // Разрешённые пути вызова (D98, I1): при реплее без квитанции сверка с ними.
-            o.insert("paths".into(), paths);
+        if let Some(o) = payload.as_object_mut() {
+            if !args.is_null() {
+                o.insert("arguments".into(), args);
+                o.insert("decision".into(), decision);
+                // Разрешённые пути вызова (D98, I1): при реплее без квитанции сверка с ними.
+                o.insert("paths".into(), paths);
+            }
+            if marked {
+                o.insert(RULE_OF_TWO_MARK.into(), Value::Bool(true));
+            }
         }
         if !self
             .append(EventKind::ToolStarted, Actor::Runtime, payload, false, fref)
@@ -1628,7 +1935,7 @@ impl Live {
             tracing::error!(key = %self.key, "tool.started не записано, инструмент не вызван");
             return Err(JOURNAL_FAILED.to_owned());
         }
-        let receipt = match action {
+        let mut receipt = match action {
             Action::Tool(t) => self.tool(*t, fref, &mut halt).await,
             Action::Answer(a) => Receipt {
                 out: ToolOutput::ok(a),
@@ -1639,7 +1946,26 @@ impl Live {
                 ..Receipt::default()
             },
             Action::Grant(g) => self.grant(g, fref).await?,
+            Action::Skill(l) => self.skill(*l, fref).await,
         };
+        // Третье свойство дала только метка результата (до инструмента её не знать) —
+        // запись после вызова, отметка в `tool.finished`. Без записи результат не
+        // выдаётся: недоверенного содержимого в контексте нет, свойств два; флаги
+        // `private` и `external` исполненного вызова остаются.
+        let at_end = self.exposure.union(receipt.exposure());
+        let mut marked_after = false;
+        if link && !marked && at_end.all() {
+            marked_after = self.rule_of_two(at_end, fref).await;
+            if !marked_after {
+                receipt = Receipt {
+                    out: ToolOutput::error(JOURNAL_FAILED),
+                    private: receipt.private,
+                    external: receipt.external,
+                    ..Receipt::default()
+                };
+            }
+        }
+        receipt.rule_of_two = marked || marked_after;
         let tainted = !receipt.origins.is_empty();
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Инструмент уже отработал: квитанция фиксирует его итог, а ошибка
@@ -1653,20 +1979,87 @@ impl Live {
             tracing::error!(key = %self.key, "tool.finished не записано");
             *fref = Some(StoreError::Io(INJECTED_FAULT.into()));
         } else {
-            self.append(
-                EventKind::ToolFinished,
-                Actor::Tool,
-                json!({ "call_id": self.call_id, "is_error": receipt.out.is_error,
-                    "duration_ms": duration_ms, "tainted": tainted }),
-                tainted,
-                fref,
-            )
-            .await;
+            let mut payload = json!({ "call_id": self.call_id, "is_error": receipt.out.is_error,
+                "duration_ms": duration_ms, "tainted": tainted });
+            if marked_after && let Some(o) = payload.as_object_mut() {
+                o.insert(RULE_OF_TWO_MARK.into(), Value::Bool(true));
+            }
+            self.append(EventKind::ToolFinished, Actor::Tool, payload, tainted, fref)
+                .await;
         }
         serde_json::to_value(&receipt).map_err(|e| {
             tracing::error!(key = %self.key, error = %e, "итог инструмента не сериализуется");
             JOURNAL_FAILED.to_owned()
         })
+    }
+
+    /// Запись аудита `rule_of_two {call_id, tool, exposure, effect_key}` (D106), объект —
+    /// run; одна на ключ эффекта: повтор замыкания после сбоя процесса новой не даёт.
+    /// `false` — запись не удалась (ошибка журнала в `fref`, run встанет на паузу `store`).
+    async fn rule_of_two(&self, exposure: Exposure, fref: &mut Option<StoreError>) -> bool {
+        let injected = self
+            .fault
+            .as_ref()
+            .is_some_and(|h| h(FaultPoint::RuleOfTwoAudit { step: self.step }));
+        let r = if injected {
+            // Тест: ошибка записи аудита, как настоящая.
+            Err(StoreError::Io(INJECTED_FAULT.into()))
+        } else {
+            let a = AuditNew {
+                actor: AUDIT_ACTOR.into(),
+                action: audit_action::RULE_OF_TWO.into(),
+                target: self.run.to_string(),
+                payload: json!({"call_id": self.call_id, "tool": self.name, "exposure": exposure}),
+            };
+            self.journal.store().append_audit_once(a, &self.key).await
+        };
+        match r {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                tracing::info!(key = %self.key, "запись аудита rule_of_two уже есть: повтор вызова");
+                true
+            }
+            Err(e) => {
+                tracing::error!(key = %self.key, error = %e, "запись аудита rule_of_two не удалась");
+                if fref.is_none() {
+                    *fref = Some(e);
+                }
+                false
+            }
+        }
+    }
+
+    /// `activate_skill` (R1-C2 D118): загрузка [`crate::skills::load`] и событие
+    /// `skill.activated {by: "model"}`. Ошибка хранилища — квитанция-отказ без текста
+    /// скилла, run встаёт на паузу `store`.
+    async fn skill(&self, job: LoadJob, fref: &mut Option<StoreError>) -> Receipt {
+        let loaded = match crate::skills::load(job, self.journal.store()).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(key = %self.key, error = %e, "скилл не загружен: ошибка хранилища");
+                if fref.is_none() {
+                    *fref = Some(e);
+                }
+                return Receipt {
+                    out: ToolOutput::error(JOURNAL_FAILED),
+                    ..Receipt::default()
+                };
+            }
+        };
+        if let Some(s) = &loaded.skill {
+            let e = crate::skills::activated_event(self.run, s, za_protocol::skill_by::MODEL);
+            self.append(e.kind, e.actor, e.payload, false, fref).await;
+        }
+        let out = if loaded.is_error {
+            ToolOutput::error(loaded.content)
+        } else {
+            ToolOutput::ok(loaded.content)
+        };
+        Receipt {
+            out,
+            skill: loaded.skill,
+            ..Receipt::default()
+        }
     }
 
     /// Одобренный грант (D78): запись аудита, затем `grant.added`. Без записи аудита
@@ -1709,8 +2102,8 @@ impl Live {
             .await;
         Ok(Receipt {
             out: ToolOutput::ok(granted_text(&g)),
-            origins: Vec::new(),
             grant: Some(g),
+            ..Receipt::default()
         })
     }
 
@@ -1770,6 +2163,13 @@ impl Live {
                 })
             })
             .collect();
+        // D106: нативный вызов, дошедший до инструмента с путём вне проекта, — `private`;
+        // нативный сетевой — `external`. `bash` в свойства не входит. До вызова те же флаги
+        // даёт `ToolJob::exposure_before` (классы путей здесь совпали с решением). Ошибка
+        // самого инструмента флаги не снимает: запрос мог уйти (m3 ревью задачи 5).
+        let native = spec.kind != ToolKind::Exec;
+        let private = native && !outside.is_empty();
+        let external = native && spec.risk == RiskClass::Network;
         if !outside.is_empty() {
             self.append(
                 EventKind::BoundaryOutside,
@@ -1780,7 +2180,8 @@ impl Live {
             )
             .await;
         }
-        // (4) Чекпоинт перед `Edit` и `Exec` (D89).
+        // (4) Чекпоинт перед `Edit` и `Exec` (D89); секретные файлы в него не входят (D103).
+        let mut secret_skipped = false;
         if matches!(spec.kind, ToolKind::Edit | ToolKind::Exec)
             && let Some(cp) = &checkpointer
         {
@@ -1806,7 +2207,11 @@ impl Live {
                 if let Some(r) = &c.reason {
                     o.insert("reason".into(), json!(r));
                 }
+                if !c.secret_skipped.is_empty() {
+                    o.insert("secret_skipped".into(), json!(c.secret_skipped));
+                }
             }
+            secret_skipped = !c.secret_skipped.is_empty();
             self.append(
                 EventKind::CheckpointCreated,
                 Actor::Runtime,
@@ -1816,20 +2221,40 @@ impl Live {
             )
             .await;
         }
-        // (5)–(7) Вызов между точками сбоя.
+        // (5)–(7) Вызов между точками сбоя. Дедлайн вызова — раньше внешнего тайм-аута
+        // (D107): инструмент, соблюдающий его сам, возвращает журнал обращений; внешний
+        // тайм-аут — страховка, при нём future брошен и журнала нет.
         self.crash_at(false, halt).await;
+        cx.deadline = Some(call_deadline(std::time::Instant::now(), timeout));
         let mut out = match tokio::time::timeout(timeout, tool.call(args, cx)).await {
             Ok(o) => o,
-            Err(_) => ToolOutput::error(timeout_text(timeout)),
+            Err(_) => {
+                // Сетевой инструмент обязан вернуться к своему дедлайну (D107): при внешнем
+                // тайм-ауте его журнал обращений брошен вместе с future (M8 ревью задачи 8).
+                if spec.risk == RiskClass::Network {
+                    tracing::warn!(
+                        key = %self.key,
+                        tool = %self.name,
+                        "внешний тайм-аут слота: сетевые обращения вызова не записаны"
+                    );
+                }
+                ToolOutput::error(timeout_text(timeout))
+            }
         };
+        // (6a) Сетевые обращения вызова (D112): события до `tool.finished`, в квитанцию
+        // записи не попадают. Реплей квитанции замыкание не запускает — повтора нет.
+        let requests = std::mem::take(&mut out.requests);
+        self.web_requests(&requests, masker.as_deref(), fref).await;
         self.crash_at(true, halt).await;
+        // Строки слота (здесь и в (8)) идут и в `digest`: длинный результат показывается
+        // им (I1 ревью задачи 8).
+        if secret_skipped {
+            push_line(&mut out, SECRET_NO_CHECKPOINT);
+        }
         // (8) Постусловия (TOOL-004).
         let failed = check_posts(&roots.project, &out.post).await;
         for what in &failed {
-            if !out.content.is_empty() && !out.content.ends_with('\n') {
-                out.content.push('\n');
-            }
-            out.content.push_str(&postcondition_text(what));
+            push_line(&mut out, &postcondition_text(what));
             out.is_error = true;
         }
         // (9) Изменённые файлы.
@@ -1850,12 +2275,23 @@ impl Live {
         // (10) Метки происхождения и невидимые символы (D82, SEC-051).
         let origins = origins_of(&spec, &subjects, &raw, &now, &roots, out.taint.as_deref());
         let tainted = !origins.is_empty();
-        out.content = clean_invisible(&out.content, tainted).into_owned();
+        // D102: прежнее поведение — теги из любого результата, остальное — из помеченного.
+        let level = if tainted {
+            Clean::Untrusted
+        } else {
+            Clean::Tags
+        };
+        out.content = clean_invisible(&out.content, level).0.into_owned();
         out.digest = out
             .digest
-            .map(|d| clean_invisible(&d, tainted).into_owned());
+            .map(|d| clean_invisible(&d, level).0.into_owned());
+        // Метка — первой строкой и у `digest` (I1 ревью задачи 8): длинный результат модель
+        // видит через него, а метка должна быть в первой строке того, что она видит (D110).
+        // Место под строку — в `DIGEST_RESERVE`.
         if tainted {
-            out.content = format!("{}\n{}", untrusted_line(&origins), out.content);
+            let mark = untrusted_line(&origins);
+            out.content = format!("{mark}\n{}", out.content);
+            out.digest = out.digest.map(|d| format!("{mark}\n{d}"));
         }
         // (11) Маскировка секретов (D90): до квитанции и до выгрузки.
         if let Some(m) = masker.as_deref() {
@@ -1867,7 +2303,36 @@ impl Live {
         Receipt {
             out,
             origins,
-            grant: None,
+            private,
+            external,
+            ..Receipt::default()
+        }
+    }
+
+    /// События `web.request {call_id, tool, ...NetRequest}` (D112, SEC-045) — тем же путём,
+    /// что `boundary.outside`. Строки маскируются (D90): `url`, `final_url` и `reason` (в
+    /// причине бывает адрес редиректа) могут нести секрет из параметра запроса.
+    async fn web_requests(
+        &self,
+        requests: &[NetRequest],
+        masker: Option<&SecretMasker>,
+        fref: &mut Option<StoreError>,
+    ) {
+        for r in requests {
+            let mut payload = match serde_json::to_value(r) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(key = %self.key, error = %e, "запись обращения не сериализуется");
+                    continue;
+                }
+            };
+            if let Some(o) = payload.as_object_mut() {
+                o.insert("call_id".into(), json!(self.call_id));
+                o.insert("tool".into(), json!(self.name));
+            }
+            let payload = mask_value(masker, &payload);
+            self.append(EventKind::WebRequest, Actor::Runtime, payload, false, fref)
+                .await;
         }
     }
 }
@@ -1875,6 +2340,12 @@ impl Live {
 /// Происхождения недоверенного содержимого результата (D82): внешний путь чтения (и по
 /// гранту, Ruling 7.24), у `Exec` — любой внешний путь и сетевая команда, метка самого
 /// инструмента или `spec.tainted`.
+///
+/// Собственное происхождение инструмента (`own`, например `web`) заменяет общие `tool` и
+/// `network` от спецификации (`spec.tainted`, `risk = Network`; R1-C2 D110): инструмент
+/// знает точнее, откуда содержимое, и первая строка результата веба —
+/// `[untrusted content: web]`. По предметам вызова — как прежде: `outside_project` по путям,
+/// `network` у сетевой команды (`bash` с меткой `outside_project` и сетевым сегментом).
 fn origins_of(
     spec: &ToolSpec,
     s: &Subjects,
@@ -1896,6 +2367,7 @@ fn origins_of(
     }
     if let Some(o) = own {
         set.insert(o.to_owned());
+        return set.into_iter().collect();
     }
     if spec.tainted {
         set.insert(taint_origin::TOOL.to_owned());
@@ -1905,30 +2377,6 @@ fn origins_of(
         set.insert(taint_origin::NETWORK.to_owned());
     }
     set.into_iter().collect()
-}
-
-/// Невидимые символы (SEC-051): теги U+E0000–U+E007F — из любого результата; нулевой
-/// ширины и bidi — из помеченного (U+FEFF в самом начале остаётся: это BOM).
-fn clean_invisible(s: &str, tainted: bool) -> Cow<'_, str> {
-    let drop = |i: usize, c: char| {
-        let u = c as u32;
-        (0xE0000..=0xE007F).contains(&u)
-            || (tainted
-                && ((0x200B..=0x200F).contains(&u)
-                    || (0x2060..=0x2064).contains(&u)
-                    || (u == 0xFEFF && i > 0)
-                    || (0x202A..=0x202E).contains(&u)
-                    || (0x2066..=0x2069).contains(&u)))
-    };
-    if !s.char_indices().any(|(i, c)| drop(i, c)) {
-        return Cow::Borrowed(s);
-    }
-    Cow::Owned(
-        s.char_indices()
-            .filter(|&(i, c)| !drop(i, c))
-            .map(|(_, c)| c)
-            .collect(),
-    )
 }
 
 /// Проверка постусловий (TOOL-004) в `spawn_blocking`; итог — описания нарушенных.
@@ -1998,6 +2446,7 @@ async fn shorten(out: ToolOutput, cut: Cut) -> ToolOutput {
         taint,
         digest,
         post,
+        requests,
     } = out;
     let work = tokio::task::spawn_blocking(move || {
         let escaped = escape_untrusted(&content);
@@ -2035,6 +2484,7 @@ async fn shorten(out: ToolOutput, cut: Cut) -> ToolOutput {
             taint,
             digest: None,
             post,
+            requests,
         },
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         Err(e) => {
@@ -2070,6 +2520,12 @@ impl Tool for Builtin {
         let name = self.spec.schema.name.clone();
         Box::pin(async move { ToolOutput::error(runtime_only_text(&name)) })
     }
+}
+
+/// Встроенный инструмент со своей спецификацией (`activate_skill`, R1-C2 D118): исполняет
+/// пакет, прямой вызов — ошибка.
+pub(crate) fn runtime_tool(spec: ToolSpec) -> Arc<dyn Tool> {
+    Arc::new(Builtin { spec })
 }
 
 fn builtin(schema: ToolSchema, roles: Vec<RunRole>, min_tier: Tier) -> Arc<dyn Tool> {
@@ -2162,6 +2618,77 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 mod tests {
     use super::*;
 
+    /// Ruling сомнения 1 прохода fix-5: внешняя связь — `risk = Network`, `web_*`, команда
+    /// сетевая или неопределённая (неразобранный сегмент, метка `unparsed`, нет команды).
+    #[test]
+    fn external_link_cases() {
+        let spec = |name: &str, kind: ToolKind, risk: RiskClass| ToolSpec {
+            schema: ToolSchema {
+                name: name.into(),
+                description: String::new(),
+                parameters: json!({}),
+            },
+            class: EffectClass::ReadOnly,
+            kind,
+            approval: Approval::Mode,
+            risk,
+            roles: vec![RunRole::Top],
+            min_tier: Tier::Small,
+            timeout: BUILTIN_TIMEOUT,
+            output_limit: None,
+            tainted: false,
+        };
+        let cmd = |c: &str| Subjects {
+            command: Some(c.into()),
+            segments: za_core::shell::segments(c, za_core::shell::Dialect::Bash),
+            ..Subjects::default()
+        };
+        let none = Subjects::default();
+        let read = spec("read", ToolKind::Read, RiskClass::Read);
+        let bash = spec("bash", ToolKind::Exec, RiskClass::Exec);
+        assert!(external_link(
+            &spec("x", ToolKind::Read, RiskClass::Network),
+            &none
+        ));
+        assert!(external_link(
+            &spec("x", ToolKind::Exec, RiskClass::Network),
+            &cmd("ls")
+        ));
+        assert!(external_link(
+            &spec("web_search", ToolKind::Read, RiskClass::Read),
+            &none
+        ));
+        assert!(!external_link(&read, &none));
+        assert!(!external_link(
+            &spec("edit", ToolKind::Edit, RiskClass::LocalWrite),
+            &none
+        ));
+        assert!(!external_link(
+            &spec(FINISH_TOOL, ToolKind::Control, RiskClass::Read),
+            &none
+        ));
+        // Команда: локальная — нет; сетевая, неразобранная, с меткой `unparsed`, без
+        // команды в предметах — да.
+        assert!(!external_link(&bash, &cmd("ls -la")));
+        let net = Subjects {
+            network: true,
+            ..cmd("curl https://a.test/")
+        };
+        assert!(external_link(&bash, &net));
+        assert!(external_link(&bash, &cmd("echo 'a")));
+        let label = Subjects {
+            irreversible: vec![irreversible::UNPARSED],
+            ..cmd("ls")
+        };
+        assert!(external_link(&bash, &label));
+        assert!(external_link(&bash, &none));
+        // `web_` — префикс имени, не подстрока.
+        assert!(!external_link(
+            &spec("my_web_x", ToolKind::Read, RiskClass::Read),
+            &none
+        ));
+    }
+
     #[test]
     fn timeout_text_whole_and_fraction() {
         assert_eq!(timeout_text(Duration::from_secs(1)), "timeout after 1 s");
@@ -2193,13 +2720,30 @@ mod tests {
         assert!(finish_args(&json!({"status": "ok", "result": "r"})).is_err());
     }
 
+    /// D106, решение заказчика «не спрашивать» (m5 ревью задачи 5): экспозиция вопросов
+    /// не добавляет — причины `rule_of_two` в порядке причин одобрения нет.
     #[test]
-    fn invisible_chars_cleaned() {
-        let tag = "a\u{E0041}b";
-        assert_eq!(clean_invisible(tag, false), "ab");
-        let zw = "\u{FEFF}x\u{200B}y\u{202E}z\u{FEFF}";
-        assert_eq!(clean_invisible(zw, false), zw);
-        assert_eq!(clean_invisible(zw, true), "\u{FEFF}xyz");
+    fn reason_order_has_no_rule_of_two() {
+        assert!(!REASON_ORDER.contains(&audit_action::RULE_OF_TWO));
+        assert_eq!(REASON_ORDER.len(), 6);
+    }
+
+    /// Квитанция без признаков R1-C2 читается: флагов и отметки `rule_of_two` нет; отметка
+    /// пишется только истинной.
+    #[test]
+    fn receipt_rule_of_two_flag_roundtrip() {
+        let r: Receipt =
+            serde_json::from_value(json!({"content": "c", "is_error": false, "external": true}))
+                .unwrap();
+        assert!(r.external && !r.private && !r.rule_of_two);
+        let marked = Receipt {
+            rule_of_two: true,
+            ..r
+        };
+        let v = serde_json::to_value(&marked).unwrap();
+        assert_eq!(v["rule_of_two"], true);
+        let plain = serde_json::to_value(Receipt::default()).unwrap();
+        assert!(plain.get("rule_of_two").is_none(), "{plain}");
     }
 
     #[test]
@@ -2208,5 +2752,90 @@ mod tests {
             serde_json::from_value(json!({"content": "c", "is_error": false})).unwrap();
         assert_eq!(r.out.content, "c");
         assert!(r.origins.is_empty() && r.grant.is_none());
+    }
+
+    /// D110: своё происхождение заменяет `tool` и `network` от спецификации; по предметам
+    /// вызова — как прежде (`outside_project` по путям, `network` сетевой команды).
+    #[test]
+    fn own_origin_replaces_spec_origins_only() {
+        let spec = |kind: ToolKind, risk: RiskClass, tainted: bool| ToolSpec {
+            schema: ToolSchema {
+                name: "t".into(),
+                description: String::new(),
+                parameters: json!({}),
+            },
+            class: EffectClass::ReadOnly,
+            kind,
+            approval: Approval::Mode,
+            risk,
+            roles: vec![RunRole::Top],
+            min_tier: Tier::Small,
+            timeout: BUILTIN_TIMEOUT,
+            output_limit: None,
+            tainted,
+        };
+        let roots = Roots {
+            project: PathBuf::from("/p"),
+            za_home: PathBuf::from("/h"),
+        };
+        let raw = [RawPath {
+            arg: "/x/a".into(),
+            access: Access::Read,
+        }];
+        let outside = [ResolvedPath {
+            path: PathBuf::from("/x/a"),
+            inside: false,
+            protected: false,
+        }];
+        let net = Subjects {
+            network: true,
+            ..Subjects::default()
+        };
+        let web = spec(ToolKind::Read, RiskClass::Network, true);
+        let none = Subjects::default();
+        let of = |s: &ToolSpec, sub: &Subjects, own: Option<&str>, out: bool| {
+            let (r, p): (&[RawPath], &[ResolvedPath]) =
+                if out { (&raw, &outside) } else { (&[], &[]) };
+            origins_of(s, sub, r, p, &roots, own)
+        };
+        assert_eq!(of(&web, &net, None, false), ["network", "tool"]);
+        assert_eq!(of(&web, &net, Some("web"), false), ["web"]);
+        assert_eq!(
+            of(&web, &net, Some("web"), true),
+            ["outside_project", "web"]
+        );
+        // `bash`: сетевая команда с меткой `outside_project` — `network` остаётся.
+        let bash = spec(ToolKind::Exec, RiskClass::Exec, false);
+        assert_eq!(
+            of(&bash, &net, Some("outside_project"), true),
+            ["network", "outside_project"]
+        );
+        assert_eq!(of(&bash, &none, Some("network"), false), ["network"]);
+    }
+
+    /// I1/I2 ревью задачи 8: запас `DIGEST_RESERVE` покрывает строки слота вокруг `digest`
+    /// в худшем случае — все известные происхождения и самый длинный ключ эффекта.
+    #[test]
+    fn digest_reserve_covers_slot_lines() {
+        use crate::context::{SPILL_DIGEST_POINTER, SPILL_DIR, SPILL_SEARCH};
+        let all: Vec<String> = [
+            taint_origin::OUTSIDE_PROJECT,
+            taint_origin::UNTRUSTED_PROJECT,
+            taint_origin::NETWORK,
+            taint_origin::TOOL,
+            taint_origin::WEB,
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mark = untrusted_line(&all).len() + 1;
+        let key = EffectKey::derive(RunId::new(), u64::MAX, u64::MAX);
+        let path = format!("{SPILL_DIR}/{}.txt", spill_name(&key));
+        // Указатель и перевод строки перед ним (`spill_digest`).
+        let pointer = format!("{SPILL_DIGEST_POINTER}{SPILL_SEARCH}{path}]").len() + 1;
+        assert!(
+            mark + pointer <= za_core::DIGEST_RESERVE,
+            "{mark} + {pointer} > {}",
+            za_core::DIGEST_RESERVE
+        );
     }
 }

@@ -58,20 +58,40 @@ pub struct ContextBudget {
     pub memory: u32,
     pub output_reserve: u32,
     pub compaction_reserve: u32,
+    /// Каталог скиллов в описании `activate_skill` (R1-C2 D117): своя колонка, а не
+    /// остаток слота Tools — нативные, встроенные и веб занимают слот 16k уже без каталога.
+    /// Значения по умолчанию нет (m2 ревью задачи 13): колонка зависит от окна, и запись
+    /// без поля — ошибка разбора, а не 1500 на любом окне. Бюджет не хранится — он
+    /// строится [`ContextBudget::for_context`] по `n_ctx`.
+    pub catalog: u32,
 }
+
+/// Потолок каталога скиллов на окне 64k+, токены (D117).
+pub const CATALOG_LIMIT: u32 = 1500;
 
 impl ContextBudget {
     /// Строка таблицы 2.3 по `n_ctx` (D40): меньше 16384 — 8k; меньше 32768 — 16k;
-    /// меньше 65536 — 32k; иначе 64k+. `memory` — [`memory_budget`] (не дубль).
+    /// меньше 65536 — 32k; иначе 64k+. `memory` — [`memory_budget`] (не дубль). Каталог
+    /// скиллов (D117): 16k — 300, 32k — 600, 64k+ — [`CATALOG_LIMIT`]; у окна 8k (там
+    /// тир small, `activate_skill` и каталога нет — он виден только при `--tier
+    /// standard`) — как у 16k.
+    ///
+    /// Примечание к строкам 8k и 16k (R1-C2 D169): слот Tools 550 и 800 рассчитан на набор
+    /// tier small, и рантайм читает его только у small (`small_instructions`). Набор
+    /// standard на окне 16k бывает только по `--tier`: его пределы CI — по частям
+    /// (`standard_tools_cases`): описания без каталога не больше 1700 на 16k и 32k
+    /// (`STANDARD_TOOLS_LIMIT`; слот окна 32k, 1500, по осторожной оценке уже превышен),
+    /// каталог — не больше колонки окна; резерв вывода хода standard на 16k — 5120 (D40),
+    /// рабочая часть окна ≈ 9,7k.
     pub fn for_context(n_ctx: u32) -> ContextBudget {
-        let (prompt, tools, output_reserve, compaction_reserve) = if n_ctx < 16_384 {
-            (800, Some(550), 1000, 1000)
+        let (prompt, tools, output_reserve, compaction_reserve, catalog) = if n_ctx < 16_384 {
+            (800, Some(550), 1000, 1000, 300)
         } else if n_ctx < 32_768 {
-            (900, Some(800), 2000, 1500)
+            (900, Some(800), 2000, 1500, 300)
         } else if n_ctx < 65_536 {
-            (2000, Some(1500), 4000, 3000)
+            (2000, Some(1500), 4000, 3000, 600)
         } else {
-            (3000, None, 8000, 6000)
+            (3000, None, 8000, 6000, CATALOG_LIMIT)
         };
         ContextBudget {
             n_ctx,
@@ -80,6 +100,7 @@ impl ContextBudget {
             memory: memory_budget(n_ctx),
             output_reserve,
             compaction_reserve,
+            catalog,
         }
     }
 }

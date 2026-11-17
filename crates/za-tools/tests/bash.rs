@@ -54,6 +54,8 @@ fn cx(root: &Path, run: RunId) -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 1, 1),
         paths: Vec::new(),
+        deadline: None,
+        output_budget: None,
     }
 }
 
@@ -644,6 +646,34 @@ fn subjects_mark_outside_and_network() {
     let s = tool.subjects(&json!({"cmd": "rm -rf build"}));
     assert_eq!(s.irreversible, ["delete"]);
     assert!(tool.subjects(&json!({})).command.is_none());
+}
+
+/// R1-C2 D104, D105: хосты сетевых сегментов для правил по домену — нормализованные
+/// (`za_core::net::shell_hosts`), неопределённый хост — признак, а не пропуск.
+#[test]
+fn subjects_hosts_for_domain_rules() {
+    let tool = bash_tool(
+        Arc::new(DirectRunner),
+        fake_shell(Dialect::Bash),
+        home(Path::new("/p/x")),
+    );
+    let s = tool.subjects(&json!({"cmd": "curl https://EVIL.test./x && ssh me@Ok.Test"}));
+    assert_eq!(s.hosts, ["evil.test", "ok.test"]);
+    assert!(!s.hosts_unknown);
+    for cmd in [
+        "curl $URL",
+        "ssh -J jump.test me@ok.test",
+        "curl https://1.2.3.4.5/",
+    ] {
+        let s = tool.subjects(&json!({ "cmd": cmd }));
+        assert!(s.hosts_unknown, "{cmd}");
+    }
+    // Не сетевая команда — хостов нет.
+    let s = tool.subjects(&json!({"cmd": "echo https://evil.test"}));
+    assert!(s.hosts.is_empty() && !s.hosts_unknown, "{s:?}");
+    // Страховка лексера (`unparsed`) — хост неизвестен.
+    let s = tool.subjects(&json!({"cmd": "curl\u{a0}https://ok.test/"}));
+    assert!(s.hosts_unknown, "{s:?}");
 }
 
 #[test]

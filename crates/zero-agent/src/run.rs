@@ -25,8 +25,23 @@
 //! у доверенного проекта — `AGENTS.md` или `CLAUDE.md`. Resume сверяет якорь аудита из
 //! снимка и передаёт отличия доверия, политики и грантов через `ResumeChange`. Пауза
 //! `needs_trust` — код 3.
+//!
+//! R1-C2 (задача 14): `run` строит сетевой шлюз один раз на процесс и регистрирует
+//! `web_fetch` и `web_search` ([`crate::web`]; веб не выключен глобально или проектом,
+//! поиск — только при `[web.search] url`), подключает извлекатель в подпроцессе
+//! ([`crate::extract::RunExtractor`]: PDF в `read` и `web_fetch`, HTML у `web_fetch`) и
+//! каталог скиллов ([`crate::skills::catalog`] после проверки доверия; пустой каталог —
+//! без capability `skills` и `activate_skill`, m7 ревью задачи 13). Resume регистрирует
+//! веб-инструменты, только если они есть в замороженном префиксе run (новых инструментов
+//! посреди run нет, а выключенный сейчас веб не включается); веб-инструмент префикса,
+//! выключенный конфигурацией после старта, снимается с исполнения: вызов отвечает модели
+//! `<имя>: web tools are disabled by configuration since this run started` (Ruling «Задача
+//! 15»), в stderr — строка о выключенном вебе. `policy.loaded` получает
+//! `web_disabled` и `search_host` и сверяется с действующим снимком у нового run и у
+//! каждого resume (I1 ревью задачи 14). Печать: строки `web.request` (D112), `skill.activated`
+//! (D122) и предупреждение о тире standard на окне меньше 32k (D169).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -37,12 +52,13 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use za_agent::{
     AuditHead, EnvInfo, Grant, GrantMode, GrantSource, LoopDeps, LoopError, LoopOutcome,
-    PolicyError, PolicySnapshot, ResumeChange, RunSpec, TrustSetFn, WorkMode, builtin_tools,
-    control_channel, git_branch, resume_run, start_run,
+    PolicyError, PolicySnapshot, ResumeChange, RuleOfTwoNotice, RunSpec, TrustSetFn, WorkMode,
+    builtin_tools, control_channel, git_branch, resume_run, skills_capability, start_run,
 };
+use za_core::extract::Extractor;
 use za_core::paths::{self, Roots};
 use za_core::{
-    Access, AgentEvent, EventBus, InterruptKind, Journal, ToolRegistry, UnknownDecision,
+    Access, AgentEvent, EventBus, InterruptKind, Journal, Tool, ToolRegistry, UnknownDecision,
     resolve_unknown,
 };
 use za_jail::DirectRunner;
@@ -53,9 +69,14 @@ use za_protocol::{
 };
 use za_secrets::SecretMasker;
 use za_store::{AuditNew, INTERRUPT_OPEN, InterruptRow, ProjectStore, StoreError};
-use za_tools::{AgentHome, GitCheckpointer, NativeDeps, ReadTracker, Shell, native_capability};
+use za_tools::{
+    AgentHome, GitCheckpointer, NativeDeps, ReadTracker, SecretFilter, Shell, native_capability,
+};
 
-use crate::config::{AgentConfig, PROJECT_CONFIG, load_config, parse_project_config};
+use crate::config::{
+    AgentConfig, PROJECT_CONFIG, ProjectConfig, load_config, parse_project_config,
+};
+use crate::extract::RunExtractor;
 use crate::home;
 use crate::journal::open_retrying;
 use crate::models::{CommandError, PROBE_WAIT, start_gateway, state_text, wait_endpoint};
@@ -129,6 +150,9 @@ pub enum RunError {
         "журнал аудита проекта изменён: записи {seq}, сохранённой при прошлом запуске run, нет в цепочке; проверка: zero-agent audit --verify"
     )]
     AuditAnchor { seq: u64 },
+    /// Сетевой шлюз не построен (D107): неверные настройки `[web]`.
+    #[error("веб: {0}")]
+    Web(#[from] za_web::WebError),
 }
 
 /// Точка аварийного завершения `--crash-at` (D33; только для тестов).
@@ -141,31 +165,40 @@ pub enum RunCrash {
     /// квитанции и `tool.finished` нет (R1-C1 D92, `CrashPoint::InTool`). Resume видит
     /// намерение без квитанции: класс `NonIdempotent` даёт прерывание `unk-…`.
     InTool(u64),
+    /// `std::process::abort()` после записи эффекта границы шага N (шаги с 1), до снимка
+    /// шага (`CrashPoint::AfterBoundary`): квитанции вызовов шага N − 1 записаны, а снимка
+    /// после них нет. Resume реплеит шаг N − 1 по квитанциям — без повторного вызова
+    /// (R1-C2, приёмка: реплей `web_fetch` без сети, D112).
+    AfterBoundary(u64),
 }
 
-/// Разбор `--crash-at after-delta:N` и `--crash-at in-tool:N`.
+/// Разбор `--crash-at after-delta:N`, `in-tool:N` и `after-boundary:N`.
 pub fn parse_run_crash(s: &str) -> Result<RunCrash, String> {
-    let bad = || format!("ожидается after-delta:N или in-tool:N, получено {s:?}");
+    let bad = || format!("ожидается after-delta:N, in-tool:N или after-boundary:N, получено {s:?}");
     let (kind, n) = s.split_once(':').ok_or_else(bad)?;
     let n: u32 = n.trim().parse().map_err(|_| bad())?;
     match kind.trim() {
         "after-delta" if n >= 1 => Ok(RunCrash::AfterDelta(n)),
         "in-tool" if n >= 1 => Ok(RunCrash::InTool(u64::from(n))),
+        "after-boundary" if n >= 1 => Ok(RunCrash::AfterBoundary(u64::from(n))),
         _ => Err(bad()),
     }
 }
 
-/// Крюк сбоя цикла для `--crash-at in-tool:N`: настоящее аварийное завершение процесса
-/// (эквивалент `kill -9`) в точке `CrashPoint::InTool { step: N, after_call: true }`.
+/// Крюк сбоя цикла для `--crash-at in-tool:N` и `after-boundary:N`: настоящее аварийное
+/// завершение процесса (эквивалент `kill -9`) в точке `CrashPoint::InTool { step: N,
+/// after_call: true }` или `CrashPoint::AfterBoundary { step: N }`.
 fn crash_hook(crash: Option<RunCrash>) -> Option<za_agent::CrashHook> {
-    let Some(RunCrash::InTool(step)) = crash else {
-        return None;
-    };
-    Some(Arc::new(move |p| {
-        if p == (za_agent::CrashPoint::InTool {
+    let at = match crash? {
+        RunCrash::InTool(step) => za_agent::CrashPoint::InTool {
             step,
             after_call: true,
-        }) {
+        },
+        RunCrash::AfterBoundary(step) => za_agent::CrashPoint::AfterBoundary { step },
+        RunCrash::AfterDelta(_) => return None,
+    };
+    Some(Arc::new(move |p| {
+        if p == at {
             std::process::abort();
         }
         false
@@ -210,6 +243,31 @@ pub struct RunArgs {
     /// Предел чекпоинта git при вызове инструмента вместо `CHECKPOINT_TIMEOUT` (скрытый
     /// `--checkpoint-timeout`, только для тестов под нагрузкой: × `ZA_TEST_TIME_SCALE`).
     pub checkpoint_timeout: Option<Duration>,
+    /// Тестовые подмены (D128); без признака `test-hooks` — пусто.
+    pub hooks: RunHooks,
+}
+
+/// Тестовые подмены `run` (D128): поля существуют только с признаком `test-hooks`, обычная
+/// и release-сборка флага `--web-resolve` не знают.
+#[derive(Debug, Clone, Default)]
+pub struct RunHooks {
+    /// `--web-resolve host=addr`: имя разрешается шлюзом в заданный адрес мимо фильтра
+    /// (`WebGateway::with_test_resolve`).
+    #[cfg(feature = "test-hooks")]
+    pub web_resolve: Vec<(String, std::net::SocketAddr)>,
+}
+
+/// Разбор `--web-resolve host=addr` (D128): `addr` — `ip:port`.
+#[cfg(feature = "test-hooks")]
+pub fn parse_web_resolve(s: &str) -> Result<(String, std::net::SocketAddr), String> {
+    let (host, addr) = s
+        .split_once('=')
+        .ok_or_else(|| format!("ожидается host=ip:port, получено {s:?}"))?;
+    let addr = addr
+        .trim()
+        .parse()
+        .map_err(|e| format!("адрес {addr:?}: {e}"))?;
+    Ok((host.trim().to_owned(), addr))
 }
 
 /// Флаги бюджета `run`: каждый задаёт своё поле поверх базового бюджета.
@@ -419,6 +477,8 @@ struct Prepared {
     grants: Vec<Grant>,
     roots: Roots,
     project_id: String,
+    /// Проектная конфигурация доверенного проекта (`[web] enabled = false`, D105).
+    project_cfg: Option<ProjectConfig>,
 }
 
 /// Подготовка run (новый и resume). Порядок: доверие (D83: набор сейчас против
@@ -467,6 +527,14 @@ async fn prepare(
         None
     };
     let policy = PolicySnapshot::build(&cfg.policy, project_cfg.as_ref().map(|c| &c.policy))?;
+    if project_cfg
+        .as_ref()
+        .is_some_and(|c| c.web_enabled == Some(false))
+    {
+        eprintln!(
+            "zero-agent: {PROJECT_CONFIG}: веб выключен проектом ([web] enabled = false): web_fetch и web_search в run нет"
+        );
+    }
     for _ in &policy.ignored {
         eprintln!(
             "zero-agent: {PROJECT_CONFIG}: правило allow проекта не действует (только ask и deny, ARC-041)"
@@ -496,23 +564,235 @@ async fn prepare(
         grants,
         roots,
         project_id,
+        project_cfg,
     })
 }
 
-/// Записи бинарника в аудит прямо перед циклом (D78, D91): `policy.loaded` при смене
-/// хэша политики run (`policy` — `None`, если политика run не меняется), `grant.added` на
-/// каждый новый грант run (источник `cli` — actor `user`, `config` — `runtime`); затем
-/// голова цепочки — якорь снимка (после всех записей, m3 ревью задачи 13).
+/// Подключения run R1-C2 (задача 14): веб-инструменты, извлекатель, каталог скиллов и
+/// что из этого пишется в `policy.loaded`.
+struct Wiring {
+    web: Vec<Arc<dyn Tool>>,
+    extractor: Option<Arc<dyn Extractor>>,
+    /// `None` — `[skills] enabled = false`.
+    catalog: Option<Arc<za_skills::Catalog>>,
+    /// Кто выключил веб (`crate::web::DISABLED_BY_*`); `None` — включён.
+    web_disabled: Option<&'static str>,
+    /// Хост поставщика поиска, если `web_search` зарегистрирован (D105).
+    search_host: Option<String>,
+    /// Resume: веб-инструменты и `activate_skill` замороженного префикса, которые
+    /// конфигурация выключила после старта run, — имя и текст вызова
+    /// (`ToolRegistry::withdraw`, Ruling «Задача 15»; [`withdrawn_skills`]).
+    withdrawn: Vec<(String, String)>,
+}
+
+/// Веб-инструменты замороженного префикса `frozen`, которых нет среди зарегистрированных
+/// `web`, с текстом вызова (Ruling «Задача 15», находка 1): веб выключен —
+/// [`za_web::WEB_DISABLED`], убран `[web.search] url` — [`za_web::SEARCH_UNCONFIGURED`].
+/// Префикс не меняется (кэш), поэтому модель видит описание и может позвать инструмент.
+fn withdrawn_web(
+    frozen: &BTreeSet<String>,
+    web: &[Arc<dyn Tool>],
+    web_disabled: Option<&str>,
+) -> Vec<(String, String)> {
+    [za_web::WEB_FETCH, za_web::WEB_SEARCH]
+        .into_iter()
+        .filter(|n| frozen.contains(*n) && !web.iter().any(|t| t.spec().schema.name == *n))
+        .filter_map(|n| {
+            let reason = match (web_disabled, n) {
+                (Some(_), _) => za_web::WEB_DISABLED,
+                (None, za_web::WEB_SEARCH) => za_web::SEARCH_UNCONFIGURED,
+                // `web_fetch` при включённом вебе регистрируется всегда.
+                _ => return None,
+            };
+            Some((n.to_owned(), za_web::withdrawn_text(n, reason)))
+        })
+        .collect()
+}
+
+/// `activate_skill` замороженного префикса `frozen`, когда скиллы выключены после старта
+/// run (`[skills] enabled = false`, каталога нет), — имя и текст вызова (Minor 4 финального
+/// ревью скиллов, по образцу веба). Записанный `skill.load` пакет реплеит до реестра (D92).
+fn withdrawn_skills(
+    frozen: &BTreeSet<String>,
+    catalog: Option<&Arc<za_skills::Catalog>>,
+) -> Option<(String, String)> {
+    (catalog.is_none() && frozen.contains(za_agent::ACTIVATE_SKILL_TOOL)).then(|| {
+        (
+            za_agent::ACTIVATE_SKILL_TOOL.to_owned(),
+            za_agent::skills_withdrawn_text(),
+        )
+    })
+}
+
+/// Строка stderr resume о снятых веб-инструментах (`withdrawn` из [`withdrawn_web`]).
+fn withdrawn_line(withdrawn: &[(String, String)], web_disabled: Option<&str>) -> Option<String> {
+    if withdrawn.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = withdrawn.iter().map(|(n, _)| n.as_str()).collect();
+    let why = match web_disabled {
+        Some(crate::web::DISABLED_BY_PROJECT) => {
+            format!("веб выключен после старта run ({PROJECT_CONFIG}: [web] enabled = false)")
+        }
+        Some(_) => "веб выключен после старта run ([web] enabled = false)".to_owned(),
+        None => "поиск не настроен после старта run ([web.search] url)".to_owned(),
+    };
+    Some(format!(
+        "zero-agent: {why}: вызовы {} этого run не исполняются",
+        names.join(", ")
+    ))
+}
+
+/// Имена инструментов замороженного префикса из снимка run (`frozen.tools[].name`).
+fn frozen_tools(snap: &Value) -> BTreeSet<String> {
+    snap.get("frozen")
+        .and_then(|f| f.get("tools"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Сетевой шлюз процесса (D107) из `[web]` глобальной конфигурации; с признаком
+/// `test-hooks` — подмена имён `--web-resolve` (D128).
+fn gateway(
+    cfg: &AgentConfig,
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] hooks: &RunHooks,
+) -> Result<za_web::WebGateway, RunError> {
+    let gw = za_web::WebGateway::new(crate::web::web_config(&cfg.web))?;
+    #[cfg(feature = "test-hooks")]
+    if !hooks.web_resolve.is_empty() {
+        return Ok(gw.with_test_resolve(hooks.web_resolve.clone()));
+    }
+    Ok(gw)
+}
+
+/// Извлекатели run по пути бинарника `exe` (`current_exe`): нативным инструментам (`read`) и
+/// `web_fetch`. Путь известен — у обоих `RunExtractor` (подпроцесс `extract`, каталог
+/// `work_dir("tmp/<run>")` по первому вызову). Путь не определён (m2 ревью задачи 14):
+/// `read` без извлекателя (PDF — `binary file`), а `web_fetch` остаётся в наборе с
+/// [`za_core::extract::Unavailable`] — текст, JSON и XML читает, на HTML и PDF отвечает
+/// `html: …`/`pdf: extraction is unavailable in this session`; `web_search` извлекатель не
+/// нужен вовсе. Строка stderr называет, что не работает.
+fn extractors(
+    exe: std::io::Result<PathBuf>,
+    project: &Path,
+    run: RunId,
+) -> (Option<Arc<dyn Extractor>>, Arc<dyn Extractor>) {
+    match exe {
+        Ok(exe) => {
+            let ex: Arc<dyn Extractor> = Arc::new(RunExtractor::new(
+                Arc::new(DirectRunner),
+                exe,
+                project.to_path_buf(),
+                run,
+            ));
+            (Some(Arc::clone(&ex)), ex)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "путь бинарника не определён: PDF и HTML не извлекаются");
+            eprintln!(
+                "zero-agent: путь бинарника не определён ({e}): PDF и HTML не извлекаются — read отвечает на PDF «binary file», web_fetch читает текст, JSON и XML, а на HTML и PDF отвечает отказом"
+            );
+            (None, Arc::new(za_core::extract::Unavailable))
+        }
+    }
+}
+
+/// Подключения run: извлекатели ([`extractors`]), шлюз и веб-инструменты, если веб не выключен
+/// (`allowed` — имена из замороженного префикса при resume: только они), каталог скиллов
+/// после проверки доверия (проектные — у доверенного проекта по сверенному обходу, D116).
+async fn wire(
+    home: &Path,
+    project: &Path,
+    run: RunId,
+    cfg: &AgentConfig,
+    prep: &Prepared,
+    hooks: &RunHooks,
+    allowed: Option<&BTreeSet<String>>,
+) -> Result<Wiring, RunError> {
+    let (extractor, web_extractor) = extractors(std::env::current_exe(), project, run);
+    let web_disabled = crate::web::web_disabled(cfg, prep.project_cfg.as_ref());
+    let mut web = Vec::new();
+    if web_disabled.is_none() {
+        web = crate::web::web_tools(&Arc::new(gateway(cfg, hooks)?), web_extractor);
+        if let Some(names) = allowed {
+            web.retain(|t| names.contains(&t.spec().schema.name));
+        }
+    }
+    let withdrawn = allowed.map_or_else(Vec::new, |names| withdrawn_web(names, &web, web_disabled));
+    if let Some(line) = withdrawn_line(&withdrawn, web_disabled) {
+        eprintln!("{line}");
+    }
+    let search_host = web
+        .iter()
+        .any(|t| t.spec().schema.name == za_web::WEB_SEARCH)
+        .then(|| crate::web::search_host(&cfg.web))
+        .flatten();
+    let catalog = if cfg.skills.enabled {
+        let trusted = prep.trusted.then_some((project, &prep.set));
+        let cat = crate::skills::catalog(home, &cfg.skills, trusted)
+            .await
+            .map_err(|source| RunError::Io {
+                what: "каталог скиллов",
+                path: project.to_path_buf(),
+                source,
+            })?;
+        for k in cat
+            .skipped
+            .iter()
+            .filter(|k| k.reason == crate::skills::TREE_CHANGED)
+        {
+            eprintln!(
+                "zero-agent: дерево скиллов {} изменилось после проверки доверия: его скиллы в run не читаются",
+                k.path
+            );
+        }
+        for line in crate::skills::limit_lines(&cat, &cfg.skills)
+            .into_iter()
+            .chain(crate::skills::linked_lines(&cat))
+        {
+            tracing::warn!("{line}");
+        }
+        Some(Arc::new(cat))
+    } else {
+        None
+    };
+    let mut withdrawn = withdrawn;
+    if let Some(off) = allowed.and_then(|names| withdrawn_skills(names, catalog.as_ref())) {
+        eprintln!(
+            "zero-agent: скиллы выключены после старта run ([skills] enabled = false): вызовы {} этого run не исполняются",
+            off.0
+        );
+        withdrawn.push(off);
+    }
+    Ok(Wiring {
+        web,
+        extractor,
+        catalog,
+        web_disabled,
+        search_host,
+        withdrawn,
+    })
+}
+
+/// Записи бинарника в аудит прямо перед циклом (D78, D91): `policy.loaded` с действующим
+/// снимком политики run — у нового run и у каждого resume (I1 ревью задачи 14: смена
+/// `web_disabled` или `search_host` при том же хэше видна в аудите; дубликат последней
+/// записи [`policy_loaded`] не пишет), `grant.added` на каждый новый грант run (источник
+/// `cli` — actor `user`, `config` — `runtime`); затем голова цепочки — якорь снимка (после
+/// всех записей, m3 ревью задачи 13).
 async fn record_start(
     store: &ProjectStore,
     project: &Path,
     run: RunId,
-    policy: Option<&PolicySnapshot>,
+    policy: &PolicySnapshot,
+    web: &Wiring,
     grants: &[Grant],
 ) -> Result<Option<AuditHead>, RunError> {
-    if let Some(p) = policy {
-        policy_loaded(store, project, p).await?;
-    }
+    policy_loaded(store, project, policy, web).await?;
     grants_audit(store, run, grants).await?;
     Ok(store
         .audit_head()
@@ -621,13 +901,17 @@ async fn cleanup_run_tmp(project: &Path, run: RunId) {
     }
 }
 
-/// `policy.loaded` (D91): пишется, только если хэш снимка политики отличается от
-/// последней такой записи аудита. Цепочка аудита не сходится — запись не пишется (`warn`):
-/// её сверит `audit --verify`.
+/// `policy.loaded` (D91): вызывается у нового run и у каждого resume с действующим снимком
+/// политики, а пишется, только если хэш снимка, `web_disabled` (кто выключил веб: `config`,
+/// `project` или `null`, D105) или `search_host` (хост поставщика поиска, если `web_search`
+/// зарегистрирован: правила по домену к поиску не применяются, D126) отличаются от
+/// последней такой записи аудита — дубликатов нет. Цепочка аудита не сходится — запись не
+/// пишется (`warn`): её сверит `audit --verify`.
 async fn policy_loaded(
     store: &ProjectStore,
     project: &Path,
     policy: &PolicySnapshot,
+    web: &Wiring,
 ) -> Result<(), RunError> {
     let last = match store.last_audit(audit_action::POLICY_LOADED).await {
         Ok(l) => l,
@@ -637,12 +921,13 @@ async fn policy_loaded(
         }
         Err(e) => return Err(e.into()),
     };
-    if last
-        .as_ref()
-        .and_then(|e| e.payload.get("hash"))
-        .and_then(Value::as_str)
-        == Some(policy.hash.as_str())
-    {
+    let same = last.as_ref().is_some_and(|e| {
+        let p = &e.payload;
+        p.get("hash").and_then(Value::as_str) == Some(policy.hash.as_str())
+            && p.get("web_disabled").and_then(Value::as_str) == web.web_disabled
+            && p.get("search_host").and_then(Value::as_str) == web.search_host.as_deref()
+    });
+    if same {
         return Ok(());
     }
     let project_rules = policy
@@ -661,6 +946,8 @@ async fn policy_loaded(
                 "rules": policy.rules.len(),
                 "project_rules": project_rules,
                 "ignored": policy.ignored,
+                "web_disabled": web.web_disabled,
+                "search_host": web.search_host,
             }),
         })
         .await?;
@@ -725,15 +1012,21 @@ async fn check_audit_anchor(store: &ProjectStore, snap: &Value) -> Result<(), Ru
     Ok(())
 }
 
-/// Отличия resume от снимка run (D92): доверие, политика, гранты. Доверие снимается
-/// только явным отзывом (`trust --revoke`): правка доверенных файлов посреди run (тем же
-/// агентом) доверие этого run не отменяет, предупреждение — в stderr.
+/// Отличия resume от снимка run (D92): доверие, политика, гранты — и отдельно действующий
+/// снимок политики, с которым run продолжается (для `policy.loaded` при каждом resume, I1
+/// ревью задачи 14; в `ResumeChange.policy` он попадает, только если хэш другой). Доверие
+/// снимается только явным отзывом (`trust --revoke`): правка доверенных файлов посреди run
+/// (тем же агентом) доверие этого run не отменяет, предупреждение — в stderr.
 ///
 /// Проектные `deny` и `ask` не теряются (I1 ревью задачи 13): если снимок доверенный, а
 /// проект сейчас не доверен (доверенные файлы изменились или доверие отозвано), проектная
 /// часть политики берётся из снимка run — она только ограничивает; глобальная — из
 /// нынешней конфигурации.
-fn resume_changes(p: &Prepared, cfg: &AgentConfig, snap: &Value) -> Result<ResumeChange, RunError> {
+fn resume_changes(
+    p: &Prepared,
+    cfg: &AgentConfig,
+    snap: &Value,
+) -> Result<(ResumeChange, PolicySnapshot), RunError> {
     let snap_trusted = snap
         .get("trusted")
         .and_then(Value::as_bool)
@@ -774,7 +1067,7 @@ fn resume_changes(p: &Prepared, cfg: &AgentConfig, snap: &Value) -> Result<Resum
     } else {
         p.policy.clone()
     };
-    let policy = (effective.hash != snap_hash).then_some(effective);
+    let policy = (effective.hash != snap_hash).then(|| effective.clone());
     let had: Vec<Grant> = snap
         .get("grants")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -794,12 +1087,29 @@ fn resume_changes(p: &Prepared, cfg: &AgentConfig, snap: &Value) -> Result<Resum
     {
         p.policy.check_mode(RunMode::Bypass)?;
     }
-    Ok(ResumeChange {
-        policy,
-        trusted,
-        grants_add,
-        ..ResumeChange::default()
-    })
+    Ok((
+        ResumeChange {
+            policy,
+            trusted,
+            grants_add,
+            ..ResumeChange::default()
+        },
+        effective,
+    ))
+}
+
+/// Предупреждение D169 на resume с `--model` (`model_changed`, m4 ревью задачи 14): тир run
+/// заморожен в снимке (`setup.tier`), а окно — у новой модели `n_ctx` (неизвестно — run
+/// считает его 8192, D43). Без `--model` окно то же, что при старте, — без предупреждения.
+fn resume_window_warning(snap: &Value, model_changed: bool, n_ctx: Option<u32>) -> Option<String> {
+    if !model_changed {
+        return None;
+    }
+    let tier = snap
+        .get("setup")
+        .and_then(|s| s.get("tier"))
+        .and_then(|t| serde_json::from_value::<Tier>(t.clone()).ok())?;
+    crate::doctor::tier_window_warning(Some(tier), n_ctx)
 }
 
 /// Оболочка `bash` (D85): `pwsh`/`powershell` на Windows, `bash`/`sh` иначе; не найдена —
@@ -870,6 +1180,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
     let started = start_gateway(home, &cfg, true).await?;
     // Маска печати ответа — по секретам, прочитанным при старте вместе с ключами (D90).
     let masker = started.secrets.masker();
+    let secret_filter = started.secrets.checkpoint_filter();
     let gateway = Arc::new(started.gateway);
     let select = |model: Option<String>| -> Result<EndpointId, SelectError> {
         gateway.select(&Selection {
@@ -901,9 +1212,18 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 );
                 return Ok(ExitCode::from(EXIT_ERROR));
             }
+            // D169: тир standard (и full) на окне меньше 32k или на неизвестном окне (run считает
+            // его 8192, D43; m4 ревью задачи 14) — только явно, с предупреждением.
+            if let Some(line) =
+                crate::doctor::tier_window_warning(n.tier.or(cfg.context.tier), view.context_tokens)
+            {
+                eprintln!("zero-agent: {line}");
+            }
             let dir = journal_dir(home, &project)?;
             let store = ProjectStore::open(&dir)?;
             let prep = prepare(home, &project, &store, &cfg, &args.grants).await?;
+            let wiring = wire(home, &project, run, &cfg, &prep, &args.hooks, None).await?;
+            register(&mut tools, &wiring);
             // Бюджет нового run: `[budgets.run]`, поверх него флаги.
             let budget = run_budget(&cfg.budgets.run, &args.budget);
             // D83, CAP-084: инструкции — только у доверенного проекта.
@@ -951,15 +1271,17 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 &gateway,
                 tools,
                 &masker,
+                secret_filter.clone(),
                 &prep,
+                &wiring,
                 args.checkpoint_timeout,
             );
             deps.crash = crash_hook(args.crash);
             deps.audit_head =
-                record_start(&store, &project, run, Some(&prep.policy), &prep.grants).await?;
+                record_start(&store, &project, run, &prep.policy, &wiring, &prep.grants).await?;
             let (ctl, rx) = control_channel(store.clone(), run);
             let fut = start_run(&deps, run, spec, rx);
-            let outcome = drive(&bus, fut, &ctl, args.crash, masker.clone()).await;
+            let outcome = drive(&store, &bus, fut, &ctl, args.crash, masker.clone()).await;
             cleanup_run_tmp(&project, run).await;
             report(&store, &project, run, outcome, &masker).await
         }
@@ -975,7 +1297,20 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 .unwrap_or(Value::Null);
             check_audit_anchor(&store, &snap).await?;
             let prep = prepare(home, &project, &store, &cfg, &args.grants).await?;
-            let mut change = resume_changes(&prep, &cfg, &snap)?;
+            let (mut change, policy) = resume_changes(&prep, &cfg, &snap)?;
+            // Веб-инструменты — только из замороженного префикса run: новых посреди run нет.
+            let frozen = frozen_tools(&snap);
+            let wiring = wire(
+                home,
+                &project,
+                r.run,
+                &cfg,
+                &prep,
+                &args.hooks,
+                Some(&frozen),
+            )
+            .await?;
+            register(&mut tools, &wiring);
             let endpoint = match r.model {
                 Some(m) => Some(select(Some(m)).map_err(CommandError::from)?),
                 None => None,
@@ -983,6 +1318,14 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             // Зонды до продолжения: размер контекста и состояние эндпоинта. Неготовый
             // эндпоинт run не останавливает — ошибка модели посреди run ставит паузу (D11).
             gateway.wait_probed(PROBE_WAIT).await;
+            // D169 (m4 ревью задачи 14): `--model` на модель с окном меньше 32k или с
+            // неизвестным окном при тире run standard или full — предупреждение.
+            let window = endpoint
+                .as_ref()
+                .and_then(|ep| za_llm::ModelPort::context_tokens(gateway.as_ref(), ep));
+            if let Some(line) = resume_window_warning(&snap, endpoint.is_some(), window) {
+                eprintln!("zero-agent: {line}");
+            }
             // Бюджет resume: без флагов — бюджет run сохраняется; с флагами — флаги поверх
             // текущего бюджета run из последнего снимка. `[budgets.run]` применён при старте
             // и не перечитывается (решение контроллера, I2 ревью задачи 16).
@@ -997,15 +1340,19 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 &gateway,
                 tools,
                 &masker,
+                secret_filter.clone(),
                 &prep,
+                &wiring,
                 args.checkpoint_timeout,
             );
             deps.crash = crash_hook(args.crash);
+            // I1 ревью задачи 14: `policy.loaded` — с действующим снимком при каждом resume.
             deps.audit_head = record_start(
                 &store,
                 &project,
                 r.run,
-                change.policy.as_ref(),
+                &policy,
+                &wiring,
                 &change.grants_add,
             )
             .await?;
@@ -1016,7 +1363,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
             change.budget = budget;
             change.input = r.input;
             let fut = resume_run(&deps, r.run, change, rx);
-            let outcome = drive(&bus, fut, &ctl, args.crash, masker.clone()).await;
+            let outcome = drive(&store, &bus, fut, &ctl, args.crash, masker.clone()).await;
             cleanup_run_tmp(&project, r.run).await;
             report(&store, &project, r.run, outcome, &masker).await
         }
@@ -1051,6 +1398,26 @@ async fn grants_audit(store: &ProjectStore, run: RunId, grants: &[Grant]) -> Res
     Ok(())
 }
 
+/// Capability `skills` (`activate_skill` с каталогом, D117) — только у непустого каталога
+/// (m7 ревью задачи 13): описание `activate_skill` ссылается на каталог ниже, а без скиллов
+/// звать его незачем. Пустой каталог run по-прежнему получает: `skill.catalog` с пропусками.
+fn skills_capability_of(cat: &Arc<za_skills::Catalog>) -> Option<za_core::Capability> {
+    (!cat.skills.is_empty()).then(|| skills_capability(Arc::clone(cat)))
+}
+
+/// Веб-инструменты подключений в реестр run (повтор имени — `warn`, как у встроенных) и
+/// снятые с исполнения имена замороженного префикса (`Wiring::withdrawn`).
+fn register(reg: &mut ToolRegistry, wiring: &Wiring) {
+    for t in &wiring.web {
+        if let Err(e) = reg.register(Arc::clone(t)) {
+            tracing::warn!(error = %e, "инструмент уже зарегистрирован");
+        }
+    }
+    for (name, text) in &wiring.withdrawn {
+        reg.withdraw(name.as_str(), text.as_str());
+    }
+}
+
 /// Первая строка stderr: `run <id>` — по нему продолжают после сбоя.
 fn announce(run: RunId) {
     eprintln!("run {run}");
@@ -1058,14 +1425,19 @@ fn announce(run: RunId) {
 }
 
 /// Зависимости цикла и шина его событий (`EventBus::DEFAULT_CAPACITY`, D35): нативные
-/// инструменты (D74), чекпоинты (D89), политика, корни, маска, набор доверия и голова
-/// аудита (задача 13).
+/// инструменты (D74) с извлекателем PDF (D113), чекпоинты (D89), политика, корни, маска,
+/// набор доверия и голова аудита (задача 13 R1-C1), каталог скиллов (D114–D119): capability
+/// `skills` — только у непустого каталога (m7 ревью задачи 13: описание `activate_skill`
+/// ссылается на каталог ниже), сам каталог — у любого (событие `skill.catalog` с пропусками).
+#[allow(clippy::too_many_arguments)]
 fn deps(
     store: &ProjectStore,
     gateway: &Arc<za_llm::Gateway>,
     tools: ToolRegistry,
     masker: &SecretMasker,
+    secret_filter: SecretFilter,
     prep: &Prepared,
+    wiring: &Wiring,
     checkpoint_timeout: Option<Duration>,
 ) -> (LoopDeps, EventBus) {
     let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
@@ -1084,8 +1456,22 @@ fn deps(
         tracker: ReadTracker::new(),
         shell: shell(),
         home: agent_home.clone(),
+        // Маркер повтора правки в `ZA_HOME` — с маскированным diff (ревью задачи 2 R1-C2).
+        mask: Some({
+            let m = masker.clone();
+            Arc::new(move |s: &str| m.mask(s).into_owned())
+        }),
+        // Извлекатель PDF в подпроцессе (D113): без него `read` отвечает на PDF
+        // `binary file …`.
+        extractor: wiring.extractor.clone(),
     })];
-    let mut checkpointer = GitCheckpointer::new(runner, agent_home);
+    if let Some(cat) = &wiring.catalog {
+        deps.capabilities.extend(skills_capability_of(cat));
+        deps.skills = Some(Arc::clone(cat));
+    }
+    // D103: секретные файлы (имя, известные значения, PEM) в чекпоинты не входят.
+    let mut checkpointer =
+        GitCheckpointer::new(runner, agent_home).with_secret_filter(secret_filter);
     if let Some(t) = checkpoint_timeout {
         checkpointer = checkpointer.with_create_timeout_for_tests(t);
     }
@@ -1116,7 +1502,14 @@ struct Printer {
     /// сводка для истории, а не ответ, и не печатаются.
     compacting: bool,
     crash: Option<RunCrash>,
+    /// Строка Rule of Two (D106): одна на run, по первому вызову с внешней связью при всех
+    /// трёх свойствах.
+    rule_of_two: RuleOfTwoNotice,
 }
+
+/// Строка D106 (SEC-052): вызов исполнен при всех трёх свойствах по решению заказчика
+/// «не спрашивать». Модели не уходит.
+const RULE_OF_TWO_LINE: &str = "zero-agent: в этом запуске сошлись недоверенное содержимое, ваши файлы вне проекта и обращение в сеть (SEC-052); вызов выполнен, запись в аудите";
 
 impl Printer {
     fn new(crash: Option<RunCrash>, masker: SecretMasker) -> Self {
@@ -1168,6 +1561,24 @@ impl Printer {
                     self.current.clear();
                     eprintln!("zero-agent: повтор запроса к модели, ответ печатается заново");
                 }
+            }
+            // D106, Ruling I1 ревью задачи 5: отметка `rule_of_two` вызова.
+            EventKind::ToolStarted | EventKind::ToolFinished => {
+                if self.rule_of_two.on_event(&ev.event.kind, p) {
+                    eprintln!("{RULE_OF_TWO_LINE}");
+                }
+            }
+            // D112: сетевое обращение нативного инструмента — строка на запрос.
+            EventKind::WebRequest => eprintln!("{}", crate::web::request_line(p)),
+            // D122: загруженный скилл.
+            EventKind::SkillActivated => {
+                let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("?");
+                let by = if s("by") == za_protocol::skill_by::ROUTER {
+                    ", карточка роутера"
+                } else {
+                    ""
+                };
+                eprintln!("zero-agent: скилл {} ({}){by}", s("name"), s("source"));
             }
             // D96: исполненный вызов с путями вне проекта — строка на путь.
             EventKind::BoundaryOutside => {
@@ -1229,8 +1640,26 @@ async fn ctrl_c() {
     }
 }
 
-/// Ведёт цикл: печатает ответ по шине, обрабатывает Ctrl+C.
+/// У run есть запись аудита `rule_of_two` (D106): строка SEC-052 о нём уже положена.
+/// Ошибка чтения — `false` с предупреждением: лишняя строка лучше пропущенной.
+async fn rule_of_two_recorded(store: &ProjectStore, run: RunId) -> bool {
+    match store
+        .audit_by(audit_action::RULE_OF_TWO, &run.to_string())
+        .await
+    {
+        Ok(v) => !v.is_empty(),
+        Err(e) => {
+            tracing::warn!(error = %e, "записи аудита rule_of_two не прочитаны");
+            false
+        }
+    }
+}
+
+/// Ведёт цикл: печатает ответ по шине, обрабатывает Ctrl+C. Строка SEC-052 — одна на run
+/// (Ruling I1, m4 ревью задачи 5): resume run с записью `rule_of_two` её не повторяет, а
+/// событие, потерянное при отставании шины, восполняет проверка аудита в конце.
 async fn drive(
+    store: &ProjectStore,
     bus: &EventBus,
     fut: impl std::future::Future<Output = Result<LoopOutcome, LoopError>>,
     ctl: &za_agent::RunControl,
@@ -1240,6 +1669,7 @@ async fn drive(
     // Подписка до первого опроса цикла: future ленив, ни одно событие не теряется.
     let mut rx = bus.subscribe();
     let mut printer = Printer::new(crash, masker);
+    printer.rule_of_two = RuleOfTwoNotice::new(rule_of_two_recorded(store, ctl.run_id()).await);
     let mut fut = std::pin::pin!(fut);
     let mut interrupt = Box::pin(ctrl_c());
     let mut presses = 0u32;
@@ -1279,6 +1709,13 @@ async fn drive(
         _ => None,
     };
     printer.finish(answer);
+    if printer.rule_of_two.pending()
+        && printer
+            .rule_of_two
+            .at_end(rule_of_two_recorded(store, ctl.run_id()).await)
+    {
+        eprintln!("{RULE_OF_TWO_LINE}");
+    }
     outcome
 }
 
@@ -1733,6 +2170,171 @@ async fn reask_trust(
 mod tests {
     use super::*;
 
+    /// D106, Ruling I1 ревью задачи 5: строка Rule of Two — одна на run, по отметке
+    /// `rule_of_two` вызова (`tool.started`), а не по `exposure.changed`; два вызова при
+    /// трёх свойствах — одна строка; resume run с записью — без строки.
+    #[test]
+    fn rule_of_two_line_once_per_run() {
+        let mut p = Printer::default();
+        assert!(p.rule_of_two.pending());
+        let marked = |id: &str| json!({"call_id": id, "rule_of_two": true});
+        assert!(!p.rule_of_two.on_event(
+            &EventKind::ExposureChanged,
+            &json!({"untrusted": true, "private": true, "external": true,
+                "calls": ["w1"], "rule_of_two": ["w1"]})
+        ));
+        assert!(
+            p.rule_of_two
+                .on_event(&EventKind::ToolStarted, &marked("w1"))
+        );
+        assert!(
+            !p.rule_of_two
+                .on_event(&EventKind::ToolStarted, &marked("w2"))
+        );
+        assert!(!p.rule_of_two.pending());
+        let mut resumed = RuleOfTwoNotice::new(true);
+        assert!(!resumed.on_event(&EventKind::ToolStarted, &marked("w3")));
+        assert!(RULE_OF_TWO_LINE.contains("SEC-052"));
+    }
+
+    /// m7 ревью задачи 13: пустой каталог — без capability `skills` и `activate_skill`.
+    #[test]
+    fn empty_catalog_has_no_skills_capability() {
+        assert!(skills_capability_of(&Arc::new(za_skills::Catalog::default())).is_none());
+        let full = za_skills::discover(&za_skills::DiscoverInput {
+            bundled: za_skills::bundled(),
+            ..za_skills::DiscoverInput::default()
+        });
+        let cap = skills_capability_of(&Arc::new(full)).expect("capability у поставки");
+        assert_eq!(cap.tools.len(), 1);
+        assert_eq!(
+            cap.tools[0].spec().schema.name,
+            za_agent::ACTIVATE_SKILL_TOOL
+        );
+    }
+
+    /// Имена инструментов замороженного префикса из снимка (resume, задача 14).
+    #[test]
+    fn frozen_tool_names() {
+        let snap = json!({"frozen": {"tools": [{"name": "read"}, {"name": "web_fetch"}]}});
+        let names = frozen_tools(&snap);
+        assert!(names.contains("web_fetch") && names.contains("read"));
+        assert!(frozen_tools(&json!({})).is_empty());
+    }
+
+    /// m4 ревью задачи 14: resume с `--model` сверяет тир run (из снимка) с окном новой
+    /// модели; без `--model` и у small — без предупреждения.
+    #[test]
+    fn resume_model_window_warning() {
+        let snap = json!({"setup": {"tier": "standard", "n_ctx": 32768}});
+        let w = resume_window_warning(&snap, true, Some(16_384)).unwrap();
+        assert!(w.contains("тир standard выбран на окне 16384"), "{w}");
+        assert!(
+            resume_window_warning(&snap, true, None)
+                .unwrap()
+                .contains("неизвестно")
+        );
+        assert!(resume_window_warning(&snap, false, Some(16_384)).is_none());
+        assert!(resume_window_warning(&snap, true, Some(32_768)).is_none());
+        let small = json!({"setup": {"tier": "small"}});
+        assert!(resume_window_warning(&small, true, Some(8192)).is_none());
+        assert!(resume_window_warning(&json!({}), true, Some(8192)).is_none());
+    }
+
+    /// m2 ревью задачи 14: путь бинарника не определён — у `read` извлекателя нет, а
+    /// `web_fetch` остаётся с `Unavailable` (честный отказ на HTML и PDF), `web_search` тоже.
+    #[test]
+    fn extractors_without_exe_keep_web_tools() {
+        let (native, web) = extractors(
+            Err(std::io::Error::other("no path")),
+            Path::new("."),
+            RunId::new(),
+        );
+        assert!(native.is_none());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let r = rt.block_on(web.html(za_core::extract::HtmlRequest {
+            html: "<p>x</p>".into(),
+            base_url: "https://a.test/".into(),
+        }));
+        assert_eq!(r.unwrap_err(), za_core::extract::ExtractError::Unavailable);
+        let cfg =
+            crate::config::parse_config("[web.search]\nurl = \"http://127.0.0.1:8888\"\n").unwrap();
+        let gw = Arc::new(za_web::WebGateway::new(crate::web::web_config(&cfg.web)).unwrap());
+        let names: Vec<String> = crate::web::web_tools(&gw, web)
+            .iter()
+            .map(|t| t.spec().schema.name.clone())
+            .collect();
+        assert_eq!(names, ["web_fetch", "web_search"]);
+        let (native, _) = extractors(
+            Ok(PathBuf::from("zero-agent")),
+            Path::new("."),
+            RunId::new(),
+        );
+        assert!(native.is_some());
+    }
+
+    /// Minor 4 финального ревью скиллов: `activate_skill` префикса при выключенных скиллах
+    /// снимается с исполнения с текстом причины; при включённых или без него в префиксе —
+    /// нет.
+    #[test]
+    fn withdrawn_activate_skill_of_frozen_prefix() {
+        let frozen: BTreeSet<String> = ["read", "activate_skill"].map(str::to_owned).into();
+        assert_eq!(
+            withdrawn_skills(&frozen, None),
+            Some((
+                "activate_skill".to_owned(),
+                "activate_skill: skills are disabled by configuration since this run started"
+                    .to_owned()
+            ))
+        );
+        let cat = Arc::new(za_skills::Catalog::default());
+        assert_eq!(withdrawn_skills(&frozen, Some(&cat)), None);
+        let without: BTreeSet<String> = ["read"].map(str::to_owned).into();
+        assert_eq!(withdrawn_skills(&without, None), None);
+    }
+
+    /// Ruling «Задача 15», находка 1: веб-инструменты префикса, которых нет в реестре resume,
+    /// снимаются с исполнения с текстом причины; строка stderr называет, кто выключил.
+    #[test]
+    fn withdrawn_web_tools_of_frozen_prefix() {
+        let frozen: BTreeSet<String> = ["read", "web_fetch", "web_search"]
+            .map(str::to_owned)
+            .into();
+        let off = withdrawn_web(&frozen, &[], Some(crate::web::DISABLED_BY_PROJECT));
+        assert_eq!(
+            off,
+            [
+                (
+                    "web_fetch".to_owned(),
+                    "web_fetch: web tools are disabled by configuration since this run started"
+                        .to_owned()
+                ),
+                (
+                    "web_search".to_owned(),
+                    "web_search: web tools are disabled by configuration since this run started"
+                        .to_owned()
+                ),
+            ]
+        );
+        let line = withdrawn_line(&off, Some(crate::web::DISABLED_BY_PROJECT)).unwrap();
+        assert!(line.contains(PROJECT_CONFIG), "{line}");
+        assert!(line.ends_with("вызовы web_fetch, web_search этого run не исполняются"));
+        // Веб включён, поиска нет: снят только `web_search`.
+        let only: BTreeSet<String> = ["web_search"].map(str::to_owned).into();
+        let search = withdrawn_web(&only, &[], None);
+        assert_eq!(search.len(), 1);
+        assert_eq!(
+            search[0].1,
+            "web_search: web search is not configured since this run started"
+        );
+        // Префикс без веба — ничего не снято, строки нет.
+        let none: BTreeSet<String> = ["read"].map(str::to_owned).into();
+        assert!(withdrawn_web(&none, &[], Some("config")).is_empty());
+        assert!(withdrawn_line(&[], Some("config")).is_none());
+    }
+
     #[test]
     fn crash_parses() {
         assert_eq!(
@@ -1744,6 +2346,11 @@ mod tests {
         assert!(parse_run_crash("intent:1").is_err());
         assert_eq!(parse_run_crash("in-tool:3"), Ok(RunCrash::InTool(3)));
         assert!(parse_run_crash("in-tool:0").is_err());
+        assert_eq!(
+            parse_run_crash("after-boundary:2"),
+            Ok(RunCrash::AfterBoundary(2))
+        );
+        assert!(parse_run_crash("after-boundary:0").is_err());
     }
 
     #[test]

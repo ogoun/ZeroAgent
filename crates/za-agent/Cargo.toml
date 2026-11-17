@@ -15,6 +15,9 @@ za-store = { path = "../za-store" }
 za-core = { path = "../za-core" }
 # Маска секретов результатов и ответа модели (R1-C1 D90, D100); разрешено политикой D73.
 za-secrets = { path = "../za-secrets" }
+# Скиллы (R1-C2, D114, D120): тексты core pack (`za_skills::bundled`) входят в хэш промптов
+# под именами `skills/<name>` и в случаи бюджета; разрешено `AGENT_ALLOWED_ZA_DEPS`.
+za-skills = { path = "../za-skills" }
 # Без функций по умолчанию: без HTTP и `Gateway`, модель — только через `ModelPort`
 # (проверяется `cargo xtask policy` и шагом CI `cargo check -p za-agent`).
 za-llm = { path = "../za-llm", default-features = false }
@@ -40,3 +43,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 # проверить формы на проводе. Рабочая сборка `-p za-agent` остаётся без функций
 # (`cargo xtask policy`, шаг CI `cargo check -p za-agent`).
 za-llm = { path = "../za-llm", default-features = false, features = ["http"] }
+# Заглушки скиллов поставки в тестах (`Catalog::bundled_for_tests`) — признак `test-hooks`
+# (D128, перенос сомнения 5 задачи 11): без подмены хэша, в обычной сборке их нет.
+za-skills = { path = "../za-skills", features = ["test-hooks"] }
+# Проверка, что `freeze` не пишет `warn` (каталог скиллов на small, D117): подписчик с
+# буфером в тесте; оба крейта уже в workspace.
+tracing.workspace = true
+tracing-subscriber.workspace = true

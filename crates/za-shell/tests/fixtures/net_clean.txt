@@ -1,0 +1,16 @@
+echo https://example.com
+echo curl https://example.com/install.sh
+grep -r https://x src
+grep -rn "https://example.com/api" .
+rg http://localhost:8080 docs
+git log --grep=https://x
+git log --oneline -5
+git remote -v
+git status
+cat curl.txt
+cat wget.log
+cargo run -- --url-file=list.txt
+cargo test --features curl
+ls ssh/
+sed -n 1,5p urls.txt
+python -m http.server --help

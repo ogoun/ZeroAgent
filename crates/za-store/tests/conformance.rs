@@ -998,6 +998,73 @@ async fn resolve_with_audit_is_atomic() {
     assert_eq!(s.verify_audit().await.unwrap(), Ok(()));
 }
 
+/// R1-C2, ревью задачи 5 (Ruling m2): запись, единственная на ключ эффекта. Повтор с тем
+/// же ключом, действием и объектом новой записи не даёт; иной ключ, действие или объект —
+/// новая запись. Ключ лежит в `payload.effect_key`; выборка по действию и объекту — по
+/// порядку записей.
+#[tokio::test]
+async fn audit_once_per_effect_key() {
+    let s = open("audit-once");
+    let a = s
+        .append_audit_once(
+            n("agent", "rule_of_two", "run-1", json!({"call_id": "w1"})),
+            "k:1",
+        )
+        .await
+        .unwrap()
+        .expect("первая запись");
+    assert_eq!(a.payload, json!({"call_id": "w1", "effect_key": "k:1"}));
+    // Повтор того же ключа (замыкание слота после сбоя) — без записи.
+    let again = s
+        .append_audit_once(
+            n("agent", "rule_of_two", "run-1", json!({"call_id": "w1"})),
+            "k:1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, None);
+    // Иной ключ, иной объект, иное действие — новые записи.
+    for (action, target, key) in [
+        ("rule_of_two", "run-1", "k:2"),
+        ("rule_of_two", "run-2", "k:1"),
+        ("other", "run-1", "k:1"),
+    ] {
+        assert!(
+            s.append_audit_once(n("agent", action, target, json!({})), key)
+                .await
+                .unwrap()
+                .is_some(),
+            "{action} {target} {key}"
+        );
+    }
+    // Обычная запись того же действия с иным `effect_key` повтор не подавляет и не
+    // подавляется.
+    s.append_audit(n(
+        "agent",
+        "rule_of_two",
+        "run-1",
+        json!({"effect_key": "k:3"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        s.append_audit_once(n("agent", "rule_of_two", "run-1", json!({})), "k:3")
+            .await
+            .unwrap(),
+        None
+    );
+    let by = s.audit_by("rule_of_two", "run-1").await.unwrap();
+    assert_eq!(
+        by.iter()
+            .map(|e| e.payload["effect_key"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["k:1", "k:2", "k:3"]
+    );
+    assert_eq!(by[0], a);
+    assert!(s.audit_by("rule_of_two", "run-3").await.unwrap().is_empty());
+    assert_eq!(s.verify_audit().await.unwrap(), Ok(()));
+}
+
 /// Пустой журнал: цепочка цела, записей нет.
 #[tokio::test]
 async fn empty_audit_verifies() {

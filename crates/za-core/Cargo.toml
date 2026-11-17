@@ -26,6 +26,8 @@ tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 # Сверка открытого дескриптора с каноническим путём (D98).
 same-file.workspace = true
+# Нормализация хоста (R1-C2 D124): `url::Host::parse` — IDNA и IP-литералы по WHATWG.
+url.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Число жёстких ссылок у `paths::open_checked` (I3).

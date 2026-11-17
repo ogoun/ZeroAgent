@@ -95,6 +95,44 @@ pub struct Subjects {
     pub irreversible: Vec<&'static str>,
     /// Вызов обращается к сети.
     pub network: bool,
+    /// Хосты вызова для правил политики по домену (R1-C2 D104, D105): нормализованы
+    /// [`crate::net::normalize_host`] (D124), без повторов. У `bash` — хосты сетевых
+    /// сегментов ([`crate::net::shell_hosts`]), у `web_fetch` — хост URL, у `web_search` —
+    /// пусто (правила по домену к поиску не применяются).
+    pub hosts: Vec<String>,
+    /// Вызов сетевой, но хост определить нельзя (D104: подстановка, подмена адреса, хост
+    /// не записан буквально или не принят нормализацией). При правиле `deny` или `ask` по
+    /// домену — вопрос с причиной `rule`; без таких правил ни на что не влияет.
+    pub hosts_unknown: bool,
+}
+
+/// Одно обращение сетевого шлюза (R1-C2 D112, SEC-045): HTTP-запрос вызова, в том числе
+/// `robots.txt`, отказ фильтра до соединения и запрос, прерванный дедлайном.
+///
+/// Шлюз `za-web` кладёт по записи на каждый запрос; пакет пишет из них события
+/// `web.request` (`url` и `final_url` — через маску секретов).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetRequest {
+    /// Метод: в R1-C2 только `GET`.
+    pub method: String,
+    /// Адрес запроса (после нормализации хоста, без userinfo).
+    pub url: String,
+    /// Куда указал ответ-редирект (`Location`, абсолютный адрес без userinfo и фрагмента);
+    /// иначе `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_url: Option<String>,
+    /// Код ответа, если заголовки ответа получены.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Прочитано байт тела.
+    pub bytes: u64,
+    /// Длительность от начала запроса, мс.
+    pub ms: u64,
+    /// Исход: `za_protocol::net_outcome::{OK, BLOCKED, ERROR}`.
+    pub outcome: String,
+    /// Причина отказа или сбоя (`timeout` — дедлайн вызова).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Постусловие результата (TOOL-004, D75): что пакет проверяет после вызова.
@@ -151,6 +189,14 @@ pub struct ToolOutput {
     /// Постусловия (TOOL-004).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post: Vec<Postcondition>,
+    /// Журнал сетевых обращений вызова (R1-C2 D112): по записи на HTTP-запрос шлюза.
+    /// Пакет пишет из них события `web.request` (строки — через маску секретов) и в
+    /// квитанцию эффекта поле не кладёт: URL с секретом в параметре оказался бы там без
+    /// маски, а при реплее записи не нужны — события уже в журнале. `Box<[_]>`, а не `Vec`:
+    /// `ToolOutput` — `Err` многих функций инструментов, и лишние 8 байт довели бы его до
+    /// предела `clippy::result_large_err` (128 байт).
+    #[serde(skip)]
+    pub requests: Box<[NetRequest]>,
 }
 
 impl ToolOutput {
@@ -186,6 +232,39 @@ pub struct ToolCx {
     /// предметов политики (`Subjects::paths`, затем `cwd`); пусто — пакет путей не
     /// разрешал (вызов вне пакета, тест инструмента).
     pub paths: Vec<crate::paths::ResolvedPath>,
+    /// Дедлайн вызова (R1-C2 D107, D112): слот ставит [`call_deadline`] от старта вызова.
+    /// Инструмент, который сам соблюдает дедлайн (сетевой шлюз), успевает вернуть журнал
+    /// обращений раньше внешнего тайм-аута слота. `None` — вызов вне пакета: инструмент
+    /// считает дедлайн сам от своего старта.
+    pub deadline: Option<std::time::Instant>,
+    /// Фактический предел результата вызова в контексте на этом окне, байт текста после
+    /// экранирования (R1-C2 D110, I2 ревью задачи 8): с выгрузкой — доля окна
+    /// `spill_limit_bytes`, уменьшенная `output_limit`; без выгрузки — `output_limit`.
+    /// Инструмент со сжатым представлением (`ToolOutput::digest`) укладывает его в этот
+    /// предел за вычетом [`DIGEST_RESERVE`]. `None` — предела нет или вызов вне пакета.
+    pub output_budget: Option<usize>,
+}
+
+/// Запас под строки слота вокруг `ToolOutput::digest` (R1-C2 D110, I1 и I2 ревью задачи 8):
+/// первая строка происхождений `[untrusted content: …]` и указатель выгрузки
+/// `[output digest; full output: search …]`, каждая с переводом строки. `digest` не длиннее
+/// `output_budget − DIGEST_RESERVE` (после экранирования) приходит в контекст целиком.
+/// Худший случай строк — около 220 байт (тест слота `digest_reserve_covers_slot_lines`).
+pub const DIGEST_RESERVE: usize = 256;
+
+/// Запас до внешнего тайм-аута слота (D107): дедлайн вызова — тайм-аут инструмента минус
+/// это значение.
+pub const DEADLINE_GRACE: Duration = Duration::from_secs(1);
+
+/// Дедлайн вызова, начатого в `start`, с пределом `timeout` (D107): `timeout` минус
+/// [`DEADLINE_GRACE`]. Предел не больше запаса (тесты с долями секунды) — половина предела:
+/// дедлайн остаётся раньше внешнего тайм-аута и не совпадает со стартом.
+pub fn call_deadline(start: std::time::Instant, timeout: Duration) -> std::time::Instant {
+    let budget = match timeout.checked_sub(DEADLINE_GRACE) {
+        Some(d) if !d.is_zero() => d,
+        _ => timeout / 2,
+    };
+    start + budget
 }
 
 /// Инструмент run.
@@ -258,9 +337,17 @@ pub fn gate(mode: RunMode, spec: &ToolSpec) -> Gate {
 pub struct DuplicateTool(pub String);
 
 /// Реестр инструментов по имени.
+///
+/// Кроме инструментов, реестр знает имена, снятые с исполнения ([`ToolRegistry::withdraw`]):
+/// инструмент есть в замороженном префиксе run (модель его видит, префикс не меняется ради
+/// кэша), но этот процесс его не исполняет — например, веб выключен конфигурацией между
+/// паузой и resume (находка 1 приёмки R1-C2). Вызов такого имени получает текст причины
+/// вместо `unknown tool`.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Имя, снятое с исполнения → текст результата-ошибки для модели (английский, D23).
+    withdrawn: BTreeMap<String, String>,
 }
 
 impl ToolRegistry {
@@ -278,6 +365,22 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// Снимает имя `name` с исполнения: вызов отвечает `text` (результат-ошибка). На
+    /// зарегистрированный инструмент не действует — [`ToolRegistry::get`] важнее; повтор
+    /// заменяет текст.
+    pub fn withdraw(&mut self, name: impl Into<String>, text: impl Into<String>) {
+        self.withdrawn.insert(name.into(), text.into());
+    }
+
+    /// Текст вызова имени, снятого с исполнения ([`ToolRegistry::withdraw`]); `None` —
+    /// имя не снималось или инструмент зарегистрирован.
+    pub fn withdrawn(&self, name: &str) -> Option<&str> {
+        if self.tools.contains_key(name) {
+            return None;
+        }
+        self.withdrawn.get(name).map(String::as_str)
     }
 
     /// Инструменты роли с `min_tier <= tier`, по имени.

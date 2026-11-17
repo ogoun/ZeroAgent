@@ -19,7 +19,7 @@ use zero_agent::trust::{EXTERNAL_LINK, LINK_PREFIX, TrustDiff, TrustSet, trust_s
 
 mod support;
 use support::fake_llama::{Fake, call_reply, llama_config, text_reply};
-use support::process::{Env, env_in, interrupt_id, run_id, unique_dir};
+use support::process::{Env, dir_link, env_in, interrupt_id, run_id, unique_dir};
 
 /// Каталог проекта и внешний каталог теста.
 fn fixture(name: &str) -> (PathBuf, PathBuf) {
@@ -33,31 +33,6 @@ fn fixture(name: &str) -> (PathBuf, PathBuf) {
 
 fn hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
-}
-
-/// Ссылка на каталог: junction на Windows (`mklink /J` прав не требует), символическая
-/// ссылка на Unix.
-fn dir_link(link: &Path, target: &Path) {
-    #[cfg(windows)]
-    {
-        // `mklink` понимает только `\`: путь собирается заново по компонентам.
-        let native = |p: &Path| p.components().collect::<PathBuf>();
-        let out = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(native(link))
-            .arg(native(target))
-            .output()
-            .expect("cmd не запустился");
-        assert!(
-            out.status.success(),
-            "mklink /J: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
 }
 
 /// Ссылка на файл. На Windows требует прав администратора или режима разработчика:
@@ -178,6 +153,41 @@ fn directory_links_are_not_walked() {
     // Своё содержимое дерева по-прежнему учитывается.
     std::fs::write(p.join(".agents/skills/own/SKILL.md"), "своё 2").unwrap();
     assert_ne!(trust_set(&p).unwrap().files[".agents/skills"], own_tree);
+}
+
+/// R1-C2 D116 (миграция): пределы обхода доверия меняют значение только у деревьев сверх
+/// них. Файл дерева больше 1 МиБ входит в хэш дерева как `too-large:<size>`, без чтения
+/// содержимого (его правка того же размера набор не меняет: рантайм такой файл не читает);
+/// больше 10 000 записей — дереву значение `external-link`. Доверенные файлы в корне
+/// хэшируются целиком, как в R1-C1.
+#[test]
+fn tree_limits_change_only_big_trees() {
+    let (p, _) = fixture("tree-limits");
+    std::fs::create_dir_all(p.join(".claude/skills/x")).unwrap();
+    std::fs::write(p.join(".claude/skills/x/SKILL.md"), "s").unwrap();
+    std::fs::write(p.join(".claude/skills/x/big.bin"), vec![1u8; 2 << 20]).unwrap();
+    std::fs::write(p.join("CLAUDE.md"), vec![b'c'; 2 << 20]).unwrap();
+    let list = serde_json::json!([
+        ["x/SKILL.md", hex(b"s")],
+        ["x/big.bin", "too-large:2097152"]
+    ]);
+    let tree = hex(za_protocol::canonical_json(&list).as_bytes());
+    let first = trust_set(&p).unwrap();
+    assert_eq!(first.files[".claude/skills"], tree);
+    assert_eq!(first.files["CLAUDE.md"], hex(&vec![b'c'; 2 << 20]));
+    std::fs::write(p.join(".claude/skills/x/big.bin"), vec![2u8; 2 << 20]).unwrap();
+    assert_eq!(trust_set(&p).unwrap(), first);
+    // Больше 10 000 записей в дереве.
+    let t = p.join(".agents/skills");
+    std::fs::create_dir_all(&t).unwrap();
+    for i in 0..10_001 {
+        std::fs::write(t.join(format!("f{i:05}")), "").unwrap();
+    }
+    assert_eq!(
+        trust_set(&p).unwrap().files[".agents/skills"],
+        EXTERNAL_LINK
+    );
+    std::fs::remove_dir_all(&t).unwrap();
 }
 
 /// I2, Ruling 7.4: `.claude` и `AGENTS.md` — ссылки на `\\host\share`. Набор строится без
@@ -388,6 +398,39 @@ fn claude_md_is_fallback() {
     let system = system_of(&srv.bodies()[1]);
     assert!(system.contains(&format!("{MARK} agents")), "{system}");
     assert!(!system.contains(&format!("{MARK} claude")), "{system}");
+}
+
+/// D102, SEC-051: невидимые символы `AGENTS.md` доверенного проекта удаляются до
+/// system; число удалённых — `input.cleaned {source: "agents_md"}`.
+#[test]
+fn agents_md_hidden_chars_removed() {
+    let (srv, e) = run_env("agents-md-hidden", paris);
+    std::fs::write(
+        e.project.join("AGENTS.md"),
+        format!("{MARK} a\u{E0041}\u{E0042}b"),
+    )
+    .unwrap();
+    e.trust();
+    let o = e.run_cmd(&["Вопрос"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let run = run_id(&o);
+    let system = e.snapshot(run)["frozen"]["system"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(system.contains(&format!("{MARK} ab")), "{system}");
+    assert!(!system.contains('\u{E0041}'), "{system:?}");
+    assert!(!system_of(&srv.bodies()[0]).contains('\u{E0041}'));
+    let cleaned: Vec<Value> = e
+        .events(run)
+        .into_iter()
+        .filter(|(k, _)| *k == za_protocol::EventKind::InputCleaned)
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(
+        cleaned,
+        [serde_json::json!({"source": "agents_md", "removed": 2})]
+    );
 }
 
 #[test]

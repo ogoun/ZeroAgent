@@ -14,14 +14,17 @@ use std::time::Duration;
 
 use serde_json::json;
 use za_agent::{
-    Decision, Grant, GrantConfig, GrantMode, GrantSource, PolicyConfig, PolicyCx, PolicyError,
-    PolicySnapshot, Rule, RuleAction, RuleSource, covers, decide, grants_text, parse_grant_flag,
-    runtime_texts, subject_paths,
+    Decision, Exposure, Grant, GrantConfig, GrantMode, GrantSource, PolicyConfig, PolicyCx,
+    PolicyError, PolicySnapshot, Rule, RuleAction, RuleSource, covers, decide, grants_text,
+    parse_grant_flag, runtime_texts, subject_paths,
 };
+use za_core::net::{normalize_host, shell_hosts};
 use za_core::paths::{ResolvedPath, Roots, classify, protected_place, resolve, within};
 use za_core::shell::{self, Dialect};
 use za_core::{Access, Approval, RawPath, RiskClass, Subjects, ToolKind, ToolSchema, ToolSpec};
-use za_protocol::{EffectClass, RunMode, RunRole, Tier, approval_reason as ar, deny_reason};
+use za_protocol::{
+    EffectClass, RunMode, RunRole, Tier, approval_reason as ar, deny_reason, taint_origin,
+};
 
 // ---- Помощники ----
 
@@ -83,6 +86,32 @@ fn edit_spec() -> ToolSpec {
 fn bash_spec() -> ToolSpec {
     spec("bash", ToolKind::Exec, RiskClass::Exec)
 }
+/// Описание `web_fetch` по таблице D123: чтение, риск — сеть.
+fn fetch_spec() -> ToolSpec {
+    spec("web_fetch", ToolKind::Read, RiskClass::Network)
+}
+fn search_spec() -> ToolSpec {
+    spec("web_search", ToolKind::Read, RiskClass::Network)
+}
+
+/// Предметы `web_fetch` (D105): нормализованный хост URL (D124), путей нет.
+fn fetch(host: &str) -> (Subjects, Vec<ResolvedPath>) {
+    let s = Subjects {
+        hosts: vec![normalize_host(host).expect("хост")],
+        network: true,
+        ..Subjects::default()
+    };
+    (s, Vec::new())
+}
+
+/// Предметы `web_search` (D105): хостов нет — правила по домену к поиску не применяются.
+fn search() -> (Subjects, Vec<ResolvedPath>) {
+    let s = Subjects {
+        network: true,
+        ..Subjects::default()
+    };
+    (s, Vec::new())
+}
 
 /// Разрешённый путь без ввода-вывода: лексический разбор и признаки по корням.
 fn rp(r: &Roots, arg: &str, access: Access) -> ResolvedPath {
@@ -135,6 +164,8 @@ fn bash(r: &Roots, cmd: &str) -> (Subjects, Vec<ResolvedPath>) {
             }
         }
     }
+    // Хосты для правил по домену — общей функцией, как у `za-tools` (D104, D124).
+    let (hosts, hosts_unknown) = shell_hosts(&segs, d);
     let s = Subjects {
         network: segs.iter().any(|s| shell::is_network(s, d)),
         command: Some(cmd.to_owned()),
@@ -142,6 +173,8 @@ fn bash(r: &Roots, cmd: &str) -> (Subjects, Vec<ResolvedPath>) {
         irreversible,
         segments: segs,
         cwd: None,
+        hosts,
+        hosts_unknown,
     };
     // Слово, которое `classify` отвергает (на Windows `/etc/hosts` — `DriveRelative`),
     // не разрешается: список короче `subject_paths`, граница неизвестна — Ask.
@@ -159,6 +192,7 @@ fn rule(action: RuleAction) -> Rule {
         tool: None,
         path: None,
         command: None,
+        domain: None,
     }
 }
 fn tool_rule(action: RuleAction, tool: &str) -> Rule {
@@ -178,6 +212,15 @@ fn cmd_rule(action: RuleAction, command: &str) -> Rule {
         command: Some(command.to_owned()),
         ..rule(action)
     }
+}
+fn domain_rule(action: RuleAction, domain: &str) -> Rule {
+    Rule {
+        domain: Some(domain.to_owned()),
+        ..rule(action)
+    }
+}
+fn deny_domain(domain: &str) -> Vec<Rule> {
+    vec![domain_rule(RuleAction::Deny, domain)]
 }
 
 fn cfg_with(rules: Vec<Rule>) -> PolicyConfig {
@@ -447,6 +490,373 @@ fn decide_table() {
     );
 }
 
+// ---- Правила по домену (R1-C2 D104, D105, D124) ----
+
+/// D105: поле `domain` — предмет правила; `deny` по хосту — отказ, `ask` — причина
+/// `rule`, `allow` по домену ничего не снимает; проект задаёт только `deny` и `ask`.
+#[test]
+fn domain_rules() {
+    let r = roots();
+    let auto = |rules: Vec<Rule>| Cx::new(RunMode::Auto).policy(snap(rules));
+    let deny = Decision::Deny(deny_reason::POLICY_RULE);
+
+    // Правило только с `domain` собирается (нет `PolicyError::Empty`).
+    let sub = auto(deny_domain("*.evil.test"));
+    assert_eq!(sub.decide(&fetch_spec(), &fetch("a.evil.test")), deny);
+    assert_eq!(sub.decide(&fetch_spec(), &fetch("x.a.evil.test")), deny);
+    // `*.evil.test` — поддомены, но не сам `evil.test`.
+    assert_eq!(
+        sub.decide(&fetch_spec(), &fetch("evil.test")),
+        Decision::Allow
+    );
+
+    // Хост команды нормализован: регистр и последняя точка правило не обходят.
+    let exact = auto(deny_domain("evil.test"));
+    for cmd in [
+        "curl https://EVIL.test/x",
+        "curl https://evil.test./x",
+        "echo a && wget https://evil.test:8443/x",
+    ] {
+        assert_eq!(exact.decide(&bash_spec(), &bash(&r, cmd)), deny, "{cmd}");
+    }
+    assert_eq!(
+        exact.decide(&bash_spec(), &bash(&r, "curl https://ok.test/x")),
+        Decision::Allow
+    );
+    assert_eq!(
+        exact.decide(&fetch_spec(), &fetch("Evil.Test.")),
+        deny,
+        "web_fetch"
+    );
+    // У вызова без хостов правило по домену не срабатывает.
+    assert_eq!(
+        exact.decide(&read_spec(), &one(&r, "a.txt", Access::Read)),
+        Decision::Allow
+    );
+
+    // `domain` и `tool` вместе — должны совпасть оба.
+    let docs = auto(vec![Rule {
+        tool: Some("web_fetch".into()),
+        ..domain_rule(RuleAction::Ask, "docs.rs")
+    }]);
+    assert_eq!(
+        docs.decide(&fetch_spec(), &fetch("docs.rs")),
+        ask(&[ar::RULE])
+    );
+    assert_eq!(
+        docs.decide(&bash_spec(), &bash(&r, "curl https://docs.rs/x")),
+        Decision::Allow,
+        "tool не совпал"
+    );
+    assert_eq!(
+        docs.decide(&fetch_spec(), &fetch("crates.io")),
+        Decision::Allow
+    );
+
+    // `allow` по домену не расширяет: вопрос режима остаётся.
+    let allow = Cx::new(RunMode::Ask).policy(snap(vec![domain_rule(RuleAction::Allow, "*")]));
+    assert_eq!(
+        allow.decide(&bash_spec(), &bash(&r, "curl https://x.test")),
+        ask(&[ar::MODE])
+    );
+    // Даже вместе с `command`: правило с `domain` не разрешает.
+    let allow_cmd = Cx::new(RunMode::Ask).policy(snap(vec![Rule {
+        command: Some("curl *".into()),
+        ..domain_rule(RuleAction::Allow, "x.test")
+    }]));
+    assert_eq!(
+        allow_cmd.decide(&bash_spec(), &bash(&r, "curl https://x.test")),
+        ask(&[ar::MODE])
+    );
+
+    // Проект: `deny` по домену действует, `allow` — в `ignored`.
+    let project = PolicyConfig {
+        rules: vec![
+            domain_rule(RuleAction::Deny, "x.test"),
+            domain_rule(RuleAction::Allow, "y.test"),
+        ],
+        ..PolicyConfig::default()
+    };
+    let p = PolicySnapshot::build(&PolicyConfig::default(), Some(&project)).unwrap();
+    assert_eq!(p.ignored, vec![domain_rule(RuleAction::Allow, "y.test")]);
+    let cx = Cx::new(RunMode::Auto).policy(p);
+    assert_eq!(cx.decide(&fetch_spec(), &fetch("x.test")), deny);
+    assert_eq!(
+        cx.decide(&bash_spec(), &bash(&r, "curl https://x.test/")),
+        deny
+    );
+}
+
+/// D104, D105, Ruling задачи 3: неопределённый хост команды — `Ask` с причиной `rule`
+/// только при подходящем правиле `deny` или `ask` по домену; без правил по домену вопроса
+/// нет (решение заказчика «сеть не влияет на команды»).
+#[test]
+fn unknown_host_asks_only_with_domain_rules() {
+    let r = roots();
+    let with = Cx::new(RunMode::Auto).policy(snap(deny_domain("evil.test")));
+    let without = Cx::new(RunMode::Auto);
+    for cmd in [
+        "curl $URL",
+        "ssh -J jump.test me@ok.test",
+        "curl --resolve ok.test:443:1.2.3.4 https://ok.test/",
+        // Сырой хост, который нормализация не принимает, — неизвестен (I1 ревью задачи 3).
+        "curl https://1.2.3.4.5/",
+        // Проходы 3c и 3d: присваивание в команде, мастер-соединение ssh, ключ `git -c` вне
+        // белого списка.
+        "export https_proxy=http://p.test:1; curl https://ok.test/",
+        "ssh -S ctl me@ok.test",
+        "git -c http.curloptResolve=ok.test:443:b.test fetch https://ok.test/r",
+    ] {
+        let sp = bash(&r, cmd);
+        assert!(sp.0.hosts_unknown, "{cmd}");
+        assert_eq!(with.decide(&bash_spec(), &sp), ask(&[ar::RULE]), "{cmd}");
+        assert_eq!(without.decide(&bash_spec(), &sp), Decision::Allow, "{cmd}");
+    }
+    // Правило `ask` по домену — так же.
+    let ask_rule = Cx::new(RunMode::Auto).policy(snap(vec![domain_rule(RuleAction::Ask, "*")]));
+    assert_eq!(
+        ask_rule.decide(&bash_spec(), &bash(&r, "curl $URL")),
+        ask(&[ar::RULE])
+    );
+    // Правило по домену другого инструмента или `allow` по домену вопроса не дают.
+    for rules in [
+        vec![Rule {
+            tool: Some("web_fetch".into()),
+            ..domain_rule(RuleAction::Deny, "evil.test")
+        }],
+        vec![domain_rule(RuleAction::Allow, "*")],
+        vec![cmd_rule(RuleAction::Deny, "wget")],
+    ] {
+        let cx = Cx::new(RunMode::Auto).policy(snap(rules.clone()));
+        assert_eq!(
+            cx.decide(&bash_spec(), &bash(&r, "curl $URL")),
+            Decision::Allow,
+            "{rules:?}"
+        );
+    }
+    // Остальные поля правила сверяются как обычно: `command` не совпал — вопроса нет.
+    let curl_only = Cx::new(RunMode::Auto).policy(snap(vec![Rule {
+        command: Some("curl".into()),
+        ..domain_rule(RuleAction::Deny, "evil.test")
+    }]));
+    assert_eq!(
+        curl_only.decide(&bash_spec(), &bash(&r, "wget $URL")),
+        Decision::Allow
+    );
+    assert_eq!(
+        curl_only.decide(&bash_spec(), &bash(&r, "curl $URL")),
+        ask(&[ar::RULE])
+    );
+    // Известный совпавший хост сильнее: отказ, а не вопрос.
+    assert_eq!(
+        with.decide(
+            &bash_spec(),
+            &bash(&r, "curl https://evil.test/ && curl $URL")
+        ),
+        Decision::Deny(deny_reason::POLICY_RULE)
+    );
+    // Сетевой команды нет — хост не нужен.
+    assert_eq!(
+        with.decide(&bash_spec(), &bash(&r, "echo https://evil.test")),
+        Decision::Allow
+    );
+}
+
+/// M1 ревью задачи 4: вопрос о неизвестном хосте (причина `rule`) не снимают ни `bypass`,
+/// ни глобальное `allow` с `command` — снимается только `mode`.
+#[test]
+fn unknown_host_rule_survives_bypass_and_allow() {
+    let r = roots();
+    let p = snap(vec![
+        cmd_rule(RuleAction::Allow, "curl *"),
+        domain_rule(RuleAction::Deny, "evil.test"),
+    ]);
+    assert!(p.allow_bypass);
+    let bypass = Cx::new(RunMode::Bypass).policy(p.clone());
+    let ask_mode = Cx::new(RunMode::Ask).policy(p);
+    for cx in [&bypass, &ask_mode] {
+        // `allow` действует: известный хост вне правила — без вопроса.
+        assert_eq!(
+            cx.decide(&bash_spec(), &bash(&r, "curl https://ok.test/")),
+            Decision::Allow
+        );
+        assert_eq!(
+            cx.decide(&bash_spec(), &bash(&r, "curl $URL")),
+            ask(&[ar::RULE])
+        );
+    }
+}
+
+/// D105: шаблон `domain` нормализуется по меткам — метки не из ASCII в punycode.
+#[test]
+fn domain_pattern_is_punycoded() {
+    let deny = Decision::Deny(deny_reason::POLICY_RULE);
+    let exact = Cx::new(RunMode::Auto).policy(snap(deny_domain("пример.рф")));
+    assert_eq!(
+        exact.decide(&fetch_spec(), &fetch("xn--e1afmkfd.xn--p1ai")),
+        deny
+    );
+    assert_eq!(exact.decide(&fetch_spec(), &fetch("ПРИМЕР.РФ")), deny);
+    let sub = Cx::new(RunMode::Auto).policy(snap(deny_domain("*.пример.рф")));
+    assert_eq!(
+        sub.decide(&fetch_spec(), &fetch("www.xn--e1afmkfd.xn--p1ai")),
+        deny
+    );
+    assert_eq!(
+        sub.decide(&fetch_spec(), &fetch("xn--e1afmkfd.xn--p1ai")),
+        Decision::Allow
+    );
+    let p = snap(deny_domain("*.Пример.РФ"));
+    assert_eq!(
+        p.rules[0].1.domain.as_deref(),
+        Some("*.xn--e1afmkfd.xn--p1ai")
+    );
+    // Метка не из ASCII с символом шаблона в punycode не переводится — ошибка сборки, а
+    // не правило, которое молча никогда не сработает.
+    assert!(matches!(
+        PolicySnapshot::build(&cfg_with(deny_domain("при*мер.рф")), None),
+        Err(PolicyError::Glob(0, "domain", _))
+    ));
+}
+
+/// D105: одна последняя точка снимается при сборке.
+#[test]
+fn domain_pattern_trailing_dot() {
+    let p = snap(deny_domain("Evil.Test."));
+    assert_eq!(p.rules[0].1.domain.as_deref(), Some("evil.test"));
+    let cx = Cx::new(RunMode::Auto).policy(p);
+    assert_eq!(
+        cx.decide(&fetch_spec(), &fetch("evil.test")),
+        Decision::Deny(deny_reason::POLICY_RULE)
+    );
+}
+
+#[test]
+fn bad_domain_pattern_rejected() {
+    assert!(matches!(
+        PolicySnapshot::build(&cfg_with(deny_domain("[")), None),
+        Err(PolicyError::Glob(0, "domain", _))
+    ));
+    for bad in [
+        "",
+        ".",
+        "a..b",
+        "evil.test..",
+        // I1 ревью задачи 4: такой `deny` молча не совпал бы ни с одним хостом — ошибка
+        // сборки. Метка — только `[a-z0-9_-]` и `*`, `?`; IP — только литералом.
+        "evil.test/*",
+        "*.evil.test:443",
+        "https://*.evil.test",
+        "*.evil.test ",
+        "[fe80::*]",
+        "192.168.*.*",
+    ] {
+        assert!(
+            matches!(
+                PolicySnapshot::build(&cfg_with(deny_domain(bad)), None),
+                Err(PolicyError::Glob(0, "domain", _))
+            ),
+            "{bad:?}"
+        );
+    }
+    // Допустимые формы: имя с glob, IP-литерал (IPv6 — в скобках или без).
+    let deny = Decision::Deny(deny_reason::POLICY_RULE);
+    for (pat, host) in [
+        ("*", "a.test"),
+        ("*.evil.test", "a.evil.test"),
+        ("api-?.evil.test", "api-1.evil.test"),
+        // Ruling прохода fix-4: `_` в метке допустим.
+        ("a_b.evil.test", "a_b.evil.test"),
+        ("*.Svc_X.test", "_tcp.svc_x.test"),
+        ("10.0.0.1", "10.0.0.1"),
+        ("[::1]", "[::1]"),
+        ("::1", "[::1]"),
+    ] {
+        let cx = Cx::new(RunMode::Auto).policy(snap(deny_domain(pat)));
+        assert_eq!(cx.decide(&fetch_spec(), &fetch(host)), deny, "{pat}");
+    }
+    // Проектные правила проверяются так же.
+    let project = PolicyConfig {
+        rules: deny_domain("["),
+        ..PolicyConfig::default()
+    };
+    assert!(matches!(
+        PolicySnapshot::build(&PolicyConfig::default(), Some(&project)),
+        Err(PolicyError::Glob(0, "domain", _))
+    ));
+}
+
+/// D105, D111: у `web_search` хостов нет — `deny domain="*"` поиск не останавливает.
+#[test]
+fn search_is_not_subject_to_domain_rules() {
+    let cx = Cx::new(RunMode::Auto).policy(snap(deny_domain("*")));
+    assert_eq!(cx.decide(&search_spec(), &search()), Decision::Allow);
+    assert_eq!(
+        cx.decide(&fetch_spec(), &fetch("any.test")),
+        Decision::Deny(deny_reason::POLICY_RULE)
+    );
+}
+
+/// Хэш снимка включает `domain`; правило без него хэшируется как в R1-C1, снимок без
+/// поля читается.
+#[test]
+fn domain_in_hash_and_old_snapshots_read() {
+    let base = snap(vec![tool_rule(RuleAction::Deny, "bash")]);
+    let with = snap(vec![Rule {
+        domain: Some("x.test".into()),
+        ..tool_rule(RuleAction::Deny, "bash")
+    }]);
+    let other = snap(vec![Rule {
+        domain: Some("y.test".into()),
+        ..tool_rule(RuleAction::Deny, "bash")
+    }]);
+    assert_ne!(base.hash, with.hash);
+    assert_ne!(with.hash, other.hash);
+    // Сериализация правила без `domain` — прежняя (хэш политики R1-C1 не меняется).
+    let v = serde_json::to_value(tool_rule(RuleAction::Deny, "bash")).unwrap();
+    assert_eq!(
+        v,
+        json!({"action": "deny", "tool": "bash", "path": null, "command": null})
+    );
+    let back: Rule = serde_json::from_value(v).unwrap();
+    assert_eq!(back.domain, None);
+    let back: PolicySnapshot =
+        serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+    assert_eq!(back, with);
+}
+
+/// M4 ревью задачи 4: хэш политики R1-C1 закреплён значением, которое дал код R1-C1
+/// (`main`, 7aac95f), — любое изменение `policy_hash` или сериализации `Rule` видно.
+/// Политика задана JSON без `domain`: тот же текст собирается и кодом R1-C1. Пути — строкой
+/// через `/`: хэш одинаков на всех ОС. Значение не перезаписывать: смена хэша — новая запись
+/// `policy.loaded` у каждой прежней конфигурации (миграция в CHANGELOG).
+#[test]
+fn r1c1_policy_hash_is_pinned() {
+    let global: PolicyConfig = serde_json::from_value(json!({
+        "allow_bypass": true,
+        "rules": [
+            {"action": "allow", "command": "cargo test*"},
+            {"action": "ask", "tool": "edit"},
+            {"action": "deny", "path": "secrets/**"},
+            {"action": "deny", "tool": "bash", "command": "rm *", "path": "/data/**"},
+        ],
+        "grants": [
+            {"path": "/data", "mode": "ro", "reason": "r"},
+            {"path": "/srv", "mode": "rw"},
+        ],
+    }))
+    .unwrap();
+    let project: PolicyConfig = serde_json::from_value(json!({
+        "rules": [
+            {"action": "ask", "command": "git push*"},
+            {"action": "allow", "tool": "bash"},
+        ],
+    }))
+    .unwrap();
+    let hash = PolicySnapshot::build(&global, Some(&project)).unwrap().hash;
+    assert_eq!(hash, include_str!("golden/policy_r1c1.hash").trim());
+}
+
 // ---- Режим × вид инструмента ----
 
 #[test]
@@ -647,6 +1057,95 @@ fn tainted_never_asks() {
         Cx::new(RunMode::Auto).decide(&bash_spec(), &bash(&r, "curl -s https://example.com")),
         Decision::Allow
     );
+}
+
+// ---- R1-C2, задача 5: Rule of Two без вопросов (D106, решение заказчика 2026-11-11) ----
+
+/// Решение заказчика «не спрашивать»: `decide` не знает экспозиции, и сочетание трёх
+/// свойств вопроса не даёт. Недоверенное содержимое — метка `web`, приватные данные —
+/// чтение вне проекта (`outside_project`); вызов, который добавил бы третье свойство,
+/// идёт по режиму. Без гранта чтение вне проекта спрашивается, как в R1-C1, — только
+/// `outside_project`, без `rule_of_two`.
+#[test]
+fn rule_of_two_never_asks() {
+    let r = roots();
+    let cx = Cx::new(RunMode::Auto)
+        .taint(taint_origin::WEB)
+        .taint(taint_origin::OUTSIDE_PROJECT);
+    // untrusted + private: сетевое чтение — внешняя связь.
+    assert_eq!(cx.decide(&fetch_spec(), &fetch("a.test")), Decision::Allow);
+    assert_eq!(cx.decide(&search_spec(), &search()), Decision::Allow);
+    // untrusted + external: чтение вне проекта по гранту ro — приватные данные.
+    let read_out = one(&r, &pat("/data/x"), Access::Read);
+    let with_grant = Cx::new(RunMode::Auto)
+        .taint(taint_origin::WEB)
+        .taint(taint_origin::NETWORK)
+        .grants(vec![g_ro("/data")]);
+    assert_eq!(with_grant.decide(&read_spec(), &read_out), Decision::Allow);
+    let no_grant = Cx::new(RunMode::Auto).taint(taint_origin::WEB);
+    assert_eq!(
+        no_grant.decide(&read_spec(), &read_out),
+        ask(&[ar::OUTSIDE_PROJECT])
+    );
+    // Команда с внешним путём по гранту rw после чтения сети — по режиму.
+    assert_eq!(
+        Cx::new(RunMode::Auto)
+            .taint(taint_origin::WEB)
+            .grants(vec![grant("/etc", GrantMode::Rw)])
+            .decide(&bash_spec(), &bash(&r, &format!("cat {}", pat("/etc/x")))),
+        Decision::Allow
+    );
+    // В текстах для модели нет `rule_of_two`. Что его нет и в порядке причин одобрения
+    // (`REASON_ORDER` R1-C1), проверяет модульный тест
+    // `tools::tests::reason_order_has_no_rule_of_two`.
+    assert!(
+        !runtime_texts()
+            .iter()
+            .any(|(_, t)| t.contains(za_protocol::audit_action::RULE_OF_TWO)),
+        "rule_of_two не должен попадать в тексты модели"
+    );
+}
+
+/// R1-C1 (D82, решение заказчика): метка `web` вопросов к командам не добавляет.
+#[test]
+fn tainted_never_asks_still_holds() {
+    let r = roots();
+    for origin in [taint_origin::WEB, taint_origin::NETWORK, taint_origin::TOOL] {
+        assert_eq!(
+            Cx::new(RunMode::Auto)
+                .taint(origin)
+                .decide(&bash_spec(), &bash(&r, "cargo test")),
+            Decision::Allow,
+            "{origin}"
+        );
+    }
+}
+
+/// D106, preflight 1.9: `untrusted` — любое происхождение метки, кроме `outside_project`
+/// (чтение вне проекта — свойство `private`, а не недоверенный ввод).
+#[test]
+fn untrusted_ignores_outside_project_origin() {
+    let set = |o: &[&str]| {
+        o.iter()
+            .map(|s| (*s).to_owned())
+            .collect::<BTreeSet<String>>()
+    };
+    assert!(!Exposure::untrusted_from(&BTreeSet::new()));
+    assert!(!Exposure::untrusted_from(&set(&[
+        taint_origin::OUTSIDE_PROJECT
+    ])));
+    for o in [
+        taint_origin::WEB,
+        taint_origin::NETWORK,
+        taint_origin::TOOL,
+        taint_origin::UNTRUSTED_PROJECT,
+    ] {
+        assert!(Exposure::untrusted_from(&set(&[o])), "{o}");
+        assert!(
+            Exposure::untrusted_from(&set(&[o, taint_origin::OUTSIDE_PROJECT])),
+            "{o} + outside_project"
+        );
+    }
 }
 
 #[test]
@@ -1196,7 +1695,7 @@ fn empty_rule_rejected() {
     .unwrap_err();
     assert_eq!(
         e.to_string(),
-        "policy.rules[1]: нужно хотя бы одно поле tool, path или command"
+        "policy.rules[1]: нужно хотя бы одно поле tool, path, command или domain"
     );
     // Проектные правила проверяются так же.
     let project = PolicyConfig {

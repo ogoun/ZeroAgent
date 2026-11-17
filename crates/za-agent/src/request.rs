@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use za_core::Capability;
+use za_core::{Capability, InstructionsTarget};
 use za_llm::{
     ChatRequest, EndpointId, PromptBlocks, ReasoningMode, Sampling, ToolChoice, ToolSchema,
     prefix_hash, render_system, render_tools,
@@ -133,20 +133,31 @@ fn overlay_in_role_limit(role: RunRole, tier: Tier) -> bool {
     !(role == RunRole::Top && tier == Tier::Small)
 }
 
+/// Инструкции capability с местом `target` и непустым текстом.
+fn instructions_of(
+    caps: &[Capability],
+    target: InstructionsTarget,
+) -> impl Iterator<Item = (&Capability, &str)> {
+    caps.iter()
+        .filter(move |c| c.instructions_target == target)
+        .filter_map(|c| c.instructions.as_deref().map(|i| (c, i)))
+        .filter(|(_, i)| !i.trim().is_empty())
+}
+
 /// Инструкции capability (блок 2 после Core, D21) в пределах `budget` байт.
 ///
 /// Инструкции — переменный текст: считаются верхней оценкой (байты, `upper_tokens`) с
 /// разделителем. Берутся по порядку `caps` целиком; не помещающаяся отбрасывается с
 /// `warn`, следующие ещё пробуются, — результат детерминирован. У top small инструкции
 /// не входят в system вовсе: они дописываются к описанию инструмента capability
-/// ([`small_instructions`], R1-C1 D93). Возвращает текст блока 2 и занятые байты.
+/// ([`small_instructions`], R1-C1 D93). Инструкции `FirstTool` (каталог скиллов) в system
+/// не идут никогда ([`first_tool_instructions`], R1-C2 D117). Возвращает текст блока 2 и
+/// занятые байты.
 fn core_block(setup: &RunSetup, caps: &[Capability], budget: u32) -> (String, u32) {
     let mut core = role_core(setup.role).to_string();
     let mut used = 0u32;
-    let instructions = caps
-        .iter()
-        .filter_map(|c| c.instructions.as_deref().map(|i| (c.name.as_str(), i)))
-        .filter(|(_, i)| !i.trim().is_empty());
+    let instructions =
+        instructions_of(caps, InstructionsTarget::System).map(|(c, i)| (c.name.as_str(), i));
     for (name, text) in instructions {
         if setup.role == RunRole::Top && setup.tier == Tier::Small {
             // R1-C1 D93: на top small — в описании инструмента ([`small_instructions`]).
@@ -176,19 +187,13 @@ fn core_block(setup: &RunSetup, caps: &[Capability], budget: u32) -> (String, u3
 /// инструкции опущены. Если оценка [`approx_tokens`] описаний (`render_tools`) с ними
 /// выходит за слот Tools окна ([`ContextBudget::for_context`]`(n_ctx).tools`; у окна
 /// 64k+ слота нет — без проверки), инструкции опускаются с `warn`. Capability берутся по
-/// порядку, каждая проверяется поверх уже принятых: результат детерминирован.
+/// порядку, каждая проверяется поверх уже принятых: результат детерминирован. Инструкции
+/// `FirstTool` здесь не участвуют ([`first_tool_instructions`]): их инструмент на small
+/// обычно не выдаётся, и это не повод для `warn` в каждом run (R1-C2 D117).
 fn small_instructions(setup: &RunSetup, tools: &mut [ToolSchema], caps: &[Capability]) {
     let slot = ContextBudget::for_context(setup.n_ctx).tools;
-    for c in caps {
-        let Some(text) = c.instructions.as_deref().filter(|i| !i.trim().is_empty()) else {
-            continue;
-        };
-        let names: Vec<&str> = c
-            .tools
-            .iter()
-            .map(|t| t.spec().schema.name.as_str())
-            .collect();
-        let Some(i) = tools.iter().position(|t| names.contains(&t.name.as_str())) else {
+    for (c, text) in instructions_of(caps, InstructionsTarget::System) {
+        let Some(i) = first_tool_of(tools, c) else {
             tracing::warn!(
                 capability = %c.name,
                 "инструкции capability на top small опущены: её инструментов нет в наборе run"
@@ -215,11 +220,41 @@ fn small_instructions(setup: &RunSetup, tools: &mut [ToolSchema], caps: &[Capabi
     }
 }
 
+/// Индекс первого по имени инструмента capability `c` в наборе run (`tools` отсортированы).
+fn first_tool_of(tools: &[ToolSchema], c: &Capability) -> Option<usize> {
+    let names: Vec<&str> = c
+        .tools
+        .iter()
+        .map(|t| t.spec().schema.name.as_str())
+        .collect();
+    tools.iter().position(|t| names.contains(&t.name.as_str()))
+}
+
+/// Инструкции `FirstTool` (R1-C2 D117) на любом тире: каталог скиллов дописывается к
+/// описанию первого по имени инструмента capability (`activate_skill`) через пустую
+/// строку — в ограждении `<skill_catalog>` и в своей колонке окна
+/// [`ContextBudget::catalog`] ([`crate::skills::fit_catalog`]: полный вид, имена через
+/// запятую, обрезка с конца). Инструмента в наборе нет (tier small, роль без него) —
+/// инструкции молча опускаются: так задумано, `warn` в каждом run не нужен.
+fn first_tool_instructions(setup: &RunSetup, tools: &mut [ToolSchema], caps: &[Capability]) {
+    let budget = ContextBudget::for_context(setup.n_ctx).catalog;
+    for (c, text) in instructions_of(caps, InstructionsTarget::FirstTool) {
+        let Some(i) = first_tool_of(tools, c) else {
+            tracing::debug!(capability = %c.name, "инструмента capability нет в наборе run: каталог не нужен");
+            continue;
+        };
+        let catalog = crate::skills::fit_catalog(text, budget);
+        let before = &tools[i].description;
+        tools[i].description = format!("{before}\n\n{catalog}");
+    }
+}
+
 /// Замораживает префикс run.
 ///
 /// Core роли + инструкции capability (блок 2), адаптер `""` (PRM-009), overlay режима
 /// (блок 4), `AGENTS.md` (блок 5) после [`escape_untrusted`] и обрезки по D22; tools
-/// отсортированы по имени, повтор имени — [`PrefixError::DuplicateTool`].
+/// отсортированы по имени, повтор имени — [`PrefixError::DuplicateTool`]; инструкции
+/// `FirstTool` (каталог скиллов) — в описании инструмента capability (D117).
 ///
 /// Лимит роли ([`role_limit`], решение контроллера: блоки 2–5 вместе с резервом
 /// [`ENV_LIMIT`] у top standard и full и с overlay, кроме top small) делится по
@@ -267,6 +302,7 @@ pub fn freeze(
         // завышает, поэтому здесь только `debug`.
         tracing::debug!(fixed, limit, "оценка фиксированных блоков выше лимита роли");
     }
+    first_tool_instructions(setup, &mut tools, caps);
     if role == RunRole::Top && tier == Tier::Small {
         small_instructions(setup, &mut tools, caps);
     }

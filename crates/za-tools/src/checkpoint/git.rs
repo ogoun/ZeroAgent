@@ -13,7 +13,10 @@
 //! ограничен `CHECKPOINT_MAX_TOTAL` (N5) → `hash-object -w` для новых →
 //! `update-index -z --index-info` в свой индекс → `write-tree` → `commit-tree` →
 //! `update-ref <ref> <commit> ""`. Сообщение коммита несёт `zero-agent-project:
-//! <project_id>` и `zero-agent-skipped: <путь>` для файлов сверх [`CHECKPOINT_MAX_FILE`].
+//! <project_id>`, `zero-agent-skipped: <путь>` для файлов сверх [`CHECKPOINT_MAX_FILE`] и
+//! `zero-agent-skipped-secret: <путь>` для секретных файлов (D103: проверка имени и фильтра
+//! — до кэша stat и до `hash-object`, их байты в хранилище не попадают). Восстановление
+//! не пишет и не удаляет файлы с именем секрета, даже из чекпоинтов до R1-C2.
 //!
 //! Восстановление: `ls-tree -r -z -l --full-tree`, мелкие объекты — `cat-file --batch`
 //! порциями, крупные (больше [`STREAM_FROM`]) — `cat-file blob` прямо во временный файл.
@@ -24,7 +27,7 @@
 //! `protocol.<вид>.allow`), помощников учётных данных нет, `core.excludesFile` и
 //! `core.attributesFile` — пустой файл, журнал ссылок и разделённый индекс выключены.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,8 +43,8 @@ use za_protocol::{RunId, checkpoint_kind, checkpoint_reason};
 use super::home::{agent_dir, is_missing, private, read_private, write_private};
 use super::write::{Mode, Target, Tmp, fill, finish, target};
 use super::{
-    CHECKPOINT_MAX_FILE, CHECKPOINT_REF_PREFIX, RestoreError, blocking, is_oid, join_rel, sort_key,
-    valid_id,
+    CHECKPOINT_MAX_FILE, CHECKPOINT_REF_PREFIX, RestoreError, Restored, SecretScan, blocking,
+    is_oid, join_rel, sort_key, valid_id,
 };
 use crate::AgentHome;
 
@@ -52,9 +55,9 @@ const BATCH_BYTES: u64 = 32 << 20;
 /// Объект больше этого восстанавливается потоком в файл.
 const STREAM_FROM: u64 = 1 << 20;
 /// Запись кэша stat моложе этого (до сохранения кэша) не доверяется («racy git»).
-const RACY: Duration = Duration::from_secs(2);
-/// Версия кэша stat.
-const STAT_V: u32 = 3;
+pub(super) const RACY: Duration = Duration::from_secs(2);
+/// Версия кэша stat. 4 (R1-C2 D103): кэш R1-C1 мог хранить oid секретного файла.
+const STAT_V: u32 = 4;
 /// Кэш stat проекта (объекты своего репозитория живут дольше run).
 const STAT_FILE: &str = "stat.json";
 /// Свой голый репозиторий в каталоге чекпоинтов проекта.
@@ -69,6 +72,7 @@ const IDENTITY: &str = "zero-agent";
 /// Строки сообщения коммита.
 const PROJECT_TRAILER: &str = "zero-agent-project: ";
 const SKIPPED_TRAILER: &str = "zero-agent-skipped: ";
+const SECRET_TRAILER: &str = "zero-agent-skipped-secret: ";
 /// Файловые режимы git.
 const MODE_FILE: &str = "100644";
 const MODE_EXEC: &str = "100755";
@@ -179,6 +183,8 @@ pub(super) struct Session {
     timeout: Duration,
     /// Предел новых байт на чекпоинт.
     max_total: u64,
+    /// Проверка секретов (D103): имя и фильтр по содержимому с кэшем итогов.
+    scan: SecretScan,
     safe: Option<SafePaths>,
     /// Свой репозиторий уже создан в этом сеансе.
     ready: bool,
@@ -187,6 +193,8 @@ pub(super) struct Session {
 /// Чекпоинт из скрытой ссылки этого проекта.
 pub(super) struct RefCp {
     pub cp: Checkpoint,
+    /// Пропущенные как секреты пути (трейлер сообщения).
+    pub secret: HashSet<String>,
 }
 
 impl Session {
@@ -197,6 +205,7 @@ impl Session {
         base_env: Vec<(OsString, OsString)>,
         timeout: Duration,
         max_total: u64,
+        scan: SecretScan,
     ) -> Self {
         Self {
             runner,
@@ -205,6 +214,7 @@ impl Session {
             base_env,
             timeout,
             max_total,
+            scan,
             safe: None,
             ready: false,
         }
@@ -527,8 +537,15 @@ impl Session {
         deadline: Instant,
     ) -> Result<Made, Skip> {
         let git_ref = format!("{CHECKPOINT_REF_PREFIX}/{id}");
+        // Затронутые вызовом пути: секретные из них — в `secret_skipped` (D103).
+        let touched: HashSet<String> = req
+            .paths
+            .iter()
+            .filter(|p| za_core::paths::within(&repo.top, p) && **p != repo.top)
+            .map(|p| display(&repo.top, p))
+            .collect();
         // Повтор после сбоя: ссылка уже есть.
-        if let Some(found) = self.existing(repo, id, &git_ref).await? {
+        if let Some(found) = self.existing(repo, id, &git_ref, &touched).await? {
             return Ok(found);
         }
         let safe = self.safe().await?;
@@ -550,7 +567,8 @@ impl Session {
         }
         // 2. stat, кэш проекта и пределы.
         let (top, cache_path) = (repo.top.clone(), safe.root.join(STAT_FILE));
-        let mut plan = blocking(move || plan_entries(&top, &cache_path, rels)).await?;
+        let scan = self.scan.clone();
+        let mut plan = blocking(move || plan_entries(&top, &cache_path, rels, &scan)).await?;
         // Объекты из кэша должны быть в хранилище (N12): нет — хэшируются заново.
         let known_oids: Vec<String> = plan.known.values().map(|(_, o)| o.clone()).collect();
         let known_have = self.present(repo, &known_oids).await?;
@@ -719,6 +737,11 @@ impl Session {
             msg.push_str(s);
             msg.push('\n');
         }
+        for s in &plan.secret {
+            msg.push_str(SECRET_TRAILER);
+            msg.push_str(s);
+            msg.push('\n');
+        }
         let mut args = vec!["commit-tree", tree.as_str()];
         if let Some(p) = &parent {
             args.extend(["-p", p.as_str()]);
@@ -733,7 +756,7 @@ impl Session {
             .simple(repo, &["update-ref", &git_ref, &commit, ""])
             .await
         {
-            if let Some(found) = self.existing(repo, id, &git_ref).await? {
+            if let Some(found) = self.existing(repo, id, &git_ref, &touched).await? {
                 return Ok(found);
             }
             return Err(e.into());
@@ -748,10 +771,9 @@ impl Session {
         )
         .await;
         let _ = blocking(move || remove_checked(&private(index))).await;
-        Ok(Made {
-            cp: git_cp(id, git_ref, commit),
-            included,
-        })
+        let mut cp = git_cp(id, git_ref, commit);
+        cp.secret_skipped = touched_secrets(&plan.secret, &touched);
+        Ok(Made { cp, included })
     }
 
     /// Существующий чекпоинт `id` этого проекта; ссылка с тем же именем от другого
@@ -761,6 +783,7 @@ impl Session {
         repo: &Repo,
         id: &str,
         git_ref: &str,
+        touched: &HashSet<String>,
     ) -> Result<Option<Made>, Skip> {
         let out = self
             .simple(repo, &["for-each-ref", "--format=%(objectname)", git_ref])
@@ -779,7 +802,10 @@ impl Session {
                         tracing::warn!(error = %e, "дерево чекпоинта не прочитано");
                         Skip(checkpoint_reason::GIT_ERROR)
                     })?;
-                    Ok(Some(Made { cp: r.cp, included }))
+                    let mut cp = r.cp;
+                    let secret: Vec<String> = r.secret.into_iter().collect();
+                    cp.secret_skipped = touched_secrets(&secret, touched);
+                    Ok(Some(Made { cp, included }))
                 }
                 None => {
                     tracing::warn!(id, "ссылка чекпоинта занята другим проектом");
@@ -888,38 +914,37 @@ impl Session {
             if meta.project.as_deref() == Some(self.home.project_id.as_str()) {
                 res.push(RefCp {
                     cp: git_cp(&id, name, oid),
+                    secret: meta.secret,
                 });
             }
         }
         Ok(res)
     }
 
-    /// Пропущенные пути чекпоинта `commit` (из его сообщения).
-    async fn skipped_of(
-        &mut self,
-        repo: &Repo,
-        commit: &str,
-    ) -> Result<HashSet<String>, RestoreError> {
+    /// Сведения сообщения чекпоинта `commit`: пропущенные сверх предела и секреты.
+    async fn message_of(&mut self, repo: &Repo, commit: &str) -> Result<Message, RestoreError> {
         let out = self.listing(repo, &["cat-file", "commit", commit]).await?;
         parse_message(&out.stdout)
-            .map(|m| m.skipped)
             .ok_or_else(|| RestoreError::Git(format!("коммит {commit} не чекпоинт")))
     }
 
-    /// Записи дерева и пути, которые восстановление удалит (с `delete_new`): файлы проекта
-    /// из того же обхода агента, которых нет в чекпоинте и которые не пропущены им (M5).
+    /// Что тронет восстановление `commit` ([`RestoreSet`]). Секрет не пишется и не
+    /// удаляется (D103; ревью задачи 2: I1, I2): пропущенный чекпоинтом (трейлер), с
+    /// именем секрета (и блоб чекпоинта R1-C1) и файл, который секрет сейчас по
+    /// содержимому.
     async fn restore_set(
         &mut self,
         repo: &Repo,
         commit: &str,
         delete_new: bool,
-    ) -> Result<(Vec<TreeEntry>, Vec<String>), RestoreError> {
+    ) -> Result<RestoreSet, RestoreError> {
         let tree = self
             .listing(repo, &["ls-tree", "-r", "-z", "-l", "--full-tree", commit])
             .await?;
         let all = parse_tree(&tree.stdout)?;
+        let msg = self.message_of(repo, commit).await?;
         let in_cp: HashSet<String> = all.iter().map(|e| e.rel.clone()).collect();
-        let entries: Vec<TreeEntry> = all
+        let files: Vec<TreeEntry> = all
             .into_iter()
             .filter(|e| {
                 let ok = e.mode == MODE_FILE || e.mode == MODE_EXEC;
@@ -929,22 +954,45 @@ impl Session {
                 ok
             })
             .collect();
-        let mut extra = Vec::new();
+        let mut candidates = Vec::new();
         if delete_new {
-            let skipped = self.skipped_of(repo, commit).await?;
             let rels = self.project_rels(repo).await.map_err(|Skip(r)| {
                 RestoreError::Git(format!("обход файлов проекта не завершён: {r}"))
             })?;
             for rel in rels {
                 if !rel.chars().any(char::is_control)
                     && !in_cp.contains(&rel)
-                    && !skipped.contains(&rel)
+                    && !msg.skipped.contains(&rel)
+                    && !msg.secret.contains(&rel)
                 {
-                    extra.push(rel);
+                    candidates.push(rel);
                 }
             }
         }
-        Ok((entries, extra))
+        let (top, scan) = (repo.top.clone(), self.scan.clone());
+        let mut secret: BTreeSet<String> = msg.secret.into_iter().collect();
+        let (entries, extra, now) = blocking(move || {
+            let mut now = Vec::new();
+            let mut keep = |rel: &str| {
+                if scan.now(rel, &join_rel(&top, rel)) {
+                    tracing::warn!(path = %rel, "секрет: восстановление не трогает");
+                    now.push(rel.to_owned());
+                    false
+                } else {
+                    true
+                }
+            };
+            let entries: Vec<TreeEntry> = files.into_iter().filter(|e| keep(&e.rel)).collect();
+            let extra: Vec<String> = candidates.into_iter().filter(|r| keep(r)).collect();
+            Ok((entries, extra, now))
+        })
+        .await?;
+        secret.extend(now);
+        Ok(RestoreSet {
+            entries,
+            extra,
+            secret: secret.into_iter().collect(),
+        })
     }
 
     /// Пути (от корня проекта), которые восстановление `commit` действительно изменит:
@@ -957,7 +1005,7 @@ impl Session {
         commit: &str,
         delete_new: bool,
     ) -> Result<Vec<String>, RestoreError> {
-        let (entries, extra) = self.restore_set(repo, commit, delete_new).await?;
+        let RestoreSet { entries, extra, .. } = self.restore_set(repo, commit, delete_new).await?;
         let top = repo.top.clone();
         let rels: Vec<(String, String, bool)> = entries
             .iter()
@@ -1025,8 +1073,12 @@ impl Session {
         roots: Roots,
         commit: &str,
         delete_new: bool,
-    ) -> Result<Vec<PathBuf>, RestoreError> {
-        let (entries, extra) = self.restore_set(repo, commit, delete_new).await?;
+    ) -> Result<Restored, RestoreError> {
+        let RestoreSet {
+            entries,
+            extra,
+            secret,
+        } = self.restore_set(repo, commit, delete_new).await?;
         // Проверка всех целей до записи.
         let roots = Arc::new(roots);
         let (r2, rels) = (
@@ -1176,8 +1228,19 @@ impl Session {
             .await?;
             changed.extend(removed);
         }
-        Ok(changed)
+        Ok(Restored {
+            changed,
+            secret_untouched: secret,
+        })
     }
+}
+
+/// Что тронет восстановление: записи дерева, удаляемые пути (`delete_new`) и пути, не
+/// тронутые как секрет (по возрастанию).
+struct RestoreSet {
+    entries: Vec<TreeEntry>,
+    extra: Vec<String>,
+    secret: Vec<String>,
 }
 
 fn git_cp(id: &str, git_ref: String, commit: String) -> Checkpoint {
@@ -1187,13 +1250,29 @@ fn git_cp(id: &str, git_ref: String, commit: String) -> Checkpoint {
         git_ref: Some(git_ref),
         commit: Some(commit),
         reason: None,
+        secret_skipped: Vec::new(),
     }
+}
+
+/// Секретные пути `secret`, затронутые вызовом, по возрастанию.
+fn touched_secrets(secret: &[String], touched: &HashSet<String>) -> Vec<String> {
+    let mut v: Vec<String> = secret
+        .iter()
+        .filter(|s| touched.contains(*s))
+        .cloned()
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Сведения из сообщения коммита чекпоинта.
 struct Message {
     project: Option<String>,
+    /// Пропущенные сверх предела и по управляющему символу.
     skipped: HashSet<String>,
+    /// Пропущенные как секреты (D103).
+    secret: HashSet<String>,
 }
 
 /// Разбор объекта коммита: заголовки до пустой строки, затем сообщение.
@@ -1203,10 +1282,13 @@ fn parse_message(body: &[u8]) -> Option<Message> {
     let mut m = Message {
         project: None,
         skipped: HashSet::new(),
+        secret: HashSet::new(),
     };
     for line in msg.lines() {
         if let Some(p) = line.strip_prefix(PROJECT_TRAILER) {
             m.project = Some(p.to_owned());
+        } else if let Some(s) = line.strip_prefix(SECRET_TRAILER) {
+            m.secret.insert(s.to_owned());
         } else if let Some(s) = line.strip_prefix(SKIPPED_TRAILER) {
             m.skipped.insert(s.to_owned());
         }
@@ -1269,21 +1351,22 @@ struct Stat {
     ino: u64,
 }
 
-/// План: известные oid (кэш), файлы на хэширование `(rel, абсолютный путь, stat)` и
-/// пропущенные сверх предела.
+/// План: известные oid (кэш), файлы на хэширование `(rel, абсолютный путь, stat)`,
+/// пропущенные сверх предела и пропущенные как секреты (D103).
 struct Plan {
     known: BTreeMap<String, (Stat, String)>,
     hash: Vec<(String, String, Stat)>,
     skipped: Vec<String>,
+    secret: Vec<String>,
 }
 
-fn now_ns() -> u64 {
+pub(super) fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
-fn mtime_ns(m: &std::fs::Metadata) -> u64 {
+pub(super) fn mtime_ns(m: &std::fs::Metadata) -> u64 {
     m.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -1291,7 +1374,7 @@ fn mtime_ns(m: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(unix)]
-fn ctime_ino(m: &std::fs::Metadata) -> (u64, u64) {
+pub(super) fn ctime_ino(m: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     let ns = u64::try_from(m.ctime())
         .unwrap_or(0)
@@ -1301,13 +1384,19 @@ fn ctime_ino(m: &std::fs::Metadata) -> (u64, u64) {
 }
 
 #[cfg(not(unix))]
-fn ctime_ino(_m: &std::fs::Metadata) -> (u64, u64) {
+pub(super) fn ctime_ino(_m: &std::fs::Metadata) -> (u64, u64) {
     (0, 0)
 }
 
 /// План по файлам обхода `rels`: обычный файл (не ссылка — её обход не выдаёт, но файл
-/// мог смениться с тех пор), stat, кэш проекта, предел файла.
-fn plan_entries(top: &Path, cache_path: &Path, rels: Vec<String>) -> io::Result<Plan> {
+/// мог смениться с тех пор), stat, предел файла, секрет (D103: имя и `filter`, до кэша —
+/// кэш мог запомнить oid секрета), кэш проекта.
+fn plan_entries(
+    top: &Path,
+    cache_path: &Path,
+    rels: Vec<String>,
+    scan: &SecretScan,
+) -> io::Result<Plan> {
     let cache: StatCache = read_private(cache_path, 256 << 20)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -1320,6 +1409,7 @@ fn plan_entries(top: &Path, cache_path: &Path, rels: Vec<String>) -> io::Result<
         known: BTreeMap::new(),
         hash: Vec::new(),
         skipped: Vec::new(),
+        secret: Vec::new(),
     };
     for rel in rels {
         if rel.chars().any(char::is_control) {
@@ -1338,6 +1428,11 @@ fn plan_entries(top: &Path, cache_path: &Path, rels: Vec<String>) -> io::Result<
         if meta.len() > CHECKPOINT_MAX_FILE {
             tracing::warn!(path = %rel, size = meta.len(), "файл больше предела: в чекпоинт не входит");
             plan.skipped.push(rel);
+            continue;
+        }
+        if scan.is_secret(&rel, &abs, &meta) {
+            tracing::info!(path = %rel, "похоже на секрет: в чекпоинт не входит");
+            plan.secret.push(rel);
             continue;
         }
         let (ctime_ns, ino) = ctime_ino(&meta);
@@ -1458,9 +1553,10 @@ mod tests {
 
     #[test]
     fn message_trailers() {
-        let body = b"tree x\nauthor a\n\nzero-agent checkpoint r/1-1\n\nzero-agent-project: abc\nzero-agent-skipped: big.bin\n";
+        let body = b"tree x\nauthor a\n\nzero-agent checkpoint r/1-1\n\nzero-agent-project: abc\nzero-agent-skipped: big.bin\nzero-agent-skipped-secret: .env\n";
         let m = parse_message(body).unwrap();
         assert_eq!(m.project.as_deref(), Some("abc"));
         assert!(m.skipped.contains("big.bin"));
+        assert!(m.secret.contains(".env") && !m.skipped.contains(".env"));
     }
 }

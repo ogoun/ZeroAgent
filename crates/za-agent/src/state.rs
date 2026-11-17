@@ -15,16 +15,18 @@ use crate::context::{ContextMeter, UserInput};
 use crate::conversation::Conversation;
 use crate::detect::DetectorState;
 use crate::exit::LoopExit;
+use crate::exposure::Exposure;
 use crate::policy::{Grant, PolicySnapshot};
 use crate::request::{FrozenPrefix, RunSetup};
 use crate::tools::FinishArgs;
 use crate::turn::{Reviewed, Signals};
 
-/// Версия формата снимка: 3 — R1-C1 (D92: политика, доверие, гранты, метки). Снимки
-/// версий 2 (R1-B2) и 1 (R1-B1) читаются: новые поля — по умолчанию (проект не доверен,
+/// Версия формата снимка: 4 — R1-C2 (D130: экспозиция Rule of Two и активные скиллы; обе
+/// части `#[serde(default)]`). Снимки версий 3 (R1-C1), 2 (R1-B2) и 1 (R1-B1) читаются:
+/// новые поля — по умолчанию (экспозиции и скиллов нет; у v2 и v1 ещё проект не доверен,
 /// меток и грантов нет, политика пустая), у версии 1 `resume` восстанавливает поля R1-B2
 /// разбором истории.
-pub const SNAPSHOT_V: u32 = 3;
+pub const SNAPSHOT_V: u32 = 4;
 
 /// Голова цепочки аудита журнала проекта (R1-C1 D91, m1 ревью задачи 4): последняя
 /// запись на момент старта или продолжения run. Хранится в снимке; бинарник при resume
@@ -34,6 +36,24 @@ pub const SNAPSHOT_V: u32 = 3;
 pub struct AuditHead {
     pub seq: u64,
     pub hash: String,
+}
+
+/// Активный скилл run (D130; заполняется с задачи 13 R1-C2): текст скилла в истории,
+/// который удаление старых результатов и компакция не трогают.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSkill {
+    /// Имя скилла из каталога.
+    pub name: String,
+    /// Источник — константа `za_protocol::skill_source`.
+    pub source: String,
+    /// Хэш файла скилла при загрузке.
+    pub hash: String,
+    /// Вызов `activate_skill`, загрузивший скилл; `None` — загрузил рантайм (`/имя`).
+    pub call_id: Option<String>,
+    /// Блоб загруженного текста.
+    pub content: BlobHash,
+    /// Кто загрузил.
+    pub by: String,
 }
 
 /// С чего resume продолжает run (D4).
@@ -113,6 +133,12 @@ pub struct Snapshot {
     /// `None` — не задана (тесты без бинарника, снимки до задачи 13).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_head: Option<AuditHead>,
+    /// Экспозиция Rule of Two (R1-C2 D106); снимок v3 — по умолчанию.
+    #[serde(default)]
+    pub exposure: Exposure,
+    /// Активные скиллы (R1-C2 D130; пусто до задачи 13).
+    #[serde(default)]
+    pub skills: Vec<ActiveSkill>,
 }
 
 /// Счётчики цикла, переживающие resume.
@@ -236,6 +262,11 @@ pub struct LoopState {
     pub taint: BTreeSet<String>,
     /// Голова цепочки аудита (D91): из `LoopDeps::audit_head`, иначе из снимка.
     pub audit_head: Option<AuditHead>,
+    /// Экспозиция run (D106): флаги объединяются после каждого пакета, снимает их только
+    /// новый run.
+    pub exposure: Exposure,
+    /// Активные скиллы (D130; пусто до задачи 13).
+    pub skills: Vec<ActiveSkill>,
 }
 
 impl LoopState {
@@ -267,6 +298,14 @@ impl LoopState {
             }
         }
         added
+    }
+
+    /// Экспозиция на начало пакета (D106): флаги run и `untrusted` по нынешним меткам.
+    pub fn exposure_now(&self) -> Exposure {
+        Exposure {
+            untrusted: self.exposure.untrusted || Exposure::untrusted_from(&self.taint),
+            ..self.exposure
+        }
     }
 
     /// Доверие дано (D83): метка недоверенного проекта снимается.
@@ -306,6 +345,8 @@ impl LoopState {
             grants: self.grants.clone(),
             taint: self.taint.clone(),
             audit_head: self.audit_head.clone(),
+            exposure: self.exposure,
+            skills: self.skills.clone(),
         }
     }
 }

@@ -1,0 +1,25 @@
+[package]
+name = "za-skills"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zero-agent: za-skills"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Коды источников скиллов (`skill_source`) и канонический JSON хэша дерева.
+za-protocol = { path = "../za-protocol" }
+# Разрешение и безопасное открытие путей (`paths::{classify, resolve, open_checked}`, D98)
+# и очистка невидимых символов описаний (`text::clean_invisible`, D102).
+za-core = { path = "../za-core" }
+blake3.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[features]
+# Заглушки поставки для тестов (`Catalog::bundled_for_tests`) — только с этим признаком, не
+# под `debug_assertions` (D128): обычная и release-сборка их не содержат.
+test-hooks = []

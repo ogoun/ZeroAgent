@@ -16,7 +16,7 @@ use za_llm::{Effort, ReasoningMode};
 use za_protocol::{RunId, RunRole, Tier};
 
 /// Версия набора промптов; входит в `FrozenPrefix` и `model.request` (PRM-010).
-pub const PROMPT_VERSION: &str = "r1c1.1";
+pub const PROMPT_VERSION: &str = "r1c2.1";
 
 /// Лимит блока `<env>`, токены (PRM-002: «top small ≤ 800 + `<env>` ≤ 200»).
 pub const ENV_LIMIT: u32 = 200;
@@ -154,18 +154,31 @@ const RUNTIME_TEXTS: &[(&str, &str)] = &[
 /// ([`RUNTIME_TEXTS`]) и образцы текстов, собираемых `format!`, — результат их функций
 /// рендера с фиксированными аргументами (ошибки инструментов, отказы нормализации,
 /// разметка сводки компакции; M-1 ревью задачи 5). Правка шаблона меняет образец, а
-/// значит и [`prompt_texts_hash`].
+/// значит и [`prompt_texts_hash`]. Тексты core pack — под именами `skills/<name>`
+/// ([`pack_texts`], R1-C2 D120).
 pub fn runtime_texts() -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = RUNTIME_TEXTS
         .iter()
         .map(|(n, t)| (*n, (*t).to_owned()))
         .chain(crate::context::compact_text_samples())
         .chain(crate::policy::text_samples())
+        .chain(crate::skills::text_samples())
         .chain(crate::tools::text_samples())
         .chain(crate::turn::text_samples())
+        .chain(pack_texts().map(|(n, t)| (n, t.to_owned())))
         .collect();
     out.sort_by(|a, b| a.0.cmp(b.0));
     out
+}
+
+/// Тексты core pack (R1-C2 D120): `(skills/<name>, текст SKILL.md)` в порядке имён —
+/// `za_skills::bundled()` с именами `za_skills::PACK_TEXT_NAMES`. Текст — целиком, с
+/// frontmatter: модель видит описание в каталоге, а тело — при активации.
+fn pack_texts() -> impl Iterator<Item = (&'static str, &'static str)> {
+    za_skills::PACK_TEXT_NAMES
+        .into_iter()
+        .zip(za_skills::bundled())
+        .map(|(name, (_, text))| (name, *text))
 }
 
 /// BLAKE3 hex всех текстов, уходящих модели без подстановки (PRM-010): файлы
@@ -440,88 +453,11 @@ pub(crate) fn render_control_trusted(
     )
 }
 
-/// Символы, похожие на `<`: ASCII, одиночная кавычка-уголок, угловые скобки
-/// (технические, математические, CJK, орнаментальные), малая и полноширинная формы,
-/// гомоглифы (канадское слоговое PA, модификаторы-стрелки ˂ и ˱, «не меньше» ≮) и
-/// невидимый тег-символ
-/// U+E003C (ASCII smuggling).
-pub const LEFT_ANGLES: &[char] = &[
-    '<',
-    '\u{02C2}',
-    '\u{02F1}',
-    '\u{1438}',
-    '\u{226E}',
-    '\u{2039}',
-    '\u{2329}',
-    '\u{276C}',
-    '\u{276E}',
-    '\u{2770}',
-    '\u{27E8}',
-    '\u{27EA}',
-    '\u{27EC}',
-    '\u{2991}',
-    '\u{2993}',
-    '\u{2995}',
-    '\u{29FC}',
-    '\u{3008}',
-    '\u{300A}',
-    '\u{FE3F}',
-    '\u{FE64}',
-    '\u{FF1C}',
-    '\u{E003C}',
-];
-/// Символы, похожие на `>` — пары к [`LEFT_ANGLES`].
-pub const RIGHT_ANGLES: &[char] = &[
-    '>',
-    '\u{02C3}',
-    '\u{02F2}',
-    '\u{1433}',
-    '\u{226F}',
-    '\u{203A}',
-    '\u{232A}',
-    '\u{276D}',
-    '\u{276F}',
-    '\u{2771}',
-    '\u{27E9}',
-    '\u{27EB}',
-    '\u{27ED}',
-    '\u{2992}',
-    '\u{2994}',
-    '\u{2996}',
-    '\u{29FD}',
-    '\u{3009}',
-    '\u{300B}',
-    '\u{FE40}',
-    '\u{FE65}',
-    '\u{FF1E}',
-    '\u{E003E}',
-];
-
-/// Экранирование разметки промпта в недоверенном тексте (D23, PRM-011, решение
-/// контроллера, раунд 2).
-///
-/// Каждый символ из [`LEFT_ANGLES`] заменяется на `&lt;`, из [`RIGHT_ANGLES`] — на `&gt;`,
-/// независимо от того, что за ним: обходы распознавания имени тега (невидимые символы
-/// внутри имени, гомоглифы, полноширинные буквы, `ſ`) теряют смысл, потому что без
-/// угловой скобки тега нет. Остальной текст не меняется, `&` не трогается, поэтому
-/// функция идемпотентна. Цена — `Vec<String>` в выводе инструмента читается как
-/// `Vec&lt;String&gt;`; кавычки «» не трогаются.
-pub fn escape_untrusted(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        // Быстрый путь: из ASCII в списках только `<` и `>`.
-        if c.is_ascii() && c != '<' && c != '>' {
-            out.push(c);
-        } else if LEFT_ANGLES.contains(&c) {
-            out.push_str("&lt;");
-        } else if RIGHT_ANGLES.contains(&c) {
-            out.push_str("&gt;");
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+/// Экранирование разметки промпта в недоверенном тексте (D23, PRM-011) и списки угловых
+/// скобок живут в `za_core::text` (R1-C2, I2 ревью задачи 8): длину экранированного текста
+/// меряет и сетевой инструмент `za-web`, укладывая `digest` в предел слота. Имена в
+/// `za_agent` прежние.
+pub use za_core::text::{LEFT_ANGLES, RIGHT_ANGLES, escape_untrusted};
 
 /// Длина имени ветки в `<env>`, символы: длинное имя иначе раздувало бы блок сверх
 /// [`ENV_LIMIT`].
@@ -664,6 +600,9 @@ fn system_of(role: RunRole, overlay: Option<WorkMode>) -> String {
 ///   `"\n\n"` и `render_env(max_env())` (2000, 3000);
 /// - `orchestrator`, `orchestrator/{mode}` (500), `worker`, `worker/{mode}` (300) — Core
 ///   вместе с overlay;
+/// - `skills/<name>` — текст `SKILL.md` скилла поставки целиком
+///   (`za_skills::PACK_TOKEN_LIMIT`, 700; R1-C2 D120), под тем же именем, что в хэше
+///   промптов;
 /// - префикс top small с настоящими инструментами — [`small_prefix_cases`]: набор
 ///   инструментов собирает `xtask` (R1-C1 D93), `za-agent` от `za-tools` не зависит.
 pub fn budget_cases() -> Vec<BudgetCase> {
@@ -707,6 +646,13 @@ pub fn budget_cases() -> Vec<BudgetCase> {
                 role_limit(role, Tier::Small),
             ));
         }
+    }
+    for (name, text) in pack_texts() {
+        out.push(case(
+            name.to_owned(),
+            text.to_owned(),
+            za_skills::PACK_TOKEN_LIMIT,
+        ));
     }
     out
 }
@@ -757,6 +703,120 @@ pub fn small_prefix_cases(tools: &[std::sync::Arc<dyn za_core::Tool>]) -> Vec<Bu
         });
     }
     out
+}
+
+/// Окна случаев CI-лимита top standard (R1-C2 D117, D169): `(n_ctx, имя, есть ли случай
+/// описаний)`. Описания без каталога проверяются на 16k и 32k (у окна 64k+ слота Tools нет),
+/// каталог — на всех трёх: его колонка растёт с окном (300, 600, 1500).
+const STANDARD_WINDOWS: [(u32, &str, bool); 3] = [
+    (16_384, "16k", true),
+    (32_768, "32k", true),
+    (65_536, "64k", false),
+];
+/// Наименьшее окно тира standard по умолчанию (`Tier::for_context`): на окне меньше standard
+/// бывает только по `--tier`.
+pub const STANDARD_MIN_WINDOW: u32 = 32_768;
+/// Предел описаний инструментов top standard без каталога скиллов на окнах 16k и 32k,
+/// токены (R1-C2 D169, Ruling m1 ревью задачи 14). Набор на обоих окнах один: встроенные,
+/// нативные, веб и `activate_skill` без каталога — замер 1539 по [`approx_tokens`] (байты /
+/// 4) и около 1414 cl100k. Слот Tools окна 32k (1500) по осторожной оценке им уже превышен
+/// (рантайм слот standard не читает, D169), поэтому предел — замер и запас около 160 токенов:
+/// новое описание или правка на абзац сверх запаса роняет CI, и решать это нужно осознанно, а
+/// не поднимать предел молча.
+pub const STANDARD_TOOLS_LIMIT: u32 = 1700;
+/// Ограждение каталога скиллов в описании `activate_skill` (D117, `skills::fence`).
+const CATALOG_OPEN: &str = "<skill_catalog>";
+const CATALOG_CLOSE: &str = "</skill_catalog>";
+
+/// Каталог скиллов `text` в ограждении (с ним самим) и остаток без каталога; ограждения нет —
+/// пустой каталог и весь текст.
+fn split_catalog(text: &str) -> (String, String) {
+    let Some(at) = text.find(CATALOG_OPEN) else {
+        return (String::new(), text.to_owned());
+    };
+    let end = text[at..]
+        .find(CATALOG_CLOSE)
+        .map_or(text.len(), |e| at + e + CATALOG_CLOSE.len());
+    (
+        text[at..end].to_owned(),
+        format!("{}{}", &text[..at], &text[end..]),
+    )
+}
+
+/// Случаи CI-лимита описаний инструментов top standard (R1-C2 D117, D169, preflight 3.7,
+/// 5.10) — `render_tools` префикса run с тиром standard: встроенные инструменты
+/// ([`crate::builtin_tools`], [`crate::request_grant_tool`]), `tools` (нативные и веб — их
+/// собирает `xtask`) и инструменты capability `caps` (скиллы с каталогом поставки) так, как
+/// их видит run: через [`crate::freeze`], с каталогом в описании `activate_skill` в его
+/// колонке (`ContextBudget::catalog`). Части проверяются отдельно (Ruling m1 ревью задачи
+/// 14: сумма скрывала, что описания без каталога больше слота, и запас занимала у колонки
+/// каталога):
+/// - `top/standard/tools@16k`, `@32k` — описания без каталога, предел
+///   [`STANDARD_TOOLS_LIMIT`];
+/// - `top/standard/catalog@16k`, `@32k`, `@64k` — каталог в ограждении, предел — колонка
+///   каталога окна (300, 600, 1500).
+///
+/// Префикс не собран — ошибка, а не случай с пустым текстом: 0 токенов прошёл бы любой
+/// лимит (m1 ревью задачи 13). Каталога нет (`caps` без скиллов) — у случая каталога пустой
+/// текст, и `xtask prompt-budget` считает его несобранным.
+pub fn standard_tools_cases(
+    tools: &[std::sync::Arc<dyn za_core::Tool>],
+    caps: &[za_core::Capability],
+) -> Result<Vec<BudgetCase>, crate::request::PrefixError> {
+    let mut reg = za_core::ToolRegistry::default();
+    let all = crate::tools::builtin_tools()
+        .into_iter()
+        .chain([crate::tools::request_grant_tool()])
+        .chain(tools.iter().cloned())
+        .chain(caps.iter().flat_map(|c| c.tools.iter().cloned()));
+    for t in all {
+        if let Err(e) = reg.register(t) {
+            tracing::debug!(tool = %e.0, "инструмент уже в наборе");
+        }
+    }
+    let schemas: Vec<za_llm::ToolSchema> = reg
+        .for_run(RunRole::Top, Tier::Standard)
+        .iter()
+        .map(|t| t.spec().schema.clone())
+        .collect();
+    let mut out = Vec::new();
+    for (n_ctx, window, with_tools) in STANDARD_WINDOWS {
+        let setup = crate::request::RunSetup {
+            role: RunRole::Top,
+            tier: Tier::Standard,
+            work_mode: None,
+            run_mode: za_protocol::RunMode::Ask,
+            endpoint: za_llm::EndpointId("budget".into()),
+            n_ctx,
+            reasoning: reasoning_for(Tier::Standard),
+            priority: za_protocol::Priority::Top,
+            max_wait: None,
+            project_id: "budget".into(),
+            project_dir: std::path::PathBuf::from("."),
+            context: crate::context::ContextConfig::default(),
+        };
+        let column = crate::context::ContextBudget::for_context(n_ctx).catalog;
+        // Повтор имени отсеян реестром выше, но ошибку префикса не прячем.
+        let frozen = crate::request::freeze(&setup, &schemas, caps, None)?;
+        let text = za_llm::render_tools(&za_llm::PromptBlocks {
+            tools: frozen.tools,
+            ..Default::default()
+        });
+        let (catalog, rest) = split_catalog(&text);
+        if with_tools {
+            out.push(BudgetCase {
+                name: format!("top/standard/tools@{window}"),
+                text: rest,
+                limit: STANDARD_TOOLS_LIMIT,
+            });
+        }
+        out.push(BudgetCase {
+            name: format!("top/standard/catalog@{window}"),
+            text: catalog,
+            limit: column,
+        });
+    }
+    Ok(out)
 }
 
 /// Предел блока `AGENTS.md`, токены: «`AGENTS.md` и резерв ≤ 700» распределения Full

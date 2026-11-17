@@ -40,6 +40,10 @@ pub struct Checkpoint {
     pub commit: Option<String>,
     /// Причина у вида `skipped`.
     pub reason: Option<String>,
+    /// Затронутые вызовом файлы (от корня проекта через `/`), не вошедшие в чекпоинт как
+    /// секреты (R1-C2 D103): по имени или по содержимому. Пусто — поле не пишется.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_skipped: Vec<String>,
 }
 
 /// Делает чекпоинт. Сбой — не ошибка, а `Checkpoint` вида `skipped` с причиной: вызов

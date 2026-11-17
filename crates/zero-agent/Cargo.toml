@@ -23,6 +23,19 @@ za-jail = { path = "../za-jail" }
 # Секреты (R1-C1 D90): `EnvStore` (`ZA_SECRET_*`) под кэшем `StoreSecrets`, маскировка
 # выгрузки журнала, аудита и печати `run`; команда `secret list`.
 za-secrets = { path = "../za-secrets" }
+# Обход доверенных деревьев (`trust_set` — через `za_skills::tree_listing`, R1-C2 D116) и,
+# с задачи 14, каталог скиллов.
+za-skills = { path = "../za-skills" }
+# Разборщики враждебного HTML и PDF (R1-C2 D113, D127): работают только в скрытой подкоманде
+# `zero-agent extract` — подпроцессе, который запускает `extract::ProcessExtractor`.
+za-extract = { path = "../za-extract" }
+# Сетевой шлюз (D107): инструменты `web_fetch` и `web_search` run, проба поставщика поиска
+# в `doctor`; признак `test-hooks` (D128) включает подмены резолвера шлюза вместе с крюками
+# бинарника (`run --web-resolve`).
+za-web = { path = "../za-web" }
+# Адрес поставщика поиска `[web.search] url` (D122): разбор и проверка при чтении
+# конфигурации; уже в `Cargo.lock` через `za-web` и `reqwest`.
+url.workspace = true
 clap.workspace = true
 # `macros` — `join!` проверок doctor и `select!` команды `run`, `time` — ожидание зондов и
 # `resources --watch`, `signal` — Ctrl+C команды `run` (пауза, второй — выход).
@@ -32,13 +45,41 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 blake3.workspace = true
+# Поиск известных значений фильтром секретов чекпоинтов (D103).
+memchr.workspace = true
 # Дата `<env>` первого сообщения run (`YYYY-MM-DD` по UTC, D24).
 jiff.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[features]
+# Тестовые крюки (D128): `extract --hang`, `extract --crash` бинарника и подмены резолвера
+# шлюза. Обычная и release-сборка их не содержат.
+test-hooks = ["za-web/test-hooks"]
+
+# Сквозной тест извлекателя в подпроцессе (тайм-аут, бросок future, падение) — только с
+# крюками; обычный `cargo test` его пропускает, не ломаясь.
+[[test]]
+name = "extract"
+required-features = ["test-hooks"]
+
+# Веб и скиллы в бинарнике (задача 14): `skills list`, `doctor` с поддельным SearXNG на
+# 127.0.0.1, набор инструментов run — с крюками (`run --web-resolve`).
+[[test]]
+name = "skills"
+required-features = ["test-hooks"]
+
+# Приёмка R1-C2 (задача 15): S1 с поиском и ссылками, отказ локальных адресов, Rule of Two,
+# скиллы, resume веба, маска секрета в URL, прокси — сайты и SearXNG на 127.0.0.1 под
+# именами `--web-resolve`.
+[[test]]
+name = "r1c2_web_skills"
+required-features = ["test-hooks"]
+
 [dev-dependencies]
+# Жив ли подпроцесс извлекателя после тайм-аута и броска future (тест `extract`).
+sysinfo.workspace = true
 # Поддельный llama-server в процессе теста `r1a_models` (axum на многопоточном runtime).
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "net", "time"] }
 axum.workspace = true

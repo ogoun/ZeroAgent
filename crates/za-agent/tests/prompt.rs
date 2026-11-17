@@ -57,7 +57,7 @@ fn texts_match_appendix() {
             assert!(!text.contains("\n\n"), "{name}");
         }
     }
-    assert_eq!(PROMPT_VERSION, "r1c1.1");
+    assert_eq!(PROMPT_VERSION, "r1c2.1");
 }
 
 /// Окно байтов «4 ASCII-цифры, '-', 2 ASCII-цифры» (дата вида 2026-11).
@@ -725,7 +725,11 @@ fn runtime_texts_are_listed_and_hashed() {
     sorted.dedup();
     assert_eq!(names, sorted, "имена по порядку и без повторов");
     for (name, text) in &texts {
-        assert!(name.starts_with("runtime/"), "{name}");
+        // `skills/<name>` — тексты core pack (D120), см. `pack_texts_in_prompt_hash`.
+        assert!(
+            name.starts_with("runtime/") || name.starts_with("skills/"),
+            "{name}"
+        );
         assert!(!text.is_empty(), "{name}");
     }
     let text = |n: &str| texts.iter().find(|(x, _)| *x == n).unwrap().1.clone();
@@ -771,6 +775,52 @@ fn runtime_texts_are_listed_and_hashed() {
         assert!(names.contains(&n), "{n}");
     }
     assert!(texts.iter().any(|(_, t)| t == COMPACT_RUBRIC));
+}
+
+/// R1-C2 D120 (PRM-010): тексты core pack входят в хэш промптов под именами
+/// `skills/<name>` — правка любого скилла поставки меняет `prompt_texts_hash()`. Тест
+/// здесь, а не в `za-skills`: dev-зависимость `za-skills → za-agent` нарушила бы правило
+/// нижних слоёв `xtask policy` (preflight 1.3). Что хэш считается по всему
+/// `runtime_texts()`, а значит и по `skills/*`, проверяет точным равенством
+/// `prompt_hash_covers_names_and_texts`; здесь — что тексты поставки в нём есть.
+#[test]
+fn pack_texts_in_prompt_hash() {
+    let texts = runtime_texts();
+    let skills: Vec<(&str, &str)> = texts
+        .iter()
+        .filter(|(n, _)| n.starts_with("skills/"))
+        .map(|(n, t)| (*n, t.as_str()))
+        .collect();
+    let expected: Vec<(String, &str)> = za_skills::bundled()
+        .iter()
+        .map(|(n, t)| (format!("skills/{n}"), *t))
+        .collect();
+    assert_eq!(skills.len(), za_skills::PACK.len());
+    assert_eq!(
+        skills,
+        expected
+            .iter()
+            .map(|(n, t)| (n.as_str(), *t))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// D120: у каждого скилла поставки — случай CI-лимита `skills/<name>` с пределом
+/// `PACK_TOKEN_LIMIT` (700) и тем же текстом, что в хэше промптов.
+#[test]
+fn pack_texts_have_budget_cases() {
+    let cases = budget_cases();
+    let texts = runtime_texts();
+    let skill_cases: Vec<&BudgetCase> = cases
+        .iter()
+        .filter(|c| c.name.starts_with("skills/"))
+        .collect();
+    assert_eq!(skill_cases.len(), 14);
+    for c in skill_cases {
+        assert_eq!(c.limit, 700, "{}", c.name);
+        let hashed = texts.iter().find(|(n, _)| *n == c.name).unwrap();
+        assert_eq!(hashed.1, c.text, "{}", c.name);
+    }
 }
 
 #[test]
@@ -836,8 +886,9 @@ fn cases_cover_roles_tiers_modes() {
             .contains("<env>")
     );
     // Полный набор: top/small/core, env/max, 4 overlay, top standard и full по 5,
-    // orchestrator и worker по 5 — 26 случаев с разными именами.
-    assert_eq!(c.len(), 26);
+    // orchestrator и worker по 5 и 14 скиллов поставки (D120) — 40 случаев с разными
+    // именами.
+    assert_eq!(c.len(), 40);
     let mut names: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
     names.sort_unstable();
     names.dedup();

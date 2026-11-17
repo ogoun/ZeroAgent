@@ -12,16 +12,23 @@ use serde_json::{Value, json};
 use tokio::sync::{Barrier, watch};
 use tokio::time::{Instant, timeout};
 use za_agent::{
-    CallVerdict, PlannedCall, Signals, ToolEnv, ToolsOutcome, builtin_tools, run_tools,
-    signal_channel,
+    ACTIVATE_SKILL_TOOL, CallVerdict, Grant, GrantMode, GrantSource, PlannedCall, SPILL_DIR,
+    Signals, SpillCfg, ToolEnv, ToolsOutcome, builtin_tools, run_tools, signal_channel,
+    skills_withdrawn_text, spill_limit_bytes,
 };
+use za_core::paths::Roots;
 use za_core::{
-    Approval, EffectError, EventBus, InterruptKind, InterruptState, Journal, RiskClass, RunCtx,
-    Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, interrupt,
+    Access, Approval, DEADLINE_GRACE, DIGEST_RESERVE, EffectError, EventBus, InterruptKind,
+    InterruptState, Journal, NetRequest, RawPath, RiskClass, RunCtx, Subjects, Tool, ToolCx,
+    ToolKind, ToolOutput, ToolRegistry, ToolSpec, interrupt,
 };
 use za_llm::normalize::CallSource;
 use za_llm::{BoxFuture, Part, ToolCall, ToolSchema};
-use za_protocol::{Actor, EffectClass, EffectKey, EventKind, RunId, RunMode, RunRole, Seq, Tier};
+use za_protocol::{
+    Actor, EffectClass, EffectKey, EventKind, RunId, RunMode, RunRole, Seq, Tier, net_outcome,
+    taint_origin,
+};
+use za_secrets::SecretMasker;
 use za_store::{NewRun, ProjectStore};
 
 // ---- Помощники ----
@@ -71,6 +78,12 @@ struct TestTool {
     barrier: Option<Arc<Barrier>>,
     /// Вызов держится, пока тест не отпустит (`true`); не дождался — `hold timeout`.
     hold: Option<watch::Receiver<bool>>,
+    /// Предметы вызова (по умолчанию — пусто).
+    subjects: Subjects,
+    /// Дедлайны полученных вызовов (`ToolCx::deadline`).
+    deadlines: Arc<Mutex<Vec<Option<std::time::Instant>>>>,
+    /// Пределы результата полученных вызовов (`ToolCx::output_budget`).
+    budgets: Arc<Mutex<Vec<Option<usize>>>>,
 }
 
 impl Tool for TestTool {
@@ -78,7 +91,13 @@ impl Tool for TestTool {
         &self.spec
     }
 
+    fn subjects(&self, _args: &Value) -> Subjects {
+        self.subjects.clone()
+    }
+
     fn call(&self, _args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        self.deadlines.lock().unwrap().push(cx.deadline);
+        self.budgets.lock().unwrap().push(cx.output_budget);
         let delay = self.delay;
         let out = self.out.clone();
         let log = Arc::clone(&self.log);
@@ -166,6 +185,9 @@ fn test_tool(
         log: Arc::clone(log),
         barrier: None,
         hold: None,
+        subjects: Subjects::default(),
+        deadlines: Arc::default(),
+        budgets: Arc::default(),
     }
 }
 
@@ -562,6 +584,114 @@ async fn ask_user_input_interrupt() {
     );
 }
 
+/// SEC-051 (Minor 9 финального ревью скиллов): ответ пользователя на `ask_user` очищается
+/// уровнем `Clean::Input`, как задача и ввод `inbox`: символы тегов, bidi и нулевой ширины
+/// удаляются, ZWJ (эмодзи, письменности) остаётся.
+#[tokio::test]
+async fn ask_user_answer_is_cleaned() {
+    let (s, j, run) = setup("ask_user_clean").await;
+    let reg = registry(builtin_tools());
+    let calls = [planned("q1", "ask_user", json!({"question": "какой?"}))];
+    let e = env(run, RunMode::Ask, true);
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let int = out.suspend.expect("вопрос");
+    let answer = "a\u{202E}b\u{E0041}c\u{200B}d \u{1F468}\u{200D}\u{1F469}";
+    s.resolve_interrupt(&int.id, json!({ "answer": answer }))
+        .await
+        .unwrap();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]),
+        ("q1", "abcd \u{1F468}\u{200D}\u{1F469}", false)
+    );
+}
+
+/// Minor 4 повторного ревью финального прохода: реплей `activate_skill` до реестра — только
+/// по квитанции. Записано лишь намерение `skill.load` (сбой посреди загрузки), а скиллы
+/// выключены после старта run (`activate_skill` снят с исполнения): итога нет, поэтому
+/// ответ — текст снятия, без новой загрузки и без квитанции. Без условия квитанции
+/// намерение ушло бы в загрузку по записанным аргументам.
+#[tokio::test]
+async fn skill_intent_without_receipt_is_withdrawn() {
+    let (s, j, run) = setup("skill_intent_withdrawn").await;
+    let mut reg = registry(builtin_tools());
+    reg.withdraw(ACTIVATE_SKILL_TOOL, skills_withdrawn_text());
+    let key = EffectKey::derive(run, 0, 0);
+    let hash = "0".repeat(64);
+    s.record_intent(
+        run,
+        &key,
+        EffectClass::ReadOnly,
+        "skill.load",
+        json!({"name": "tdd", "file": null, "hash": hash}),
+    )
+    .await
+    .unwrap();
+    let calls = [planned("c1", ACTIVATE_SKILL_TOOL, json!({"name": "tdd"}))];
+    let e = env(run, RunMode::Auto, true);
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]),
+        (
+            "c1",
+            "activate_skill: skills are disabled by configuration since this run started",
+            true
+        )
+    );
+    let row = s.effect(run, &key).await.unwrap().expect("намерение");
+    assert!(row.result.is_none(), "новая квитанция: {:?}", row.result);
+}
+
+/// Minor 3 повторного ревью финального прохода: соседние каналы текста пользователя тоже
+/// очищаются уровнем `Clean::Input` до модели — запасная форма ответа `ask_user` без
+/// строкового `answer` (канонический JSON решения) и заметка отказа в одобрении.
+#[tokio::test]
+async fn user_note_and_fallback_answer_are_cleaned() {
+    let (s, j, run) = setup("ask_user_fallback_clean").await;
+    let reg = registry(builtin_tools());
+    let calls = [planned("q1", "ask_user", json!({"question": "какой?"}))];
+    let e = env(run, RunMode::Ask, true);
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let int = out.suspend.expect("вопрос");
+    s.resolve_interrupt(
+        &int.id,
+        json!({"answer": 5, "note": "a\u{202E}b\u{200B}c \u{1F468}\u{200D}\u{1F469}"}),
+    )
+    .await
+    .unwrap();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]),
+        (
+            "q1",
+            "{\"answer\":5,\"note\":\"abc \u{1F468}\u{200D}\u{1F469}\"}",
+            false
+        )
+    );
+
+    let (s, j, run) = setup("denied_note_clean").await;
+    let log = SharedLog::default();
+    let reg = registry(vec![tool("edit", ToolKind::Edit, 0, &log)]);
+    let calls = [planned("e1", "edit", json!({"path": "a"}))];
+    let e = env(run, RunMode::Ask, true);
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let id = out.suspend.expect("одобрение").id;
+    s.resolve_interrupt(
+        &id,
+        json!({"approved": false, "note": "no\u{202E}pe\u{E0041}"}),
+    )
+    .await
+    .unwrap();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]),
+        ("e1", "denied by user: nope", true)
+    );
+}
+
 #[tokio::test]
 async fn tool_output_escaped_and_verbatim() {
     let (s, j, run) = setup("escaped").await;
@@ -912,4 +1042,581 @@ async fn approval_always_read_is_barrier_in_group() {
         .map(|(c, _, _)| c.clone())
         .collect();
     assert_eq!(starts, ["r1"]);
+}
+
+// ---- R1-C2 D103: секретный файл без чекпоинта ----
+
+#[tokio::test]
+async fn secret_skipped_line_appended_by_slot() {
+    let (s, j, run) = setup("secret-skipped").await;
+    let log = SharedLog::default();
+    let reg = registry(vec![
+        tool("edit", ToolKind::Edit, 0, &log),
+        tool("edit2", ToolKind::Edit, 0, &log),
+    ]);
+    let mut e = env(run, RunMode::Auto, true);
+    e.checkpointer = Some(Arc::new(support::stub::CheckpointStub {
+        secret_skipped: vec![".env".into()],
+        ..Default::default()
+    }));
+    let calls = [planned("c1", "edit", json!({}))];
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let (_, text, is_error) = result_of(&out.results[0]);
+    assert_eq!(
+        text,
+        "edit done\n[no checkpoint for this file: it looks like a secret]"
+    );
+    assert!(!is_error);
+    let cps: Vec<Value> = s
+        .read_run(run, Seq(0), 10_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|ev| ev.kind == EventKind::CheckpointCreated)
+        .map(|ev| ev.payload)
+        .collect();
+    assert_eq!(cps.len(), 1, "{cps:?}");
+    assert_eq!(cps[0]["secret_skipped"], json!([".env"]), "{}", cps[0]);
+
+    // Без секретов строки и поля нет.
+    let (s2, j2, run2) = setup("secret-none").await;
+    let mut e2 = env(run2, RunMode::Auto, true);
+    e2.checkpointer = Some(Arc::new(support::stub::CheckpointStub::default()));
+    let calls = [planned("c2", "edit2", json!({}))];
+    let out = run_batch(&s2, &j2, &reg, &e2, &calls, &mut sig)
+        .await
+        .unwrap();
+    assert_eq!(result_of(&out.results[0]).1, "edit2 done");
+    let cp = s2
+        .read_run(run2, Seq(0), 10_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|ev| ev.kind == EventKind::CheckpointCreated)
+        .expect("checkpoint.created");
+    assert!(cp.payload.get("secret_skipped").is_none(), "{}", cp.payload);
+}
+
+/// Строка слота `[no checkpoint …]` идёт и в `digest`: длинный вывод команды показывается
+/// им, и строка не должна теряться (тот же класс, что I1 ревью задачи 8).
+#[tokio::test]
+async fn secret_skipped_line_kept_in_digest() {
+    let (s, j, run) = setup("secret-skipped-digest").await;
+    let log = SharedLog::default();
+    let mut exec = test_tool(
+        "bash",
+        ToolKind::Exec,
+        0,
+        Duration::from_secs(60),
+        ToolOutput {
+            digest: Some("[test output digest]".into()),
+            ..ToolOutput::ok("o".repeat(10_000))
+        },
+        &log,
+    );
+    exec.spec.output_limit = Some(2000);
+    let reg = registry(vec![Arc::new(exec)]);
+    let mut e = env(run, RunMode::Auto, true);
+    e.checkpointer = Some(Arc::new(support::stub::CheckpointStub {
+        secret_skipped: vec![".env".into()],
+        ..Default::default()
+    }));
+    let calls = [planned("c1", "bash", json!({}))];
+    let (_tx, mut sig) = signal_channel();
+    let out = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert_eq!(
+        result_of(&out.results[0]).1,
+        "[test output digest]\n[no checkpoint for this file: it looks like a secret]\n\
+         [output digest; full output: full output not saved]"
+    );
+}
+
+// ---- R1-C2 D110, D112: результат веба и журнал сетевых обращений ----
+
+/// Сетевое чтение с контрактом `web_fetch` (D123): `Read`, `Network`, `tainted`; вывод `out`.
+fn web_tool(out: ToolOutput, log: &SharedLog) -> TestTool {
+    let mut t = test_tool(
+        "web_fetch",
+        ToolKind::Read,
+        0,
+        Duration::from_secs(60),
+        out,
+        log,
+    );
+    t.spec.risk = RiskClass::Network;
+    t.spec.tainted = true;
+    t.subjects.network = true;
+    t
+}
+
+fn request(url: &str, final_url: Option<&str>, status: u16) -> NetRequest {
+    NetRequest {
+        method: "GET".into(),
+        url: url.into(),
+        final_url: final_url.map(str::to_owned),
+        status: Some(status),
+        bytes: 10,
+        ms: 1,
+        outcome: net_outcome::OK.into(),
+        reason: None,
+    }
+}
+
+#[tokio::test]
+async fn web_request_events_written_in_slot() {
+    let (s, j, run) = setup("web-requests").await;
+    let log = SharedLog::default();
+    // Секрет — в параметре адреса; собран из частей (сканеры репозитория).
+    let secret = ["zsk", "k7q2", "webkey", "9x"].concat();
+    let page = format!("https://site.test/a?key={secret}");
+    let moved = format!("https://site.test/b?key={secret}");
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        requests: vec![
+            request("https://site.test/robots.txt", None, 404),
+            request(&page, Some(&moved), 302),
+        ]
+        .into(),
+        ..ToolOutput::ok("page body")
+    };
+    let tool = web_tool(out, &log);
+    let deadlines = Arc::clone(&tool.deadlines);
+    let reg = registry(vec![Arc::new(tool)]);
+    let mut e = env(run, RunMode::Auto, true);
+    e.masker = Some(Arc::new(SecretMasker::new(vec![(
+        "WEB_KEY".into(),
+        secret.clone(),
+    )])));
+    let calls = [planned(
+        "c1",
+        "web_fetch",
+        json!({"url": "https://site.test/a"}),
+    )];
+    let (_tx, mut sig) = signal_channel();
+    let before = std::time::Instant::now();
+    let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert!(!result_of(&o.results[0]).2);
+
+    // Слот ставит дедлайн вызова: старт + тайм-аут − 1 с (D107).
+    let got = deadlines.lock().unwrap().clone();
+    assert_eq!(got.len(), 1);
+    let d = got[0].expect("ToolCx.deadline");
+    assert!(
+        d >= before + Duration::from_secs(60) - DEADLINE_GRACE,
+        "{d:?}"
+    );
+    assert!(d <= std::time::Instant::now() + Duration::from_secs(60) - DEADLINE_GRACE);
+
+    let all = s.read_run(run, Seq(0), 10_000).await.unwrap();
+    let kinds: Vec<EventKind> = all
+        .iter()
+        .map(|e| e.kind.clone())
+        .filter(|k| {
+            matches!(
+                k,
+                EventKind::ToolStarted | EventKind::WebRequest | EventKind::ToolFinished
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            EventKind::ToolStarted,
+            EventKind::WebRequest,
+            EventKind::WebRequest,
+            EventKind::ToolFinished
+        ]
+    );
+    let web: Vec<&Value> = all
+        .iter()
+        .filter(|e| e.kind == EventKind::WebRequest)
+        .map(|e| &e.payload)
+        .collect();
+    assert_eq!(
+        *web[0],
+        json!({"call_id": "c1", "tool": "web_fetch", "method": "GET",
+            "url": "https://site.test/robots.txt", "status": 404, "bytes": 10, "ms": 1,
+            "outcome": "ok"})
+    );
+    assert_eq!(
+        web[1]["url"],
+        "https://site.test/a?key=[secret masked: WEB_KEY]"
+    );
+    assert_eq!(
+        web[1]["final_url"],
+        "https://site.test/b?key=[secret masked: WEB_KEY]"
+    );
+    // Ни в событиях, ни в квитанции эффекта нет секрета; записей обращений в квитанции нет.
+    for ev in &all {
+        assert!(!ev.payload.to_string().contains(&secret), "{:?}", ev.kind);
+    }
+    let row = s
+        .effect(run, &EffectKey::derive(run, 0, 0))
+        .await
+        .unwrap()
+        .unwrap();
+    let receipt = row.result.expect("квитанция").to_string();
+    assert!(!receipt.contains("requests"), "{receipt}");
+    assert!(!receipt.contains(&secret), "{receipt}");
+
+    // Реплей квитанции: вызова и новых событий `web.request` нет.
+    let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    assert!(result_of(&o.results[0]).1.ends_with("page body"));
+    let again = s.read_run(run, Seq(0), 10_000).await.unwrap();
+    assert_eq!(
+        again
+            .iter()
+            .filter(|e| e.kind == EventKind::WebRequest)
+            .count(),
+        2
+    );
+    assert_eq!(log.lock().unwrap().starts.len(), 1);
+}
+
+#[tokio::test]
+async fn web_result_tainted_and_cleaned() {
+    let (s, j, run) = setup("web-tainted").await;
+    let log = SharedLog::default();
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        ..ToolOutput::ok("hello \u{202E}world")
+    };
+    let reg = registry(vec![Arc::new(web_tool(out, &log))]);
+    let calls = [planned(
+        "c1",
+        "web_fetch",
+        json!({"url": "https://site.test/"}),
+    )];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    let (_, text, is_error) = result_of(&o.results[0]);
+    assert!(!is_error);
+    // Своё происхождение заменяет `tool` и `network` (D110); bidi удалён (D102).
+    assert_eq!(text, "[untrusted content: web]\nhello world");
+    let ev = tool_events(&s, run).await;
+    assert_eq!(ev[1].0, EventKind::ToolFinished);
+    assert_eq!(ev[1].2["tainted"], true);
+}
+
+#[tokio::test]
+async fn own_origin_keeps_outside_project() {
+    let base = dir("own-outside");
+    let (project, outside, home) = (base.join("proj"), base.join("out"), base.join("home"));
+    for d in [&project, &outside, &home] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(outside.join("a.txt"), "x").unwrap();
+    let roots = Roots::canonical(&project, &home).unwrap();
+    let outside = std::fs::canonicalize(&outside).unwrap();
+    let (s, j, run) = setup("own-outside-journal").await;
+    let log = SharedLog::default();
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        ..ToolOutput::ok("page")
+    };
+    let mut tool = web_tool(out, &log);
+    tool.subjects.paths = vec![RawPath {
+        arg: outside.join("a.txt").to_string_lossy().into_owned(),
+        access: Access::Read,
+    }];
+    let reg = registry(vec![Arc::new(tool)]);
+    let mut e = ToolEnv::new(run, roots.project.clone(), RunMode::Auto, true, None);
+    e.roots = Arc::new(roots);
+    e.grants = Arc::new(vec![Grant {
+        path: outside.clone(),
+        mode: GrantMode::Ro,
+        source: GrantSource::Cli,
+        reason: String::new(),
+    }]);
+    let calls = [planned("c1", "web_fetch", json!({}))];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let (_, text, is_error) = result_of(&o.results[0]);
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        text, "[untrusted content: outside_project, web]\npage",
+        "outside_project — по путям, tool и network — нет"
+    );
+}
+
+// ---- Ревью задачи 8 R1-C2: метка у `digest` (I1) и предел результата (I2) ----
+
+/// I1 (тест рецензента `review8_digest_keeps_untrusted_line`): длинный результат с `digest`
+/// сохраняет первую строку `[untrusted content: web]` — пакет показывает `digest`, а не
+/// `content`, и метка должна быть и там.
+#[tokio::test]
+async fn digest_keeps_untrusted_line() {
+    let (s, j, run) = setup("digest-untrusted").await;
+    let log = SharedLog::default();
+    let digest = "url: https://site.test/\nstatus: 200\ntype: text/plain\n\nmatched passage";
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        digest: Some(digest.into()),
+        ..ToolOutput::ok(format!("url: https://site.test/\n\n{}", "x".repeat(10_000)))
+    };
+    let mut tool = web_tool(out, &log);
+    tool.spec.output_limit = Some(2000);
+    // Помеченный инструмент без своего происхождения (`spec.tainted`): метка `tool`.
+    let mut marked = test_tool(
+        "marked",
+        ToolKind::Read,
+        0,
+        Duration::from_secs(60),
+        ToolOutput {
+            digest: Some("short digest".into()),
+            ..ToolOutput::ok("y".repeat(10_000))
+        },
+        &log,
+    );
+    marked.spec.tainted = true;
+    marked.spec.output_limit = Some(2000);
+    let reg = registry(vec![Arc::new(tool), Arc::new(marked)]);
+    let calls = [
+        planned("c1", "web_fetch", json!({"url": "https://site.test/"})),
+        planned("c2", "marked", json!({})),
+    ];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    let (_, text, _) = result_of(&o.results[0]);
+    assert_eq!(
+        text,
+        format!(
+            "[untrusted content: web]\n{digest}\n[output digest; full output: full output not saved]"
+        )
+    );
+    let (_, text, _) = result_of(&o.results[1]);
+    assert_eq!(
+        text,
+        "[untrusted content: tool]\nshort digest\n[output digest; full output: full output not saved]"
+    );
+}
+
+/// I1 с настоящей выгрузкой (`ToolEnv::spill`): в контексте — метка, `digest` и указатель
+/// `search …`, в файле — полный вывод (с той же меткой первой строкой).
+#[tokio::test]
+async fn digest_with_spill_file_keeps_untrusted_line() {
+    let project = dir("digest-spill-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let (s, j, run) = setup("digest-spill").await;
+    let log = SharedLog::default();
+    let body = format!("url: https://site.test/\n\n{}", "x".repeat(100_000));
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        digest: Some("matched passage".into()),
+        ..ToolOutput::ok(body.clone())
+    };
+    let reg = registry(vec![Arc::new(web_tool(out, &log))]);
+    let e = ToolEnv::new(
+        run,
+        project.clone(),
+        RunMode::Auto,
+        true,
+        Some(SpillCfg {
+            n_ctx: 16_384,
+            share: 0.15,
+        }),
+    );
+    let calls = [planned(
+        "c1",
+        "web_fetch",
+        json!({"url": "https://site.test/"}),
+    )];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+    let (_, text, _) = result_of(&o.results[0]);
+    let stem = EffectKey::derive(run, 0, 0).file_stem();
+    let rel = format!("{SPILL_DIR}/{stem}.txt");
+    assert_eq!(
+        text,
+        format!(
+            "[untrusted content: web]\nmatched passage\n[output digest; full output: search {rel}]"
+        )
+    );
+    let saved = std::fs::read_to_string(project.join(&rel)).expect("файл выгрузки");
+    assert_eq!(saved, format!("[untrusted content: web]\n{body}"));
+}
+
+/// I2: слот передаёт инструменту фактический предел результата на этом окне
+/// (`ToolCx::output_budget`): с выгрузкой — `spill_limit_bytes(n_ctx, share, output_limit)`,
+/// без неё — `output_limit`, без предела — `None`.
+#[tokio::test]
+async fn slot_passes_output_budget() {
+    let cfg = |n_ctx| SpillCfg { n_ctx, share: 0.15 };
+    let cases = [
+        // Окна 16k и 64k при `output_limit` `web_fetch` (128 КиБ): предел — доля окна.
+        (Some(cfg(16_384)), Some(128 * 1024), Some(9830)),
+        (Some(cfg(65_536)), Some(128 * 1024), Some(39_321)),
+        // `output_limit` меньше доли окна — он и есть предел.
+        (Some(cfg(16_384)), Some(2000), Some(2000)),
+        (None, Some(2000), Some(2000)),
+        (None, None, None),
+    ];
+    for (i, (spill, output_limit, want)) in cases.into_iter().enumerate() {
+        let (s, j, run) = setup(&format!("output-budget-{i}")).await;
+        let log = SharedLog::default();
+        let mut tool = web_tool(ok("page"), &log);
+        tool.spec.output_limit = output_limit;
+        let budgets = Arc::clone(&tool.budgets);
+        let reg = registry(vec![Arc::new(tool)]);
+        let e = ToolEnv::new(
+            run,
+            dir("output-budget-project"),
+            RunMode::Auto,
+            true,
+            spill,
+        );
+        let calls = [planned("c1", "web_fetch", json!({}))];
+        let (_tx, mut sig) = signal_channel();
+        run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+        assert_eq!(*budgets.lock().unwrap(), [want], "случай {i}");
+    }
+}
+
+/// Инструмент, который строит `digest` по пределу слота (как `web_fetch`, I2): `digest`
+/// ровно `output_budget − DIGEST_RESERVE` байт, `content` вдвое длиннее предела.
+struct BudgetTool {
+    spec: ToolSpec,
+}
+
+impl Tool for BudgetTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call(&self, _args: Value, cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        let limit = cx.output_budget.expect("output_budget");
+        let line = "passage text\n";
+        // Последний символ — не перевод строки (хотя бы один `z`).
+        let mut digest = line.repeat((limit - DIGEST_RESERVE - 1) / line.len());
+        digest.push_str(&"z".repeat(limit - DIGEST_RESERVE - digest.len()));
+        Box::pin(async move {
+            ToolOutput {
+                taint: Some(taint_origin::WEB.into()),
+                digest: Some(digest),
+                ..ToolOutput::ok("w".repeat(limit * 2))
+            }
+        })
+    }
+}
+
+/// I2: `digest` в пределе `output_budget − DIGEST_RESERVE` приходит в контекст целиком — с
+/// меткой и указателем выгрузки, без обрезки головой и хвостом — на окнах 16k и 64k.
+#[tokio::test]
+async fn digest_within_reserve_is_not_cut() {
+    for n_ctx in [16_384u32, 65_536] {
+        let project = dir("digest-reserve-project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (s, j, run) = setup(&format!("digest-reserve-{n_ctx}")).await;
+        let mut spec = web_tool(ok("x"), &SharedLog::default()).spec;
+        spec.output_limit = Some(128 * 1024);
+        let reg = registry(vec![Arc::new(BudgetTool { spec })]);
+        let e = ToolEnv::new(
+            run,
+            project,
+            RunMode::Auto,
+            true,
+            Some(SpillCfg { n_ctx, share: 0.15 }),
+        );
+        let calls = [planned("c1", "web_fetch", json!({}))];
+        let (_tx, mut sig) = signal_channel();
+        let o = run_batch(&s, &j, &reg, &e, &calls, &mut sig).await.unwrap();
+        let (_, text, _) = result_of(&o.results[0]);
+        let limit = spill_limit_bytes(n_ctx, 0.15, Some(128 * 1024));
+        assert!(text.len() <= limit, "{n_ctx}: {} > {limit}", text.len());
+        assert!(
+            text.starts_with("[untrusted content: web]\npassage text\n"),
+            "{n_ctx}: {}",
+            &text[..80]
+        );
+        assert!(!text.contains("… omitted "), "{n_ctx}: digest обрезан");
+        let digest_end = text.find("\n[output digest; full output: search ").unwrap();
+        assert_eq!(
+            digest_end - "[untrusted content: web]\n".len(),
+            limit - DIGEST_RESERVE,
+            "{n_ctx}: digest не целиком"
+        );
+    }
+}
+
+/// M4 ревью задачи 8: два `web_fetch` одного пакета идут одновременно (группа чтений,
+/// рандеву на `Barrier`); у каждого свой дедлайн, а его события `web.request` несут его
+/// `call_id` и стоят между его `tool.started` и `tool.finished`.
+#[tokio::test]
+async fn parallel_web_fetch_have_own_requests() {
+    let (s, j, run) = setup("web-parallel").await;
+    let log = SharedLog::default();
+    let out = ToolOutput {
+        taint: Some(taint_origin::WEB.into()),
+        requests: vec![request("https://site.test/a", None, 200)].into(),
+        ..ToolOutput::ok("page")
+    };
+    let mut tool = web_tool(out, &log);
+    tool.barrier = Some(Arc::new(Barrier::new(2)));
+    let deadlines = Arc::clone(&tool.deadlines);
+    let reg = registry(vec![Arc::new(tool)]);
+    let calls = [
+        planned("c1", "web_fetch", json!({"url": "https://site.test/a"})),
+        planned("c2", "web_fetch", json!({"url": "https://site.test/a"})),
+    ];
+    let (_tx, mut sig) = signal_channel();
+    let o = run_batch(
+        &s,
+        &j,
+        &reg,
+        &env(run, RunMode::Auto, true),
+        &calls,
+        &mut sig,
+    )
+    .await
+    .unwrap();
+    for r in &o.results {
+        let (id, text, is_error) = result_of(r);
+        assert!(!is_error, "{id}: {text}");
+        assert_eq!(
+            text, "[untrusted content: web]\npage",
+            "{id}: рандеву не прошло"
+        );
+    }
+    let got = deadlines.lock().unwrap().clone();
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(Option::is_some), "{got:?}");
+    let all = s.read_run(run, Seq(0), 10_000).await.unwrap();
+    for id in ["c1", "c2"] {
+        let at = |kind: EventKind| -> Vec<u64> {
+            all.iter()
+                .filter(|e| e.kind == kind && e.payload["call_id"] == id)
+                .map(|e| e.seq.0)
+                .collect()
+        };
+        let (started, web, finished) = (
+            at(EventKind::ToolStarted),
+            at(EventKind::WebRequest),
+            at(EventKind::ToolFinished),
+        );
+        assert_eq!(
+            (started.len(), web.len(), finished.len()),
+            (1, 1, 1),
+            "{id}"
+        );
+        assert!(started[0] < web[0] && web[0] < finished[0], "{id}");
+    }
 }

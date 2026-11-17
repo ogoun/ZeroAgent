@@ -754,3 +754,92 @@ fn small_capability_instructions_go_to_tool_description() {
     assert_eq!(desc(&f, "a"), "tool a");
     assert_eq!(f, freeze(&s, &schemas, &[], None));
 }
+
+/// Буфер записей `tracing` теста.
+#[derive(Clone, Default)]
+struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `f` под подписчиком `tracing` уровня `warn`; второе значение — текст записей.
+fn with_warnings<T>(f: impl FnOnce() -> T) -> (T, String) {
+    let logs = Logs::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer({
+            let logs = logs.clone();
+            move || logs.clone()
+        })
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let out = tracing::subscriber::with_default(sub, f);
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    (out, text)
+}
+
+/// R1-C2 D117: на top small `activate_skill` (`min_tier = Standard`) в наборе нет —
+/// инструкции `FirstTool` (каталог скиллов) молча опускаются: ни описаний, ни `warn`.
+/// Инструкции `System` без инструмента — по-прежнему `warn` (проверка подписчика).
+#[test]
+fn small_tier_first_tool_instructions_silent() {
+    let catalog = za_skills::Catalog::bundled_for_tests(&[(
+        "tdd",
+        "---\nname: tdd\ndescription: Use when testing.\n---\nBody.\n",
+    )]);
+    let skills = za_agent::skills_capability(std::sync::Arc::new(catalog));
+    assert_eq!(
+        skills.instructions_target,
+        za_core::InstructionsTarget::FirstTool
+    );
+    let schemas = [tool("read")];
+    let s = setup(RunRole::Top, Tier::Small, None);
+    let (f, logs) = with_warnings(|| freeze(&s, &schemas, std::slice::from_ref(&skills), None));
+    assert!(logs.is_empty(), "{logs}");
+    assert!(!f.system.contains("skill_catalog") && !f.system.contains("Use when testing"));
+    assert!(
+        f.tools
+            .iter()
+            .all(|t| !t.description.contains("skill_catalog"))
+    );
+    assert_eq!(f, freeze(&s, &schemas, &[], None));
+    // Контроль: инструкции в system у capability без инструмента в наборе — `warn`.
+    let other = Capability {
+        name: "other".into(),
+        tools: vec![cap_tool("absent")],
+        instructions: Some("X".into()),
+        ..Capability::default()
+    };
+    let (_, logs) = with_warnings(|| freeze(&s, &schemas, &[other], None));
+    assert!(
+        logs.contains("инструкции capability на top small опущены"),
+        "{logs}"
+    );
+    // Standard: каталог — в описании activate_skill, а не в system.
+    let s = RunSetup {
+        n_ctx: 32_768,
+        ..setup(RunRole::Top, Tier::Standard, None)
+    };
+    let schemas = [
+        tool("read"),
+        za_agent::activate_skill_tool().spec().schema.clone(),
+    ];
+    let (f, logs) = with_warnings(|| freeze(&s, &schemas, std::slice::from_ref(&skills), None));
+    assert!(logs.is_empty(), "{logs}");
+    let desc = &f
+        .tools
+        .iter()
+        .find(|t| t.name == "activate_skill")
+        .unwrap()
+        .description;
+    assert!(desc.contains("\n\n<skill_catalog>\n"), "{desc}");
+    assert!(desc.contains("- tdd: Use when testing."));
+    assert!(!f.system.contains("Use when testing"));
+}

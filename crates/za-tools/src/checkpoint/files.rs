@@ -4,11 +4,17 @@
 //! Отсутствовавший файл — `absent` (удаляется при восстановлении только с `delete_new`).
 //! Файл больше [`CHECKPOINT_MAX_FILE`] — `skipped`: не копируется и при восстановлении не
 //! трогается (`strict` — ошибка); новых байт больше [`CHECKPOINT_MAX_TOTAL`] — ошибка
-//! `FileTooLarge`. Манифест пишется последним: его наличие — признак готовой копии.
+//! `FileTooLarge`. Секретный файл (D103: [`super::secret_name`] или фильтр по содержимому)
+//! — `secret`: не копируется и при восстановлении не трогается. Восстановление не трогает
+//! и файл, который секрет сейчас (по имени — и в манифесте R1-C1, по содержимому — у
+//! существующего файла; ревью задачи 2: I1, I2), и сообщает такие пути. Файл до
+//! [`super::SECRET_SCAN_MAX`] байт при фильтре читается один раз: фильтр проверяет ровно
+//! те байты, что копируются. Манифест пишется последним: его наличие — признак готовой
+//! копии.
 
 use std::collections::BTreeSet;
-use std::io::{self, Read};
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use za_core::paths::{
@@ -21,7 +27,10 @@ use super::home::{
     write_private,
 };
 use super::write::{Mode, Tmp, fill, finish, target};
-use super::{CHECKPOINT_MAX_FILE, CHECKPOINT_MAX_TOTAL, RestoreError, files_cp, valid_id};
+use super::{
+    CHECKPOINT_MAX_FILE, CHECKPOINT_MAX_TOTAL, RestoreError, Restored, SECRET_SCAN_MAX, SecretScan,
+    files_cp, join_rel, secret_name, valid_id,
+};
 use crate::AgentHome;
 
 /// Манифест копии файлов.
@@ -31,6 +40,13 @@ const FORMAT_V: u32 = 2;
 const STATE_FILE: &str = "file";
 const STATE_ABSENT: &str = "absent";
 const STATE_SKIPPED: &str = "skipped";
+/// Секретный файл (D103): копии нет, восстановление не трогает.
+const STATE_SECRET: &str = "secret";
+
+/// Состояние, которое восстановление не трогает и чекпоинт «до» не копирует.
+fn untouched(state: &str) -> bool {
+    state == STATE_SKIPPED || state == STATE_SECRET
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
@@ -43,7 +59,7 @@ struct Manifest {
 struct ManifestFile {
     /// Путь от корня проекта через `/`.
     path: String,
-    /// `file`, `absent` или `skipped` (сверх предела).
+    /// `file`, `absent`, `skipped` (сверх предела) или `secret` (D103).
     state: String,
     /// Имя копии в каталоге чекпоинта (у `file`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,17 +77,19 @@ fn too_large(what: String) -> io::Error {
 }
 
 /// Копия файлов запроса `req` под id `<run>/<stem>`. Повтор — готовая копия остаётся.
+/// Возвращает пропущенные как секреты пути (от корня проекта, D103).
 pub(super) fn copy(
     home: &AgentHome,
     req: &CheckpointRequest,
     stem: &str,
     strict: bool,
-) -> io::Result<()> {
+    scan: &SecretScan,
+) -> io::Result<Vec<String>> {
     let id = format!("{}/{stem}", req.run);
     let dir = files_dir(home, &id)?;
     let manifest_path = dir.join(MANIFEST);
-    if load(&manifest_path).is_ok() {
-        return Ok(());
+    if let Ok(m) = load(&manifest_path) {
+        return Ok(secrets_of(&m));
     }
     let roots = Roots::canonical(&req.project_dir, &home.za_home)?;
     let mut files = Vec::new();
@@ -96,10 +114,42 @@ pub(super) fn copy(
             inside: true,
             protected: false,
         };
+        // По имени — и отсутствующий файл: восстановление не удалит созданный секрет.
+        if secret_name(&rel) {
+            tracing::info!(path = %rel, "имя секретного файла: в копию не входит");
+            files.push(ManifestFile {
+                path: rel,
+                state: STATE_SECRET.into(),
+                copy: None,
+                mode: None,
+                size: None,
+            });
+            continue;
+        }
         match open_checked(&r, false) {
             Ok(src) => {
                 let meta = src.metadata()?;
                 let size = meta.len();
+                // Малый файл при фильтре читается один раз (ревью задачи 2, m1): фильтр
+                // видит ровно те байты, что пойдут в копию.
+                let head = if scan.has_filter() && size <= SECRET_SCAN_MAX {
+                    let mut buf = Vec::new();
+                    (&src).take(SECRET_SCAN_MAX).read_to_end(&mut buf)?;
+                    Some(buf)
+                } else {
+                    None
+                };
+                if head.as_deref().is_some_and(|b| scan.matches(b)) {
+                    tracing::info!(path = %rel, "похоже на секрет: в копию не входит");
+                    files.push(ManifestFile {
+                        path: rel,
+                        state: STATE_SECRET.into(),
+                        copy: None,
+                        mode: None,
+                        size: None,
+                    });
+                    continue;
+                }
                 if size > CHECKPOINT_MAX_FILE {
                     if strict {
                         return Err(too_large(format!("{rel}: {size} байт")));
@@ -122,8 +172,13 @@ pub(super) fn copy(
                 }
                 let copy = files.len().to_string();
                 let mut out = create_private(&private(dir.join(&copy)))?;
-                // Не больше заявленного размера: файл мог расти во время копии.
-                io::copy(&mut (&src).take(CHECKPOINT_MAX_FILE), &mut out)?;
+                match head {
+                    Some(buf) => out.write_all(&buf)?,
+                    // Не больше заявленного размера: файл мог расти во время копии.
+                    None => {
+                        io::copy(&mut (&src).take(CHECKPOINT_MAX_FILE), &mut out)?;
+                    }
+                }
                 out.sync_all()?;
                 files.push(ManifestFile {
                     path: rel,
@@ -149,7 +204,20 @@ pub(super) fn copy(
         files,
     };
     let json = serde_json::to_vec(&m).map_err(io::Error::other)?;
-    write_private(&manifest_path, &json)
+    write_private(&manifest_path, &json)?;
+    Ok(secrets_of(&m))
+}
+
+/// Пути манифеста в состоянии `secret`, по возрастанию.
+fn secrets_of(m: &Manifest) -> Vec<String> {
+    let mut v: Vec<String> = m
+        .files
+        .iter()
+        .filter(|f| f.state == STATE_SECRET)
+        .map(|f| f.path.clone())
+        .collect();
+    v.sort();
+    v
 }
 
 fn load(path: &std::path::Path) -> io::Result<Manifest> {
@@ -166,12 +234,24 @@ pub(super) fn exists(home: &AgentHome, id: &str) -> io::Result<bool> {
     Ok(load(&files_dir_existing(home, id)?.join(MANIFEST)).is_ok())
 }
 
-/// Пути (от корня проекта) копии `id` — для чекпоинта «до» восстановления.
-pub(super) fn paths(home: &AgentHome, id: &str) -> io::Result<Vec<String>> {
+/// Пути (от корня проекта `top`) копии `id`, которые восстановление может изменить, —
+/// для чекпоинта «до» восстановления. Секрет сейчас (имя, содержимое) восстановление не
+/// тронет, и в набор он не входит (ревью задачи 2: I1, I2).
+pub(super) fn paths(
+    home: &AgentHome,
+    id: &str,
+    top: &Path,
+    scan: &SecretScan,
+) -> io::Result<Vec<String>> {
     let m = load(&files_dir_existing(home, id)?.join(MANIFEST))?;
     Ok(m.files
         .into_iter()
-        .filter(|f| f.state != STATE_SKIPPED)
+        .filter(|f| !untouched(&f.state))
+        .filter(|f| {
+            let abs = join_rel(top, &f.path);
+            // Путь вне проекта в копию «до» не попадёт: его содержимое не читается.
+            !(secret_name(&f.path) || within(top, &abs) && scan.now(&f.path, &abs))
+        })
         .map(|f| f.path)
         .collect())
 }
@@ -197,12 +277,15 @@ pub(super) fn list(home: &AgentHome) -> io::Result<Vec<Checkpoint>> {
 }
 
 /// Восстановление по манифесту: сначала проверка всех целей, затем запись потоком.
+/// Секрет — по записи манифеста или сейчас (имя, содержимое) — не трогается и попадает в
+/// [`Restored::secret_untouched`].
 pub(super) fn restore(
     home: &AgentHome,
     roots: &Roots,
     id: &str,
     delete_new: bool,
-) -> Result<Vec<PathBuf>, RestoreError> {
+    scan: &SecretScan,
+) -> Result<Restored, RestoreError> {
     let dir = files_dir_existing(home, id)?;
     let m = load(&dir.join(MANIFEST)).map_err(|e| {
         if is_missing(&e) {
@@ -212,11 +295,21 @@ pub(super) fn restore(
         }
     })?;
     let mut plan = Vec::new();
+    let mut secret = BTreeSet::new();
     for f in &m.files {
-        if f.state == STATE_SKIPPED {
+        if f.state == STATE_SECRET || secret_name(&f.path) {
+            secret.insert(f.path.clone());
+            continue;
+        }
+        if untouched(&f.state) {
             continue;
         }
         if let Some(t) = target(roots, &f.path)? {
+            if scan.now(&f.path, &t.r.path) {
+                tracing::warn!(path = %f.path, "файл сейчас похож на секрет: не восстанавливается");
+                secret.insert(f.path.clone());
+                continue;
+            }
             plan.push((f, t));
         }
     }
@@ -242,7 +335,10 @@ pub(super) fn restore(
             changed.push(t.r.path.clone());
         }
     }
-    Ok(changed)
+    Ok(Restored {
+        changed,
+        secret_untouched: secret.into_iter().collect(),
+    })
 }
 
 #[cfg(unix)]

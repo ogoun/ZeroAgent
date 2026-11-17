@@ -22,6 +22,10 @@
 //! и классифицирует необратимые и сетевые (D77, D81), [`Checkpointer`] — контракт чекпоинта рабочей
 //! копии (D89).
 //!
+//! Модуль [`text`] удаляет невидимые символы Unicode из результатов инструментов,
+//! ввода пользователя и `AGENTS.md` (SEC-051, D102). Модуль [`extract`] — контракт
+//! извлечения текста из HTML и PDF в отдельном процессе (D113, D127).
+//!
 //! [`run_demo`] — детерминированный демонстрационный run для сквозной проверки
 //! журнала и протокола эффектов, [`replay_hash`] — хэш его значимых событий.
 
@@ -29,15 +33,18 @@ mod bus;
 mod capability;
 mod checkpoint;
 mod demo;
+pub mod extract;
 mod graph;
 pub mod interrupt;
+pub mod net;
 pub mod paths;
 mod recovery;
 mod runtime;
+pub mod text;
 mod tool;
 
 pub use bus::{AgentEvent, EventBus, Journal};
-pub use capability::{BoundaryInfo, Capability, Hook};
+pub use capability::{BoundaryInfo, Capability, Hook, InstructionsTarget};
 pub use checkpoint::{Checkpoint, CheckpointRequest, Checkpointer};
 pub use demo::{CrashPoint, DemoConfig, DemoOutcome, replay_hash, run_demo};
 pub use graph::{BoxFuture, Exit, Graph, GraphError, Node, NodeId, Transition};
@@ -47,8 +54,9 @@ pub use recovery::{
 };
 pub use runtime::{EffectError, EffectFailure, EffectSlot, EffectSource, EffectSpec, RunCtx};
 pub use tool::{
-    Access, Approval, DuplicateTool, Gate, Postcondition, RawPath, RiskClass, Subjects, Tool,
-    ToolCx, ToolKind, ToolOutput, ToolRegistry, ToolSpec, gate,
+    Access, Approval, DEADLINE_GRACE, DIGEST_RESERVE, DuplicateTool, Gate, NetRequest,
+    Postcondition, RawPath, RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
+    ToolSpec, call_deadline, gate,
 };
 /// Схема инструмента для модели (поле [`ToolSpec::schema`]): крейты инструментов
 /// (`za-tools`) строят её без зависимости от `za-llm`.

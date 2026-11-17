@@ -4,6 +4,14 @@ targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 
 [advisories]
 yanked = "deny"
+# RUSTSEC-2026-0192: `ttf-parser` не сопровождается (не уязвимость). Приходит только через
+# `lopdf 0.42` (`pdf-extract 0.12.1` требует `^0.42`, R1-C2 задача 10), где вызывается лишь при
+# создании документа со встроенным шрифтом (`lopdf::FontData::new`); разбор PDF в
+# `za-extract` (подпроцесс `zero-agent extract pdf`) этот путь не вызывает. Снять, когда
+# `pdf-extract` перейдёт на `lopdf` ≥ 0.45 (там `skrifa` вместо `ttf-parser`).
+ignore = [
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser only via lopdf FontData::new (PDF creation), not on the za-extract parsing path" },
+]
 
 [licenses]
 allow = [

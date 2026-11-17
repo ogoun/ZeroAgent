@@ -1,5 +1,6 @@
 //! Секреты бинарника (R1-C1 D90): кэш [`StoreSecrets`] для `Gateway` и маскировки,
-//! маска значений JSON, команда `zero-agent secret list`.
+//! маска значений JSON, фильтр секретов чекпоинтов (R1-C2 D103), команда
+//! `zero-agent secret list`.
 //!
 //! Источник — [`za_secrets::SecretStore`]; до клиента памяти ZeroAIMemory это
 //! [`EnvStore`] (`ZA_SECRET_<KEY_REF>`), для пользователя поведение прежнее. Значения
@@ -15,8 +16,13 @@ use serde_json::Value;
 use za_llm::config::secret_env_name;
 use za_llm::{Secret, SecretSource};
 use za_secrets::{EnvStore, MIN_SECRET_LEN, SecretMasker, SecretStore, known_values};
+use za_tools::SecretFilter;
 
 use crate::config::load_config;
+
+/// Версия правил фильтра секретов чекпоинтов (входит в отпечаток: смена правил — новая
+/// проверка файлов). v2 — ключи PGP и PuTTY (финальное ревью безопасности, Minor 2).
+const FILTER_RULES_V: &str = "zero-agent checkpoint filter v2 (values, pem, pgp, ppk)";
 
 /// Секреты, прочитанные из хранилища при старте (D90, 1.15).
 #[derive(Clone, Default)]
@@ -52,6 +58,41 @@ impl StoreSecrets {
     /// Маскировщик по известным значениям кэша и шаблонам D90.
     pub fn masker(&self) -> SecretMasker {
         SecretMasker::new(known_values(self))
+    }
+
+    /// Фильтр секретов чекпоинтов (D103): `true`, если в байтах файла есть известное
+    /// значение хранилища (`known_values`), блок PEM закрытого ключа или закрытого ключа
+    /// PGP ([`has_private_key_pem`]) либо файл — ключ PuTTY ([`is_putty_key`]). Широкие шаблоны
+    /// [`SecretMasker`] не применяются: ложное срабатывание молча лишило бы файл
+    /// чекпоинта и восстановления. Размер файла ограничивает `za-tools`
+    /// (`SECRET_SCAN_MAX`).
+    ///
+    /// Отпечаток фильтра — BLAKE3 отсортированного набора значений (с длинами, с меткой
+    /// версии правил PEM): `za-tools` кэширует итог проверки файла, пока отпечаток и stat
+    /// файла те же (ревью задачи 2, сомнение 2). Отпечаток живёт только в памяти.
+    pub fn checkpoint_filter(&self) -> SecretFilter {
+        let mut values: Vec<Vec<u8>> = known_values(self)
+            .into_iter()
+            .map(|(_, v)| v.into_bytes())
+            .collect();
+        values.sort();
+        values.dedup();
+        let mut h = blake3::Hasher::new();
+        h.update(FILTER_RULES_V.as_bytes());
+        for v in &values {
+            h.update(&(v.len() as u64).to_le_bytes());
+            h.update(v);
+        }
+        let fingerprint = *h.finalize().as_bytes();
+        let finders: Vec<memchr::memmem::Finder<'static>> = values
+            .iter()
+            .map(|v| memchr::memmem::Finder::new(v).into_owned())
+            .collect();
+        SecretFilter::new(fingerprint, move |bytes: &[u8]| {
+            finders.iter().any(|f| f.find(bytes).is_some())
+                || has_private_key_pem(bytes)
+                || is_putty_key(bytes)
+        })
     }
 
     /// Имена секретов со значением короче [`MIN_SECRET_LEN`] символов: маска их не
@@ -106,6 +147,57 @@ impl fmt::Debug for StoreSecrets {
             .field("names", &self.cache.keys().collect::<Vec<_>>())
             .finish()
     }
+}
+
+/// Начало первого вхождения `needle` в `hay`.
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Блок PEM закрытого ключа: строка `-----BEGIN … PRIVATE KEY-----` (PKCS#8, RSA, EC,
+/// DSA, OpenSSH, зашифрованный) или брони закрытого ключа PGP `-----BEGIN PGP PRIVATE KEY
+/// BLOCK-----` (RFC 4880, финальное ревью безопасности, Minor 2), метка — в пределах одной
+/// строки. Открытые ключи, подписи и сообщения PGP — не секрет.
+fn has_private_key_pem(bytes: &[u8]) -> bool {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    const END: &[u8] = b"PRIVATE KEY-----";
+    const PGP_END: &[u8] = b"PRIVATE KEY BLOCK-----";
+    /// Длина метки самое большее (`ENCRYPTED PRIVATE KEY-----` и подобные).
+    const LABEL_MAX: usize = 64;
+    let mut rest = bytes;
+    while let Some(i) = find(rest, BEGIN) {
+        let after = &rest[i + BEGIN.len()..];
+        let line_end = after
+            .iter()
+            .position(|b| *b == b'\n' || *b == b'\r')
+            .unwrap_or(after.len());
+        let label = &after[..line_end.min(LABEL_MAX)];
+        if find(label, END).is_some() || find(label, PGP_END).is_some() {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// Файл ключа PuTTY (`.ppk`, финальное ревью безопасности, Minor 2): строка
+/// `PuTTY-User-Key-File-<версия>:` в начале файла (после необязательной метки порядка
+/// байтов UTF-8). Формат не PEM, и имя файла может быть любым. Упоминание формата в тексте
+/// не в начале файла — не секрет.
+fn is_putty_key(bytes: &[u8]) -> bool {
+    const MAGIC: &[u8] = b"PuTTY-User-Key-File-";
+    const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+    bytes
+        .strip_prefix(BOM)
+        .unwrap_or(bytes)
+        .strip_prefix(MAGIC)
+        .is_some_and(|rest| {
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            digits > 0 && rest.get(digits) == Some(&b':')
+        })
 }
 
 /// Значение JSON, в котором замаскированы все строки и ключи объектов (D90, D100):
@@ -476,5 +568,91 @@ mod tests {
             }
             assert!(child.iter().any(|(k, _)| k == "PATH"));
         }
+    }
+
+    /// D103: фильтр чекпоинтов — только точные признаки. Текст «как секрет» без
+    /// известного значения и без PEM не секрет (нет ложного пропуска); известное значение
+    /// и блок закрытого ключа — секрет; открытый ключ и сертификат — нет.
+    #[test]
+    fn pattern_like_text_is_not_secret() {
+        let value = ["zeta", "-filter-", "value-5d1e"].concat();
+        let s = env(&[("ZA_SECRET_DB", value.as_str()), ("ZA_SECRET_SHORT", "abc")]);
+        let f = s.checkpoint_filter();
+        let ghp = ["ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"].concat();
+        for text in [
+            "api_key = example\n".to_owned(),
+            "password: hunter2\nsecret = changeme\n".to_owned(),
+            format!("token = {ghp}\n"),
+            "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----\n".to_owned(),
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".to_owned(),
+            "-----BEGIN \nPRIVATE KEY-----\n".to_owned(),
+            "abc abc abc\n".to_owned(),
+            String::new(),
+        ] {
+            assert!(!f.matches(text.as_bytes()), "{text:?}");
+        }
+        let pem = |label: &str| format!("x\n-----BEGIN {label}-----\nMII\n-----END {label}-----\n");
+        for text in [
+            format!("DB_URL=postgres://u:{value}@h/db\n"),
+            pem(&["PRIVATE", " KEY"].concat()),
+            pem(&["RSA PRIVATE", " KEY"].concat()),
+            pem(&["OPENSSH PRIVATE", " KEY"].concat()),
+            pem(&["ENCRYPTED PRIVATE", " KEY"].concat()),
+        ] {
+            assert!(f.matches(text.as_bytes()), "{text:?}");
+        }
+        // Без секретов в хранилище — только PEM.
+        let none = env(&[]).checkpoint_filter();
+        assert!(!none.matches(format!("v={value}").as_bytes()));
+    }
+
+    /// Финальное ревью безопасности, Minor 2: закрытый ключ PGP (блок брони
+    /// `PGP PRIVATE KEY BLOCK`) и ключ PuTTY (`PuTTY-User-Key-File-` в начале файла) —
+    /// секрет. Признаки точные: открытый ключ PGP, подпись, сообщение, упоминание формата
+    /// PuTTY в тексте и строка не в начале файла секретом не считаются. Фиктивные ключи
+    /// собираются из частей (сканеры репозитория их не видят целиком).
+    #[test]
+    fn pgp_and_putty_keys_are_secret() {
+        let f = env(&[]).checkpoint_filter();
+        let armor =
+            |label: &str| format!("-----BEGIN {label}-----\n\nlQOYBF\n-----END {label}-----\n");
+        let pgp = ["PGP PRIVATE", " KEY BLOCK"].concat();
+        let ppk = ["PuTTY-User-", "Key-File-3: ssh-ed25519\nEncryption: none\n"].concat();
+        for text in [
+            armor(&pgp),
+            format!("notes\n{}", armor(&pgp)),
+            ppk.clone(),
+            format!("\u{feff}{ppk}"),
+            ["PuTTY-User-", "Key-File-2: ssh-rsa\r\n"].concat(),
+        ] {
+            assert!(f.matches(text.as_bytes()), "{text:?}");
+        }
+        for text in [
+            armor("PGP PUBLIC KEY BLOCK"),
+            armor("PGP SIGNATURE"),
+            armor("PGP MESSAGE"),
+            format!("-----BEGIN {pgp}\n"),
+            format!("The file starts with {ppk}"),
+            format!("\n{ppk}"),
+            "PuTTY-User-Key-File".to_owned(),
+        ] {
+            assert!(!f.matches(text.as_bytes()), "{text:?}");
+        }
+    }
+
+    /// Сомнение 2 ревью задачи 2: отпечаток фильтра зависит только от набора значений —
+    /// тот же набор в другом порядке и под другими именами даёт тот же отпечаток, другое
+    /// значение — другой.
+    #[test]
+    fn filter_fingerprint_follows_value_set() {
+        let a = ["zeta", "-fp-", "value-0001"].concat();
+        let b = ["zeta", "-fp-", "value-0002"].concat();
+        let one = env(&[("ZA_SECRET_A", a.as_str()), ("ZA_SECRET_B", b.as_str())]);
+        let same = env(&[("ZA_SECRET_X", b.as_str()), ("ZA_SECRET_Y", a.as_str())]);
+        let other = env(&[("ZA_SECRET_A", a.as_str())]);
+        let fp = one.checkpoint_filter().fingerprint();
+        assert_eq!(fp, same.checkpoint_filter().fingerprint());
+        assert_ne!(fp, other.checkpoint_filter().fingerprint());
+        assert_ne!(fp, env(&[]).checkpoint_filter().fingerprint());
     }
 }

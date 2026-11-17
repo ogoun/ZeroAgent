@@ -22,7 +22,7 @@ use za_jail::{CommandSpec, DirectRunner, Output, Runner, RunnerError};
 use za_protocol::{EffectKey, RunId, checkpoint_kind, checkpoint_reason};
 use za_tools::{
     AgentHome, CHECKPOINT_MAX_FILE, CHECKPOINT_REF_PREFIX, CHECKPOINT_TIMEOUT, GitCheckpointer,
-    RestoreError, backup_before_restore, restore,
+    RestoreError, SECRET_SCAN_MAX, SecretFilter, backup_before_restore, restore, secret_name,
 };
 
 #[path = "../../../test-support/unique_dir.rs"]
@@ -431,7 +431,7 @@ async fn repo_hooks_fsmonitor_filters_not_executed() {
     )
     .await
     .expect("восстановление");
-    assert!(!changed.is_empty());
+    assert!(!changed.changed.is_empty());
     assert_eq!(c.read("a.txt"), b"beta\n");
     let left: Vec<_> = std::fs::read_dir(&markers).unwrap().collect();
     assert!(left.is_empty(), "сработал код репозитория: {left:?}");
@@ -484,7 +484,7 @@ async fn restore_round_trip_exact_bytes() {
     assert_eq!(c.read("big.dat"), big);
     assert_eq!(c.read("untracked.txt"), b"u\r\n");
     assert!(c.project.join("brand-new.txt").exists());
-    assert_eq!(changed.len(), 5, "{changed:?}");
+    assert_eq!(changed.changed.len(), 5, "{changed:?}");
 
     // С --delete-new — удаляются; неизменившиеся файлы не переписываются.
     let changed = within(
@@ -496,7 +496,7 @@ async fn restore_round_trip_exact_bytes() {
     .expect("восстановление");
     assert!(!c.project.join("brand-new.txt").exists());
     assert!(!c.project.join("d/also-new.txt").exists());
-    assert_eq!(changed.len(), 2, "{changed:?}");
+    assert_eq!(changed.changed.len(), 2, "{changed:?}");
     assert_eq!(c.read("crlf.txt"), crlf);
 }
 
@@ -641,7 +641,7 @@ async fn untrusted_or_non_git_uses_files() {
     .expect("восстановление");
     assert_eq!(c.read("a.txt"), b"before\r\n");
     assert!(!c.project.join("new.txt").exists());
-    assert_eq!(changed.len(), 2, "{changed:?}");
+    assert_eq!(changed.changed.len(), 2, "{changed:?}");
     assert_eq!(stub.calls(), 0);
     // Чекпоинт перед восстановлением держит состояние «после».
     within(
@@ -1018,6 +1018,7 @@ async fn lazy_fetch_never_runs() {
         git_ref: Some(format!("{CHECKPOINT_REF_PREFIX}/{id}")),
         commit: Some("ab".repeat(20)),
         reason: None,
+        secret_skipped: Vec::new(),
     };
     let r = within(
         Duration::from_secs(60),
@@ -1411,4 +1412,768 @@ async fn store_self_heals() {
         c.ours(&["show", &format!("{}:b.txt", cp4.commit.as_deref().unwrap())]),
         "bee\n"
     );
+}
+
+// ---- R1-C2 D103: секретные файлы ----
+
+/// Значение секрета теста: собрано из частей, целиком в исходнике не встречается.
+fn secret_value() -> String {
+    ["zeta", "-ckpt-", "value-91c4e2"].concat()
+}
+
+fn has(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Фильтр «как у бинарника»: известное значение в байтах файла.
+fn value_filter(value: String) -> SecretFilter {
+    let fp = *blake3::hash(value.as_bytes()).as_bytes();
+    SecretFilter::new(fp, move |b: &[u8]| has(b, value.as_bytes()))
+}
+
+/// Все обычные файлы под `dir`.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let t = e.file_type().unwrap();
+            if t.is_dir() {
+                stack.push(e.path());
+            } else if t.is_file() {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
+/// Сообщение коммита и имена дерева чекпоинта git.
+fn commit_and_tree(c: &Case, cp: &Checkpoint) -> (String, Vec<String>) {
+    let commit = cp.commit.clone().expect("чекпоинт git");
+    let msg = c.ours(&["cat-file", "commit", &commit]);
+    let names = c
+        .ours(&["ls-tree", "-r", "--name-only", &commit])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (msg, names)
+}
+
+#[test]
+fn secret_names_table() {
+    for p in [
+        ".env",
+        "app/.env.local",
+        "certs/server.PEM",
+        "id_ed25519",
+        ".npmrc",
+        "x/.git-credentials",
+        "a\\b\\.ENV.production",
+        "k/site.key",
+        "store.p12",
+        "db.kdbx",
+        "_netrc",
+        ".pypirc",
+        // Ключ PuTTY (финальное ревью безопасности, Minor 2): обычен на Windows.
+        "deploy/key.ppk",
+        "keys/Server.PPK",
+    ] {
+        assert!(secret_name(p), "{p}");
+    }
+    for p in [
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+        ".env.dist",
+        "id_ed25519.pub",
+        "envelope.rs",
+        "keys.md",
+        "pem.txt",
+        "src/env.rs",
+        "secret.env",
+        ".envrc",
+        ".pem/readme.md",
+        "ppk.txt",
+        "docs/ppk-format.md",
+    ] {
+        assert!(!secret_name(p), "{p}");
+    }
+}
+
+/// `.env` не попадает в свой репозиторий агента: ни объект, ни сырые байты каталога;
+/// в сообщении коммита — трейлер, `a.txt` в снимке есть.
+#[tokio::test]
+async fn env_file_not_in_checkpoint_repo() {
+    let c = case("secret-env");
+    c.init();
+    let value = secret_value();
+    c.write(".env", format!("TOKEN={value}\n"));
+    c.write("a.txt", "plain\n");
+    let ck = c.ck();
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    // `Exec` не трогает `.env`: в `secret_skipped` только затронутые вызовом файлы.
+    assert!(cp.secret_skipped.is_empty(), "{cp:?}");
+    let (msg, names) = commit_and_tree(&c, &cp);
+    assert!(
+        msg.lines().any(|l| l == "zero-agent-skipped-secret: .env"),
+        "{msg}"
+    );
+    assert!(!msg.contains("zero-agent-skipped: .env"), "{msg}");
+    assert!(names.contains(&"a.txt".to_owned()), "{names:?}");
+    assert!(!names.contains(&".env".to_owned()), "{names:?}");
+    // Распакованные объекты хранилища.
+    let all = c.ours(&["cat-file", "--batch-all-objects", "--batch"]);
+    assert!(all.contains("plain"), "объекты не прочитаны");
+    assert!(!all.contains(&value), "значение секрета в объектах");
+    // Сырые байты каталога чекпоинтов (объекты, индекс, кэш stat).
+    let dir = c.own_repo().parent().unwrap().to_path_buf();
+    for f in files_under(&dir) {
+        let data = std::fs::read(&f).unwrap();
+        assert!(!has(&data, value.as_bytes()), "секрет в {}", f.display());
+    }
+
+    // Правка `.env`: чекпоинт git без копии файлов, `secret_skipped == [".env"]`.
+    let run = RunId::new();
+    let e = create(&ck, c.req_edit(&[".env", "a.txt"], true, run)).await;
+    assert_eq!(e.kind, checkpoint_kind::GIT, "{e:?}");
+    assert_eq!(e.secret_skipped, vec![".env".to_owned()]);
+    // Повтор с тем же ключом эффекта возвращает тот же чекпоинт с тем же признаком.
+    let r = create(&ck, c.req_edit(&[".env", "a.txt"], true, run)).await;
+    assert_eq!((r.commit, r.secret_skipped), (e.commit, e.secret_skipped));
+}
+
+/// Кэш stat R1-C1 (версия 3) хранит oid `.env`: новый чекпоинт `.env` не содержит, кэш
+/// переписан версией 4 без `.env`.
+#[tokio::test]
+async fn env_file_skipped_despite_r1c1_stat_cache() {
+    let c = case("secret-cache");
+    c.init();
+    c.write("a.txt", "plain\n");
+    let ck = c.ck();
+    // Хранилище создано первым чекпоинтом.
+    let first = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(first.kind, checkpoint_kind::GIT, "{first:?}");
+    // «Как в R1-C1»: объект `.env` в хранилище и его oid в кэше stat версии 3.
+    c.write(".env", format!("TOKEN={}\n", secret_value()));
+    let env_path = c.project.join(".env");
+    let oid = c
+        .ours(&[
+            "hash-object",
+            "-w",
+            "--no-filters",
+            &env_path.display().to_string(),
+        ])
+        .trim()
+        .to_owned();
+    let meta = std::fs::metadata(&env_path).unwrap();
+    let mtime_ns = meta
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    #[cfg(unix)]
+    let (ctime_ns, ino) = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            meta.ctime() as u64 * 1_000_000_000 + meta.ctime_nsec() as u64,
+            meta.ino(),
+        )
+    };
+    #[cfg(not(unix))]
+    let (ctime_ns, ino) = (0u64, 0u64);
+    let stat_path = c.own_repo().parent().unwrap().join("stat.json");
+    // Кэш «записан» позже файла с запасом больше 2 с (racy git).
+    let at_ns = mtime_ns.max(ctime_ns) + 60_000_000_000;
+    let cache = serde_json::json!({
+        "v": 3,
+        "at_ns": at_ns,
+        "entries": {
+            ".env": {
+                "mode": "100644",
+                "size": meta.len(),
+                "mtime_ns": mtime_ns,
+                "ctime_ns": ctime_ns,
+                "ino": ino,
+                "oid": oid,
+            }
+        }
+    });
+    std::fs::write(&stat_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    let (msg, names) = commit_and_tree(&c, &cp);
+    assert!(!names.contains(&".env".to_owned()), "{names:?}");
+    assert!(
+        msg.lines().any(|l| l == "zero-agent-skipped-secret: .env"),
+        "{msg}"
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&stat_path).unwrap()).unwrap();
+    assert_eq!(saved["v"], 4, "{saved}");
+    assert!(saved["entries"].get(".env").is_none(), "{saved}");
+    assert!(saved["entries"].get("a.txt").is_some(), "{saved}");
+}
+
+/// Файл с секретом по содержимому (фильтр бинарника) не сохраняется; файл больше
+/// `SECRET_SCAN_MAX` фильтр не проверяет.
+#[tokio::test]
+async fn content_secret_skipped_by_filter() {
+    let c = case("secret-content");
+    c.init();
+    let value = secret_value();
+    c.write("config.txt", format!("db_password = {value}\n"));
+    c.write("a.txt", "plain\n");
+    let mut big = vec![b'x'; usize::try_from(SECRET_SCAN_MAX).unwrap()];
+    big.extend_from_slice(value.as_bytes());
+    c.write("big.log", &big);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (n, v) = (calls.clone(), value.clone());
+    let filter = SecretFilter::new([7; 32], move |b: &[u8]| {
+        n.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            b.len() as u64 <= SECRET_SCAN_MAX,
+            "фильтр получил {} байт",
+            b.len()
+        );
+        has(b, v.as_bytes())
+    });
+    let ck = c.ck().with_secret_filter(filter);
+    let cp = create(&ck, c.req_edit(&["config.txt"], true, RunId::new())).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    assert_eq!(cp.secret_skipped, vec!["config.txt".to_owned()]);
+    let (msg, names) = commit_and_tree(&c, &cp);
+    assert!(!names.contains(&"config.txt".to_owned()), "{names:?}");
+    assert!(names.contains(&"a.txt".to_owned()), "{names:?}");
+    assert!(names.contains(&"big.log".to_owned()), "{names:?}");
+    assert!(
+        msg.lines()
+            .any(|l| l == "zero-agent-skipped-secret: config.txt"),
+        "{msg}"
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 2, "фильтр не вызывался");
+    // Без фильтра тот же файл в снимок входит (имя не секретное).
+    let plain = case("secret-content-plain");
+    plain.init();
+    plain.write("config.txt", format!("db_password = {value}\n"));
+    let cp = create(
+        &plain.ck(),
+        plain.req(ToolKind::Exec, true, RunId::new(), 1),
+    )
+    .await;
+    let (_, names) = commit_and_tree(&plain, &cp);
+    assert!(names.contains(&"config.txt".to_owned()), "{names:?}");
+}
+
+/// Восстановление не трогает секретный файл: ни перезаписи, ни удаления (и созданного
+/// после чекпоинта), прочие файлы восстановлены.
+#[tokio::test]
+async fn restore_leaves_secret_file_alone() {
+    let c = case("secret-restore");
+    c.init();
+    c.write(".env", "TOKEN=old\n");
+    c.write("a.txt", "one\n");
+    let ck = c.ck();
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    c.write(".env", "TOKEN=new\n");
+    c.write("a.txt", "two\n");
+    c.write("app/.env.local", "LOCAL=1\n");
+    c.write("brand-new.txt", "new\n");
+    let backup = within(
+        Duration::from_secs(60),
+        "чекпоинт перед восстановлением",
+        backup_before_restore(&ck, &c.root(), &cp, true, true),
+    )
+    .await
+    .expect("чекпоинт «до»");
+    assert!(
+        backup.kind == checkpoint_kind::GIT || backup.kind == checkpoint_kind::FILES,
+        "{backup:?}"
+    );
+    let changed = within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &c.root(), &cp, true, true),
+    )
+    .await
+    .expect("восстановление");
+    assert_eq!(c.read("a.txt"), b"one\n");
+    assert_eq!(c.read(".env"), b"TOKEN=new\n");
+    assert_eq!(c.read("app/.env.local"), b"LOCAL=1\n");
+    assert!(!c.project.join("brand-new.txt").exists());
+    assert_eq!(changed.changed.len(), 2, "{changed:?}");
+}
+
+/// Каталог без git (`files::copy`): у секрета состояние `secret` в манифесте, копии нет;
+/// восстановление его не трогает. Фильтр по содержимому — и для копии файлов.
+#[tokio::test]
+async fn files_snapshot_skips_secret() {
+    let c = case("secret-files");
+    let value = secret_value();
+    c.write(".env", format!("TOKEN={value}\n"));
+    c.write("conf.txt", format!("x = {value}\n"));
+    c.write("a.txt", "one\n");
+    let ck = c.ck().with_secret_filter(value_filter(value.clone()));
+    let run = RunId::new();
+    let rels = [".env", "conf.txt", "a.txt", "app/.env.local"];
+    let cp = create(&ck, c.req_edit(&rels, true, run)).await;
+    assert_eq!(cp.kind, checkpoint_kind::FILES, "{cp:?}");
+    // Отсутствующий файл с именем секрета — тоже `secret`: восстановление его не удалит.
+    assert_eq!(cp.secret_skipped, [".env", "app/.env.local", "conf.txt"]);
+    let dir = c
+        .home
+        .za_home
+        .join("projects/0123456789abcdef/checkpoints")
+        .join(&cp.id);
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    let state = |p: &str| {
+        m["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == p)
+            .unwrap_or_else(|| panic!("{p}: {m}"))
+            .clone()
+    };
+    for p in [".env", "conf.txt", "app/.env.local"] {
+        let f = state(p);
+        assert_eq!(f["state"], "secret", "{m}");
+        assert!(f.get("copy").is_none(), "{m}");
+    }
+    assert_eq!(state("a.txt")["state"], "file", "{m}");
+    for f in files_under(&dir) {
+        let data = std::fs::read(&f).unwrap();
+        assert!(!has(&data, value.as_bytes()), "секрет в {}", f.display());
+    }
+
+    c.write(".env", "TOKEN=changed\n");
+    c.write("conf.txt", "x = changed\n");
+    c.write("a.txt", "two\n");
+    c.write("app/.env.local", "LOCAL=1\n");
+    let changed = within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &c.root(), &cp, true, true),
+    )
+    .await
+    .expect("восстановление");
+    assert_eq!(c.read("a.txt"), b"one\n");
+    assert_eq!(c.read(".env"), b"TOKEN=changed\n");
+    assert_eq!(c.read("conf.txt"), b"x = changed\n");
+    assert_eq!(c.read("app/.env.local"), b"LOCAL=1\n");
+    assert_eq!(changed.changed.len(), 1, "{changed:?}");
+    // Повтор по ключу эффекта: готовая копия, тот же признак.
+    let again = create(&ck, c.req_edit(&rels, true, run)).await;
+    assert_eq!(again.secret_skipped, cp.secret_skipped);
+}
+
+// ---- ревью задачи 2 R1-C2: I1, I2, кэш проверки по содержимому ----
+
+impl Case {
+    /// git над своим репозиторием агента со входом `stdin`.
+    fn ours_in(&self, args: &[&str], stdin: &[u8]) -> String {
+        use std::io::Write;
+        let mut child = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(self.own_repo())
+            .args(args)
+            .current_dir(&self.base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("git не запустился: нужен git в PATH");
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Каталог копии файлов чекпоинта `id`.
+    fn files_dir(&self, id: &str) -> PathBuf {
+        self.home
+            .za_home
+            .join("projects")
+            .join(&self.home.project_id)
+            .join("checkpoints")
+            .join(id)
+    }
+
+    /// Манифест копии файлов «как в R1-C1»: пути `from` переименованы в `to`.
+    fn rename_in_manifest(&self, id: &str, renames: &[(&str, &str)]) {
+        let path = self.files_dir(id).join("manifest.json");
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for f in m["files"].as_array_mut().unwrap() {
+            for (from, to) in renames {
+                if f["path"] == *from {
+                    f["path"] = serde_json::json!(to);
+                }
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+    }
+
+    /// Чекпоинт git «как в R1-C1»: в дереве `cp` путь `from` переименован в `to`, ссылка
+    /// указывает на новый коммит с тем же сообщением.
+    fn rename_in_git_cp(&self, cp: &Checkpoint, from: &str, to: &str) -> Checkpoint {
+        let commit = cp.commit.clone().unwrap();
+        let tree = self.ours(&["ls-tree", "--full-tree", &commit]);
+        let tree = tree.replace(&format!("\t{from}\n"), &format!("\t{to}\n"));
+        let new_tree = self.ours_in(&["mktree"], tree.as_bytes());
+        let raw = self.ours(&["cat-file", "commit", &commit]);
+        let msg = raw.split_once("\n\n").unwrap().1;
+        let new_commit = self.ours_in(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit-tree",
+                new_tree.trim(),
+                "-F",
+                "-",
+            ],
+            msg.as_bytes(),
+        );
+        let new_commit = new_commit.trim().to_owned();
+        let git_ref = cp.git_ref.clone().unwrap();
+        self.ours(&["update-ref", &git_ref, &new_commit]);
+        Checkpoint {
+            commit: Some(new_commit),
+            ..cp.clone()
+        }
+    }
+}
+
+/// I1: копия файлов «как в R1-C1» с `.env` (`file` и `absent`) — восстановление с
+/// `--delete-new` не перезаписывает и не удаляет текущие секретные файлы.
+#[tokio::test]
+async fn files_restore_of_r1c1_manifest_leaves_env() {
+    let c = case("secret-r1c1-files");
+    c.write("env.txt", "TOKEN=old\n");
+    c.write("a.txt", "one\n");
+    let ck = c.ck();
+    let cp = create(
+        &ck,
+        c.req_edit(&["env.txt", "a.txt", "local.txt"], false, RunId::new()),
+    )
+    .await;
+    assert_eq!(cp.kind, checkpoint_kind::FILES, "{cp:?}");
+    c.rename_in_manifest(
+        &cp.id,
+        &[("env.txt", ".env"), ("local.txt", "app/.env.local")],
+    );
+    c.write(".env", "TOKEN=now\n");
+    c.write("app/.env.local", "LOCAL=now\n");
+    c.write("a.txt", "two\n");
+    within(
+        Duration::from_secs(60),
+        "чекпоинт перед восстановлением",
+        backup_before_restore(&ck, &c.root(), &cp, true, false),
+    )
+    .await
+    .expect("чекпоинт «до»");
+    let r = within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &c.root(), &cp, true, false),
+    )
+    .await
+    .expect("восстановление");
+    assert_eq!(c.read("a.txt"), b"one\n");
+    assert_eq!(c.read(".env"), b"TOKEN=now\n");
+    assert_eq!(c.read("app/.env.local"), b"LOCAL=now\n");
+    assert_eq!(r.changed, vec![c.root().join("a.txt")], "{r:?}");
+    assert_eq!(r.secret_untouched, [".env", "app/.env.local"], "{r:?}");
+}
+
+/// Чекпоинт git «как в R1-C1» с блобом `.env` в дереве: восстановление не пишет его
+/// поверх текущего `.env`.
+#[tokio::test]
+async fn git_restore_of_r1c1_tree_leaves_env() {
+    let c = case("secret-r1c1-git");
+    c.init();
+    c.write("env.txt", "TOKEN=old\n");
+    c.write("a.txt", "one\n");
+    let ck = c.ck();
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    let cp = c.rename_in_git_cp(&cp, "env.txt", ".env");
+    std::fs::remove_file(c.project.join("env.txt")).unwrap();
+    c.write(".env", "TOKEN=now\n");
+    c.write("a.txt", "two\n");
+    within(
+        Duration::from_secs(60),
+        "чекпоинт перед восстановлением",
+        backup_before_restore(&ck, &c.root(), &cp, true, true),
+    )
+    .await
+    .expect("чекпоинт «до»");
+    let r = within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &c.root(), &cp, true, true),
+    )
+    .await
+    .expect("восстановление");
+    assert_eq!(c.read("a.txt"), b"one\n");
+    assert_eq!(c.read(".env"), b"TOKEN=now\n");
+    assert_eq!(r.changed, vec![c.root().join("a.txt")], "{r:?}");
+    assert_eq!(r.secret_untouched, [".env"], "{r:?}");
+}
+
+/// I2: файл, который сейчас секрет по содержимому, восстановление не перезаписывает и
+/// (новый) не удаляет — в обеих ветках.
+#[tokio::test]
+async fn content_secret_not_overwritten_by_restore() {
+    for git in [true, false] {
+        let c = case(if git {
+            "secret-now-git"
+        } else {
+            "secret-now-files"
+        });
+        if git {
+            c.init();
+        }
+        let value = secret_value();
+        c.write("config.txt", "level = 1\n");
+        c.write("a.txt", "one\n");
+        let ck = c.ck().with_secret_filter(value_filter(value.clone()));
+        let cp = create(
+            &ck,
+            c.req_edit(&["config.txt", "a.txt", "fresh.txt"], git, RunId::new()),
+        )
+        .await;
+        let want = if git {
+            checkpoint_kind::GIT
+        } else {
+            checkpoint_kind::FILES
+        };
+        assert_eq!(cp.kind, want, "{cp:?}");
+        let now = format!("level = 2\ntoken = {value}\n");
+        c.write("config.txt", &now);
+        c.write("fresh.txt", format!("token = {value}\n"));
+        c.write("a.txt", "two\n");
+        within(
+            Duration::from_secs(60),
+            "чекпоинт перед восстановлением",
+            backup_before_restore(&ck, &c.root(), &cp, true, git),
+        )
+        .await
+        .expect("чекпоинт «до»");
+        let r = within(
+            Duration::from_secs(60),
+            "восстановление",
+            restore(&ck, &c.root(), &cp, true, git),
+        )
+        .await
+        .expect("восстановление");
+        assert_eq!(c.read("a.txt"), b"one\n", "git={git}");
+        assert_eq!(c.read("config.txt"), now.as_bytes(), "git={git}");
+        assert!(c.project.join("fresh.txt").exists(), "git={git}");
+        assert_eq!(r.changed, vec![c.root().join("a.txt")], "git={git}: {r:?}");
+        assert_eq!(
+            r.secret_untouched,
+            ["config.txt", "fresh.txt"],
+            "git={git}: {r:?}"
+        );
+    }
+}
+
+/// Часы проверки секретов на 10 минут впереди системных (признак `test-hooks`).
+#[cfg(feature = "test-hooks")]
+fn ten_minutes_ahead() -> u64 {
+    let now = std::time::SystemTime::now() + Duration::from_secs(600);
+    let d = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+    u64::try_from(d.as_nanos()).unwrap()
+}
+
+/// Сомнение 2: итог проверки по содержимому кэшируется по stat и отпечатку набора
+/// значений; имя проверяется до кэша; смена файла или фильтра — новая проверка.
+///
+/// Кэш не доверяет файлу, у которого `mtime` или `ctime` (Unix) моложе 2 с (racy).
+/// `set_modified` здесь не помогает: на Unix он ставит `ctime` на «сейчас». Поэтому часы
+/// проверки сдвинуты на 10 минут вперёд (`with_secret_clock_for_tests`, только с
+/// признаком `test-hooks`, D128), и тест не ждёт по таймеру.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn content_scan_cached_by_stat_and_fingerprint() {
+    let c = case("secret-scan-cache");
+    c.init();
+    c.write("a.txt", "plain\n");
+    c.write("b.txt", "other\n");
+    c.write(".env", "MODE=dev\n");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let filter = |fp: u8| {
+        let seen = seen.clone();
+        SecretFilter::new([fp; 32], move |b: &[u8]| {
+            seen.lock().unwrap().push(b.to_vec());
+            false
+        })
+    };
+    let count = |what: &[u8]| seen.lock().unwrap().iter().filter(|b| *b == what).count();
+    let ck = c
+        .ck()
+        .with_secret_clock_for_tests(ten_minutes_ahead)
+        .with_secret_filter(filter(1));
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    assert_eq!(count(b"plain\n"), 1);
+    // `.env` отсекается по имени: фильтр его не видит.
+    assert_eq!(count(b"MODE=dev\n"), 0);
+    // Тот же stat и отпечаток — итог из кэша.
+    create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(count(b"plain\n"), 1);
+    // Файл изменился — проверка заново.
+    c.write("b.txt", "changed\n");
+    create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(count(b"changed\n"), 1);
+    assert_eq!(count(b"plain\n"), 1);
+    // Новый фильтр (другой набор значений) — новый кэш, проверка заново; часы прежние.
+    // Сверку отпечатка в записи кэша проверяют модульные тесты `checkpoint::secret`.
+    let ck = ck.with_secret_filter(filter(2));
+    create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(count(b"plain\n"), 2);
+}
+
+/// Чекпоинт «до» восстановления `cp` под пределом теста.
+#[cfg(feature = "test-hooks")]
+async fn backup_ok(ck: &GitCheckpointer, c: &Case, cp: &Checkpoint, git: bool) {
+    within(
+        Duration::from_secs(60),
+        "чекпоинт перед восстановлением",
+        backup_before_restore(ck, &c.root(), cp, false, git),
+    )
+    .await
+    .expect("чекпоинт «до»");
+}
+
+/// Восстановление `cp` под пределом теста.
+#[cfg(feature = "test-hooks")]
+async fn restore_ok(
+    ck: &GitCheckpointer,
+    c: &Case,
+    cp: &Checkpoint,
+    git: bool,
+) -> za_tools::Restored {
+    within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(ck, &c.root(), cp, false, git),
+    )
+    .await
+    .expect("восстановление")
+}
+
+/// Время изменения файла `rel` проекта — `at`.
+#[cfg(feature = "test-hooks")]
+fn set_mtime(c: &Case, rel: &str, at: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(c.project.join(rel))
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
+}
+
+/// Повторное ревью задач 1–2, Minor 1: восстановление проверяет содержимое заново, без
+/// кэша итогов. На Windows у файла нет `ctime` и `ino` в ключе, и файл, ставший секретом
+/// с прежними размером и `mtime`, иначе прошёл бы по записи кэша «не секрет».
+///
+/// На Unix свежий `ctime` (его ставит и `set_modified`) не даёт записи кэша годиться, и
+/// без подмены часов тест проходил бы, ничего не проверяя (отчёт исправления CI Linux,
+/// fix-8). Поэтому часы проверки сдвинуты на 10 минут вперёд (`test-hooks`, D128), а
+/// фильтр считает прочитанное:
+/// 1. предусловие (git): повторный чекпоинт берёт итог о файле из кэша, не читая его;
+/// 2. восстановление при том же stat всё равно читает файл фильтром — на обеих ОС;
+/// 3. файл, ставший секретом с прежними размером и `mtime`, восстановлением не тронут.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn restore_rescans_content_without_cache() {
+    for git in [true, false] {
+        let c = case(if git {
+            "secret-rescan-git"
+        } else {
+            "secret-rescan-files"
+        });
+        if git {
+            c.init();
+        }
+        let value = secret_value();
+        let secret = format!("token = {value}\n");
+        let plain = format!("{}\n", "p".repeat(secret.len() - 1));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let filter = {
+            let (seen, value) = (seen.clone(), value.clone());
+            let fp = *blake3::hash(value.as_bytes()).as_bytes();
+            SecretFilter::new(fp, move |b: &[u8]| {
+                seen.lock().unwrap().push(b.to_vec());
+                has(b, value.as_bytes())
+            })
+        };
+        let reads = |what: &[u8]| seen.lock().unwrap().iter().filter(|b| *b == what).count();
+        c.write("config.txt", "level = 1\n");
+        c.write("a.txt", "one\n");
+        let ck = c
+            .ck()
+            .with_secret_clock_for_tests(ten_minutes_ahead)
+            .with_secret_filter(filter);
+        let paths = ["config.txt", "a.txt"];
+        let cp = create(&ck, c.req_edit(&paths, git, RunId::new())).await;
+        let old = std::time::SystemTime::now() - Duration::from_secs(600);
+
+        // 1. Файл не секрет; чекпоинт «до» запоминает итог «не секрет» по stat.
+        c.write("config.txt", &plain);
+        set_mtime(&c, "config.txt", old);
+        c.write("a.txt", "two\n");
+        backup_ok(&ck, &c, &cp, git).await;
+        let before = reads(plain.as_bytes());
+        if git {
+            assert_eq!(before, 1, "чекпоинт «до» прочитал файл");
+            create(&ck, c.req_edit(&paths, git, RunId::new())).await;
+            assert_eq!(
+                reads(plain.as_bytes()),
+                before,
+                "предусловие: запись кэша доверена, повторный чекпоинт файл не читает"
+            );
+        }
+        // 2. Тот же stat, запись кэша годна — восстановление всё равно читает файл.
+        let r = restore_ok(&ck, &c, &cp, git).await;
+        assert_eq!(
+            reads(plain.as_bytes()),
+            before + 1,
+            "git={git}: восстановление взяло итог из кэша"
+        );
+        assert_eq!(c.read("config.txt"), b"level = 1\n", "git={git}: {r:?}");
+
+        // 3. Файл стал секретом с тем же размером и тем же `mtime`.
+        c.write("config.txt", &plain);
+        set_mtime(&c, "config.txt", old);
+        c.write("a.txt", "two\n");
+        backup_ok(&ck, &c, &cp, git).await;
+        c.write("config.txt", &secret);
+        set_mtime(&c, "config.txt", old);
+        let r = restore_ok(&ck, &c, &cp, git).await;
+        assert_eq!(c.read("config.txt"), secret.as_bytes(), "git={git}");
+        assert_eq!(c.read("a.txt"), b"one\n", "git={git}");
+        assert_eq!(r.secret_untouched, ["config.txt"], "git={git}: {r:?}");
+        assert!(
+            reads(secret.as_bytes()) >= 1,
+            "git={git}: секрет не прочитан"
+        );
+    }
 }

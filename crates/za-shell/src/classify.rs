@@ -6,6 +6,7 @@ use crate::command::{
     pwsh_expression,
 };
 use crate::lex::lex_code;
+use crate::net::git_global;
 use crate::{Lang, Segment, label};
 
 /// Неразобранный сегмент и перенаправление вывода наружу или в неизвестную цель.
@@ -478,30 +479,27 @@ fn git_exec_key(kv: &str) -> bool {
         || SUFFIXES.iter().any(|s| key.ends_with(s))
 }
 
-/// Индекс подкоманды `git` после глобальных опций и признак опасного `-c`.
-pub(crate) fn git_split(a: &[String]) -> (usize, bool) {
-    let mut i = 0;
-    let mut exec = false;
-    while let Some(x) = a.get(i) {
-        match x.as_str() {
-            "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" => i += 2,
-            "-c" | "--config-env" => {
-                exec |= a.get(i + 1).is_some_and(|kv| git_exec_key(kv));
-                i += 2;
-            }
-            s if s.starts_with("--config-env=") => {
-                exec |= git_exec_key(&s["--config-env=".len()..]);
-                i += 1;
-            }
-            s if s.starts_with("--exec-path=") => {
-                exec = true;
-                i += 1;
-            }
-            s if s.starts_with('-') => i += 1,
-            _ => break,
-        }
-    }
-    (i, exec)
+/// Индекс подкоманды `git` после глобальных опций (таблица `GIT_GLOBAL`, общий разбор
+/// `walk`), признак опасного `-c` или `--exec-path=` и признак глобальной опции не из
+/// таблицы (I2 третьего ревью задачи 3): её значение могло стать «подкомандой», подкоманда
+/// неизвестна — сеть и `unparsed`.
+pub(crate) fn git_split(a: &[String]) -> (usize, bool, bool) {
+    let (i, bad) = git_global(a);
+    let head = &a[..i];
+    let exec =
+        git_cfg(head).any(git_exec_key) || head.iter().any(|x| x.starts_with("--exec-path="));
+    (i, exec, bad)
+}
+
+/// Значения `ключ[=значение]` глобальных `-c` и `--config-env` git (`head` — слова до
+/// подкоманды).
+pub(crate) fn git_cfg(head: &[String]) -> impl Iterator<Item = &str> {
+    head.iter()
+        .enumerate()
+        .filter_map(|(i, x)| match x.as_str() {
+            "-c" | "--config-env" => head.get(i + 1).map(String::as_str),
+            s => s.strip_prefix("--config-env="),
+        })
 }
 
 /// Ключ записи `git config [set] [опции] ключ значение` (I5); чтение и `--unset` — `None`.
@@ -543,8 +541,8 @@ pub(crate) fn git_config_key(rest: &[String]) -> Option<&str> {
 }
 
 fn git_label(a: &[String]) -> Option<&'static str> {
-    let (i, exec) = git_split(a);
-    if exec {
+    let (i, exec, bad) = git_split(a);
+    if exec || bad {
         return Some(label::UNPARSED);
     }
     let sub = a.get(i)?.as_str();
@@ -665,11 +663,12 @@ fn sql_drop(a: &[String]) -> bool {
 
 // --- Сеть (D77, D82) -----------------------------------------------------------------
 
-/// Подкоманда git после глобальных опций и следующее слово.
-fn git_subs(a: &[String]) -> (&str, &str) {
-    let (i, _) = git_split(a);
+/// Подкоманда git после глобальных опций и следующее слово; `None` — глобальная опция не
+/// из таблицы, подкоманда неизвестна (сеть и чтение из сети — консервативно).
+fn git_subs(a: &[String]) -> Option<(&str, &str)> {
+    let (i, _, bad) = git_split(a);
     let get = |k: usize| a.get(k).map_or("", String::as_str);
-    (get(i), get(i + 1))
+    (!bad).then(|| (get(i), get(i + 1)))
 }
 
 /// Тип `New-Object` — сетевой клиент.
@@ -683,7 +682,7 @@ fn net_object(a: &[String]) -> bool {
 }
 
 /// Сокет `/dev/tcp`, `/dev/udp` в словах или перенаправлениях.
-fn uses_dev_net(seg: &Segment) -> bool {
+pub(crate) fn uses_dev_net(seg: &Segment) -> bool {
     seg.argv
         .iter()
         .any(|a| dev_net(a) || a.contains("/dev/tcp/"))
@@ -713,11 +712,15 @@ pub(crate) fn net_cmd(seg: &Segment, lang: Lang) -> bool {
         "certutil" => a.iter().any(|x| x.eq_ignore_ascii_case("-urlcache")),
         "new-object" => net_object(a),
         "rsync" => a.iter().any(|x| !x.starts_with('-') && remote_spec(x)),
-        "git" => matches!(
-            git_subs(a),
-            ("clone" | "fetch" | "pull" | "push" | "ls-remote", _)
-                | ("submodule" | "remote", "update")
-        ),
+        // `git remote add` сетевой, но не читающий (D104): адрес удалённого репозитория.
+        "git" => git_subs(a).is_none_or(|s| {
+            matches!(
+                s,
+                ("clone" | "fetch" | "pull" | "push" | "ls-remote", _)
+                    | ("submodule" | "remote", "update")
+                    | ("remote", "add")
+            )
+        }),
         _ => false,
     }
 }
@@ -742,10 +745,12 @@ pub(crate) fn reads_cmd(seg: &Segment, lang: Lang) -> bool {
         "certutil" => a.iter().any(|x| x.eq_ignore_ascii_case("-urlcache")),
         "new-object" => net_object(a),
         "gh" => matches!((s1, s2), ("api", _) | ("pr" | "issue", "view")),
-        "git" => matches!(
-            git_subs(a),
-            ("clone" | "fetch" | "pull" | "ls-remote", _) | ("submodule" | "remote", "update")
-        ),
+        "git" => git_subs(a).is_none_or(|s| {
+            matches!(
+                s,
+                ("clone" | "fetch" | "pull" | "ls-remote", _) | ("submodule" | "remote", "update")
+            )
+        }),
         _ => false,
     }
 }

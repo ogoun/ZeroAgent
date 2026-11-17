@@ -98,6 +98,12 @@ impl Env {
 
     /// [`Env::run`] с дополнительными переменными окружения.
     pub fn run_with(&self, args: &[&str], vars: &[(&str, &str)]) -> Out {
+        self.run_env(args, vars, &[])
+    }
+
+    /// [`Env::run_with`], а переменные `remove` процесс не наследует (`NO_PROXY` у теста
+    /// прокси: исключение из прокси сделало бы проверку пустой).
+    pub fn run_env(&self, args: &[&str], vars: &[(&str, &str)], remove: &[&str]) -> Out {
         let caches = self.home.with_extension("caches");
         let _ = std::fs::create_dir_all(caches.join("cargo"));
         let _ = std::fs::create_dir_all(caches.join("uv"));
@@ -116,6 +122,9 @@ impl Env {
             if k.starts_with("ZA_SECRET_") {
                 cmd.env_remove(k);
             }
+        }
+        for k in remove {
+            cmd.env_remove(k);
         }
         for (k, v) in vars {
             cmd.env(k, v);
@@ -266,4 +275,29 @@ pub fn is_subsequence(hay: &[&str], needle: &[&str]) -> bool {
 
 pub fn journal_exists(e: &Env) -> bool {
     Path::new(&e.journal_dir()).exists()
+}
+
+/// Ссылка на каталог: junction на Windows (`mklink /J` прав не требует), символическая
+/// ссылка на Unix.
+pub fn dir_link(link: &Path, target: &Path) {
+    #[cfg(windows)]
+    {
+        // `mklink` понимает только `\`: путь собирается заново по компонентам.
+        let native = |p: &Path| p.components().collect::<PathBuf>();
+        let out = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(native(link))
+            .arg(native(target))
+            .output()
+            .expect("cmd не запустился");
+        assert!(
+            out.status.success(),
+            "mklink /J: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
 }

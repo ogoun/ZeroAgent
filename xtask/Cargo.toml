@@ -17,6 +17,11 @@ za-protocol = { path = "../crates/za-protocol" }
 za-tools = { path = "../crates/za-tools" }
 za-core = { path = "../crates/za-core" }
 za-jail = { path = "../crates/za-jail" }
+# Случаи `top/standard/tools@{16k,32k}` (R1-C2 D117): описания `web_fetch` и `web_search`
+# (шлюз и поставщик только строятся, сети нет) и каталог скиллов поставки.
+za-web = { path = "../crates/za-web" }
+za-skills = { path = "../crates/za-skills" }
+url.workspace = true
 
 [lints]
 workspace = true

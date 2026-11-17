@@ -1,6 +1,9 @@
 //! Удаление старых результатов инструментов (CTX-008, шаг 2; R1-B2 D45).
 //!
-//! Результаты старше последних `keep_turns` ходов и длиннее `min_bytes` заменяются
+//! Результаты активных скиллов (`keep` — `call_id` вызовов `activate_skill`, R1-C2 D118)
+//! не трогаются никогда: текст скилла должен оставаться в контексте, пока он активен.
+//!
+//! Прочие результаты старше последних `keep_turns` ходов и длиннее `min_bytes` заменяются
 //! строкой `[result removed to save context; full text: <путь spill>]`. Текст результата
 //! всегда пишется в файл из истории (он уже экранирован): у выгруженного результата
 //! (D44) это голова, хвост и настоящий указатель на полный файл, поэтому ничего не
@@ -10,6 +13,7 @@
 //! детерминированы историей, запись идемпотентна, поэтому реплей границы даёт ту же
 //! историю; файловая система на текст новой истории не влияет.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
@@ -32,15 +36,16 @@ fn removed(path: &str) -> String {
 
 /// D45. Возвращает новую историю и число заменённых; текст каждого заменённого
 /// результата — в `{run}-{blake3(content)[..16]}.txt`. Исходная история не меняется;
-/// результаты последнего хода не трогаются при любом `keep_turns`. Ошибка — ввод-вывод
-/// файла выгрузки (первая; тогда история не меняется) или нарушенный инвариант
-/// истории (`InvalidData`).
+/// результаты последнего хода и результаты вызовов из `keep` (активные скиллы, D118) не
+/// трогаются при любом `keep_turns`. Ошибка — ввод-вывод файла выгрузки (первая; тогда
+/// история не меняется) или нарушенный инвариант истории (`InvalidData`).
 pub fn prune(
     conv: &Conversation,
     run: RunId,
     project_dir: &Path,
     keep_turns: usize,
     min_bytes: usize,
+    keep: &BTreeSet<String>,
 ) -> io::Result<(Conversation, usize)> {
     let turns = conv
         .messages()
@@ -51,8 +56,12 @@ pub fn prune(
     let mut count = 0;
     let mut failure: Option<io::Error> = None;
     let out = conv
-        .rewrite_results(&mut |turn, _call_id, content| {
-            if failure.is_some() || turn >= old_before || content.len() <= min_bytes {
+        .rewrite_results(&mut |turn, call_id, content| {
+            if failure.is_some()
+                || turn >= old_before
+                || content.len() <= min_bytes
+                || keep.contains(call_id)
+            {
                 return None;
             }
             let name = content_name(run, content);

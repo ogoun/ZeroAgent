@@ -35,6 +35,8 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "registry"] }
 # Адресация blobs по содержимому (ARC-032).
 blake3 = "1.8.7"
+# Поиск известных значений в байтах файла (фильтр секретов чекпоинтов, D103).
+memchr = "2.8.3"
 # HTTP-клиент к llama-server: без native TLS и OpenSSL, только rustls (ring).
 # Встроенные корни (webpki-roots), не хранилище ОС: одинаковое поведение на Windows и Linux.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
@@ -111,3 +113,36 @@ grep-matcher = "=0.1.9"
 # cargo; только функция `text`, без `unicode`, `bytes` и `inline`. Зависимостей нет;
 # лицензия Apache-2.0.
 similar = { version = "=2.7.0", default-features = false, features = ["text"] }
+# Нормализация хоста (R1-C2 D124, `za_core::net::normalize_host`): `Host::parse` по WHATWG —
+# IDNA в punycode, IPv4 в любой записи (`0x7f.1`), канонический IPv6. Позже — разбор URL
+# шлюза `za-web`. Крейт уже в Cargo.lock через `reqwest`, новых крейтов нет; только `std`.
+# Лицензия MIT OR Apache-2.0.
+url = { version = "=2.5.8", default-features = false, features = ["std"] }
+# Кодировка ответа `web_fetch` (R1-C2 D109, `za_web::convert`): `charset` заголовка или
+# `<meta>`, BOM, декодирование с заменой. Версия — та, что уже в Cargo.lock (через
+# `grep-searcher`), новых крейтов нет. Лицензия (Apache-2.0 OR MIT) AND BSD-3-Clause
+# (таблицы WHATWG; BSD-3-Clause разрешена в `deny.toml`).
+encoding_rs = "=0.8.44"
+# HTML в Markdown (R1-C2 D109, D127, CAP-002) — только у `za-extract`, который работает
+# лишь в подпроцессе `zero-agent extract html`: обход DOM у `htmd` рекурсивный, глубокая
+# вложенность переполняет стек. Последняя версия старше двух недель (0.5.6 от 2026-10-15);
+# лицензия Apache-2.0. Тянет `html5ever`/`markup5ever_rcdom` 0.38 и `phf` 0.13 (MIT OR
+# Apache-2.0); прирост `Cargo.lock` — в журнале.
+htmd = "=0.5.6"
+# Тип узла DOM (`NodeData`) для заголовка `<title>` отдельным полем: `htmd` отдаёт дерево
+# (`html_to_tree`), но не тип его узлов. Та же версия, что у `htmd`, новых крейтов нет.
+# Только у `za-extract`. Лицензия MIT OR Apache-2.0.
+markup5ever_rcdom = "=0.38.0"
+# Онлайн-страж разбора HTML (R1-C2 D127, ревью задачи 7): собственный `TreeSink` поверх
+# `RcDom` считает события разборщика кусками по 16 КиБ и прерывает квадратичные классы до
+# полного разбора 2 МиБ; токенизатор без построителя дерева — запасное линейное извлечение.
+# Та же версия 0.38.0, что тянет `htmd`; новых крейтов в `Cargo.lock` нет. Только у
+# `za-extract`. Лицензия MIT OR Apache-2.0.
+html5ever = "=0.38.0"
+# Текст страниц PDF (R1-C2 D113, CAP-002, таблица 5.2: `read` — «PDF-страницы») — только у
+# `za-extract`, который работает лишь в подпроцессе `zero-agent extract pdf`: у `pdf-extract`
+# и `lopdf` бывают паники и вечные циклы на битых данных, отдельный процесс их изолирует.
+# Последняя версия старше двух недель (0.12.1 от 2026-09-16); лицензия MIT. Тянет `lopdf`
+# 0.42 (MIT), шрифты и кодировки PDF; прирост `Cargo.lock` (39 записей) и новый дубль
+# `cpufeatures` 0.2/0.3 — в журнале (`multiple-versions = "warn"`).
+pdf-extract = "=0.12.1"
