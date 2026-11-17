@@ -487,9 +487,9 @@ pub fn bash_tool(runner: Arc<dyn Runner>, shell: Shell, home: AgentHome) -> Arc<
     })
 }
 
-/// Слово-путь относительно: не от корня, не `~`, не `X:`.
-/// Слово относительное: не абсолютное, не `~` и не другое начало домашнего каталога
-/// (`$HOME`, `%USERPROFILE%`, `$env:USERPROFILE`, R1-M D157) — его `cwd` не сдвигает.
+/// Слово-путь относительное: не от корня (`/`, `\`), не `X:`, не `~` и не другое начало
+/// домашнего каталога (`$HOME`, `%USERPROFILE%`, `$env:USERPROFILE`, R1-M D157) — такое
+/// слово `cwd` не сдвигает.
 fn is_relative(w: &str) -> bool {
     let b = w.as_bytes();
     !(w.starts_with(['/', '\\', '~'])
