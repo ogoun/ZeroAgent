@@ -2,13 +2,15 @@
 //! `[budgets.run]` (бюджет run по умолчанию, R1-B1 D19), `[context]` (пороги контекста,
 //! R1-B2 D65), `[policy]` с `[[policy.rules]]` и `[[policy.grants]]` (политика, R1-C1
 //! D78, D80; правила по домену — R1-C2 D105), `[web]` с `[web.search]` (сетевой шлюз и
-//! поставщик поиска, R1-C2 D107, D122, D125) и `[skills]` (источники скиллов, D114, D122).
-//! Проектная конфигурация — `[policy]` и `[web] enabled = false`
-//! ([`parse_project_config`]): адрес поставщика поиска проект не задаёт (D126).
+//! поставщик поиска, R1-C2 D107, D122, D125), `[skills]` (источники скиллов, D114, D122) и
+//! `[memory]` (сервер памяти ZeroAIMemory, R1-M D134, D152).
+//! Проектная конфигурация — `[policy]`, `[web] enabled = false` и `[memory] enabled = false`
+//! ([`parse_project_config`]): адрес поставщика поиска и сервера памяти проект не задаёт
+//! (D126, D134).
 //!
-//! `[policy]`, `[web]` и `[skills]` разбираются вторым проходом по уже прочитанной
-//! таблице: ошибка называет путь поля (`policy.rules[0]`, `web.search.url`), а не только
-//! строку.
+//! `[policy]`, `[web]`, `[skills]` и `[memory]` разбираются вторым проходом по уже
+//! прочитанной таблице: ошибка называет путь поля (`policy.rules[0]`, `web.search.url`,
+//! `memory.url`), а не только строку.
 //!
 //! Текст ошибки разбора наружу — только [`ConfigParseError`] (белый список: место,
 //! категория, имя известного поля). `Display` ошибки `toml` печатает строку исходника,
@@ -25,6 +27,7 @@ use za_agent::{
 };
 use za_llm::config::{ConfigError, ConfigParseError, EndpointConfig, ModelsConfig};
 use za_llm::{BackendKind, EndpointId};
+use za_memory::{MemoryConfig, TOKEN_ENV, Token};
 use za_protocol::Budget;
 use za_res::{ResourcesConfig, ResourcesConfigError};
 
@@ -51,6 +54,8 @@ pub struct AgentConfig {
     pub web: WebSettings,
     /// `[skills]` (D114, D122): источники скиллов вне проекта.
     pub skills: SkillsSettings,
+    /// `[memory]` (D134, D152): сервер памяти; `None` — память не настроена (L0).
+    pub memory: Option<MemoryConfig>,
     /// `models` — запасной эндпоинт `local` из `LLAMA_URL`, а не раздел файла.
     pub llama_url_fallback: bool,
 }
@@ -132,8 +137,8 @@ impl Default for SkillsSettings {
 /// так что 100 000 записей — около двух минут старта run на корень.
 pub const MAX_SKILL_ENTRIES: usize = 100_000;
 
-/// Файл как его читает `toml`: `[policy]`, `[web]` и `[skills]` — таблицами, их разбирают
-/// [`parse_policy`], [`parse_web`] и [`parse_skills`].
+/// Файл как его читает `toml`: `[policy]`, `[web]`, `[skills]` и `[memory]` — таблицами, их
+/// разбирают [`parse_policy`], [`parse_web`], [`parse_skills`] и [`parse_memory`].
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -150,6 +155,8 @@ struct RawConfig {
     web: Option<toml::Value>,
     #[serde(default)]
     skills: Option<toml::Value>,
+    #[serde(default)]
+    memory: Option<toml::Value>,
 }
 
 /// Раздел `[budgets]`. Незнакомый ключ — ошибка разбора: `deny_unknown_fields`
@@ -207,8 +214,8 @@ pub const PROJECT_CONFIG: &str = ".zero-agent/config.toml";
 
 /// Проектная конфигурация (R1-C1 D80, ARC-041): действует раздел `[policy]`, и в нём —
 /// правила `ask` и `deny` (проектные `allow`, `allow_bypass` и `[[policy.grants]]`
-/// отбрасывает `PolicySnapshot::build` с `warn`), и `[web] enabled = false` (R1-C2 D105).
-/// Прочие разделы и ключи не действуют — `warn`.
+/// отбрасывает `PolicySnapshot::build` с `warn`), `[web] enabled = false` (R1-C2 D105) и
+/// `[memory] enabled = false` (R1-M D134). Прочие разделы и ключи не действуют — `warn`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectConfig {
     pub policy: PolicyConfig,
@@ -216,6 +223,10 @@ pub struct ProjectConfig {
     /// `web_fetch` в run не регистрируются. Проект только ужесточает: `true` и отсутствие
     /// ключа — `None`.
     pub web_enabled: Option<bool>,
+    /// `Some(false)` — проект выключил память (`[memory] enabled = false`): run этого
+    /// проекта — без памяти (L0). Только ужесточение, как у веба: `true` и отсутствие
+    /// ключа — `None`; адрес и машину проект не задаёт (D134).
+    pub memory_enabled: Option<bool>,
 }
 
 /// Разделы глобальной конфигурации, которые в проектной не действуют: их имена `warn`
@@ -233,10 +244,15 @@ const WEB_KEYS: &[&str] = &[
     "search",
 ];
 const WEB_SEARCH_KEYS: &[&str] = &["provider", "url"];
+/// Ключи `[memory]` глобальной конфигурации (D134): в проекте, кроме `enabled`, не действуют
+/// — чужой репозиторий не направит запросы с токеном на свой адрес.
+const MEMORY_KEYS: &[&str] = &["url", "machine"];
+/// Что действует в проектной конфигурации — для текста предупреждений.
+const PROJECT_SCOPE: &str = "только [policy], [web] enabled и [memory] enabled";
 
-/// Разбор текста `.zero-agent/config.toml` (D80, D105): `[policy]` — тем же разбором, что
-/// глобальный, `[web] enabled` — выключение веба, прочие разделы и ключи — `warn` без
-/// ошибки. Правила проверяются (шаблоны, `..`).
+/// Разбор текста `.zero-agent/config.toml` (D80, D105, D134): `[policy]` — тем же разбором,
+/// что глобальный, `[web] enabled` и `[memory] enabled` — выключение веба и памяти, прочие
+/// разделы и ключи — `warn` без ошибки. Правила проверяются (шаблоны, `..`).
 pub fn parse_project_config(src: &str) -> Result<ProjectConfig, AppConfigError> {
     let table = toml::from_str::<toml::Table>(src).map_err(|e| {
         AppConfigError::Project(
@@ -249,18 +265,20 @@ pub fn parse_project_config(src: &str) -> Result<ProjectConfig, AppConfigError> 
             out.policy = parse_policy(value).map_err(project_error)?;
         } else if key == "web" {
             out.web_enabled = parse_project_web(value)?;
+        } else if key == "memory" {
+            out.memory_enabled = parse_project_memory(value)?;
         } else if let Some(name) = GLOBAL_ONLY_SECTIONS.iter().find(|s| **s == key) {
             tracing::warn!(
                 section = *name,
-                "раздел проектной конфигурации не действует: только [policy] и [web] enabled (ARC-041)"
+                "раздел проектной конфигурации не действует: {PROJECT_SCOPE} (ARC-041)"
             );
             eprintln!(
-                "zero-agent: {PROJECT_CONFIG}: раздел [{name}] в проекте не действует, только [policy] и [web] enabled"
+                "zero-agent: {PROJECT_CONFIG}: раздел [{name}] в проекте не действует, {PROJECT_SCOPE}"
             );
         } else {
             tracing::warn!("незнакомый раздел проектной конфигурации не действует");
             eprintln!(
-                "zero-agent: {PROJECT_CONFIG}: незнакомый раздел не действует, только [policy] и [web] enabled"
+                "zero-agent: {PROJECT_CONFIG}: незнакомый раздел не действует, {PROJECT_SCOPE}"
             );
         }
     }
@@ -283,41 +301,74 @@ fn parse_project_web(v: toml::Value) -> Result<Option<bool>, AppConfigError> {
     let mut enabled = None;
     for (key, value) in t {
         match (key.as_str(), value) {
-            ("enabled", toml::Value::Boolean(b)) => enabled = (!b).then_some(false),
-            ("enabled", _) => {
-                return Err(AppConfigError::Project(
-                    "web.enabled: ожидается true или false".to_owned(),
-                ));
-            }
+            ("enabled", v) => enabled = project_enabled("web", &v)?,
             ("search", toml::Value::Table(search)) => {
                 for k in search.keys() {
-                    warn_project_web(
+                    warn_project_key(
+                        "web",
                         &format!("web.search.{k}"),
                         WEB_SEARCH_KEYS.contains(&k.as_str()),
                     );
                 }
             }
-            (k, _) => warn_project_web(&format!("web.{k}"), WEB_KEYS.contains(&k)),
+            (k, _) => warn_project_key("web", &format!("web.{k}"), WEB_KEYS.contains(&k)),
         }
     }
     Ok(enabled)
 }
 
-/// Предупреждение о ключе `[web]` проекта, который не действует; `known` — имя ключа из
-/// белого списка, иначе имя не называется (ключ может оказаться секретом).
-fn warn_project_web(key: &str, known: bool) {
+/// Раздел `[memory]` проектной конфигурации (D134, D152) — по образцу [`parse_project_web`]:
+/// `enabled = false` выключает память run проекта, `true` ничего не включает; `enabled` не
+/// булево — ошибка с путём `memory.enabled`. `url` и `machine` — `warn` с именем ключа и не
+/// действуют: адрес сервера памяти, куда уходит токен, задаёт только глобальная
+/// конфигурация. Значения в предупреждения не попадают.
+fn parse_project_memory(v: toml::Value) -> Result<Option<bool>, AppConfigError> {
+    let toml::Value::Table(t) = v else {
+        return Err(AppConfigError::Project(
+            "memory: ожидается таблица [memory]".to_owned(),
+        ));
+    };
+    let mut enabled = None;
+    for (key, value) in t {
+        if key == "enabled" {
+            enabled = project_enabled("memory", &value)?;
+        } else {
+            warn_project_key(
+                "memory",
+                &format!("memory.{key}"),
+                MEMORY_KEYS.contains(&key.as_str()),
+            );
+        }
+    }
+    Ok(enabled)
+}
+
+/// `[<section>] enabled` проекта: `false` — `Some(false)`, `true` — `None` (проект только
+/// ужесточает), не булево — ошибка с путём `<section>.enabled`.
+fn project_enabled(section: &str, v: &toml::Value) -> Result<Option<bool>, AppConfigError> {
+    match v {
+        toml::Value::Boolean(b) => Ok((!b).then_some(false)),
+        _ => Err(AppConfigError::Project(format!(
+            "{section}.enabled: ожидается true или false"
+        ))),
+    }
+}
+
+/// Предупреждение о ключе раздела `[<section>]` проекта, который не действует; `known` — имя
+/// ключа из белого списка, иначе имя не называется (ключ может оказаться секретом).
+fn warn_project_key(section: &str, key: &str, known: bool) {
     if known {
         tracing::warn!(
             key,
-            "ключ [web] проектной конфигурации не действует: только enabled = false"
+            "ключ [{section}] проектной конфигурации не действует: только enabled = false"
         );
         eprintln!(
-            "zero-agent: {PROJECT_CONFIG}: ключ {key} в проекте не действует, только [web] enabled = false"
+            "zero-agent: {PROJECT_CONFIG}: ключ {key} в проекте не действует, только [{section}] enabled = false"
         );
     } else {
-        tracing::warn!("незнакомый ключ [web] проектной конфигурации не действует");
+        tracing::warn!("незнакомый ключ [{section}] проектной конфигурации не действует");
         eprintln!(
-            "zero-agent: {PROJECT_CONFIG}: незнакомый ключ [web] в проекте не действует, только enabled = false"
+            "zero-agent: {PROJECT_CONFIG}: незнакомый ключ [{section}] в проекте не действует, только enabled = false"
         );
     }
 }
@@ -335,6 +386,12 @@ fn project_error(e: AppConfigError) -> AppConfigError {
                 .to_owned(),
         ),
     }
+}
+
+/// Токен памяти агента из переменной [`TOKEN_ENV`] (`ZA_MEMORY_TOKEN`, D134): команда читает
+/// его один раз и передаёт значением; пусто — `None`.
+pub fn memory_token_from_env() -> Option<Token> {
+    Token::from_env_value(std::env::var(TOKEN_ENV).ok())
 }
 
 /// Читает `home/config.toml`; `LLAMA_URL` — из окружения.
@@ -389,6 +446,7 @@ pub fn parse_config(src: &str) -> Result<AgentConfig, AppConfigError> {
             .map(parse_skills)
             .transpose()?
             .unwrap_or_default(),
+        memory: raw.memory.map(parse_memory).transpose()?,
         llama_url_fallback: false,
     })
 }
@@ -578,6 +636,56 @@ fn parse_skills(v: toml::Value) -> Result<SkillsSettings, AppConfigError> {
         }
     }
     Ok(out)
+}
+
+/// Раздел `[memory]` глобальной конфигурации (D134, D152): `url` обязателен (`http` или
+/// `https` с хостом, без учётных данных, запроса и фрагмента), `machine` — имя для
+/// `X-Zam-Machine` (до 128 печатных символов), `enabled` (по умолчанию `true`). Незнакомый
+/// ключ и неверный тип — ошибка с путём поля; значения адреса и машины в текст не попадают.
+fn parse_memory(v: toml::Value) -> Result<MemoryConfig, AppConfigError> {
+    let mut url = None;
+    let mut machine = None;
+    let mut enabled = true;
+    for (key, value) in table_at("memory", v)? {
+        let at = format!("memory.{key}");
+        match key.as_str() {
+            "url" => {
+                let Some(s) = value.as_str() else {
+                    return Err(section_error(at, "ожидается строка с адресом"));
+                };
+                za_memory::config::base_url(s).map_err(memory_error)?;
+                url = Some(s.trim().to_owned());
+            }
+            "machine" => {
+                let Some(s) = value.as_str() else {
+                    return Err(section_error(at, "ожидается строка"));
+                };
+                machine = Some(za_memory::config::check_machine(s).map_err(memory_error)?);
+            }
+            "enabled" => enabled = bool_at(&at, &value)?,
+            other => return Err(unknown_key("memory", other, "url, machine или enabled")),
+        }
+    }
+    let Some(url) = url else {
+        return Err(section_error(
+            "memory.url",
+            "нужен адрес сервера памяти (пример: http://127.0.0.1:7700); без памяти — уберите раздел [memory]",
+        ));
+    };
+    Ok(MemoryConfig {
+        url,
+        machine,
+        enabled,
+    })
+}
+
+/// Ошибка проверки `[memory]` из `za-memory` (`memory.url: …`) — как ошибка раздела.
+fn memory_error(e: za_memory::ConfigError) -> AppConfigError {
+    let text = e.to_string();
+    match text.split_once(": ") {
+        Some((at, reason)) if at.starts_with("memory.") => section_error(at, reason),
+        _ => section_error("memory", text),
+    }
 }
 
 /// `[skills] dirs`: абсолютные пути каталогов `extra` (как пути грантов, D78).

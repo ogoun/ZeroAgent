@@ -8,7 +8,7 @@
 //! `secrets` называет источник секретов (R1-C1 D90): пока переменные `ZA_SECRET_*`, Vault
 //! памяти — с клиентом ZeroAIMemory. Строки `git` и `shell` (R1-C1 D96): `git` в `PATH` и
 //! его версия (без git чекпоинты — копиями файлов, D89), оболочка инструмента `bash`
-//! (D85); их нет — `Warn`. Проверка памяти ZeroAIMemory появится вместе с её клиентом.
+//! (D85); их нет — `Warn`.
 //!
 //! R1-C2 (D122, задача 14): строки `web` (`[web]` включён ли и его пределы), `search`
 //! (поставщик поиска: не настроен, или пробный запрос к своему экземпляру SearXNG через
@@ -16,6 +16,13 @@
 //! `zero-agent extract html`), `skills` (число скиллов по источникам вне проекта, пропуски и
 //! корни, не прочитанные пределом `[skills] max_entries`) и `window` (тир standard или full
 //! на окне меньше 32k, D169). Всё это — `Warn`, не `Fail`: run без них работает.
+//!
+//! R1-M (D136, D152): строка `memory` — сервер ZeroAIMemory из `[memory] url`: версия, коммит,
+//! уровень (L0–L2 по флагам `/api/v1/health`), число флагов, токен `ZA_MEMORY_TOKEN` (принят
+//! или нет), личный Vault, выключенные типы подсказок; адрес `http` на хост вне локальной
+//! сети — `Warn` «токен идёт открытым текстом». Нет `[memory]` — `Warn` «память не настроена»;
+//! сервер недоступен — `Warn`: агент работает без памяти (L0). Токен — параметром, команда
+//! читает переменную один раз.
 
 use std::path::Path;
 
@@ -27,6 +34,9 @@ use serde::Serialize;
 use za_core::extract::{Extractor, HtmlRequest};
 use za_jail::{CommandSpec, DirectRunner, EnvMode, Exit, Runner};
 use za_llm::EndpointView;
+use za_memory::{
+    Level, MemoryConfig, MemoryStatus, SolutionState, Token, TokenState, VaultState, ZamClient,
+};
 use za_protocol::Tier;
 use za_res::{GPU_QUERY_TIMEOUT, GpuStatus, MonitorConfig, ResourcesConfig, query_nvidia_smi};
 
@@ -96,6 +106,9 @@ pub struct DoctorReport {
     pub skills: Check,
     /// Тир и окно моделей (D169).
     pub window: Check,
+    /// Сервер памяти ZeroAIMemory (D136, D152): уровень, токен, Vault; не настроен или
+    /// недоступен — `Warn`.
+    pub memory: Check,
     /// Модели по id эндпоинта; `config` — ошибка или предупреждение конфигурации.
     pub models: Vec<(String, Check)>,
     /// Компилятор сборки и MSRV.
@@ -104,7 +117,7 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     /// Проверки строками отчёта: имя и итог.
-    fn rows(&self) -> [(&'static str, &Check); 11] {
+    fn rows(&self) -> [(&'static str, &Check); 12] {
         [
             ("sqlite", &self.sqlite),
             ("llama", &self.llama),
@@ -117,6 +130,7 @@ impl DoctorReport {
             ("extract", &self.extractor),
             ("skills", &self.skills),
             ("window", &self.window),
+            ("memory", &self.memory),
         ]
     }
 
@@ -149,11 +163,16 @@ impl DoctorReport {
 }
 
 /// Собирает отчёт; `llama_url` — значение `LLAMA_URL`, `home` — `ZA_HOME` (`None` — не
-/// определён: GPU и модели не проверяются, `Warn`). Проверки идут параллельно.
+/// определён: GPU и модели не проверяются, `Warn`), `memory_token` — значение
+/// `ZA_MEMORY_TOKEN`. Проверки идут параллельно.
 ///
 /// Если эндпоинт `local` создан из `LLAMA_URL` (нет раздела `[models]`), сервер
 /// зондируется один раз — как модель, и строка `llama` повторяет её итог.
-pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
+pub async fn run(
+    llama_url: Option<&str>,
+    home: Option<&Path>,
+    memory_token: Option<Token>,
+) -> DoctorReport {
     let cfg = home.map(load_config);
     let covered = matches!(&cfg, Some(Ok(c)) if c.llama_url_fallback);
     let read: Option<AgentConfig> = cfg.as_ref().and_then(|r| r.as_ref().ok()).cloned();
@@ -164,13 +183,20 @@ pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
             Some(check_llama(llama_url).await)
         }
     };
-    let (llama, (gpu, models, windows), git, (web, search), extractor, skills) = tokio::join!(
+    let memory = async {
+        match &read {
+            Some(c) => check_memory_live(c.memory.as_ref(), memory_token).await,
+            None => no_config(),
+        }
+    };
+    let (llama, (gpu, models, windows), git, (web, search), extractor, skills, memory) = tokio::join!(
         llama,
         check_home(home, cfg),
         check_git(),
         check_web_search(read.as_ref()),
         check_extractor(home),
         check_skills(home, read.as_ref()),
+        memory,
     );
     let window = check_window(read.as_ref().and_then(|c| c.context.tier), &windows);
     let llama = llama.unwrap_or_else(|| {
@@ -200,8 +226,161 @@ pub async fn run(llama_url: Option<&str>, home: Option<&Path>) -> DoctorReport {
         extractor,
         skills,
         window,
+        memory,
         models,
         rust: rust_version(),
+    }
+}
+
+/// Строка `memory` с проверкой сервера (D136, D152): клиент по `[memory]`, обнаружение и
+/// статус (токен, Vault, подсказки), затем [`check_memory`]. Решение проекта `doctor` не
+/// проверяет: проекта у него нет (это делает `memory status`).
+pub async fn check_memory_live(cfg: Option<&MemoryConfig>, token: Option<Token>) -> Check {
+    let Some(c) = cfg.filter(|c| c.enabled) else {
+        return check_memory(cfg, token, None);
+    };
+    match ZamClient::new(c, token.clone()) {
+        Ok(client) => {
+            let st = za_memory::status(&client, None).await;
+            check_memory(cfg, token, Some(&st))
+        }
+        Err(e) => Check::Warn(format!(
+            "{e}: клиент памяти не собран, работа без памяти (L0)"
+        )),
+    }
+}
+
+/// Строка `memory` по конфигурации, токену и статусу сервера (D152). Токен — параметром
+/// (`Option<Token>`): функция не читает окружение. `Ok` — L1/L2, токен принят, Vault открыт,
+/// подсказки включены, адрес не уходит открытым текстом за пределы локальной сети; иначе
+/// `Warn` с причинами. `Fail` нет: без памяти агент работает (MEM-011).
+pub fn check_memory(
+    cfg: Option<&MemoryConfig>,
+    token: Option<Token>,
+    st: Option<&MemoryStatus>,
+) -> Check {
+    let Some(cfg) = cfg else {
+        return Check::Warn(
+            "память не настроена ([memory] url в ZA_HOME/config.toml): работа без памяти (L0)"
+                .to_owned(),
+        );
+    };
+    if !cfg.enabled {
+        return Check::Ok("память выключена ([memory] enabled = false)".to_owned());
+    }
+    let url = display_url(&cfg.url);
+    let Some(st) = st else {
+        return Check::Warn(format!("{url}: не проверено"));
+    };
+    let d = &st.discovery;
+    let Some(info) = d.info.as_ref().filter(|_| d.level != Level::L0) else {
+        return Check::Warn(format!(
+            "{url}: память недоступна ({}): работа без памяти (L0)",
+            d.reason.as_deref().unwrap_or("нет ответа")
+        ));
+    };
+    let mut warn = false;
+    let git = info
+        .git
+        .as_deref()
+        .map(|g| format!(" ({g})"))
+        .unwrap_or_default();
+    let mut text = format!(
+        "ZeroAIMemory {}{git}, {}, флаги: {}",
+        info.version,
+        d.level.as_str(),
+        info.features.len()
+    );
+    let token_text = match (&token, &st.token) {
+        (None, _) | (_, TokenState::NotSet) => {
+            warn = true;
+            "токен не задан (ZA_MEMORY_TOKEN): запросы к памяти не пройдут".to_owned()
+        }
+        (Some(_), TokenState::Accepted) => "токен принят".to_owned(),
+        (Some(_), TokenState::Rejected) => {
+            warn = true;
+            "токен отклонён (401): неверен или отозван".to_owned()
+        }
+        (Some(_), TokenState::RateLimited(after)) => {
+            warn = true;
+            match after {
+                Some(a) => format!(
+                    "токен не проверен: лимит запросов, повтор через {} с",
+                    a.as_secs()
+                ),
+                None => "токен не проверен: лимит запросов".to_owned(),
+            }
+        }
+        (Some(_), TokenState::Unchecked(why)) => {
+            warn = true;
+            format!("токен не проверен: {why}")
+        }
+    };
+    text.push_str(&format!("; {token_text}"));
+    match &st.solution {
+        SolutionState::Bound { name, role, access } => {
+            text.push_str(&format!("; решение {name} ({role}, {access})"));
+        }
+        SolutionState::Forbidden(why) => {
+            warn = true;
+            text.push_str(&format!("; нет доступа к решению: {why}"));
+        }
+        SolutionState::NotFound => {
+            warn = true;
+            text.push_str("; решение не найдено на сервере");
+        }
+        SolutionState::NotBound | SolutionState::Unchecked(_) => {}
+    }
+    match &st.vault {
+        VaultState::Unlocked => text.push_str("; Vault открыт"),
+        VaultState::Locked(why) => {
+            warn = true;
+            text.push_str(&format!(
+                "; Vault заблокирован: {why} (модели с ключом ждут Vault)"
+            ));
+        }
+        VaultState::Unchecked(_) => {}
+    }
+    if !st.hooks_off.is_empty() {
+        warn = true;
+        text.push_str(&format!(
+            "; выключены подсказки: {}",
+            st.hooks_off.join(", ")
+        ));
+    }
+    if plaintext_outside_lan(&cfg.url) {
+        warn = true;
+        text.push_str(
+            "; токен идёт открытым текстом: http на хост вне локальной сети (нужен https)",
+        );
+    }
+    if warn {
+        Check::Warn(text)
+    } else {
+        Check::Ok(text)
+    }
+}
+
+/// Схема `http`, а хост — не loopback и не частный адрес (D152, preflight 7.1.6): токен
+/// идёт открытым текстом через чужие сети. Имя хоста, кроме `localhost`, не разрешается:
+/// его адрес неизвестен, и это тоже предупреждение.
+fn plaintext_outside_lan(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw.trim()) else {
+        return false;
+    };
+    if u.scheme() != "http" {
+        return false;
+    }
+    match u.host() {
+        Some(url::Host::Ipv4(ip)) => !(ip.is_loopback() || ip.is_private() || ip.is_link_local()),
+        Some(url::Host::Ipv6(ip)) => {
+            let seg = ip.segments()[0];
+            let ula = (seg & 0xfe00) == 0xfc00;
+            let link_local = (seg & 0xffc0) == 0xfe80;
+            !(ip.is_loopback() || ula || link_local)
+        }
+        Some(url::Host::Domain(d)) => !d.eq_ignore_ascii_case("localhost"),
+        None => false,
     }
 }
 
@@ -663,6 +842,7 @@ mod tests {
             extractor: Check::Ok("extract".to_owned()),
             skills: Check::Ok("скиллы".to_owned()),
             window: Check::Ok("окно".to_owned()),
+            memory: Check::Warn("память не настроена".to_owned()),
             models: vec![("local".to_owned(), Check::Warn("inactive".to_owned()))],
             rust: rust_version(),
         };
@@ -702,6 +882,28 @@ mod tests {
         assert!(matches!(check_window(None, &[]), Check::Ok(_)));
     }
 
+    /// D152: http на loopback и частные адреса — не предупреждение; на прочие хосты и имена
+    /// (кроме `localhost`) — предупреждение; https — нет.
+    #[test]
+    fn plaintext_token_warning_by_host() {
+        for (url, warn) in [
+            ("http://127.0.0.1:7700", false),
+            ("http://localhost:7700", false),
+            ("http://10.0.0.5:7700", false),
+            ("http://192.168.0.210:7700", false),
+            ("http://172.16.1.1:7700", false),
+            ("http://[::1]:7700", false),
+            ("http://[fd00::1]:7700", false),
+            ("http://example.org:7700", true),
+            ("http://8.8.8.8:7700", true),
+            ("http://memory.lan:7700", true),
+            ("http://[2001:db8::1]:7700", true),
+            ("https://example.org", false),
+        ] {
+            assert_eq!(plaintext_outside_lan(url), warn, "{url}");
+        }
+    }
+
     #[test]
     fn json_shape() {
         let r = DoctorReport {
@@ -716,6 +918,7 @@ mod tests {
             extractor: Check::Ok("extract".to_owned()),
             skills: Check::Ok("скиллы".to_owned()),
             window: Check::Warn("окно".to_owned()),
+            memory: Check::Ok("ZeroAIMemory".to_owned()),
             models: vec![("local".to_owned(), Check::Ok("ready".to_owned()))],
             rust: "rustc 1.99.1".to_owned(),
         };
@@ -734,6 +937,7 @@ mod tests {
                 "extractor": {"status": "ok", "detail": "extract"},
                 "skills": {"status": "ok", "detail": "скиллы"},
                 "window": {"status": "warn", "detail": "окно"},
+                "memory": {"status": "ok", "detail": "ZeroAIMemory"},
                 "models": [["local", {"status": "ok", "detail": "ready"}]],
                 "rust": "rustc 1.99.1",
             })

@@ -33,6 +33,9 @@ za-extract = { path = "../za-extract" }
 # в `doctor`; признак `test-hooks` (D128) включает подмены резолвера шлюза вместе с крюками
 # бинарника (`run --web-resolve`).
 za-web = { path = "../za-web" }
+# Клиент памяти ZeroAIMemory (R1-M D133): `[memory]` конфигурации, строка `doctor`; признак
+# `test-hooks` включает его ручные часы (D165).
+za-memory = { path = "../za-memory" }
 # Адрес поставщика поиска `[web.search] url` (D122): разбор и проверка при чтении
 # конфигурации; уже в `Cargo.lock` через `za-web` и `reqwest`.
 url.workspace = true
@@ -54,9 +57,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
-# Тестовые крюки (D128): `extract --hang`, `extract --crash` бинарника и подмены резолвера
-# шлюза. Обычная и release-сборка их не содержат.
-test-hooks = ["za-web/test-hooks"]
+# Тестовые крюки (D128): `extract --hang`, `extract --crash` бинарника, подмены резолвера
+# шлюза и ручные часы клиента памяти. Обычная и release-сборка их не содержат.
+test-hooks = ["za-web/test-hooks", "za-memory/test-hooks"]
 
 # Сквозной тест извлекателя в подпроцессе (тайм-аут, бросок future, падение) — только с
 # крюками; обычный `cargo test` его пропускает, не ломаясь.
@@ -75,6 +78,12 @@ required-features = ["test-hooks"]
 # именами `--web-resolve`.
 [[test]]
 name = "r1c2_web_skills"
+required-features = ["test-hooks"]
+
+# Строка `memory` команды `doctor` на поддельном ZeroAIMemory (R1-M задача 2): функция строки
+# с токеном параметром, без окружения процесса.
+[[test]]
+name = "doctor_memory"
 required-features = ["test-hooks"]
 
 [dev-dependencies]

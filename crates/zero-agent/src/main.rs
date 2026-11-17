@@ -813,7 +813,8 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode, AppError> {
 
 async fn cmd_doctor(json: bool) -> Result<ExitCode, AppError> {
     let url = std::env::var(LLAMA_URL_ENV).ok();
-    let report = doctor::run(url.as_deref(), home::za_home().ok().as_deref()).await;
+    let token = zero_agent::config::memory_token_from_env();
+    let report = doctor::run(url.as_deref(), home::za_home().ok().as_deref(), token).await;
     if json {
         let text = serde_json::to_string_pretty(&report).map_err(AppError::Json)?;
         println!("{text}");

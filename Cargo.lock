@@ -2923,6 +2923,7 @@ dependencies = [
  "za-extract",
  "za-jail",
  "za-llm",
+ "za-memory",
  "za-protocol",
  "za-res",
  "za-secrets",

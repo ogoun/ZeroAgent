@@ -347,6 +347,114 @@ fn project_web_enabled_wrong_type() {
     assert!(e.to_string().contains("web"), "{e}");
 }
 
+// ---- Раздел [memory] (R1-M задача 2, D134, D152) ----
+
+/// Глобальный `[memory]`: `url`, `machine`, `enabled`; незнакомый ключ и неверные значения —
+/// ошибка с путём поля, без значения.
+#[test]
+fn memory_section_parsed() {
+    use zero_agent::config::{AppConfigError, parse_config, validate};
+    let cfg = parse_config("[memory]\nurl = \"http://192.168.0.210:7700\"\nmachine = \"ПК-1\"\n")
+        .unwrap();
+    validate(&cfg).unwrap();
+    let m = cfg.memory.unwrap();
+    assert_eq!(m.url, "http://192.168.0.210:7700");
+    assert_eq!(m.machine.as_deref(), Some("ПК-1"));
+    assert!(m.enabled);
+    let m = parse_config("[memory]\nurl = \"https://mem.example/zam\"\nenabled = false\n")
+        .unwrap()
+        .memory
+        .unwrap();
+    assert!(!m.enabled);
+    assert_eq!(m.machine, None);
+    // Без раздела — памяти нет.
+    assert_eq!(parse_config("").unwrap().memory, None);
+
+    let err = |src: &str| match parse_config(src) {
+        Ok(c) => panic!("ожидалась ошибка: {src}: {c:?}"),
+        Err(e) => {
+            assert!(matches!(e, AppConfigError::Section { .. }), "{src}: {e}");
+            e.to_string()
+        }
+    };
+    let e = err("[memory]\nurl = \"http://h:7700\"\nzz = 1\n");
+    assert!(e.contains("memory.zz"), "{e}");
+    for (src, at) in [
+        ("[memory]\nmachine = \"pc\"\n", "memory.url"),
+        ("[memory]\nurl = 7700\n", "memory.url"),
+        ("[memory]\nurl = \"ftp://h:1\"\n", "memory.url"),
+        (
+            "[memory]\nurl = \"http://h:7700\"\nenabled = \"yes\"\n",
+            "memory.enabled",
+        ),
+        (
+            "[memory]\nurl = \"http://h:7700\"\nmachine = \"\"\n",
+            "memory.machine",
+        ),
+        ("memory = 1\n", "memory"),
+    ] {
+        let e = err(src);
+        assert!(e.contains(at), "{src}: {e}");
+    }
+    // Учётные данные в адресе — ошибка, их значение в текст не попадает.
+    let e = err("[memory]\nurl = \"http://user:pa55-zz@h:7700\"\n");
+    assert!(e.contains("memory.url"), "{e}");
+    assert!(!e.contains("pa55-zz"), "{e}");
+}
+
+/// D134: в проекте действует только `[memory] enabled = false`; `url` и `machine` — `warn` с
+/// именем ключа, адрес не взят; `enabled` не булево — ошибка типа.
+#[test]
+fn project_memory_only_enabled_false() {
+    let parse = zero_agent::config::parse_project_config;
+    let (cfg, logs) = with_logs(|| parse("[memory]\nurl = \"http://evil.example:7700\"\n"));
+    let cfg = cfg.unwrap();
+    assert_eq!(cfg.memory_enabled, None);
+    assert!(logs.contains("memory.url"), "{logs}");
+    assert!(!logs.contains("evil.example"), "{logs}");
+    let (cfg, logs) = with_logs(|| parse("[memory]\nenabled = false\nmachine = \"x\"\n"));
+    assert_eq!(cfg.unwrap().memory_enabled, Some(false));
+    assert!(logs.contains("memory.machine"), "{logs}");
+    // `true` ничего не включает; незнакомый ключ не называется.
+    assert_eq!(
+        parse("[memory]\nenabled = true\n").unwrap().memory_enabled,
+        None
+    );
+    let (cfg, logs) = with_logs(|| parse("[memory]\nhidden-name-9c1d = 1\n"));
+    assert!(cfg.is_ok());
+    assert!(!logs.contains("hidden-name-9c1d"), "{logs}");
+    assert!(logs.contains("[memory]"), "{logs}");
+    for src in ["[memory]\nenabled = \"x\"\n", "[memory]\nenabled = 0\n"] {
+        let e = parse(src).unwrap_err().to_string();
+        assert!(e.starts_with(".zero-agent/config.toml проекта"), "{e}");
+        assert!(e.contains("memory.enabled"), "{e}");
+    }
+    assert!(
+        parse("memory = 1\n")
+            .unwrap_err()
+            .to_string()
+            .contains("memory")
+    );
+    // Веб и память выключаются независимо.
+    let cfg = parse("[web]\nenabled = false\n").unwrap();
+    assert_eq!((cfg.web_enabled, cfg.memory_enabled), (Some(false), None));
+}
+
+/// Пример `[memory]` в README проходит разбор и проверку.
+#[test]
+fn readme_memory_example_is_valid() {
+    let readme = include_str!("../../../README.md");
+    let head = "```toml\n[memory]";
+    let start = readme.find(head).expect("пример [memory] в README");
+    let body = &readme[start + "```toml\n".len()..];
+    let end = body.find("```").expect("конец примера");
+    let cfg = zero_agent::config::parse_config(&body[..end]).unwrap();
+    zero_agent::config::validate(&cfg).unwrap();
+    let m = cfg.memory.expect("[memory]");
+    assert!(m.enabled);
+    za_memory::ZamClient::new(&m, None).unwrap();
+}
+
 // ---- Разделы [web] и [skills] глобальной конфигурации (R1-C2 задача 14, D122) ----
 
 /// D122: значения по умолчанию, полный раздел и ошибки с путём поля.
