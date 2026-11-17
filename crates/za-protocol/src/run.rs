@@ -160,6 +160,36 @@ pub mod net_outcome {
     pub const ERROR: &str = "error";
 }
 
+/// Исход записи в память (R1-M D153): поле `outcome` события `memory.write`.
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod memory_outcome {
+    /// Сервер принял запись.
+    pub const WRITTEN: &str = "written";
+    /// Повтор с тем же ключом идемпотентности или ревизией: запись уже есть.
+    pub const UNCHANGED: &str = "unchanged";
+    /// Запись встала в outbox и уйдёт позже (D165).
+    pub const QUEUED: &str = "queued";
+    /// Шлюз записи отказал (D163), сеть не трогалась.
+    pub const REFUSED: &str = "refused";
+}
+
+/// Повод снимка сессии памяти (R1-M D138, D149, D167): поле `trigger` тела
+/// `PUT /sessions/{id}/snapshot` и события `memory.snapshot_sent`; значения — из списка
+/// ZAM (`post_compact`, `stop`, `session_end`, `catch_up`).
+///
+/// Значения — часть протокола, менять строки нельзя.
+pub mod snapshot_trigger {
+    /// После компакции истории.
+    pub const POST_COMPACT: &str = "post_compact";
+    /// Пауза run: Ctrl+C, `blocked`.
+    pub const STOP: &str = "stop";
+    /// Конец run (конечный статус).
+    pub const SESSION_END: &str = "session_end";
+    /// Догоняющий снимок брошенного прошлого run (D167).
+    pub const CATCH_UP: &str = "catch_up";
+}
+
 /// Источник скилла (R1-C2): поле `source` каталога и событий `skill.*`.
 ///
 /// Значения — часть протокола, менять строки нельзя.
@@ -255,6 +285,9 @@ pub mod audit_action {
     /// Экспозиция Rule of Two (R1-C2 D106): запись аудита, не причина одобрения —
     /// вызов идёт по режиму (решение заказчика 2026-11-11).
     pub const RULE_OF_TWO: &str = "rule_of_two";
+    /// Раскрыт ключ из Vault памяти (R1-M D143): `name`, `scope`, `item`, `session`; значения
+    /// нет.
+    pub const SECRET_REVEALED: &str = "secret.revealed";
 }
 
 /// Детекторы зацикливания: поле `detector` события `loop.detected` (R1-B2 D63) и
@@ -450,6 +483,31 @@ mod tests {
             assert!(s.can_transition(Cancelling), "{s:?}");
         }
         assert!(!Cancelling.can_transition(Cancelling));
+    }
+
+    /// R1-M D153: коды памяти — строки протокола; `snapshot_trigger` — значения ZAM.
+    #[test]
+    fn memory_codes_are_stable() {
+        use super::{audit_action, memory_outcome, snapshot_trigger};
+        assert_eq!(
+            [
+                memory_outcome::WRITTEN,
+                memory_outcome::UNCHANGED,
+                memory_outcome::QUEUED,
+                memory_outcome::REFUSED
+            ],
+            ["written", "unchanged", "queued", "refused"]
+        );
+        assert_eq!(
+            [
+                snapshot_trigger::POST_COMPACT,
+                snapshot_trigger::STOP,
+                snapshot_trigger::SESSION_END,
+                snapshot_trigger::CATCH_UP
+            ],
+            ["post_compact", "stop", "session_end", "catch_up"]
+        );
+        assert_eq!(audit_action::SECRET_REVEALED, "secret.revealed");
     }
 
     #[test]

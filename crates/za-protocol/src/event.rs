@@ -78,6 +78,22 @@ pub enum EventKind {
     /// В тексте ввода замаскированы секреты (R1-M, Important 2 ревью задачи 1): `source`
     /// (`input_source`), `masked` — число замен; значений в событии нет.
     InputMasked,
+    /// Подключение к памяти (R1-M D153): `level`, `version`, `features`.
+    MemoryConnected,
+    /// Обращение `/recall` (D153, MEM-125): `event`, `state`, `tokens`, `rules_tokens`,
+    /// `omitted`, `ms`, `warnings`, `hooks_off` — расход памяти без текста.
+    MemoryRecall,
+    /// Вызов инструмента чтения памяти (D153): `tool`, `tokens`, `warnings`, `ms`.
+    MemoryTool,
+    /// Запись в память (D153): `op`, `kind`, `ref`, `rev`, `outcome` (`memory_outcome`),
+    /// `warnings`, `ms`.
+    MemoryWrite,
+    /// Снимок сессии отправлен (D153): `trigger` (`snapshot_trigger`), `status`, `warnings`.
+    MemorySnapshotSent,
+    /// Сессия памяти run завершена (D153).
+    MemorySessionEnded,
+    /// Раскрыт ключ из Vault (D143, D153): `name`, `scope`, `item`, `cached`; значения нет.
+    SecretRevealed,
     Unknown(String),
 }
 
@@ -118,6 +134,13 @@ impl EventKind {
             Self::SkillCatalog => "skill.catalog",
             Self::SkillActivated => "skill.activated",
             Self::InputMasked => "input.masked",
+            Self::MemoryConnected => "memory.connected",
+            Self::MemoryRecall => "memory.recall",
+            Self::MemoryTool => "memory.tool",
+            Self::MemoryWrite => "memory.write",
+            Self::MemorySnapshotSent => "memory.snapshot_sent",
+            Self::MemorySessionEnded => "memory.session_ended",
+            Self::SecretRevealed => "secret.revealed",
             Self::Unknown(s) => s,
         }
     }
@@ -158,6 +181,13 @@ impl EventKind {
             "skill.catalog" => Self::SkillCatalog,
             "skill.activated" => Self::SkillActivated,
             "input.masked" => Self::InputMasked,
+            "memory.connected" => Self::MemoryConnected,
+            "memory.recall" => Self::MemoryRecall,
+            "memory.tool" => Self::MemoryTool,
+            "memory.write" => Self::MemoryWrite,
+            "memory.snapshot_sent" => Self::MemorySnapshotSent,
+            "memory.session_ended" => Self::MemorySessionEnded,
+            "secret.revealed" => Self::SecretRevealed,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -291,8 +321,25 @@ mod tests {
 
     #[test]
     fn r1m_kinds_round_trip() {
-        assert_eq!(EventKind::InputMasked.as_str(), "input.masked");
-        assert_eq!(EventKind::parse("input.masked"), EventKind::InputMasked);
+        use EventKind::*;
+        for (k, name) in [
+            (InputMasked, "input.masked"),
+            (MemoryConnected, "memory.connected"),
+            (MemoryRecall, "memory.recall"),
+            (MemoryTool, "memory.tool"),
+            (MemoryWrite, "memory.write"),
+            (MemorySnapshotSent, "memory.snapshot_sent"),
+            (MemorySessionEnded, "memory.session_ended"),
+            (SecretRevealed, "secret.revealed"),
+        ] {
+            assert_eq!(k.as_str(), name);
+            assert_eq!(EventKind::parse(name), k);
+        }
+        // Прежнее событие недоступной памяти не меняется.
+        assert_eq!(
+            EventKind::parse("memory.unavailable"),
+            EventKind::MemoryUnavailable
+        );
     }
 
     #[test]
