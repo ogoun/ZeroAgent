@@ -8,9 +8,20 @@ use std::time::Duration;
 
 use fake_zam::{FakeZam, Health, WAIT, within};
 use za_memory::{
-    ErrorKind, Level, MemoryConfig, SolutionState, Token, TokenState, VaultState, ZamClient,
-    discover, status,
+    Discovery, ErrorKind, Level, MemoryConfig, SolutionState, Token, TokenState, VaultState,
+    ZamClient, discover, status,
 };
+
+/// Обнаружение с проверкой инварианта полей `Discovery` (M12 ревью задачи 2): `level == L0`
+/// ⇔ нет `info` ⇔ есть `reason` ⇔ есть `error`.
+async fn discovered(c: &ZamClient) -> Discovery {
+    let d = within(WAIT, "discover", discover(c)).await;
+    let l0 = d.level == Level::L0;
+    assert_eq!(d.info.is_none(), l0, "{d:?}");
+    assert_eq!(d.reason.is_some(), l0, "{d:?}");
+    assert_eq!(d.error.is_some(), l0, "{d:?}");
+    d
+}
 
 /// Фиктивный токен — из частей во время выполнения (GitHub push protection).
 fn token_raw() -> String {
@@ -35,7 +46,7 @@ fn client(url: &str, token: Option<Token>) -> ZamClient {
 async fn root_health_html_is_not_zam() {
     let mut fake = FakeZam::start().await;
     fake.set_health(Health::Html);
-    let d = within(WAIT, "discover", discover(&client(&fake.url(), None))).await;
+    let d = discovered(&client(&fake.url(), None)).await;
     assert_eq!(d.level, Level::L0);
     assert_eq!(d.reason.as_deref(), Some("not a ZeroAIMemory API"));
     assert_eq!(d.error, Some(ErrorKind::NotZam));
@@ -51,12 +62,7 @@ async fn root_health_html_is_not_zam() {
 async fn health_without_features_is_l1() {
     let fake = FakeZam::start().await;
     fake.set_health(Health::NoFeatures);
-    let d = within(
-        WAIT,
-        "discover",
-        discover(&client(&fake.url(), Some(token()))),
-    )
-    .await;
+    let d = discovered(&client(&fake.url(), Some(token()))).await;
     assert_eq!(d.level, Level::L1);
     let info = d.info.unwrap();
     assert_eq!(info.version, "0.0.10-m5.7");
@@ -80,12 +86,7 @@ async fn health_with_m6_is_l2_and_unknown_flags_kept() {
         "zz_new_field": {"a": [1, 2]},
     })));
     let mut fake = fake;
-    let d = within(
-        WAIT,
-        "discover",
-        discover(&client(&fake.url(), Some(token()))),
-    )
-    .await;
+    let d = discovered(&client(&fake.url(), Some(token()))).await;
     assert_eq!(d.level, Level::L2);
     let info = d.info.unwrap();
     assert!(info.features.contains("zz_future"), "{:?}", info.features);
@@ -105,7 +106,7 @@ async fn health_with_m6_is_l2_and_unknown_flags_kept() {
 async fn health_m65_is_l2_with_idea_review() {
     let fake = FakeZam::start().await;
     fake.set_health(Health::M65);
-    let d = within(WAIT, "discover", discover(&client(&fake.url(), None))).await;
+    let d = discovered(&client(&fake.url(), None)).await;
     assert_eq!(d.level, Level::L2);
     let info = d.info.unwrap();
     assert_eq!(info.version, fake_zam::VERSION_M65);
@@ -119,11 +120,11 @@ async fn health_without_version_or_5xx_is_l0() {
     let fake = FakeZam::start().await;
     fake.set_health(Health::Json(serde_json::json!({"status": "ok"})));
     let c = client(&fake.url(), None);
-    let d = within(WAIT, "discover", discover(&c)).await;
+    let d = discovered(&c).await;
     assert_eq!(d.level, Level::L0);
     assert_eq!(d.error, Some(ErrorKind::NotZam));
     fake.set_health(Health::Status(503));
-    let d = within(WAIT, "discover", discover(&c)).await;
+    let d = discovered(&c).await;
     assert_eq!(d.level, Level::L0);
     assert_eq!(d.error, Some(ErrorKind::Server));
     assert!(d.reason.unwrap().contains("503"));
@@ -132,7 +133,7 @@ async fn health_without_version_or_5xx_is_l0() {
 #[tokio::test]
 async fn connection_refused_is_l0_offline() {
     let c = client(&fake_zam::closed_port_url(), Some(token()));
-    let d = within(WAIT, "discover", discover(&c)).await;
+    let d = discovered(&c).await;
     assert_eq!(d.level, Level::L0);
     assert_eq!(d.error, Some(ErrorKind::Offline));
     assert!(d.reason.is_some());

@@ -400,6 +400,22 @@ fn memory_section_parsed() {
     let e = err("[memory]\nurl = \"http://user:pa55-zz@h:7700\"\n");
     assert!(e.contains("memory.url"), "{e}");
     assert!(!e.contains("pa55-zz"), "{e}");
+    // Путь поля и причина — из `ConfigError::field()` и `reason()` (M7 ревью задачи 2): ровно
+    // одно поле, причина без повтора пути.
+    let parsed = |src: &str| match parse_config(src) {
+        Err(AppConfigError::Section { at, reason }) => (at, reason),
+        other => panic!("{src}: {other:?}"),
+    };
+    let (at, reason) = parsed("[memory]\nurl = \"ftp://h:1\"\n");
+    assert_eq!(
+        (at.as_str(), reason.as_str()),
+        ("memory.url", "только http или https")
+    );
+    let (at, reason) = parsed("[memory]\nurl = \"http://h:7700\"\nmachine = \"\"\n");
+    assert_eq!(
+        (at.as_str(), reason.as_str()),
+        ("memory.machine", "пустое значение")
+    );
 }
 
 /// D134: в проекте действует только `[memory] enabled = false`; `url` и `machine` — `warn` с

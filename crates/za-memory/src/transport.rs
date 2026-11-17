@@ -37,7 +37,7 @@ use reqwest::header::{
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::config::{ConfigError, MemoryConfig, Token, base_url, check_machine, host_machine};
+use crate::config::{ConfigError, MemoryConfig, Token, base_url, check_attrib, host_machine};
 use crate::error::{ErrorKind, ZamError, parse_mcp_error, truncate};
 
 /// Метод HTTP для [`ZamClient::send_json`]: остальной крейт не называет `reqwest`.
@@ -127,7 +127,7 @@ impl ZamClient {
         let url = base_url(&cfg.url)?;
         let base = url.as_str().trim_end_matches('/').to_owned();
         let machine_name = match &cfg.machine {
-            Some(m) => Some(check_machine(m)?),
+            Some(m) => Some(check_attrib(m).map_err(ConfigError::Machine)?),
             None => host_machine(),
         };
         let machine = match &machine_name {
@@ -419,11 +419,10 @@ fn bearer(t: &Token) -> Option<HeaderValue> {
     Some(v)
 }
 
-/// Значение заголовка атрибуции: байты UTF-8, до 128 символов, без управляющих (как
-/// принимает сервер, `attrib.rs` e391440).
+/// Значение заголовка атрибуции ([`check_attrib`]) байтами UTF-8.
 fn attrib_value(s: &str) -> Option<HeaderValue> {
-    check_machine(s).ok()?;
-    HeaderValue::from_bytes(s.trim().as_bytes()).ok()
+    let v = check_attrib(s).ok()?;
+    HeaderValue::from_bytes(v.as_bytes()).ok()
 }
 
 fn bad_header(name: &str) -> ZamError {

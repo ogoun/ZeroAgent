@@ -5,7 +5,8 @@
 //!   Проектная конфигурация адрес не задаёт (её разбирает бинарник).
 //! - **Машина** — `[memory] machine` или имя хоста (`COMPUTERNAME`, `HOSTNAME`, на Unix ещё
 //!   `/etc/hostname`): до 128 печатных символов UTF-8, как принимает сервер
-//!   (`crates/zam-server/src/attrib.rs` e391440).
+//!   (`crates/zam-server/src/attrib.rs` e391440) — та же проверка [`check_attrib`], что у
+//!   всех заголовков атрибуции.
 //! - **Токен** — переменная окружения [`TOKEN_ENV`]; бинарник читает её один раз и передаёт
 //!   [`Token`] параметром. Других источников нет: ни файла, ни `~/.zeroaimemory/config.toml`.
 //!   `Debug` токена — `zam_…` без хвоста.
@@ -18,8 +19,13 @@ use url::Url;
 /// Переменная окружения с токеном памяти агента (D134).
 pub const TOKEN_ENV: &str = "ZA_MEMORY_TOKEN";
 
-/// Предел длины `X-Zam-Machine` и `X-Zam-Area`, символов (`ATTRIB_MAX_CHARS` ZAM).
+/// Предел длины значений заголовков атрибуции `X-Zam-*`, символов (`ATTRIB_MAX_CHARS` ZAM).
 pub const ATTRIB_MAX_CHARS: usize = 128;
+
+/// Путь поля адреса в конфигурации (текст [`ConfigError::Url`], [`ConfigError::field`]).
+pub const URL_FIELD: &str = "memory.url";
+/// Путь поля имени машины в конфигурации.
+pub const MACHINE_FIELD: &str = "memory.machine";
 
 /// Раздел `[memory]` глобальной конфигурации (D134, D152).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -82,21 +88,50 @@ impl fmt::Debug for Token {
 }
 
 /// Ошибка подключения: неверный адрес, машина, токен или сборка клиента. Значения адреса,
-/// машины и токена в текст не попадают.
+/// машины и токена в текст не попадают. Текст ошибки поля — `<путь>: <причина>`; путь и
+/// причину отдельно дают [`ConfigError::field`] и [`ConfigError::reason`] (M7 ревью задачи 2:
+/// бинарник не разбирает `Display`).
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("memory.url: {0}")]
+    #[error("{at}: {0}", at = URL_FIELD)]
     Url(&'static str),
-    #[error("memory.machine: {0}")]
+    #[error("{at}: {0}", at = MACHINE_FIELD)]
     Machine(&'static str),
-    #[error("{env}: недопустимые символы в токене", env = TOKEN_ENV)]
+    #[error("{env}: {TOKEN_REASON}", env = TOKEN_ENV)]
     Token,
-    #[error("HTTP-клиент памяти не собран: {0}")]
+    #[error("{CLIENT_REASON}: {0}")]
     Client(String),
 }
 
+/// Причина [`ConfigError::Token`].
+const TOKEN_REASON: &str = "недопустимые символы в токене";
+/// Начало причины [`ConfigError::Client`].
+const CLIENT_REASON: &str = "HTTP-клиент памяти не собран";
+
+impl ConfigError {
+    /// Путь поля `[memory]` (`memory.url`, `memory.machine`); у токена (переменная окружения,
+    /// не поле) и у сборки клиента — `None`.
+    pub fn field(&self) -> Option<&'static str> {
+        match self {
+            Self::Url(_) => Some(URL_FIELD),
+            Self::Machine(_) => Some(MACHINE_FIELD),
+            Self::Token | Self::Client(_) => None,
+        }
+    }
+
+    /// Причина без пути поля и без значений.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Url(r) | Self::Machine(r) => (*r).to_owned(),
+            Self::Token => TOKEN_REASON.to_owned(),
+            Self::Client(m) => format!("{CLIENT_REASON}: {m}"),
+        }
+    }
+}
+
 /// Проверенный базовый адрес `[memory] url` (D134): `http` или `https`, хост, без учётных
-/// данных, строки запроса и фрагмента; последний `/` пути снимается.
+/// данных, строки запроса и фрагмента; путь — как есть (у адреса без пути `Url` даёт `/`).
+/// Последний `/` снимает не эта функция, а [`crate::ZamClient::new`].
 pub fn base_url(raw: &str) -> Result<Url, ConfigError> {
     let u = Url::parse(raw.trim())
         .map_err(|_| ConfigError::Url("адрес не разбирается; пример: http://127.0.0.1:7700"))?;
@@ -119,33 +154,82 @@ pub fn base_url(raw: &str) -> Result<Url, ConfigError> {
     Ok(u)
 }
 
-/// Проверенное имя машины: 1–128 символов UTF-8 без управляющих, пробелы по краям сняты.
-pub fn check_machine(raw: &str) -> Result<String, ConfigError> {
+/// Проверенное значение заголовка атрибуции — `X-Zam-Machine`, `X-Zam-Session`,
+/// `X-Zam-Solution`, `X-Zam-Area` (как принимает сервер, `attrib.rs` e391440): 1–128 символов
+/// UTF-8 без управляющих, пробелы по краям сняты. Ошибка — причина без значения.
+pub fn check_attrib(raw: &str) -> Result<String, &'static str> {
     let s = raw.trim();
     if s.is_empty() {
-        return Err(ConfigError::Machine("пустое имя машины"));
+        return Err("пустое значение");
     }
     if s.chars().count() > ATTRIB_MAX_CHARS {
-        return Err(ConfigError::Machine("длиннее 128 символов"));
+        return Err("длиннее 128 символов");
     }
     if s.chars().any(char::is_control) {
-        return Err(ConfigError::Machine("управляющие символы недопустимы"));
+        return Err("управляющие символы недопустимы");
     }
     Ok(s.to_owned())
 }
 
 /// Имя хоста для `X-Zam-Machine` (D134): `COMPUTERNAME`, затем `HOSTNAME`, на Unix ещё
-/// `/etc/hostname`; негодное имя ([`check_machine`]) пропускается.
+/// `/etc/hostname`; негодное имя ([`check_attrib`]) пропускается.
 pub fn host_machine() -> Option<String> {
     let from_env = ["COMPUTERNAME", "HOSTNAME"]
         .iter()
         .filter_map(|v| std::env::var(v).ok())
-        .find_map(|v| check_machine(&v).ok());
+        .find_map(|v| check_attrib(&v).ok());
     #[cfg(unix)]
     let from_env = from_env.or_else(|| {
         std::fs::read_to_string("/etc/hostname")
             .ok()
-            .and_then(|v| check_machine(&v).ok())
+            .and_then(|v| check_attrib(&v).ok())
     });
     from_env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M7 ревью задачи 2: путь поля и причина — отдельно; текст ошибки — `<путь>: <причина>`.
+    #[test]
+    fn config_error_field_and_reason() {
+        for (e, field) in [
+            (base_url("ftp://h:1").unwrap_err(), URL_FIELD),
+            (base_url("http://u:p@h:7700").unwrap_err(), URL_FIELD),
+            (ConfigError::Machine("пустое значение"), MACHINE_FIELD),
+        ] {
+            assert_eq!(e.field(), Some(field));
+            assert_eq!(e.to_string(), format!("{field}: {}", e.reason()));
+            assert!(!e.reason().contains(field), "{e}");
+            assert!(!e.reason().contains("u:p"), "{e}");
+        }
+        assert_eq!(ConfigError::Token.field(), None);
+        assert_eq!(
+            ConfigError::Token.to_string(),
+            format!("{TOKEN_ENV}: {}", ConfigError::Token.reason())
+        );
+        let c = ConfigError::Client("tls".into());
+        assert_eq!(c.field(), None);
+        assert_eq!(c.to_string(), c.reason());
+    }
+
+    /// Значения атрибуции (M12 ревью задачи 2: одна проверка для всех `X-Zam-*`).
+    #[test]
+    fn attrib_values_are_checked() {
+        assert_eq!(check_attrib("  ПК-1 ").as_deref(), Ok("ПК-1"));
+        assert_eq!(
+            check_attrib(&"я".repeat(128)).map(|s| s.chars().count()),
+            Ok(128)
+        );
+        for bad in [
+            String::new(),
+            "   ".to_owned(),
+            "a\nb".to_owned(),
+            "a\u{7f}b".to_owned(),
+            "x".repeat(129),
+        ] {
+            assert!(check_attrib(&bad).is_err(), "{bad:?}");
+        }
+    }
 }

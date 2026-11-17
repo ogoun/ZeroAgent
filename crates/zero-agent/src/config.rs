@@ -660,7 +660,9 @@ fn parse_memory(v: toml::Value) -> Result<MemoryConfig, AppConfigError> {
                 let Some(s) = value.as_str() else {
                     return Err(section_error(at, "ожидается строка"));
                 };
-                machine = Some(za_memory::config::check_machine(s).map_err(memory_error)?);
+                machine = Some(
+                    za_memory::config::check_attrib(s).map_err(|why| section_error(&at, why))?,
+                );
             }
             "enabled" => enabled = bool_at(&at, &value)?,
             other => return Err(unknown_key("memory", other, "url, machine или enabled")),
@@ -679,12 +681,12 @@ fn parse_memory(v: toml::Value) -> Result<MemoryConfig, AppConfigError> {
     })
 }
 
-/// Ошибка проверки `[memory]` из `za-memory` (`memory.url: …`) — как ошибка раздела.
+/// Ошибка проверки `[memory]` из `za-memory` — как ошибка раздела: путь поля и причина —
+/// методами ошибки, не разбором её текста (M7 ревью задачи 2); без поля — раздел `memory`.
 fn memory_error(e: za_memory::ConfigError) -> AppConfigError {
-    let text = e.to_string();
-    match text.split_once(": ") {
-        Some((at, reason)) if at.starts_with("memory.") => section_error(at, reason),
-        _ => section_error("memory", text),
+    match e.field() {
+        Some(at) => section_error(at, e.reason()),
+        None => section_error("memory", e.to_string()),
     }
 }
 

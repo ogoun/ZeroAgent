@@ -70,6 +70,13 @@ impl ServerInfo {
 }
 
 /// Итог обнаружения.
+///
+/// Инвариант полей (M12 ревью задачи 2): `level == L0` ⇔ `info.is_none()` ⇔
+/// `reason.is_some()` ⇔ `error.is_some()`. У L1 и L2 есть только `info`; у L0 — только
+/// причина текстом (`reason`, для людей) и видом (`error`, для порта: повторная проба по
+/// `Offline`, `Timeout`, `Interrupted`, 5xx — D137). Значения строят только [`from_health`] и
+/// ошибка обнаружения; при следующей правке интерфейса поля L0 можно свернуть в одно
+/// `l0: Option<(ErrorKind, String)>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovery {
     pub level: Level,
