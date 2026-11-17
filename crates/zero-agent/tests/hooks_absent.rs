@@ -9,6 +9,8 @@
 
 #![cfg(not(feature = "test-hooks"))]
 
+mod support;
+
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
@@ -24,7 +26,9 @@ fn home(name: &str) -> PathBuf {
 
 fn run(name: &str, args: &[&str]) -> Output {
     let home = home(name);
-    let out = Command::new(env!("CARGO_BIN_EXE_zero-agent"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zero-agent"));
+    support::process::strip_private_env(&mut cmd);
+    let out = cmd
         .args(args)
         .env("ZA_HOME", &home)
         .env_remove("LLAMA_URL")

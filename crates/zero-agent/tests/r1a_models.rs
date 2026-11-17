@@ -4,6 +4,8 @@
 //! llama-server и провайдер облака — axum в процессе теста (многопоточный runtime,
 //! пока основной поток ждёт бинарник). Облачных ключей и сети наружу нет.
 
+mod support;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -19,9 +21,8 @@ use axum::response::{IntoResponse, Response};
 use http_body::Frame;
 use serde_json::{Value, json};
 
-#[path = "../../../test-support/unique_dir.rs"]
-mod unique_dir;
-use unique_dir::unique_dir;
+// Общий помощник каталогов теста — тот же модуль, что у `support::process`.
+use support::process::unique_dir;
 
 /// Ключ, который не должен появиться ни в одном выводе.
 const KEY: &str = "sk-test-xyz";
@@ -210,8 +211,8 @@ impl Env {
         self.run_with(args, &[])
     }
 
-    /// Запуск бинарника; `LLAMA_URL`, `ZA_LOG`, `RUST_LOG` и ключи окружения тестов не
-    /// наследуются. Кэши cargo и uv (категории данных монитора) — пустые каталоги
+    /// Запуск бинарника; `LLAMA_URL`, `ZA_LOG`, `RUST_LOG`, ключи и переменные памяти
+    /// окружения тестов не наследуются ([`support::process::strip_private_env`]). Кэши cargo и uv (категории данных монитора) — пустые каталоги
     /// внутри теста: время первого замера не зависит от размера кэшей машины или CI.
     fn run_with(&self, args: &[&str], vars: &[(&str, &str)]) -> Output {
         let caches = self.home.with_extension("caches");
@@ -225,11 +226,7 @@ impl Env {
             .env_remove("LLAMA_URL")
             .env_remove("ZA_LOG")
             .env_remove("RUST_LOG");
-        for (k, _) in std::env::vars() {
-            if k.starts_with("ZA_SECRET_") {
-                cmd.env_remove(k);
-            }
-        }
+        support::process::strip_private_env(&mut cmd);
         for (k, v) in vars {
             cmd.env(k, v);
         }

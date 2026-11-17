@@ -62,6 +62,34 @@ pub fn env_in(group: &str, name: &str, config: &str) -> Env {
     e
 }
 
+/// Префиксы переменных окружения разработчика, которых бинарник теста не наследует: ключи
+/// `ZA_SECRET_*`, токен памяти агента `ZA_MEMORY_*` и переменные клиента `zam` (`ZAM_*`,
+/// R1-M D159) — как `za_jail::child_env` у детей агента.
+const PRIVATE_PREFIXES: [&str; 3] = ["ZA_SECRET_", "ZA_MEMORY_", "ZAM_"];
+
+/// Снимает с `cmd` переменные окружения процесса теста с префиксами
+/// [`PRIVATE_PREFIXES`]: токен владельца не уходит поддельному серверу и не ломает
+/// проверки «токена нет». Один помощник у всех запускателей бинарника в тестах (Minor 1
+/// ревью задачи 1 R1-M).
+pub fn strip_private_env(cmd: &mut Command) -> &mut Command {
+    strip_private_env_of(cmd, std::env::vars_os().map(|(k, _)| k))
+}
+
+/// [`strip_private_env`] по списку имён `names`: префикс без учёта регистра ASCII на любой
+/// ОС (`zam_token` — тоже), `ZAMBA_X` и `ZAM` остаются.
+pub fn strip_private_env_of(
+    cmd: &mut Command,
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> &mut Command {
+    for k in names {
+        let up = k.to_string_lossy().to_ascii_uppercase();
+        if PRIVATE_PREFIXES.iter().any(|p| up.starts_with(p)) {
+            cmd.env_remove(k);
+        }
+    }
+    cmd
+}
+
 /// Итог процесса бинарника.
 #[derive(Debug)]
 pub struct Out {
@@ -118,18 +146,8 @@ impl Env {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Ключи и токены окружения разработчика процессу не уходят: `ZA_SECRET_*`, токен
-        // памяти `ZA_MEMORY_*` и переменные клиента `zam` (`ZAM_*`, R1-M D159). Нужное тест
-        // задаёт сам через `vars`.
-        for (k, _) in std::env::vars_os() {
-            let up = k.to_string_lossy().to_ascii_uppercase();
-            if ["ZA_SECRET_", "ZA_MEMORY_", "ZAM_"]
-                .iter()
-                .any(|p| up.starts_with(p))
-            {
-                cmd.env_remove(k);
-            }
-        }
+        // Нужное тест задаёт сам через `vars`.
+        strip_private_env(&mut cmd);
         for k in remove {
             cmd.env_remove(k);
         }

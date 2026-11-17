@@ -5,6 +5,9 @@
 //! `ZA_HOME/projects/<project_id>/journal.db` (ARC-020) и после выхода
 //! бинарника открывается тестом напрямую.
 
+mod support;
+
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -14,9 +17,8 @@ use za_store::{NewRun, ProjectStore};
 use zero_agent::home::project_id;
 use zero_agent::journal::open_retrying;
 
-#[path = "../../../test-support/unique_dir.rs"]
-mod unique_dir;
-use unique_dir::unique_dir;
+// Общий помощник каталогов теста — тот же модуль, что у `support::process`.
+use support::process::unique_dir;
 
 /// Код выхода «нужно решение пользователя».
 const NEEDS_DECISION: i32 = 3;
@@ -29,6 +31,36 @@ struct Env {
 /// Чистые `ZA_HOME` и каталог проекта для теста.
 fn env(name: &str) -> Env {
     env_at(name, "home", "project")
+}
+
+/// R1-M D159, Minor 1 ревью задачи 1: общий помощник запускателей бинарника снимает
+/// `ZA_SECRET_*`, `ZA_MEMORY_*` и `ZAM_*` без учёта регистра ASCII; `ZAMBA_X`, `ZAM` и
+/// прочие переменные остаются.
+#[test]
+fn private_env_stripped_by_shared_helper() {
+    let names = [
+        "ZA_SECRET_T",
+        "za_memory_token",
+        "ZAM_URL",
+        "Zam_Token",
+        "ZAMBA_X",
+        "ZAM",
+        "ZA_MEMORYX",
+        "PATH",
+    ];
+    let mut cmd = Command::new("x");
+    support::process::strip_private_env_of(&mut cmd, names.iter().map(OsString::from));
+    // Имена — без учёта регистра: на Windows `Command` сравнивает их так же.
+    let mut got: Vec<String> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().to_ascii_uppercase())
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        ["ZAM_TOKEN", "ZAM_URL", "ZA_MEMORY_TOKEN", "ZA_SECRET_T"]
+    );
 }
 
 fn env_at(name: &str, home: &str, project: &str) -> Env {
@@ -46,8 +78,9 @@ impl Env {
         self.run_with(args, &[])
     }
 
-    /// Запуск бинарника с дополнительными переменными окружения; `ZA_LOG` и
-    /// `RUST_LOG` окружения тестов не наследуются.
+    /// Запуск бинарника с дополнительными переменными окружения; `ZA_LOG`, `RUST_LOG`,
+    /// ключи и переменные памяти окружения тестов не наследуются
+    /// ([`support::process::strip_private_env`]).
     fn run_with(&self, args: &[&str], vars: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_zero-agent"));
         cmd.args(args)
@@ -55,6 +88,7 @@ impl Env {
             .env_remove("LLAMA_URL")
             .env_remove("ZA_LOG")
             .env_remove("RUST_LOG");
+        support::process::strip_private_env(&mut cmd);
         for (k, v) in vars {
             cmd.env(k, v);
         }
@@ -314,7 +348,9 @@ fn journal_lives_outside_project() {
 #[test]
 fn doctor_warns_when_llama_is_down_and_exits_zero() {
     let e = env("doctor_down");
-    let o = Command::new(env!("CARGO_BIN_EXE_zero-agent"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zero-agent"));
+    support::process::strip_private_env(&mut cmd);
+    let o = cmd
         .args(["doctor", "--json"])
         .env("ZA_HOME", &e.home)
         .env("LLAMA_URL", "http://127.0.0.1:9")
