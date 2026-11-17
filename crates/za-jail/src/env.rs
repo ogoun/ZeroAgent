@@ -1,17 +1,28 @@
-//! Окружение дочернего процесса (D84): разрешённый набор вместо унаследованного целиком.
+//! Окружение дочернего процесса (D84; R1-M D159): разрешённый набор вместо унаследованного
+//! целиком; секреты агента и переменные памяти (`ZA_MEMORY_*`, `ZAM_*`) детям не уходят.
 
 use std::ffi::{OsStr, OsString};
 
 use crate::{CommandSpec, EnvMode};
 
-/// Префикс секретов: `ZA_SECRET_*` и `ZA_SECRETS_*` (и любое имя, начинающееся с него).
-const SECRET_PREFIX: &str = "ZA_SECRET";
+/// Префиксы имён, которые `EnvMode::Inherit` снимает без учёта регистра на любой
+/// платформе:
+/// - `ZA_SECRET` — секреты агента: `ZA_SECRET_*` и `ZA_SECRETS_*` (D84);
+/// - `ZA_MEMORY_` — переменные клиента памяти агента, прежде всего токен
+///   `ZA_MEMORY_TOKEN` (R1-M D134, D159);
+/// - `ZAM_` — переменные клиента `zam` ZeroAIMemory: `ZAM_URL`, `ZAM_TOKEN`,
+///   `ZAM_SESSION*`, `ZAM_MACHINE` и будущие (D159).
+///
+/// Префиксы памяти — с подчёркиванием: `ZAMBA_X` и `ZA_MEMORYX` остаются.
+const REMOVED_PREFIXES: &[&str] = &["ZA_SECRET", "ZA_MEMORY_", "ZAM_"];
 /// Переменные, которые `EnvMode::Inherit` снимает всегда: каталог данных агента, адрес
 /// его модели (`LLAMA_URL` может содержать учётные данные, ревью задачи 5 M9) и маркер
 /// дерева родителя (свой ставит `DirectRunner` на Linux).
 ///
-/// Ключи провайдеров пользователя (`*_API_KEY`, `*_TOKEN`) не снимаются: по D84 и
-/// SEC-041 собственные ключи агента живут только в `ZA_SECRET_*`.
+/// Прочие ключи провайдеров пользователя (`*_API_KEY`, `*_TOKEN`) не снимаются: по D84 и
+/// SEC-041 собственные секреты агента — `ZA_SECRET_*` и токен памяти `ZA_MEMORY_TOKEN`
+/// (снимаются по префиксу, [`REMOVED_PREFIXES`]), а `ZAM_TOKEN` клиента `zam` — тоже по
+/// префиксу (D159).
 const ALWAYS_REMOVED: &[&str] = &["ZA_HOME", "LLAMA_URL", "ZA_JAIL_CALL"];
 /// Единственные переменные родителя, которые переходят в `EnvMode::Clear`.
 const CLEAR_KEEP: &[&str] = &["PATH", "SystemRoot", "WINDIR"];
@@ -23,15 +34,16 @@ const NON_INTERACTIVE: &[(&str, &str)] =
 
 /// Окружение дочернего процесса из окружения-основы `base` (обычно `std::env::vars_os()`).
 ///
-/// - `EnvMode::Inherit`: всё из `base`, кроме секретов (`ZA_SECRET*`), `ZA_HOME`,
-///   `LLAMA_URL`, `ZA_JAIL_CALL` и `spec.remove_env`; плюс `GIT_TERMINAL_PROMPT=0`,
-///   `GCM_INTERACTIVE=never`.
+/// - `EnvMode::Inherit`: всё из `base`, кроме секретов (`ZA_SECRET*`), переменных памяти
+///   (`ZA_MEMORY_*`, `ZAM_*`, R1-M D159), `ZA_HOME`, `LLAMA_URL`, `ZA_JAIL_CALL` и
+///   `spec.remove_env`; плюс `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`.
 /// - `EnvMode::Clear`: из `base` — только `PATH`, `SystemRoot`, `WINDIR`.
 ///
 /// Затем `TMP`, `TEMP`, `TMPDIR` = `spec.tmp_dir` (если задан) и `spec.env_set` (заменяют
 /// одноимённые). `windows` — имена без учёта регистра (`Path` и `PATH` — одна переменная).
-/// Секреты снимаются без учёта регистра на любой платформе: `za_secret_x` на Unix — другое
-/// имя, но передавать его дочернему процессу незачем (консервативнее спецификации D84).
+/// Префиксы [`REMOVED_PREFIXES`] снимаются без учёта регистра на любой платформе:
+/// `za_secret_x` или `zam_token` на Unix — другие имена, но передавать их дочернему
+/// процессу незачем (консервативнее спецификации D84).
 pub fn child_env(
     base: impl Iterator<Item = (OsString, OsString)>,
     spec: &CommandSpec,
@@ -76,12 +88,14 @@ pub fn child_env(
     env
 }
 
-/// Имя секрета: начинается с `ZA_SECRET` без учёта регистра.
+/// Имя секрета или переменной памяти: начинается с одного из [`REMOVED_PREFIXES`] без
+/// учёта регистра.
 fn is_secret(name: &OsStr) -> bool {
     let n = name.to_string_lossy();
-    n.len() >= SECRET_PREFIX.len()
-        && n.is_char_boundary(SECRET_PREFIX.len())
-        && n[..SECRET_PREFIX.len()].eq_ignore_ascii_case(SECRET_PREFIX)
+    REMOVED_PREFIXES.iter().any(|p| {
+        n.get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p))
+    })
 }
 
 /// Одна ли это переменная: на Windows — без учёта регистра ASCII.

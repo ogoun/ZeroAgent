@@ -199,6 +199,8 @@ impl LoopDeps {
             roots: Roots {
                 project: PathBuf::new(),
                 za_home: PathBuf::new(),
+                home: None,
+                sealed: Vec::new(),
             },
             checkpointer: None,
             masker: None,

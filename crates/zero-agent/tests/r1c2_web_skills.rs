@@ -901,6 +901,27 @@ fn skill_activation_end_to_end() {
     assert!(r.contains(SKILL_BODY), "{r}");
 }
 
+/// R1-M D157: `ZA_HOME` — защищённое место для инструментов модели, но скиллы
+/// `ZA_HOME/skills` рантайм читает своими путями (D118): `activate_skill` скилла источника
+/// `user` работает, текст скилла — в результате вызова.
+#[test]
+fn user_skill_activation_with_sealed_home() {
+    let srv = Fake::start(N_CTX, true, activate_model);
+    let e = env_in(GROUP, "skill-user-sealed", &llama_config(&srv.base));
+    write(&e.home.join("skills/deploy-notes/SKILL.md"), SKILL_MD);
+    let o = e.run_cmd(&["Выпусти сервис"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let ev = activated(&e, run_id(&o));
+    assert_eq!(ev["name"], "deploy-notes", "{ev}");
+    assert_eq!(ev["source"], "user", "{ev}");
+    let r = result_of(&srv.bodies(), "k1");
+    assert!(
+        r.contains("<skill_content name=\"deploy-notes\" source=\"user\""),
+        "{r}"
+    );
+    assert!(r.contains(SKILL_BODY), "{r}");
+}
+
 /// `/имя` пользователя (D119): полный текст скилла дописан к сообщению пользователя уже в
 /// первом запросе, `skill.activated {by: "user"}`.
 #[test]

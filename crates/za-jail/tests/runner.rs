@@ -175,6 +175,51 @@ fn env_drops_secrets_case_insensitive_on_windows() {
     assert!(names(&env).contains(&"PATH".to_string()));
 }
 
+/// R1-M D159: переменные памяти — токен агента `ZA_MEMORY_TOKEN`, адрес, токен и сессия
+/// клиента `zam` (`ZAM_*`) — не наследуются ни на какой платформе, без учёта регистра.
+/// Префикс — с подчёркиванием: `ZAMBA_X` и `ZA_MEMORYX` остаются.
+#[test]
+fn memory_vars_not_inherited() {
+    let project = dir("env_memory");
+    let s = spec(&project, &[], Duration::from_secs(1));
+    let token = ["zam", "_", "t3st", "Fake0Value"].concat();
+    let vars = [
+        ("ZA_MEMORY_TOKEN", token.as_str()),
+        ("ZA_MEMORY_X", "v"),
+        ("za_memory_url", "v"),
+        ("ZAM_TOKEN", token.as_str()),
+        ("ZAM_URL", "http://evil.test"),
+        ("zam_session", "s"),
+        ("Zam_Machine", "m"),
+        ("ZAMBA_X", "keep"),
+        ("ZA_MEMORYX", "keep"),
+        ("ZAM", "keep"),
+        ("PATH", "p"),
+    ];
+    for windows in [true, false] {
+        let env = child_env(base(&vars), &s, windows);
+        let n = names(&env);
+        for gone in [
+            "ZA_MEMORY_TOKEN",
+            "ZA_MEMORY_X",
+            "za_memory_url",
+            "ZAM_TOKEN",
+            "ZAM_URL",
+            "zam_session",
+            "Zam_Machine",
+        ] {
+            assert!(!n.contains(&gone.to_string()), "{gone} windows={windows}");
+        }
+        for kept in ["ZAMBA_X", "ZA_MEMORYX", "ZAM", "PATH"] {
+            assert!(n.contains(&kept.to_string()), "{kept} windows={windows}");
+        }
+        assert!(
+            env.iter().all(|(_, v)| v.to_string_lossy() != token),
+            "значение токена ушло ребёнку"
+        );
+    }
+}
+
 #[test]
 fn spec_debug_hides_env_values() {
     let mut s = CommandSpec::new("x", ".", Duration::from_secs(1));

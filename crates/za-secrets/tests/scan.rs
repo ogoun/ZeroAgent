@@ -617,6 +617,60 @@ fn stream_mask_is_linear_on_long_word() {
     }
 }
 
+/// Тело фиктивного токена памяти: 40 символов base62 разных классов (R1-M D160).
+fn zam_body() -> String {
+    let b = j(&["Xq7Lm2Rt", "9Vb4Nc8K", "d3Wp6Zs1", "Hy5Gj0Ue", "4Ao2Fi7Q"]);
+    assert_eq!(b.len(), 40);
+    b
+}
+
+/// R1-M D160: токен ZeroAIMemory `zam_` + 40 символов base62 маскируется видом
+/// `zam_token` — в тексте, в строке присваивания, в JSON, перед переводом строки и после
+/// экранирования JSON; тело короче или длиннее 40 символов и неслучайное тело (одна буква,
+/// один класс символов, мало разных символов) — нет; слева нужна граница слова.
+#[test]
+fn zam_token_masked() {
+    let m = none();
+    let token = j(&["zam", "_", &zam_body()]);
+    for text in [
+        format!("token: {token} end"),
+        format!("ZA_MEMORY_TOKEN={token}"),
+        format!("{{\"token\":\"{token}\"}}"),
+        format!("{token}\nnext line"),
+        format!("a\\n{token}"),
+        format!("ZeroAIMemoryToken: {token}."),
+        token.clone(),
+    ] {
+        let out = m.mask(&text);
+        assert!(out.contains(&label("zam_token")), "{text} → {out}");
+        assert_no_part(&out, &zam_body());
+    }
+    // Токен с цифрами только в начале и без цифр вовсе — тоже маска: в теле из ОС-источника
+    // цифры может не быть (около 0,09 % токенов), проверка `random_looking` их бы пропустила.
+    let no_digit = j(&["zam", "_", "XqLmRtVbNcKdWpZsHyGjUeAoFiQxBnMvCkTrEwSy"]);
+    assert_eq!(no_digit.len(), 44);
+    assert!(
+        m.mask(&no_digit).contains(&label("zam_token")),
+        "{no_digit}"
+    );
+    let body = zam_body();
+    for text in [
+        j(&["zam", "_", &body[..39], " end"]),
+        j(&["zam", "_", &body, "Z"]),
+        j(&["zam", "_", &"a".repeat(40)]),
+        j(&["zam", "_", &"abcdefghij".repeat(4)]),
+        j(&["zam", "_", &"ABCDEFGHIJ".repeat(4)]),
+        j(&["zam", "_", &"0123456789".repeat(4)]),
+        j(&["zam", "_", &"ab1".repeat(13), "a"]),
+        j(&["xzam", "_", &body]),
+        j(&["my_zam", "_", &body]),
+        j(&["zam", "-", &body]),
+        "zam_session_id zam_token zam_".to_owned(),
+    ] {
+        assert_eq!(m.mask(&text), text.as_str(), "{text}");
+    }
+}
+
 /// Длинный незаконченный токен и блок PEM мелкими фрагментами: метка отдаётся сразу,
 /// продолжение пропускается, склейка равна маске целого текста.
 #[test]

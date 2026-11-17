@@ -5,6 +5,12 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-M, задача 1 (защита токена и клиента памяти, D155, D157–D160; ADR 0007):
+  - защищённые места памяти: `ZA_HOME` и `~/.zeroaimemory/` (`USERPROFILE` на Windows, `HOME` иначе) — нативные инструменты не читают, не ищут, не перечисляют и не пишут, `cwd` команды там — отказ `denied: protected path` даже по гранту, правилу `allow` и в `bypass`; слова команды `bash` с началом `~`, `$HOME`, `${HOME}`, `%USERPROFILE%`, `$env:USERPROFILE` и абсолютные пути туда — тот же отказ. `za-core`: `Roots.home`, `Roots.sealed`, `Roots::with_home`, `paths::sealed_place`; `<project>/.zeroaimemory/` защищён от нативной записи. Скиллы `ZA_HOME/skills` (`activate_skill`) рантайм читает по-прежнему;
+  - встроенный запрет клиента `zam` в `bash` (любой сегмент, вложенная интерпретация, обёртки, полный путь, `.exe`): `denied: memory client` (`za_protocol::deny_reason::MEMORY_CLIENT`); в снимок и хэш политики не входит;
+  - `run` отказывает, если каталог проекта внутри `ZA_HOME` или `~/.zeroaimemory/`;
+  - маска секретов знает токен ZeroAIMemory: `zam_` и 40 символов base62 → `[secret masked: zam_token]`;
+  - `zero_agent::home::user_home`.
 - R1-C2, финальный проход исправлений (три финальных ревью ветки, 2026-11-17):
   - `za-extract`: закреплённый корпус извлечения — генераторы десяти синтетических страниц (`tests/corpus/pages.rs`), тест `tests/corpus.rs` сверяет BLAKE3 вывода 17 страниц с `tests/corpus/expected.txt` (реальные — если их снимки есть в `.tmp/review7-pages`); `ZA_CORPUS_DUMP` пишет дампы, `ZA_UPDATE_GOLDEN=1` обновляет хэши (m4 ревью извлечения);
   - `za-skills`: каталог скилла, подключённый ссылкой или junction, — в пропущенных с причиной `linked skill directory` (`LINKED_SKILL_DIR`); `skills list` и `doctor` дают подсказку (I1 ревью скиллов);
@@ -242,6 +248,9 @@
 - `za-protocol`: `checkpoint_reason` — причины пропуска чекпоинта.
 
 ### Изменено
+- **Чтение `ZA_HOME` — отказ, а не вопрос** (R1-M, D157): прежде чтение `ZA_HOME` нативным инструментом или командой `bash` спрашивалось (`outside_project`), теперь — `denied: protected path` без вопроса, грант и `bypass` не действуют.
+- **Командам `bash` не передаются `ZA_MEMORY_*` и `ZAM_*`** (R1-M, D159): префиксы снимаются без учёта регистра на любой ОС, как `ZA_SECRET*`; `ZAMBA_X` остаётся.
+- **Версия промптов `r1m.1`** (R1-M, D155): в хэш вошёл текст `denied: memory client`; хэш — e08cf9f48672d5cf89d82262bac5f276234ee2a8fdd94cfe0d178444247b0825.
 - **Выравнивание таблиц — не больше 25 % вывода таблицы** (R1-C2, финальный проход, I2 ревью извлечения; Ruling прохода fix-10): иначе — та же таблица Markdown без пробелов дополнения. Корпус изменился на 7 из 17 страниц (только пробелы и тире таблиц): `wiki_states` 2 074 756 → 285 189 байт текста.
 - **Заголовок страницы — не длиннее 1 КиБ** и входит в бюджет вывода `htmd` вместе с текстом (R1-C2, m1 ревью извлечения).
 - **Строка скилла, снятого компакцией, на small** — `[skill "x" unloaded by compaction; the user can load it again with /x]`: `activate_skill` на small нет (R1-C2, m1 ревью fix-13). Хэш промптов `r1c2.1` — 743190981964a109dfb73be3b0711abcb0f51b10d024a8db77d2b45314a0a5ce.

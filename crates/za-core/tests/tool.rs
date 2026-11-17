@@ -303,9 +303,15 @@ fn protocol_strings_stable() {
         [
             deny_reason::PROTECTED_PATH,
             deny_reason::POLICY_RULE,
-            deny_reason::UNTRUSTED_PROJECT
+            deny_reason::UNTRUSTED_PROJECT,
+            deny_reason::MEMORY_CLIENT
         ],
-        ["protected path", "policy rule", "untrusted project"]
+        [
+            "protected path",
+            "policy rule",
+            "untrusted project",
+            "memory client"
+        ]
     );
     assert_eq!(
         [

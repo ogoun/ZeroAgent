@@ -296,6 +296,8 @@ pub(crate) fn fallback_roots(project: &Path) -> Roots {
     Roots {
         project: project.to_path_buf(),
         za_home: project.join(".zero-agent"),
+        home: None,
+        sealed: Vec::new(),
     }
 }
 
@@ -2777,6 +2779,8 @@ mod tests {
         let roots = Roots {
             project: PathBuf::from("/p"),
             za_home: PathBuf::from("/h"),
+            home: None,
+            sealed: Vec::new(),
         };
         let raw = [RawPath {
             arg: "/x/a".into(),

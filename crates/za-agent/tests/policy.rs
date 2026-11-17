@@ -19,7 +19,9 @@ use za_agent::{
     parse_grant_flag, runtime_texts, subject_paths,
 };
 use za_core::net::{normalize_host, shell_hosts};
-use za_core::paths::{ResolvedPath, Roots, classify, protected_place, resolve, within};
+use za_core::paths::{
+    ResolvedPath, Roots, classify, protected_place, resolve, sealed_place, within,
+};
 use za_core::shell::{self, Dialect};
 use za_core::{Access, Approval, RawPath, RiskClass, Subjects, ToolKind, ToolSchema, ToolSpec};
 use za_protocol::{
@@ -50,6 +52,18 @@ fn roots() -> Roots {
     Roots {
         project: abs("/proj"),
         za_home: abs("/home/u/.zero-agent-home"),
+        home: None,
+        sealed: Vec::new(),
+    }
+}
+
+/// Корни run бинарника (D157): домашний каталог пользователя `/home/u` и защищённое место
+/// клиента памяти `/home/u/.zeroaimemory` — так их заполняет `Roots::with_home`.
+fn sealed_roots() -> Roots {
+    Roots {
+        home: Some(abs("/home/u")),
+        sealed: vec![abs("/home/u/.zeroaimemory")],
+        ..roots()
     }
 }
 
@@ -113,12 +127,13 @@ fn search() -> (Subjects, Vec<ResolvedPath>) {
     (s, Vec::new())
 }
 
-/// Разрешённый путь без ввода-вывода: лексический разбор и признаки по корням.
+/// Разрешённый путь без ввода-вывода: лексический разбор и признаки по корням, как у
+/// `paths::resolve` (D79, D157): защищённое место — при любом доступе, прочие — от записи.
 fn rp(r: &Roots, arg: &str, access: Access) -> ResolvedPath {
     let path = classify(&r.project, arg).unwrap().as_path().to_path_buf();
     ResolvedPath {
         inside: within(&r.project, &path),
-        protected: access == Access::Write && protected_place(r, &path),
+        protected: sealed_place(r, &path) || (access == Access::Write && protected_place(r, &path)),
         path,
     }
 }
@@ -139,7 +154,11 @@ fn one(r: &Roots, arg: &str, access: Access) -> (Subjects, Vec<ResolvedPath>) {
 /// Предметы `bash` так, как их строит `za-tools` (D77, D81): сегменты, метки
 /// необратимости, слова-пути, сеть; пути разрешены лексически.
 fn bash(r: &Roots, cmd: &str) -> (Subjects, Vec<ResolvedPath>) {
-    let d = Dialect::Bash;
+    bash_in(r, cmd, Dialect::Bash)
+}
+
+/// [`bash`] в диалекте `d`: на Windows оболочка инструмента — PowerShell (D85).
+fn bash_in(r: &Roots, cmd: &str, d: Dialect) -> (Subjects, Vec<ResolvedPath>) {
     let root = r.project.clone();
     let segs = shell::segments(cmd, d);
     let outside = |w: &str| {
@@ -1244,22 +1263,26 @@ fn tilde_words_are_outside() {
     );
 }
 
+/// R1-C1 давал чтению `ZA_HOME` вопрос; с R1-M (D157) `ZA_HOME` — защищённое место:
+/// чтение и запись — Deny даже с грантом, глобальным `allow` и в `bypass`.
 #[test]
-fn za_home_read_asks_and_write_is_denied() {
+fn za_home_read_and_write_are_denied() {
     let r = roots();
     let inside_home = r.za_home.join("config.toml").to_string_lossy().into_owned();
     let all = Cx::new(RunMode::Bypass)
         .grants(vec![grant("/", GrantMode::Rw)])
         .policy(snap(vec![path_rule(RuleAction::Allow, &pat("/**"))]));
-    // Чтение ZA_HOME — Ask даже с грантом и глобальным allow.
+    // Чтение ZA_HOME — Deny, даже если разрешение пути не отметило защиту.
+    let (s, mut p) = one(&r, &inside_home, Access::Read);
+    p[0].protected = false;
     assert_eq!(
-        all.decide(&read_spec(), &one(&r, &inside_home, Access::Read)),
-        ask(&[ar::OUTSIDE_PROJECT])
+        all.decide(&read_spec(), &(s, p)),
+        Decision::Deny(deny_reason::PROTECTED_PATH)
     );
     let cmd = format!("cat {}", inside_home.replace('\\', "/"));
     assert_eq!(
         all.decide(&bash_spec(), &bash(&r, &cmd)),
-        ask(&[ar::OUTSIDE_PROJECT])
+        Decision::Deny(deny_reason::PROTECTED_PATH)
     );
     // Запись — Deny, даже если разрешение пути не отметило защиту.
     let (s, mut p) = one(&r, &inside_home, Access::Write);
@@ -1272,17 +1295,23 @@ fn za_home_read_asks_and_write_is_denied() {
     let nested = Roots {
         project: abs("/proj"),
         za_home: abs("/proj/.za"),
+        home: None,
+        sealed: Vec::new(),
     };
     let mut cx = Cx::new(RunMode::Auto);
     cx.roots = nested.clone();
-    assert_eq!(
-        cx.decide(&read_spec(), &one(&nested, ".za/x", Access::Read)),
-        ask(&[ar::OUTSIDE_PROJECT])
-    );
-    assert_eq!(
-        cx.decide(&edit_spec(), &one(&nested, ".za/x", Access::Write)),
-        Decision::Deny(deny_reason::PROTECTED_PATH)
-    );
+    for access in [Access::Read, Access::Write] {
+        let spec = if access == Access::Read {
+            read_spec()
+        } else {
+            edit_spec()
+        };
+        assert_eq!(
+            cx.decide(&spec, &one(&nested, ".za/x", access)),
+            Decision::Deny(deny_reason::PROTECTED_PATH),
+            "{access:?}"
+        );
+    }
 }
 
 #[test]
@@ -1325,6 +1354,8 @@ fn inside_is_ordinal_by_components() {
     let r = Roots {
         project: abs("/p/Kelvin"),
         za_home: abs("/home/za"),
+        home: None,
+        sealed: Vec::new(),
     };
     let mut cx = Cx::new(RunMode::Auto);
     cx.roots = r.clone();
@@ -1870,6 +1901,11 @@ fn policy_texts_are_hashed() {
         text("runtime/policy.denied_untrusted_project"),
         "denied: untrusted project"
     );
+    // R1-M D158: отказ клиенту памяти — в хэше промптов (D155).
+    assert_eq!(
+        text("runtime/policy.denied_memory_client"),
+        "denied: memory client"
+    );
     assert_eq!(text("runtime/policy.grants_none"), "none");
     assert_eq!(text("runtime/policy.grants"), "/data (ro)\n/srv (rw)");
     for (n, t) in &texts {
@@ -2095,5 +2131,338 @@ fn tool_pattern_ignores_case() {
     assert_eq!(
         cx.decide(&bash_spec(), &bash(&r, "ls")),
         Decision::Deny(deny_reason::POLICY_RULE)
+    );
+}
+
+// ---- R1-M D157, D158: защищённые места памяти и клиент `zam` ----
+
+/// Путь текущей ОС строкой через `/` (как его напишет модель).
+fn slash(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+fn glob_spec() -> ToolSpec {
+    spec("glob", ToolKind::Read, RiskClass::Read)
+}
+fn search_tool_spec() -> ToolSpec {
+    spec("search", ToolKind::Read, RiskClass::Read)
+}
+
+/// Контексты с корнями бинарника ([`sealed_roots`]): `bypass` с разрешением, грантами `rw`
+/// на весь диск и домашний каталог и глобальными `allow` по пути, инструменту и команде
+/// (в том числе `zam*`); обычные `auto` и `ask`.
+fn permissive() -> Vec<Cx> {
+    let mut wide = Cx::new(RunMode::Bypass)
+        .grants(vec![
+            grant("/", GrantMode::Rw),
+            grant("/home/u", GrantMode::Rw),
+        ])
+        .policy(snap(vec![
+            path_rule(RuleAction::Allow, &pat("/**")),
+            tool_rule(RuleAction::Allow, "*"),
+            cmd_rule(RuleAction::Allow, "*"),
+            cmd_rule(RuleAction::Allow, "zam*"),
+        ]));
+    wide.roots = sealed_roots();
+    let mut auto = Cx::new(RunMode::Auto);
+    auto.roots = sealed_roots();
+    let mut ask_mode = Cx::new(RunMode::Ask);
+    ask_mode.roots = sealed_roots();
+    vec![wide, auto, ask_mode]
+}
+
+/// D157: чтение `~/.zeroaimemory/` и `ZA_HOME` нативными инструментами — Deny("protected
+/// path") даже с грантом `rw` на домашний каталог, глобальным `allow` и в `bypass`; `glob`
+/// и `search` в `ZA_HOME` и `cwd` команды там — тоже. Политика сверяет место сама, даже
+/// если разрешение пути защиту не отметило.
+#[test]
+fn sealed_read_denied_even_with_grant() {
+    let r = sealed_roots();
+    let zam_cfg = slash(&abs("/home/u/.zeroaimemory/config.toml"));
+    let home_cfg = slash(&r.za_home.join("config.toml"));
+    let home_dir = slash(&r.za_home);
+    for cx in permissive() {
+        for (spec, arg) in [
+            (read_spec(), zam_cfg.clone()),
+            (read_spec(), home_cfg.clone()),
+            (glob_spec(), home_dir.clone()),
+            (search_tool_spec(), home_dir.clone()),
+            (glob_spec(), slash(&abs("/home/u/.zeroaimemory"))),
+        ] {
+            let (s, mut p) = one(&r, &arg, Access::Read);
+            assert!(p[0].protected, "{arg}: разрешение отмечает защиту");
+            assert_eq!(
+                cx.decide(&spec, &(s.clone(), p.clone())),
+                Decision::Deny(deny_reason::PROTECTED_PATH),
+                "{} {arg} {:?}",
+                spec.schema.name,
+                cx.mode
+            );
+            p[0].protected = false;
+            assert_eq!(
+                cx.decide(&spec, &(s, p)),
+                Decision::Deny(deny_reason::PROTECTED_PATH),
+                "{} {arg}: политика повторяет проверку",
+                spec.schema.name
+            );
+        }
+        // `cwd` команды в защищённом месте — тоже.
+        let s = Subjects {
+            cwd: Some(slash(&abs("/home/u/.zeroaimemory"))),
+            command: Some("ls".into()),
+            segments: shell::segments("ls", Dialect::Bash),
+            ..Subjects::default()
+        };
+        let p = subject_paths(&s)
+            .iter()
+            .map(|x| rp(&r, &x.arg, x.access))
+            .collect();
+        assert_eq!(
+            cx.decide(&bash_spec(), &(s, p)),
+            Decision::Deny(deny_reason::PROTECTED_PATH)
+        );
+    }
+    // Соседние места не защищены: прочий домашний каталог — вне проекта, вопрос.
+    let auto = &permissive()[1];
+    for other in ["/home/u/notes.txt", "/home/u/.zeroaimemory-x/a"] {
+        assert_eq!(
+            auto.decide(&read_spec(), &one(&r, &slash(&abs(other)), Access::Read)),
+            ask(&[ar::OUTSIDE_PROJECT]),
+            "{other}"
+        );
+    }
+}
+
+/// D157: слова команды `bash` с началом `~`, `$HOME`, `${HOME}`, `%USERPROFILE%`,
+/// `$env:USERPROFILE` раскрываются лексически по домашнему каталогу корней, абсолютные —
+/// как есть; слово внутри защищённого места — Deny("protected path") при любых грантах,
+/// правилах и режимах. Значения опций, цели перенаправлений, тела подстановок и строка
+/// вложенной интерпретации — тоже.
+#[test]
+fn bash_words_into_sealed_denied() {
+    let r = sealed_roots();
+    let za_cfg = slash(&r.za_home.join("config.toml"));
+    let zam_abs = slash(&abs("/home/u/.zeroaimemory/config.toml"));
+    let both: &[Dialect] = &[Dialect::Bash, Dialect::PowerShell];
+    let pwsh: &[Dialect] = &[Dialect::PowerShell];
+    let bash_only: &[Dialect] = &[Dialect::Bash];
+    let mut table: Vec<(String, &[Dialect])> = vec![
+        ("cat ~/.zeroaimemory/config.toml".into(), both),
+        ("cat ~/.zeroaimemory".into(), both),
+        ("cat ~/../u/.zeroaimemory/config.toml".into(), both),
+        (r"type %USERPROFILE%\.zeroaimemory\config.toml".into(), pwsh),
+        (
+            r"cmd /c type %USERPROFILE%\.zeroaimemory\config.toml".into(),
+            pwsh,
+        ),
+        ("type %USERPROFILE%/.zeroaimemory/config.toml".into(), both),
+        (
+            "Get-Content $env:USERPROFILE/.zeroaimemory/config.toml".into(),
+            both,
+        ),
+        (
+            r"Get-Content -Path:$env:USERPROFILE\.zeroaimemory\config.toml".into(),
+            pwsh,
+        ),
+        ("cat ${env:USERPROFILE}/.zeroaimemory/x".into(), both),
+        ("cat $HOME/.zeroaimemory/x".into(), both),
+        ("cat ${HOME}/.zeroaimemory/x".into(), both),
+        ("cat \"$HOME/.zeroaimemory/x\"".into(), both),
+        (format!("cat {za_cfg}"), both),
+        (format!("cat {zam_abs}"), both),
+        ("echo x > ~/.zeroaimemory/config.toml".into(), both),
+        ("rg --file=~/.zeroaimemory/config.toml x".into(), both),
+        ("cd ~/.zeroaimemory && cat config.toml".into(), both),
+        ("sh -c \"cat ~/.zeroaimemory/config.toml\"".into(), both),
+        ("echo $(cat ~/.zeroaimemory/config.toml)".into(), bash_only),
+    ];
+    if cfg!(windows) {
+        table.push(("cat ~/.ZeroAIMemory/config.toml".into(), both));
+        table.push((r"type $HOME\.zeroaimemory\config.toml".into(), pwsh));
+    }
+    for cx in permissive() {
+        for (cmd, dialects) in &table {
+            for d in dialects.iter() {
+                assert_eq!(
+                    cx.decide(&bash_spec(), &bash_in(&r, cmd, *d)),
+                    Decision::Deny(deny_reason::PROTECTED_PATH),
+                    "{d:?} {cmd:?} {:?}",
+                    cx.mode
+                );
+            }
+        }
+    }
+    // Прочие слова с домашним каталогом решаются как раньше: `~` — вне проекта, вопрос;
+    // `$HOMEDIR` и `~other` — не домашний каталог; `.zeroaimemory` проекта читается.
+    let auto = &permissive()[1];
+    for d in both.iter().copied() {
+        assert_eq!(
+            auto.decide(&bash_spec(), &bash_in(&r, "cat ~/.ssh/config", d)),
+            ask(&[ar::OUTSIDE_PROJECT]),
+            "{d:?}"
+        );
+        for cmd in [
+            "cat $HOME/notes.txt",
+            "echo $HOMEDIR/.zeroaimemory/x",
+            "echo ~other/.zeroaimemory/x",
+            "cat .zeroaimemory/solution.toml",
+        ] {
+            let got = auto.decide(&bash_spec(), &bash_in(&r, cmd, d));
+            assert!(!matches!(got, Decision::Deny(_)), "{d:?} {cmd}: {got:?}");
+        }
+    }
+    // Без домашнего каталога корней (`LoopDeps::new`) `~` не раскрывается, а `ZA_HOME`
+    // по-прежнему защищён.
+    let plain = roots();
+    let cx = Cx::new(RunMode::Auto);
+    assert_eq!(
+        cx.decide(&bash_spec(), &bash(&plain, &format!("cat {za_cfg}"))),
+        Decision::Deny(deny_reason::PROTECTED_PATH)
+    );
+    assert_eq!(
+        cx.decide(
+            &bash_spec(),
+            &bash(&plain, "cat ~/.zeroaimemory/config.toml")
+        ),
+        ask(&[ar::OUTSIDE_PROJECT])
+    );
+}
+
+/// D158: вызов клиента памяти `zam` в `bash` — Deny("memory client") в любом сегменте, во
+/// вложенной интерпретации, сквозь обёртки, по полному пути, с `.exe`, в любом регистре.
+/// Глобальное `allow command="zam*"`, `bypass`, гранты и недоверенный проект запрет не
+/// снимают и не превращают в вопрос.
+#[test]
+fn zam_client_denied_table() {
+    let r = sealed_roots();
+    let both: &[Dialect] = &[Dialect::Bash, Dialect::PowerShell];
+    let pwsh: &[Dialect] = &[Dialect::PowerShell];
+    let bash_only: &[Dialect] = &[Dialect::Bash];
+    let table: Vec<(&str, &[Dialect])> = vec![
+        ("zam vault get k", both),
+        ("ZAM.EXE search x", both),
+        (r"C:\tools\zam.exe search x", pwsh),
+        ("C:/tools/zam.exe search x", both),
+        ("/usr/local/bin/zam search", both),
+        ("env zam search", both),
+        ("sudo zam search", both),
+        ("timeout 5 zam search", both),
+        ("sh -c \"zam search x\"", both),
+        ("bash -c 'echo a; zam x'", both),
+        ("pwsh -Command \"zam search x\"", both),
+        ("cmd /c zam search", both),
+        ("echo x | zam search", both),
+        ("ls && zam search", both),
+        ("x=$(zam search)", bash_only),
+        ("eval \"zam search\"", bash_only),
+        ("iex \"zam search\"", pwsh),
+        (r"& 'C:\tools\zam.exe' search", pwsh),
+        ("zam.cmd search", both),
+    ];
+    let mut cxs = permissive();
+    let mut untrusted = Cx::new(RunMode::Auto).untrusted(false);
+    untrusted.roots = r.clone();
+    cxs.push(untrusted);
+    for cx in &cxs {
+        for (cmd, dialects) in &table {
+            for d in dialects.iter() {
+                assert_eq!(
+                    cx.decide(&bash_spec(), &bash_in(&r, cmd, *d)),
+                    Decision::Deny(deny_reason::MEMORY_CLIENT),
+                    "{d:?} {cmd:?} {:?}",
+                    cx.mode
+                );
+            }
+        }
+    }
+    // Корни без домашнего каталога — запрет тот же: он не зависит от путей.
+    assert_eq!(
+        Cx::new(RunMode::Bypass).decide(&bash_spec(), &bash(&roots(), "zam search x")),
+        Decision::Deny(deny_reason::MEMORY_CLIENT)
+    );
+}
+
+/// D158: корпус ложных срабатываний — слово `zam` не в позиции имени команды и имена,
+/// лишь начинающиеся на `zam`, запретом клиента не считаются.
+#[test]
+fn zam_false_positives_table() {
+    let r = sealed_roots();
+    let mut auto = Cx::new(RunMode::Auto);
+    auto.roots = r.clone();
+    for d in [Dialect::Bash, Dialect::PowerShell] {
+        for cmd in [
+            "zamba",
+            "zam-cli --help",
+            "zamx search",
+            "grep zam f.txt",
+            "echo zam",
+            "git log --grep zam",
+            "cargo build -p zam-cli",
+            "cat zam.txt",
+            "ls zam",
+        ] {
+            let got = auto.decide(&bash_spec(), &bash_in(&r, cmd, d));
+            assert!(!matches!(got, Decision::Deny(_)), "{d:?} {cmd}: {got:?}");
+        }
+    }
+}
+
+/// D158: встроенный запрет не входит в снимок политики и её хэш — golden хэш R1-C1
+/// прежний, правил о `zam` в снимке нет, снимок пустой конфигурации пуст.
+#[test]
+fn policy_hash_unchanged_by_builtin_rule() {
+    let empty = PolicySnapshot::build(&PolicyConfig::default(), None).unwrap();
+    assert!(empty.rules.is_empty(), "{:?}", empty.rules);
+    let global: PolicyConfig = serde_json::from_value(json!({
+        "allow_bypass": true,
+        "rules": [
+            {"action": "allow", "command": "cargo test*"},
+            {"action": "ask", "tool": "edit"},
+            {"action": "deny", "path": "secrets/**"},
+            {"action": "deny", "tool": "bash", "command": "rm *", "path": "/data/**"},
+        ],
+        "grants": [
+            {"path": "/data", "mode": "ro", "reason": "r"},
+            {"path": "/srv", "mode": "rw"},
+        ],
+    }))
+    .unwrap();
+    let project: PolicyConfig = serde_json::from_value(json!({
+        "rules": [
+            {"action": "ask", "command": "git push*"},
+            {"action": "allow", "tool": "bash"},
+        ],
+    }))
+    .unwrap();
+    let s = PolicySnapshot::build(&global, Some(&project)).unwrap();
+    assert_eq!(s.hash, include_str!("golden/policy_r1c1.hash").trim());
+    assert_eq!(s.rules.len(), 5, "{:?}", s.rules);
+    assert!(
+        s.rules
+            .iter()
+            .all(|(_, r)| !r.command.as_deref().is_some_and(|c| c.contains("zam"))),
+        "{:?}",
+        s.rules
+    );
+}
+
+/// D157: `<project>/.zeroaimemory/` — нативная запись Deny, чтение разрешено.
+#[test]
+fn project_zeroaimemory_write_denied_read_allowed() {
+    let r = sealed_roots();
+    let mut cx = Cx::new(RunMode::Bypass);
+    cx.roots = r.clone();
+    let (s, mut p) = one(&r, ".zeroaimemory/solution.toml", Access::Write);
+    p[0].protected = false;
+    assert_eq!(
+        cx.decide(&edit_spec(), &(s, p)),
+        Decision::Deny(deny_reason::PROTECTED_PATH)
+    );
+    assert_eq!(
+        cx.decide(
+            &read_spec(),
+            &one(&r, ".zeroaimemory/solution.toml", Access::Read)
+        ),
+        Decision::Allow
     );
 }

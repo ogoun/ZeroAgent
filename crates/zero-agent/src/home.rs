@@ -43,6 +43,20 @@ fn za_home_from(var: impl Fn(&str) -> Option<OsString>, windows: bool) -> Result
     base.map(|b| b.join(APP_DIR)).ok_or(NoHome)
 }
 
+/// Домашний каталог пользователя для защищённых мест памяти (R1-M D157): `USERPROFILE` на
+/// Windows, `HOME` иначе — так его ищет клиент `zam` (там его `.zeroaimemory/config.toml`
+/// с токеном). Пустое значение и отсутствие переменной — `None`: тогда и клиенту `zam`
+/// домашнего каталога не найти.
+pub fn user_home() -> Option<PathBuf> {
+    user_home_from(|k| std::env::var_os(k), cfg!(windows))
+}
+
+/// [`user_home`] с явным окружением и платформой (для тестов).
+fn user_home_from(var: impl Fn(&str) -> Option<OsString>, windows: bool) -> Option<PathBuf> {
+    let name = if windows { "USERPROFILE" } else { "HOME" };
+    var(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
 /// Идентификатор проекта: первые 16 hex-символов BLAKE3 от канонического пути
 /// каталога (байты пути в кодировке ОС). Каталог должен существовать.
 pub fn project_id(dir: &Path) -> std::io::Result<String> {
@@ -115,5 +129,19 @@ mod tests {
     fn no_home_is_an_error() {
         assert_eq!(za_home_from(env(&[]), true), Err(NoHome));
         assert_eq!(za_home_from(env(&[]), false), Err(NoHome));
+    }
+
+    /// D157: домашний каталог — как у клиента `zam`: `USERPROFILE` на Windows (даже если
+    /// задан `HOME`, как в Git Bash), `HOME` иначе; пустое значение — нет каталога.
+    #[test]
+    fn user_home_like_zam_client() {
+        let e = env(&[("USERPROFILE", "C:/Users/u"), ("HOME", "/home/u")]);
+        assert_eq!(user_home_from(&e, true), Some(PathBuf::from("C:/Users/u")));
+        assert_eq!(user_home_from(&e, false), Some(PathBuf::from("/home/u")));
+        let only_home = env(&[("HOME", "/home/u")]);
+        assert_eq!(user_home_from(&only_home, true), None);
+        let empty = env(&[("USERPROFILE", ""), ("HOME", "")]);
+        assert_eq!(user_home_from(&empty, true), None);
+        assert_eq!(user_home_from(&empty, false), None);
     }
 }

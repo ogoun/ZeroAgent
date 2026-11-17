@@ -735,6 +735,18 @@ const RULES: &[Rule] = &[
         right_boundary: false,
         check: None,
     },
+    Rule {
+        // Токен ZeroAIMemory (R1-M D160): `zam_` и ровно 40 символов base62 из
+        // ОС-источника случайности (`zam-core/src/token.rs`). Так маскируется и токен
+        // агента, и токен клиента `zam`, если его прочли в обход D157 и D158.
+        prefixes: &["zam_"],
+        kind: "zam_token",
+        body: Class::Alnum,
+        min: 40,
+        max: 40,
+        right_boundary: true,
+        check: Some(mixed_random),
+    },
 ];
 
 /// Индексы «мёртвых до» для особых правил после [`RULES`].
@@ -760,6 +772,38 @@ fn random_looking(body: &[u8]) -> bool {
         .unwrap_or(0);
     digit && alnum >= 32 && run >= 16
 }
+
+/// Тело токена фиксированной длины из base62 похоже на случайное (R1-M D160): в нём
+/// символы хотя бы двух классов из трёх (цифры, строчные, прописные) и не меньше
+/// [`MIN_DISTINCT`] разных символов. Повтор одной буквы, слово одного регистра, одни
+/// цифры — нет. В отличие от [`random_looking`] цифра не обязательна: 40 символов base62
+/// без цифры выпадают у ~0,09 % настоящих токенов, а два класса и 10 разных символов не
+/// набираются с вероятностью порядка 1e-15. Проверка монотонна: хвост тела, не прошедшего
+/// её, тоже не проходит.
+fn mixed_random(body: &[u8]) -> bool {
+    let classes = [
+        body.iter().any(u8::is_ascii_digit),
+        body.iter().any(u8::is_ascii_lowercase),
+        body.iter().any(u8::is_ascii_uppercase),
+    ]
+    .into_iter()
+    .filter(|&c| c)
+    .count();
+    let mut seen = [false; 128];
+    let mut distinct = 0;
+    for &c in body {
+        if let Some(s) = seen.get_mut(usize::from(c))
+            && !*s
+        {
+            *s = true;
+            distinct += 1;
+        }
+    }
+    classes >= 2 && distinct >= MIN_DISTINCT
+}
+
+/// Наименьшее число разных символов тела у [`mixed_random`].
+const MIN_DISTINCT: usize = 10;
 
 /// Токен после `Bearer `: есть цифра (не слово прозы).
 fn opaque_token(body: &[u8]) -> bool {

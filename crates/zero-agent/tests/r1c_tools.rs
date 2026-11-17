@@ -1074,6 +1074,124 @@ fn unc_path_rejected_without_io() {
     assert!(outside_lines(&o.stderr).is_empty(), "{o:?}");
 }
 
+// ---- R1-M D157, D158: защищённые места памяти и клиент `zam` ----
+
+/// Домашний каталог пользователя и `ZA_HOME` из задачи: `ZAMTEST |<home>|<za_home>|`.
+fn zam_marker(seen: &[Value]) -> (String, String) {
+    let text = messages(seen.first().expect("нет запроса"))
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(content)
+        .find(|t| t.contains("ZAMTEST |"))
+        .expect("нет задачи ZAMTEST");
+    let rest = &text[text.find("ZAMTEST |").unwrap() + "ZAMTEST |".len()..];
+    let mut parts = rest.split('|');
+    (
+        parts.next().unwrap().to_owned(),
+        parts.next().unwrap().to_owned(),
+    )
+}
+
+/// Модель: один пакет попыток добраться до токена — `read` и `glob` в
+/// `~/.zeroaimemory/`, `read` в `ZA_HOME`, `zam` в `bash`, `cat` по `~` и по переменной
+/// домашнего каталога, — затем ответ.
+fn zam_model(seen: &[Value]) -> Response {
+    let cur = seen.last().unwrap();
+    if tool_results(Some(cur)) > 0 {
+        return text_reply(&["готово"]);
+    }
+    let (home, za_home) = zam_marker(std::slice::from_ref(cur));
+    let by_var = if cfg!(windows) {
+        "Get-Content $env:USERPROFILE/.zeroaimemory/config.toml"
+    } else {
+        "cat $HOME/.zeroaimemory/config.toml"
+    };
+    calls_reply(&[
+        call(
+            "r1",
+            "read",
+            json!({"path": format!("{home}/.zeroaimemory/config.toml")}),
+        ),
+        call(
+            "g1",
+            "glob",
+            json!({"pattern": format!("{home}/.zeroaimemory/*.toml")}),
+        ),
+        call(
+            "r2",
+            "read",
+            json!({"path": format!("{za_home}/config.toml")}),
+        ),
+        call("b1", "bash", json!({"cmd": "zam search token"})),
+        call(
+            "b2",
+            "bash",
+            json!({"cmd": "cat ~/.zeroaimemory/config.toml"}),
+        ),
+        call("b3", "bash", json!({"cmd": by_var})),
+    ])
+}
+
+/// R1-M D157, D158 в бинарнике: корни run знают домашний каталог (`USERPROFILE` на
+/// Windows, `HOME` иначе — как клиент `zam`). Чтение и `glob` в `~/.zeroaimemory/` и
+/// `ZA_HOME` — `denied: protected path` в режиме `bypass` с грантом `rw` на домашний
+/// каталог; `zam` в `bash` — `denied: memory client`; слова `~` и `$env:USERPROFILE` /
+/// `$HOME` — `denied: protected path`. Ни один вызов не исполнен, вопросов нет, токен из
+/// `~/.zeroaimemory/config.toml` не уходит модели.
+#[test]
+fn memory_places_and_client_denied() {
+    let c = Case::new("zam-denied", zam_model);
+    c.trust();
+    let user = unique_dir(SUITE, "zam-user");
+    std::fs::create_dir_all(user.join(".zeroaimemory")).unwrap();
+    let token = ["zam", "_", "Xq7Lm2Rt9Vb4Nc8Kd3Wp", "6Zs1Hy5Gj0Ue4Ao2Fi7Q"].concat();
+    std::fs::write(
+        user.join(".zeroaimemory").join("config.toml"),
+        format!("url = \"http://127.0.0.1:9\"\ntoken = \"{token}\"\n"),
+    )
+    .unwrap();
+    let cfg = std::fs::read_to_string(c.e.home.join("config.toml")).unwrap();
+    std::fs::write(
+        c.e.home.join("config.toml"),
+        format!("{cfg}\n[policy]\nallow_bypass = true\n"),
+    )
+    .unwrap();
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let user_s = shown(&user).to_string_lossy().replace('\\', "/");
+    let za_s = shown(&c.e.home).to_string_lossy().replace('\\', "/");
+    let grant = format!("{}=rw", shown(&user).display());
+    let c = c.var(home_var, &shown(&user).to_string_lossy());
+    let task = format!("Найди токен памяти ZAMTEST |{user_s}|{za_s}|");
+    let o = c.run(&["--mode", "bypass", "--grant", &grant, &task]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    assert_eq!(o.stdout, "готово\n", "{o:?}");
+    let bodies = c.bodies();
+    for id in ["r1", "g1", "r2", "b2", "b3"] {
+        let r = result_of(&bodies, id);
+        assert!(r.contains("denied: protected path"), "{id}: {r}");
+    }
+    let r = result_of(&bodies, "b1");
+    assert!(r.contains("denied: memory client"), "b1: {r}");
+    let events = c.e.events(run_id(&o));
+    assert_eq!(count(&events, EventKind::ToolStarted), 0, "{events:?}");
+    assert_eq!(count(&events, EventKind::InterruptOpened), 0, "{events:?}");
+    for b in &bodies {
+        assert!(!b.to_string().contains(&token[4..]), "токен ушёл модели");
+    }
+}
+
+/// D157: проект внутри `ZA_HOME` — отказ старта run с причиной, к модели нет запросов.
+#[test]
+fn project_inside_za_home_refused() {
+    let c = Case::new("zam-sealed-project", zam_model);
+    let inner = c.e.home.join("proj");
+    std::fs::create_dir_all(&inner).unwrap();
+    let o = c.za(&["run", "--project", inner.to_str().unwrap(), "задача"]);
+    assert_eq!(o.code(), Some(1), "{o:?}");
+    assert!(o.stderr.contains("внутри защищённого места"), "{o:?}");
+    assert!(c.bodies().is_empty(), "{:?}", c.bodies());
+}
+
 // ---- Живой llama-server ----
 
 /// Ручная проверка S4 без памяти (задача 14, шаг 3): настоящая модель чинит `calc.txt` в

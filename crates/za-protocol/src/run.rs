@@ -93,8 +93,12 @@ pub mod approval_reason {
 ///
 /// Значения — часть протокола, менять строки нельзя.
 pub mod deny_reason {
-    /// Нативная запись в защищённый путь (D79).
+    /// Нативная запись в защищённый путь (D79) или любой доступ к защищённому месту
+    /// памяти: `ZA_HOME`, `~/.zeroaimemory/` (R1-M D157).
     pub const PROTECTED_PATH: &str = "protected path";
+    /// Вызов клиента памяти `zam` в `bash` (R1-M D158): встроенный запрет, его не снимают
+    /// правила, гранты и `bypass`.
+    pub const MEMORY_CLIENT: &str = "memory client";
     /// Сработало правило `deny` (D80).
     pub const POLICY_RULE: &str = "policy rule";
     /// Пользователь отказал проекту в доверии (D83).

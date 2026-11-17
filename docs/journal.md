@@ -2,6 +2,20 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-17. R1-M, задача 1: защита токена и клиента памяти — защищённые места, запрет `zam`, окружение детей, шаблон маски
+
+Бриф — `.superpowers/sdd/2026-11-16-r1m-memory/task-1-brief.md`, отчёт — `task-1-report.md` рядом. Решения D155, D157–D160 (шаблон маски), Ruling 1; ADR 0007, раздел «Токен и клиент `zam`».
+
+- **Защищённые места (D157).** `Roots` получил `home` и `sealed`; `Roots::with_home` канонизирует домашний каталог и кладёт в `sealed` `<home>/.zeroaimemory` (и цель, если это ссылка или junction). `paths::sealed_place` — `ZA_HOME` или `sealed`; `resolve` ставит `protected` при любом доступе, политика повторяет проверку. Бинарник берёт домашний каталог как клиент `zam` (`USERPROFILE` на Windows, `HOME` иначе, `home::user_home`); проект внутри защищённого места — отказ старта (`RunError::SealedProject`). `<project>/.zeroaimemory/` — только от записи. Поведение изменилось: чтение `ZA_HOME` прежде спрашивалось (`outside_project`), теперь — `denied: protected path`; тест `za_home_read_asks_and_write_is_denied` стал `za_home_read_and_write_are_denied`.
+- **Слова `bash`.** `za_shell::path_words` слов `$HOME/…`, `%USERPROFILE%…`, `$env:USERPROFILE…` не отдаёт (`path_like`), поэтому места сверяются по `command_words` политики: все слова сегментов, цели перенаправлений, значения опций; начала `~`, `$HOME`, `${HOME}`, `%USERPROFILE%`, `$env:USERPROFILE`, `${env:USERPROFILE}`, `$env:HOME`, `${env:HOME}` раскрываются лексически, хвост делится по `/` и `\` на любой ОС. Правила `deny` с `path` видят те же раскрытые слова — только ужесточение.
+- **`zam` (D158).** Шаг 1 `decide`: `za_shell::argv0` любого сегмента равно `zam` — `Deny("memory client")`. Проба разбора показала, что `segments` уже отдаёт вложенный код (`sh -c`, `pwsh -Command`, `cmd /c`, `eval`, `iex`) и тела подстановок отдельными сегментами: таблица брифа покрыта без правок `za-shell`. В bash-диалекте `C:\tools\zam.exe` теряет `\` (как и в настоящем bash) — эта форма проверяется в PowerShell. Хэш политики прежний (`policy_r1c1.hash`).
+- **Окружение (D159).** `za_jail::child_env` снимает `ZA_MEMORY_` и `ZAM_` без учёта регистра на любой ОС; тесты бинарника (`support/process.rs`) — тоже.
+- **Маска (D160).** Правило `zam_` + ровно 40 символов base62 с правой границей, вид `zam_token`. Проверка тела — `mixed_random` (два класса из трёх, ≥ 10 разных символов) вместо `random_looking`: последняя требует цифру, а её нет у ~0,09 % настоящих токенов. Отступление записано в ADR 0007.
+- **Хэш промптов (D155).** `PROMPT_VERSION = "r1m.1"`, `golden/prompts.hash`: `e08cf9f48672d5cf89d82262bac5f276234ee2a8fdd94cfe0d178444247b0825` (новый текст `runtime/policy.denied_memory_client`).
+- **Мутации.** Снятый запрет `zam` и `protected` слов роняют ровно `bash_words_into_sealed_denied` и `zam_client_denied_table`; бинарник без домашнего каталога роняет `memory_places_and_client_denied` (код 3, вопрос `outside_project`).
+- **Остаточный риск, найденный при работе:** `search` и `glob` с корнем выше защищённого места (проект — домашний каталог) заходят в него при обходе — инструменты обхода защищённых мест не знают. Токен в выводе закрывает маска; доработка — передать `sealed` инструментам обхода (вне задачи 1).
+- **Прогоны** (Windows, общий `target/`): `cargo test --workspace --locked --no-fail-fast` — 116 наборов, 1909 passed, 0 failed, 9 ignored; с признаком `test-hooks`: `zero-agent` — 219 passed, 3 ignored, `za-tools` — 153, `za-web` — 110, `za-extract` — 87 (1 ignored); `za-llm --no-default-features` — 108; fmt, clippy (с признаками и без), `cargo check -p za-core`, `-p za-agent`, `xtask policy`, `xtask prompt-budget` (50 случаев в лимитах), `cargo deny check` — зелёные.
+
 ## 2026-11-17. R1-C2, проход fix-final-b: повторное ревью финального прохода
 
 Бриф — `.superpowers/sdd/2026-11-11-r1c2-skills-web/fix-final-b-brief.md`, отчёт — `fix-final-b-report.md` рядом. Находки — `final-fix-review-extract.md` (часть A) и `final-fix-review-rest.md` (часть B).

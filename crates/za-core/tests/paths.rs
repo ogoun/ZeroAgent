@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use za_core::Access;
 use za_core::paths::{
     LexPath, PathError, Platform, ResolvedPath, Roots, classify, classify_with, display, home_dir,
-    open_checked, resolve, within, work_dir,
+    open_checked, resolve, sealed_place, within, work_dir,
 };
 
 #[path = "../../../test-support/unique_dir.rs"]
@@ -928,4 +928,142 @@ fn za_home_dotdot_after_missing_is_normalized() {
     let target = base.join("u").join("zah").join("config.toml");
     let lex = classify(&project, &target.to_string_lossy()).unwrap();
     assert!(resolve(&roots, &lex, Access::Write).unwrap().protected);
+}
+
+// ---- R1-M D157: защищённые места памяти ----
+
+/// Проект, `ZA_HOME` и домашний каталог пользователя с `.zeroaimemory/config.toml`
+/// (каталог клиента `zam`); корни — с домашним каталогом ([`Roots::with_home`]).
+struct Sealed {
+    f: Fixture,
+    user: PathBuf,
+}
+
+fn sealed_fixture(name: &str) -> Sealed {
+    let f = fixture(name);
+    let user = f.project.parent().unwrap().join("user");
+    std::fs::create_dir_all(user.join(".zeroaimemory")).unwrap();
+    std::fs::write(user.join(".zeroaimemory").join("config.toml"), "x").unwrap();
+    std::fs::write(f.home.join("config.toml"), "x").unwrap();
+    let roots = f.roots.clone().with_home(&user).unwrap();
+    Sealed {
+        f: Fixture { roots, ..f },
+        user,
+    }
+}
+
+fn arg(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// D157: `~/.zeroaimemory/` и `ZA_HOME` — любой доступ, не только запись; корни знают
+/// домашний каталог, `sealed` — канонический `<home>/.zeroaimemory`.
+#[test]
+fn sealed_denies_any_access() {
+    let s = sealed_fixture("sealed_any");
+    let zam = arg(&s.user.join(".zeroaimemory").join("config.toml"));
+    for access in [Access::Read, Access::Write, Access::Exec] {
+        assert!(res(&s.f, &zam, access).protected, "{access:?}");
+        let dir = arg(&s.user.join(".zeroaimemory"));
+        assert!(res(&s.f, &dir, access).protected, "{access:?} каталог");
+    }
+    let za = arg(&s.f.home.join("config.toml"));
+    assert!(res(&s.f, &za, Access::Read).protected);
+    assert!(res(&s.f, &arg(&s.f.home), Access::Read).protected);
+    // Соседи защищённого места — не защищены: `.zeroaimemory-x` и сам домашний каталог.
+    let near = arg(&s.user.join(".zeroaimemory-x").join("a"));
+    assert!(!res(&s.f, &near, Access::Read).protected);
+    assert!(!res(&s.f, &arg(&s.user.join("notes.txt")), Access::Read).protected);
+    let canon_user = std::fs::canonicalize(&s.user).unwrap();
+    assert_eq!(
+        s.f.roots.home.as_deref().map(|h| within(h, &canon_user)),
+        Some(true)
+    );
+    assert!(
+        s.f.roots
+            .sealed
+            .iter()
+            .any(|p| p.ends_with(".zeroaimemory")),
+        "{:?}",
+        s.f.roots.sealed
+    );
+    // Функция политики — та же проверка по каноническому пути.
+    let r = res(&s.f, &zam, Access::Read);
+    assert!(sealed_place(&s.f.roots, &r.path));
+    let p = res(&s.f, "src/a.rs", Access::Read);
+    assert!(!sealed_place(&s.f.roots, &p.path));
+    // Корни без домашнего каталога: `ZA_HOME` защищён, `.zeroaimemory` — нет.
+    let plain = Roots::canonical(&s.f.project, &s.f.home).unwrap();
+    assert!(plain.home.is_none() && plain.sealed.is_empty());
+    assert!(
+        resolve(&plain, &classify(&s.f.project, &za).unwrap(), Access::Read)
+            .unwrap()
+            .protected
+    );
+}
+
+/// D157: защищённое место сверяется по каноническому пути — через junction или
+/// символическую ссылку в проекте, в другом регистре (Windows) и когда сам
+/// `.zeroaimemory` — ссылка на другой каталог.
+#[test]
+fn sealed_through_link_and_case() {
+    let s = sealed_fixture("sealed_link");
+    dir_link(&s.f.project.join("l"), &s.user.join(".zeroaimemory"));
+    let r = res(&s.f, "l/config.toml", Access::Read);
+    assert!(r.protected && !r.inside, "{}", r.path.display());
+    dir_link(&s.f.project.join("h"), &s.f.home);
+    assert!(res(&s.f, "h/config.toml", Access::Read).protected);
+    #[cfg(windows)]
+    {
+        let upper = arg(&s.user.join(".ZEROAIMEMORY").join("CONFIG.TOML")).to_uppercase();
+        assert!(res(&s.f, &upper, Access::Read).protected, "{upper}");
+        let missing = arg(&s.user.join(".ZeroAIMemory").join("new.toml"));
+        assert!(res(&s.f, &missing, Access::Write).protected, "{missing}");
+        let home_upper = arg(&s.f.home.join("CONFIG.TOML")).to_uppercase();
+        assert!(res(&s.f, &home_upper, Access::Read).protected);
+    }
+    // `.zeroaimemory` — ссылка на каталог вне домашнего: защищён и настоящий каталог.
+    let base = s.f.project.parent().unwrap().to_path_buf();
+    let real = base.join("real-zam");
+    let user2 = base.join("user2");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::create_dir_all(&user2).unwrap();
+    std::fs::write(real.join("config.toml"), "x").unwrap();
+    dir_link(&user2.join(".zeroaimemory"), &real);
+    let roots = Roots::canonical(&s.f.project, &s.f.home)
+        .unwrap()
+        .with_home(&user2)
+        .unwrap();
+    let f2 = Fixture {
+        project: s.f.project.clone(),
+        home: s.f.home.clone(),
+        outside: s.f.outside.clone(),
+        roots,
+    };
+    for p in [
+        real.join("config.toml"),
+        user2.join(".zeroaimemory").join("config.toml"),
+    ] {
+        assert!(
+            res(&f2, &arg(&p), Access::Read).protected,
+            "{}",
+            p.display()
+        );
+    }
+}
+
+/// D157: `<project>/.zeroaimemory/` (привязка к решению, D135) — запись нативными
+/// инструментами запрещена, чтение разрешено.
+#[test]
+fn project_zeroaimemory_write_protected_read_allowed() {
+    let s = sealed_fixture("project_zam");
+    std::fs::create_dir_all(s.f.project.join(".zeroaimemory")).unwrap();
+    for rel in [".zeroaimemory/solution.toml", ".zeroaimemory/area.toml"] {
+        assert!(res(&s.f, rel, Access::Write).protected, "{rel}");
+        let r = res(&s.f, rel, Access::Read);
+        assert!(!r.protected && r.inside, "{rel}");
+    }
+    assert!(!res(&s.f, ".zeroaimemory-x/a", Access::Write).protected);
+    #[cfg(windows)]
+    assert!(res(&s.f, ".ZeroAIMemory/solution.toml", Access::Write).protected);
 }

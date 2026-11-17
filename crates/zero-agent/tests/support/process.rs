@@ -89,9 +89,9 @@ impl Env {
         self.project.to_str().unwrap()
     }
 
-    /// Запуск бинарника с пределом [`process_limit`]; `LLAMA_URL`, `ZA_LOG`, `RUST_LOG`
-    /// и ключи окружения тестов не наследуются. Кэши cargo и uv (категории монитора
-    /// ресурсов) — пустые каталоги теста.
+    /// Запуск бинарника с пределом [`process_limit`]; `LLAMA_URL`, `ZA_LOG`, `RUST_LOG`,
+    /// ключи окружения тестов и переменные памяти (`ZA_MEMORY_*`, `ZAM_*`) не наследуются.
+    /// Кэши cargo и uv (категории монитора ресурсов) — пустые каталоги теста.
     pub fn run(&self, args: &[&str]) -> Out {
         self.run_with(args, &[])
     }
@@ -118,8 +118,15 @@ impl Env {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (k, _) in std::env::vars() {
-            if k.starts_with("ZA_SECRET_") {
+        // Ключи и токены окружения разработчика процессу не уходят: `ZA_SECRET_*`, токен
+        // памяти `ZA_MEMORY_*` и переменные клиента `zam` (`ZAM_*`, R1-M D159). Нужное тест
+        // задаёт сам через `vars`.
+        for (k, _) in std::env::vars_os() {
+            let up = k.to_string_lossy().to_ascii_uppercase();
+            if ["ZA_SECRET_", "ZA_MEMORY_", "ZAM_"]
+                .iter()
+                .any(|p| up.starts_with(p))
+            {
                 cmd.env_remove(k);
             }
         }

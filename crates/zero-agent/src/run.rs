@@ -40,6 +40,10 @@
 //! `web_disabled` и `search_host` и сверяется с действующим снимком у нового run и у
 //! каждого resume (I1 ревью задачи 14). Печать: строки `web.request` (D112), `skill.activated`
 //! (D122) и предупреждение о тире standard на окне меньше 32k (D169).
+//!
+//! R1-M (задача 1): корни run знают домашний каталог пользователя (`Roots::with_home` по
+//! [`crate::home::user_home`]) — `ZA_HOME` и `~/.zeroaimemory/` защищены от любого доступа
+//! инструментов модели (D157); проект внутри защищённого места — [`RunError::SealedProject`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -153,6 +157,13 @@ pub enum RunError {
     /// Сетевой шлюз не построен (D107): неверные настройки `[web]`.
     #[error("веб: {0}")]
     Web(#[from] za_web::WebError),
+    /// Каталог проекта внутри защищённого места (R1-M D157): `ZA_HOME` или
+    /// `~/.zeroaimemory/` — там инструменты агента не работают.
+    #[error(
+        "каталог проекта {} внутри защищённого места (ZA_HOME или ~/.zeroaimemory): инструменты агента туда не обращаются; запустите run в другом каталоге",
+        display_path(.0)
+    )]
+    SealedProject(PathBuf),
 }
 
 /// Точка аварийного завершения `--crash-at` (D33; только для тестов).
@@ -502,9 +513,23 @@ async fn prepare(
     }
     let roots = blocking("корни проекта", project, {
         let (p, h) = (project.to_path_buf(), za_home.to_path_buf());
-        move || Roots::canonical(&p, &h)
+        let user = home::user_home();
+        move || {
+            let roots = Roots::canonical(&p, &h)?;
+            match user {
+                Some(u) => roots.with_home(&u),
+                None => {
+                    tracing::warn!("домашний каталог пользователя не задан: ~/.zeroaimemory не защищён по пути (D157)");
+                    Ok(roots)
+                }
+            }
+        }
     })
     .await?;
+    // Проект внутри защищённого места (D157): любой вызов был бы отказом.
+    if paths::sealed_place(&roots, &roots.project) {
+        return Err(RunError::SealedProject(roots.project.clone()));
+    }
     let project_id = home::project_id(project).map_err(|source| RunError::Io {
         what: "каталог проекта",
         path: project.to_path_buf(),

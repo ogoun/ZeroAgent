@@ -1,5 +1,6 @@
-//! Пути вызовов (R1-C1 D76, D79, D98): разбор аргумента модели, граница проекта,
-//! защищённые пути, рабочие каталоги агента и безопасное открытие файла.
+//! Пути вызовов (R1-C1 D76, D79, D98; R1-M D157): разбор аргумента модели, граница
+//! проекта, защищённые пути и места памяти (`ZA_HOME`, `~/.zeroaimemory/` — без доступа,
+//! [`sealed_place`]), рабочие каталоги агента и безопасное открытие файла.
 //!
 //! Два этапа:
 //! 1. [`classify`] — чистая функция без ввода-вывода. Сетевые пути (UNC, `\\?\UNC\`),
@@ -76,7 +77,7 @@ impl LexPath {
 }
 
 /// Разрешённый путь вызова: канонический путь, внутри ли он проекта и защищён ли он
-/// от нативной записи (D79).
+/// (D79: от нативной записи; R1-M D157: защищённое место — от любого доступа).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPath {
     pub path: PathBuf,
@@ -84,16 +85,26 @@ pub struct ResolvedPath {
     pub protected: bool,
 }
 
-/// Канонические корни run (D76, Ruling 7.9): проект и `ZA_HOME`.
+/// Канонические корни run (D76, Ruling 7.9): проект и `ZA_HOME`; с R1-M (D157) — ещё
+/// домашний каталог пользователя и защищённые места памяти.
 #[derive(Debug, Clone)]
 pub struct Roots {
     pub project: PathBuf,
     pub za_home: PathBuf,
+    /// Домашний каталог пользователя (канонический): по нему политика раскрывает `~`,
+    /// `$HOME`, `%USERPROFILE%` в словах команды `bash` (D157). `None` — не задан
+    /// (`Roots::canonical` без [`Roots::with_home`]): слова не раскрываются.
+    pub home: Option<PathBuf>,
+    /// Защищённые места, кроме `ZA_HOME` (D157): `<home>/.zeroaimemory` — каталог клиента
+    /// `zam` с полным токеном пользователя, — и его каноническая цель, если сам каталог —
+    /// ссылка или junction. Нативный инструмент не делает там ничего ([`sealed_place`]).
+    pub sealed: Vec<PathBuf>,
 }
 
 impl Roots {
     /// Канонизирует корни (блокирующая). Проект должен существовать; `ZA_HOME` — нет:
-    /// канонизируется самый длинный существующий префикс.
+    /// канонизируется самый длинный существующий префикс. Домашнего каталога и
+    /// защищённых мест памяти нет — их добавляет [`Roots::with_home`].
     ///
     /// Корни разрешаются так же, как пути вызовов ([`resolve`]): проект на сетевом диске
     /// или за ссылкой на UNC — ошибка, а не корень `\\?\UNC\…` (M5 ревью).
@@ -109,12 +120,49 @@ impl Roots {
         }
         let project = canonical_prefix(&p).map_err(io::Error::other)?;
         let za_home = canonical_prefix(&std::path::absolute(za_home)?).map_err(io::Error::other)?;
-        Ok(Roots { project, za_home })
+        Ok(Roots {
+            project,
+            za_home,
+            home: None,
+            sealed: Vec::new(),
+        })
+    }
+
+    /// Корни с домашним каталогом пользователя `home` (D157; блокирующая): `home`
+    /// канонизируется, как `ZA_HOME` (может ещё не существовать; сетевой диск — ошибка),
+    /// `sealed` = `[<home>/.zeroaimemory]`. Если `.zeroaimemory` — ссылка или junction,
+    /// в `sealed` добавляется и её каноническая цель: путь через цель сверяется после
+    /// канонизации, а слово команды — лексически по `<home>/.zeroaimemory`. Цель, которую
+    /// разрешить нельзя (сетевая, висячая ссылка), — `warn`: путь через неё и так не
+    /// разрешится ([`resolve`] — ошибка), защита по лексическому месту остаётся.
+    ///
+    /// `za-core` окружение не читает: `home` передаёт бинарник (`USERPROFILE` на Windows,
+    /// `HOME` иначе — как ищет его клиент `zam`).
+    pub fn with_home(self, home: &Path) -> io::Result<Roots> {
+        let _drives = DriveScope::enter();
+        let home = canonical_prefix(&std::path::absolute(home)?).map_err(io::Error::other)?;
+        let place = home.join(ZAM_DIR);
+        let mut sealed = vec![place.clone()];
+        match canonical_prefix(&place) {
+            Ok(real) if real != place => sealed.push(real),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(place = %place.display(), error = %e, "цель защищённого места памяти не разрешена");
+            }
+        }
+        Ok(Roots {
+            home: Some(home),
+            sealed,
+            ..self
+        })
     }
 }
 
 /// Каталог служебных файлов проекта.
 const ZA_DIR: &str = ".zero-agent";
+/// Каталог ZeroAIMemory (D157): в домашнем каталоге — конфигурация клиента `zam` с
+/// токеном (защищённое место), в проекте — привязка к решению (защищён от записи, D135).
+const ZAM_DIR: &str = ".zeroaimemory";
 /// Рабочие файлы агента внутри [`ZA_DIR`]: запись туда не защищена.
 const WORK: &str = "work";
 /// Каталог репозитория git.
@@ -592,19 +640,26 @@ fn is_missing(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::NotADirectory
 }
 
-/// Разрешение пути (D76, D79). Блокирующая: вызывать только в `spawn_blocking`.
+/// Разрешение пути (D76, D79, D157). Блокирующая: вызывать только в `spawn_blocking`.
 ///
 /// `inside` — путь внутри канонического корня проекта, сравнение ординальное (I1);
-/// `protected` — нативная запись (`Access::Write`) в `ZA_HOME`, `<project>/.zero-agent/`
-/// кроме `.zero-agent/work/` или `<project>/.git/`. Защищённые места сравниваются на
-/// Windows без учёта регистра (ошибка такого сравнения — в безопасную сторону: ещё не
-/// созданный `.ZERO-AGENT` — тот же каталог NTFS). Сверяются канонические пути, поэтому
-/// защита действует и через ссылку, junction, короткое имя 8.3 и другой регистр.
+/// `protected` — любой доступ к защищённому месту ([`sealed_place`]: `ZA_HOME`,
+/// `~/.zeroaimemory/`) или нативная запись (`Access::Write`) в `<project>/.zero-agent/`
+/// кроме `.zero-agent/work/`, `<project>/.git/`, `<project>/.zeroaimemory/`. Защищённые
+/// места сравниваются на Windows без учёта регистра (ошибка такого сравнения — в
+/// безопасную сторону: ещё не созданный `.ZERO-AGENT` — тот же каталог NTFS). Сверяются
+/// канонические пути, поэтому защита действует и через ссылку, junction, короткое имя 8.3
+/// и другой регистр.
+///
+/// Вызывающий с корнями `Roots::canonical(d, d)` (`ZA_HOME` = проект: чтение скиллов,
+/// набор доверия, AGENTS.md) получает `protected` у каждого пути и на `protected` не
+/// смотрит: это корни для границы, а не для политики.
 pub fn resolve(roots: &Roots, lex: &LexPath, access: Access) -> Result<ResolvedPath, PathError> {
     let _drives = DriveScope::enter();
     let path = canonical_prefix(lex.as_path())?;
     let inside = within(&roots.project, &path);
-    let protected = access == Access::Write && protected_place(roots, &path);
+    let protected =
+        sealed_place(roots, &path) || (access == Access::Write && protected_place(roots, &path));
     Ok(ResolvedPath {
         path,
         inside,
@@ -612,14 +667,31 @@ pub fn resolve(roots: &Roots, lex: &LexPath, access: Access) -> Result<ResolvedP
     })
 }
 
-/// Канонический путь `p` лежит в защищённом месте D79: `ZA_HOME`, `<project>/.zero-agent/`
-/// кроме `.zero-agent/work/`, `<project>/.git/`. Чистая функция; на Windows без учёта
-/// регистра (ошибка — в безопасную сторону). Её же повторно применяет политика (D80).
+/// Канонический путь `p` защищён от нативной записи (D79, D157): защищённое место
+/// ([`sealed_place`]), `<project>/.zero-agent/` кроме `.zero-agent/work/`,
+/// `<project>/.git/`, `<project>/.zeroaimemory/` (привязка к решению меняется только
+/// командой `memory init`, D135). Чистая функция; на Windows без учёта регистра (ошибка —
+/// в безопасную сторону). Её же повторно применяет политика (D80).
 pub fn protected_place(roots: &Roots, p: &Path) -> bool {
     let za = roots.project.join(ZA_DIR);
+    let fold = cfg!(windows);
+    sealed_place(roots, p)
+        || (within_with(&za, p, fold) && !within(&za.join(WORK), p))
+        || within_with(&roots.project.join(GIT_DIR), p, fold)
+        || within_with(&roots.project.join(ZAM_DIR), p, fold)
+}
+
+/// Канонический путь `p` лежит в защищённом месте (R1-M D157): `ZA_HOME` или одно из
+/// [`Roots::sealed`] (`~/.zeroaimemory/`). Там нативный инструмент не делает ничего —
+/// ни чтения, ни списка, ни поиска, ни записи; грант и `bypass` не действуют. Чистая
+/// функция, на Windows без учёта регистра; её же повторно применяет политика к путям
+/// вызова и к словам команды `bash`.
+pub fn sealed_place(roots: &Roots, p: &Path) -> bool {
     in_za_home(roots, p)
-        || (within_with(&za, p, cfg!(windows)) && !within(&za.join(WORK), p))
-        || within_with(&roots.project.join(GIT_DIR), p, cfg!(windows))
+        || roots
+            .sealed
+            .iter()
+            .any(|s| within_with(s, p, cfg!(windows)))
 }
 
 /// Канонический путь `p` лежит в `ZA_HOME` агента; на Windows без учёта регистра.

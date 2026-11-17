@@ -8,7 +8,13 @@
 //! эффектов в ней нет (D30): при реплее то же состояние даёт то же решение (D92).
 //!
 //! Порядок (D80): ранний выход только у `Deny`, у прерывания доверия и у `Allow`.
-//! 1. Защищённый путь — `Deny("protected path")`.
+//! 1. Встроенные запреты, которые не снимают ни правила, ни гранты, ни `bypass`, и которых
+//!    нет в снимке политики и её хэше:
+//!    - защищённый путь — `Deny("protected path")`: нативная запись в защищённый путь
+//!      (D79), любой доступ к защищённому месту памяти `ZA_HOME`, `~/.zeroaimemory/` и
+//!      слово команды `bash` внутри него (R1-M D157);
+//!    - клиент памяти — `Deny("memory client")`: имя команды любого сегмента `bash` —
+//!      `zam` (R1-M D158).
 //! 2. Любое правило `deny` — `Deny("policy rule")`.
 //! 3. Запрет режима ([`gate`], D14) — `Deny`.
 //! 4. `Exec` в недоверенном проекте — [`Decision::Trust`], после отказа —
@@ -653,8 +659,11 @@ struct CallPath {
     /// Вне проекта, `~` команды или `ZA_HOME`.
     outside: bool,
     /// Вне проекта так, что грант и `allow` не снимают: `~` команды (путь неизвестен до
-    /// оболочки) или чтение `ZA_HOME` (защищённое место, D79).
+    /// оболочки) или `ZA_HOME` (защищённое место, D79, D157).
     pinned: bool,
+    /// Встроенный запрет пути (шаг 1 [`decide`]): у пути вызова — по разрешению и
+    /// [`paths::protected_place`] / [`paths::sealed_place`], у слова команды — только
+    /// защищённое место памяти (D157).
     protected: bool,
 }
 
@@ -666,7 +675,8 @@ struct Call<'a> {
     segments: &'a [Segment],
     paths: Vec<CallPath>,
     /// Все слова-аргументы и цели перенаправлений сегментов команды, разобранные
-    /// лексически: по ним сверяются правила `deny` с `path` (Ruling: слова bash).
+    /// лексически ([`command_words`]): по ним сверяются правила `deny` с `path` (Ruling:
+    /// слова bash) и защищённые места памяти (D157).
     words: Vec<CallPath>,
     /// Разрешение не соответствует [`subject_paths`]: граница неизвестна.
     unresolved: bool,
@@ -712,7 +722,10 @@ fn call_of<'a>(
                 rel: inside.then(|| paths::display(project, &p.path)),
                 outside: !inside || tilde || home,
                 pinned: tilde || home,
+                // Повтор проверки `resolve` (D80, D157): защищённое место — при любом
+                // доступе, прочие защищённые пути — от записи.
                 protected: p.protected
+                    || paths::sealed_place(cx.roots, &p.path)
                     || (r.access == Access::Write && paths::protected_place(cx.roots, &p.path)),
                 // Команда с путём может в него писать (`cp`, `tee`, `sed -i`): грант `ro`
                 // её не покрывает (I1 ревью, решение заказчика (а)).
@@ -738,9 +751,17 @@ fn call_of<'a>(
     }
 }
 
-/// Слова сегментов команды как пути (лексически, без ввода-вывода): относительные — от
-/// `cwd`, если он задан. Слово, которое [`paths::classify`] отвергает, пропускается.
-/// Только для сверки `deny` с `path`: граница считается по [`subject_paths`].
+/// Слова сегментов команды как пути (лексически, без ввода-вывода): все слова `argv`,
+/// цели перенаправлений и значения опций (`--file=…`, `-Path:…`, `of=…`) каждого сегмента
+/// — в том числе тел подстановок и строки вложенной интерпретации, которые [`Subjects`]
+/// несёт отдельными сегментами (D81). Относительные — от `cwd`, если он задан; слово с
+/// началом домашнего каталога ([`HOME_PREFIXES`]) раскрывается по [`Roots::home`].
+/// Слово, которое [`paths::classify`] отвергает, пропускается.
+///
+/// Слова сверяются с правилами `deny` по `path` и с защищёнными местами памяти
+/// ([`paths::sealed_place`], D157: `CallPath::protected`). Граница проекта считается по
+/// [`subject_paths`]. Косвенные пути (переменные, подстановки, `cd` и относительный путь)
+/// не ловятся — best effort (SEC-002, ADR 0007).
 fn command_words(cx: &PolicyCx<'_>, s: &Subjects) -> Vec<CallPath> {
     let project = &cx.roots.project;
     let base = s
@@ -754,31 +775,99 @@ fn command_words(cx: &PolicyCx<'_>, s: &Subjects) -> Vec<CallPath> {
             .redirects
             .iter()
             .map(|r| r.trim_start_matches(|c: char| c.is_ascii_digit() || "<>&|".contains(c)));
-        for w in seg.argv.iter().map(String::as_str).chain(redirects) {
-            if w.is_empty() {
-                continue;
+        for word in seg.argv.iter().map(String::as_str).chain(redirects) {
+            for w in word_values(word) {
+                let path = match cx.roots.home.as_deref().and_then(|h| home_word(h, w)) {
+                    Some(p) => p,
+                    None => match paths::classify(&base, w) {
+                        Ok(lex) => lex.as_path().to_path_buf(),
+                        Err(_) => continue,
+                    },
+                };
+                let inside = paths::within(project, &path);
+                let abs = slashed(&path.to_string_lossy());
+                if out.iter().any(|p| p.abs == abs) {
+                    continue;
+                }
+                out.push(CallPath {
+                    abs,
+                    rel: inside.then(|| paths::display(project, &path)),
+                    outside: !inside,
+                    pinned: false,
+                    protected: paths::sealed_place(cx.roots, &path),
+                    cover: Access::Write,
+                    path,
+                });
             }
-            let Ok(lex) = paths::classify(&base, w) else {
-                continue;
-            };
-            let path = lex.as_path().to_path_buf();
-            let inside = paths::within(project, &path);
-            let abs = slashed(&path.to_string_lossy());
-            if out.iter().any(|p| p.abs == abs) {
-                continue;
-            }
-            out.push(CallPath {
-                abs,
-                rel: inside.then(|| paths::display(project, &path)),
-                outside: !inside,
-                pinned: false,
-                protected: false,
-                cover: Access::Write,
-                path,
-            });
         }
     }
     out
+}
+
+/// Слово и его значение-путь: после первого `=` (`--file=…`, `of=…`) и у опции после
+/// первого `:` (`-Path:…` PowerShell). Пустые не выдаются.
+fn word_values(w: &str) -> impl Iterator<Item = &str> {
+    let eq = w.split_once('=').map(|(_, v)| v);
+    let colon = w
+        .starts_with('-')
+        .then(|| w.split_once(':').map(|(_, v)| v))
+        .flatten();
+    std::iter::once(w)
+        .chain(eq)
+        .chain(colon)
+        .filter(|v| !v.is_empty())
+}
+
+/// Начала слов команды, которые оболочка раскрывает в домашний каталог пользователя
+/// (D157, best effort): `~` (bash, PowerShell), `$HOME` и `${HOME}` (bash; в PowerShell —
+/// автоматическая переменная), `%USERPROFILE%` (cmd), `$env:USERPROFILE`,
+/// `${env:USERPROFILE}`, `$env:HOME`, `${env:HOME}` (PowerShell). Сравнение без учёта
+/// регистра ASCII (так у PowerShell и cmd; в bash `$home` — другая переменная, ошибка в
+/// безопасную сторону). За началом — конец слова или разделитель `/`, `\`; `~user`,
+/// `$HOMEDIR` — не домашний каталог.
+const HOME_PREFIXES: [&str; 8] = [
+    "~",
+    "$HOME",
+    "${HOME}",
+    "%USERPROFILE%",
+    "$env:USERPROFILE",
+    "${env:USERPROFILE}",
+    "$env:HOME",
+    "${env:HOME}",
+];
+
+/// Слово с началом из [`HOME_PREFIXES`] — путь от домашнего каталога `home`, лексически
+/// нормализованный; хвост делится и по `/`, и по `\` на любой ОС (в безопасную сторону).
+/// Иначе `None`.
+fn home_word(home: &Path, w: &str) -> Option<PathBuf> {
+    let rest = HOME_PREFIXES.iter().find_map(|p| {
+        let head = w.get(..p.len())?;
+        let rest = &w[p.len()..];
+        (head.eq_ignore_ascii_case(p) && (rest.is_empty() || rest.starts_with(['/', '\\'])))
+            .then_some(rest)
+    })?;
+    let rel = rest.replace('\\', "/");
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() {
+        return Some(home.to_path_buf());
+    }
+    paths::classify(home, rel)
+        .ok()
+        .map(|l| l.as_path().to_path_buf())
+}
+
+/// Имя команды клиента ZeroAIMemory (D158) — как его даёт [`shell::argv0`]: без пути,
+/// `.exe` и регистра.
+const MEMORY_CLIENT_NAME: &str = "zam";
+
+/// Сегмент вызывает клиент памяти `zam` (D158): имя команды по [`shell::argv0`] — сквозь
+/// обёртки (`env`, `sudo`, `timeout`, оператор вызова `&`), без пути, `.exe` и регистра.
+/// Сегменты внутреннего кода (`sh -c`, `bash -c`, `pwsh -Command`, `cmd /c`, `eval`,
+/// `iex`) и тела подстановок [`shell::segments`] отдаёт отдельными сегментами следом за
+/// своим, поэтому проверка каждого сегмента их покрывает. Имя из переменной или
+/// подстановки, непрозрачный код и переименованный бинарник не ловятся (ADR 0007).
+fn memory_client_segment(seg: &Segment) -> bool {
+    shell::argv0(seg).is_some_and(|n| n == MEMORY_CLIENT_NAME)
 }
 
 // ---- Гранты ----
@@ -939,9 +1028,13 @@ pub fn decide(
         .map(|(src, r)| Compiled::new(*src, r))
         .collect();
 
-    // 1. Защищённый путь (D79).
-    if call.paths.iter().any(|p| p.protected) {
+    // 1. Встроенные запреты: защищённый путь (D79), защищённое место памяти у пути или
+    // слова команды (D157) и клиент памяти `zam` (D158). В снимок и хэш не входят.
+    if call.paths.iter().chain(&call.words).any(|p| p.protected) {
         return Decision::Deny(deny_reason::PROTECTED_PATH);
+    }
+    if call.segments.iter().any(memory_client_segment) {
+        return Decision::Deny(deny_reason::MEMORY_CLIENT);
     }
     // 2. Правила deny.
     if rules
@@ -1028,6 +1121,10 @@ pub(crate) fn text_samples() -> Vec<(&'static str, String)> {
     let root = Path::new("/project");
     let denied = crate::tools::denied_text;
     vec![
+        (
+            "runtime/policy.denied_memory_client",
+            denied(deny_reason::MEMORY_CLIENT),
+        ),
         (
             "runtime/policy.denied_policy_rule",
             denied(deny_reason::POLICY_RULE),
