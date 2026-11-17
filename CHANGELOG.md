@@ -5,6 +5,14 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-M, задача 3 — память в цикле (D138, D140, D142, D161, D168, D169):
+  - `za-core`: модуль `memory` — порт `MemoryPort` (перенос из `za-agent`, реэкспорт там же), `Recall::{Partial, Capped}`, `state()`, `to_value()`/`from_value()` (значение эффекта `{text, state}`, квитанция `{text}` R1-B читается), `RecallReply` и признак режима идей `IdeasSignal` (`review`/`propose`, поле `ideas` значения), `SessionNote`, `CommandNote`, `NoteOutcome`, `PROMPT_EVENT`, `POST_TOOL_EVENT`; новые методы порта с умолчаниями — `prompt_hint`, `tool_error_hint`, `retry_digest`, `session_note`, `files_changed`, `end_session`;
+  - цикл: эффект `memory.prompt` к задаче (шаг 0) и к каждому вводу `inbox` — подсказка блоком `<memory source="zam" kind="hint">` после текста ввода; на шаге 0 дайджест и подсказка — в блоке `<memory>` первого сообщения в одном бюджете `memory_budget`;
+  - цикл: `memory.tool_error` — подсказка к первой ошибке нативного вызова пакета, сообщением после результатов;
+  - цикл: отложенный повтор дайджеста `memory.retry` (дайджест шага 0 `timeout` или `partial`) — на границе перед вторым вызовом модели, блоком `<memory source="zam" kind="digest">`; один раз;
+  - потолок подсказок эпохи `2 × memory_budget` (`MemoryState.injected`, сброс при компакции): исчерпан — эффект пишется, запроса нет, `capped`;
+  - `za-agent`: `MemoryState` (часть снимка), `memory_block`; тестовая память `tests/support/memory.rs` (`ScriptedMemory`);
+  - golden: журналы R1-C2 `tests/golden/r1c2_journal/{compact_mid,inbox_mid,batch_error,approval}` с генератором, снимок v5 `tests/golden/r1m_v5.json`.
 - R1-M, проход fix-2 (ревью задачи 2; ADR 0007):
   - `za-memory`: вид ошибки `ErrorKind::Interrupted` (`interrupted`) — соединение оборвалось после отправки, ответа со статусом нет, исход неизвестен; входит в `is_unreachable`;
   - `za-memory`: `MemoryStatus.hooks_unchecked` — причина, если подсказки проверить не удалось; `ConfigError::{field, reason}`, константы `config::{URL_FIELD, MACHINE_FIELD}`;
@@ -275,6 +283,10 @@
 - `za-protocol`: `checkpoint_reason` — причины пропуска чекпоинта.
 
 ### Изменено
+- **Снимок run — версия 5** (R1-M, задача 3, D140): поле `memory` (`MemoryState`: признак повтора дайджеста, потолок подсказок эпохи, признак режима идей, `legacy_until` и поля снимка сессии следующих задач). Снимки v1–v4 читаются; run, начатый прежней версией, доигрывает начатые ею шаги без новых эффектов памяти (`legacy_until`, D161), дальше — с ними. Golden `r1c2_v4` больше не переписывается (`ZA_UPDATE_GOLDEN` пишет `r1m_v5.json`).
+- **Новые эффекты в журнале каждого run** (R1-M, задача 3, D50): `memory.prompt` на шаге 0 и после каждого ввода, `memory.tool_error` после пакета с ошибкой, `memory.retry` — и при выключенной памяти (L0): ключи эффектов не зависят от уровня памяти. Номера эффектов шага 0 и границы с вводом сдвинулись на эти эффекты.
+- **Значение эффектов памяти — `{text, state}`** (R1-M, задача 3, D140): `memory.snapshot`, `memory.after` (аргументы прежние) и новые эффекты; у `memory.snapshot` и `memory.prompt` — необязательное поле `ideas` (D169). Текст памяти очищается от невидимых символов (`Clean::Untrusted`) и маскируется до квитанции, затем экранируется в истории.
+- **API: `MemoryLevel` без `L3`, `MemoryPort::snapshot` → `RecallReply`** (R1-M, задача 3, D136, D138, D169): `Recall::text()` даёт текст и у `Partial`, не даёт текст из одних пробельных символов; `za-core` зависит от `jiff` (уже в workspace).
 - **Обрыв соединения с сервером памяти посреди запроса — `Interrupted`, а не `Protocol`** (R1-M, fix-2, M1 ревью задачи 2): сброс, `IncompleteMessage`, обрыв тела ответа. `Offline` — только «не соединились».
 - **`session_id` в вызовах MCP — только из сессии run** (R1-M, fix-2, M3 ревью задачи 2): аргумент вызывающего снимается всегда; у инструментов вне `memory_search`, `memory_read`, `memory_recall` и без сессии run аргумента нет.
 - **Статус памяти: «не проверено» — не «всё хорошо»** (R1-M, fix-2, M2 ревью задачи 2): ответ Vault без булева `locked` — `VaultState::Unchecked` (прежде `Unlocked`); ошибка `/recall` или ответ без `hooks` — `hooks_unchecked` (прежде пустой `hooks_off` без пометки). `doctor` печатает `Warn` «Vault: не проверено: …» и «подсказки: не проверено: …».
@@ -310,6 +322,8 @@
 - `zero-agent`: ключи `Gateway` берутся из кэша `StoreSecrets`, прочитанного при старте команды, вместо `EnvSecrets`; для пользователя правило `ZA_SECRET_<KEY_REF>` прежнее. `journal export` и `audit` маскируют и шаблоны ключей, а не только значения `ZA_SECRET_*` из окружения выгрузки (ревью задачи 4, m4); печать ответа `run` проходит ту же маску.
 
 ### Исправлено
+- R1-M, задача 3 (2026-11-17):
+  - resume с вводом, на границе которого стоит эффект ввода (`skill.load` R1-C2, `memory.prompt` R1-M), после повторного сбоя на той же границе давал `ReplayMismatch`: блок `<state>` считался поздним по ключу `{step}:1`. Теперь блок на обычном месте узнаётся по записанному префиксу шага (`state` до первого `context`).
 - R1-M, проход fix-1b (повторное ревью fix-1 задачи 1, 2026-11-17):
   - `checkpoints restore` старого чекпоинта (до R1-M или из run без домашнего каталога) проекта, равного домашнему каталогу, с `~/.zeroaimemory/config.toml` в дереве или манифесте копировал текущий файл токена в чекпоинт «до» в `ZA_HOME`: теперь записи защищённых мест не входят ни в набор изменений (`restore_set`), ни в копию «до» (`files::copy`, `files::paths` сверяют корни с домашним каталогом), сам файл не переписывается и не удаляется (Minor 3).
 - R1-M, проход fix-1 (ревью задачи 1, 2026-11-17):
