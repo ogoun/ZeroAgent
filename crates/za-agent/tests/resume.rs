@@ -1939,9 +1939,10 @@ async fn legacy_step_survives_second_crash() {
     assert_eq!(snap.memory.legacy_until, Some(2));
 }
 
-/// D161: снимок v4 (форма golden `r1c2_v4`) продолжается: память — по умолчанию,
-/// `legacy_until = step + 1` у снимка `Boundary`; ввод resume на этом шаге — без
-/// подсказки памяти.
+/// D161: снимок v4 (форма golden `r1c2_v4`) продолжается: память — по умолчанию. У снимка
+/// `Boundary`, следующий шаг которого не начат, `legacy_until = step` (Minor 3 ревью задачи
+/// 3: слагаемое `next == Boundary` снято) — шаг `step + 1` целиком проходит код R1-M, и ввод
+/// resume на нём получает подсказку памяти.
 #[tokio::test]
 async fn r1c2_v4_snapshot_resumes() {
     let golden = golden_v4();
@@ -1974,15 +1975,15 @@ async fn r1c2_v4_snapshot_resumes() {
     assert_eq!(resume(&f, change).await.unwrap(), done("ок"));
     let (_, after) = last_snapshot(&f.store, f.run).await;
     assert_eq!(after.v, 5);
-    assert_eq!(after.memory.legacy_until, Some(step + 1));
+    assert_eq!(after.memory.legacy_until, Some(step));
     let names = effect_names(&events(&f.store, f.run).await);
     let prompts: Vec<u64> = names
         .iter()
         .filter(|(_, _, n)| n == "memory.prompt")
         .map(|(s, _, _)| *s)
         .collect();
-    // Подсказка к задаче шага 0 есть, к вводу шага `step + 1` — нет.
-    assert_eq!(prompts, [0]);
+    // Подсказка к задаче шага 0 и к вводу шага `step + 1`.
+    assert_eq!(prompts, [0, step + 1]);
 }
 
 /// Golden снимка v5 (`golden/r1m_v5.json`): состояние памяти run R1-M.
@@ -2075,4 +2076,304 @@ async fn resume_note_after_input_hint_replays() {
         .filter(|m| text_of(m).contains("action=\"resume\""))
         .count();
     assert_eq!(notes, 1);
+}
+
+// ---- R1-M, fix-3 задачи 3: повторный resume снимка v4, смена эндпоинта в начатом шаге ----
+
+/// Имена эффектов шага `step` по порядку ключей.
+fn names_at(names: &[(u64, u64, String)], step: u64) -> Vec<&str> {
+    names
+        .iter()
+        .filter(|(s, _, _)| *s == step)
+        .map(|(_, _, n)| n.as_str())
+        .collect()
+}
+
+/// I1 ревью задачи 3, D161 (уточнение 2026-11-17): `legacy_until` снимка v4 вычисляется один
+/// раз, при первом resume, и пишется в журнал событием. Повторный resume того же снимка (снимка
+/// v5 ещё нет) берёт записанное значение, а не пересчитывает его по журналу, который уже
+/// дописал код R1-M: шаг, начатый кодом R1-M, остаётся шагом R1-M.
+#[tokio::test]
+async fn second_resume_of_v4_snapshot_keeps_legacy_until() {
+    // (журнал, шаг сбоя после `context`, legacy_until): у `approval` снимок `Model` шага 1 и
+    // шаг 2 не начат; у `batch_error` снимок `Model` шага 2, шаг 3 не начат.
+    for (name, crashed, until) in [("approval", 2, 1), ("batch_error", 3, 2)] {
+        let (mut f, golden) = golden_r1c2(name).await;
+        if name == "approval" {
+            let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden/r1c2_journal/approval");
+            let id = std::fs::read_to_string(src.join("interrupt.txt")).unwrap();
+            assert!(
+                f.store
+                    .resolve_interrupt(id.trim(), json!({"approved": true}))
+                    .await
+                    .unwrap()
+            );
+        }
+        let mut deps = f.deps.clone();
+        deps.crash = crash_at(CrashPoint::AfterContext { step: crashed });
+        let change = ResumeChange {
+            input: Some("ещё".into()),
+            ..ResumeChange::default()
+        };
+        let err = resume_with(&f, &deps, change).await;
+        assert!(matches!(err, Err(LoopError::Halted)), "{name}: {err:?}");
+        // Снимка v5 нет: последний снимок — прежний v4.
+        let (_, v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+        assert_eq!(v, golden, "{name}");
+        // Шаг сбоя начат кодом R1-M: подсказка к вводу стоит до `context`.
+        let names = effect_names(&events(&f.store, f.run).await);
+        assert_eq!(
+            names_at(&names, crashed),
+            ["boundary", "memory.prompt", "context"],
+            "{name}"
+        );
+        f.deps.crash = None;
+        f.model.push(answer("готово"));
+        assert_eq!(
+            resume(&f, ResumeChange::default()).await.unwrap(),
+            done("готово"),
+            "{name}"
+        );
+        let evs = events(&f.store, f.run).await;
+        let after = effect_names(&evs);
+        assert_eq!(&after[..names.len()], &names[..], "{name}");
+        let (_, snap) = last_snapshot(&f.store, f.run).await;
+        assert_eq!(snap.v, za_agent::SNAPSHOT_V);
+        assert_eq!(snap.memory.legacy_until, Some(until), "{name}");
+        // Значение записано одним событием — первым resume, до первого нового эффекта.
+        let marks: Vec<&Event> = evs
+            .iter()
+            .filter(|e| e.kind.as_str() == "memory.legacy")
+            .collect();
+        assert_eq!(marks.len(), 1, "{name}: {marks:?}");
+        assert_eq!(marks[0].payload["until"], until, "{name}");
+        if name == "approval" {
+            assert_eq!(f.incr.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+/// I2 ревью задачи 3, D161: смена эндпоинта при resume со снимка `Boundary` отвергается
+/// (`ChangeMidStep`), если следующий шаг уже начат: аргумент `budget` эффектов памяти
+/// (`memory.prompt`, `memory.retry`) зависит от окна, реплей с другим окном разошёлся бы с
+/// журналом. Resume без смены доводит run.
+#[tokio::test]
+async fn endpoint_change_in_started_step_rejected() {
+    // Без повтора дайджеста — ввод с подсказкой `memory.prompt`; с повтором (частичный
+    // дайджест шага 0) — `memory.retry` без ввода.
+    for retry in [false, true] {
+        let mut f = fx(if retry {
+            "started_step_retry"
+        } else {
+            "started_step_prompt"
+        });
+        if retry {
+            let mem = Arc::new(support::memory::ScriptedMemory::new(
+                za_agent::MemoryLevel::L2,
+            ));
+            mem.push_snapshot(za_agent::Recall::Partial(
+                "### Задачи\n[in_progress] A — k:1".into(),
+            ));
+            f.deps.memory = mem;
+        }
+        // Окно 8192 (по умолчанию): бюджет памяти 200.
+        f.model.push(server_error());
+        assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+        let (_, snap) = last_snapshot(&f.store, f.run).await;
+        assert_eq!(snap.next, Next::Boundary);
+        assert_eq!(snap.memory.retry_digest, retry);
+        let step = snap.step + 1;
+        let mut deps = f.deps.clone();
+        deps.crash = crash_at(CrashPoint::AfterContext { step });
+        let change = ResumeChange {
+            input: (!retry).then(|| "ещё".to_owned()),
+            ..ResumeChange::default()
+        };
+        let err = resume_with(&f, &deps, change).await;
+        assert!(matches!(err, Err(LoopError::Halted)), "{retry}: {err:?}");
+        let names = effect_names(&events(&f.store, f.run).await);
+        let expected: [&str; 4] = if retry {
+            ["boundary", "state", "memory.retry", "context"]
+        } else {
+            ["boundary", "memory.prompt", "state", "context"]
+        };
+        assert_eq!(names_at(&names, step), expected);
+        // Второй resume на эндпоинт с окном 32768 (бюджет памяти 800) — отказ до шага.
+        let wide =
+            Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)).with_context(32768));
+        wide.push(answer("ок"));
+        let mut deps = f.deps.clone();
+        deps.model = wide.clone();
+        let change = ResumeChange {
+            endpoint: Some(EndpointId("b".into())),
+            ..ResumeChange::default()
+        };
+        let r = resume_with(&f, &deps, change).await;
+        assert!(matches!(r, Err(LoopError::ChangeMidStep)), "{retry}: {r:?}");
+        assert_eq!(status(&f.store, f.run).await, RunStatus::Running);
+        assert!(wide.calls().is_empty());
+        assert_eq!(effect_names(&events(&f.store, f.run).await), names);
+        // Без смены эндпоинта шаг доигрывается по журналу.
+        f.model.push(answer("ок"));
+        assert_eq!(
+            resume(&f, ResumeChange::default()).await.unwrap(),
+            done("ок"),
+            "{retry}"
+        );
+    }
+}
+
+/// Снимок run `f` (последний, v5) переписан на том же `seq` функцией `edit`.
+async fn rewrite_snapshot(f: &Fx, edit: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+    let (seq, mut v) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    assert_eq!(v["v"], 5);
+    edit(v.as_object_mut().unwrap());
+    f.store.save_snapshot(f.run, seq, v).await.unwrap();
+}
+
+/// Minor 1 ревью задачи 3 (исправление `state_late`, CHANGELOG): ввод `/tdd …` при resume
+/// со снимка `Boundary` — эффект `skill.load` стоит до блока `<state>`; сбой после `context`
+/// той же границы и второй resume с того же снимка проходят без `ReplayMismatch`.
+///
+/// Два варианта:
+/// - шаг R1-M: `boundary`, `skill.load`, `memory.prompt`, `state`, `context`;
+/// - шаг legacy — ровно путь R1-C2: снимок v4 `Boundary`, шаг после него начат кодом
+///   прежней версии (`boundary`, `skill.load`, `state`, `context`, без эффектов памяти).
+///   Первая попытка шага идёт под снимком с `legacy_until = step` (так код R1-M проходит шаг
+///   кодом R1-C2), затем снимок сводится к v4 — журнал той формы, что пишет R1-C2.
+///
+/// Прежний `state_late` (`{step}:1` не `state` — блок поздний) роняет оба варианта.
+#[tokio::test]
+async fn skill_load_before_state_replays() {
+    for legacy in [false, true] {
+        let name = if legacy {
+            "skill_state_legacy"
+        } else {
+            "skill_state_r1m"
+        };
+        let (_root, cat) = user_skill_catalog(name, "Test first.");
+        let mut f = fx(name);
+        with_skills(&mut f.deps, cat);
+        f.model.push(server_error());
+        assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+        let (_, snap) = last_snapshot(&f.store, f.run).await;
+        assert_eq!(snap.next, Next::Boundary);
+        let step = snap.step + 1;
+        if legacy {
+            rewrite_snapshot(&f, |o| {
+                o["memory"]["legacy_until"] = json!(step);
+            })
+            .await;
+        }
+        let mut deps = f.deps.clone();
+        deps.crash = crash_at(CrashPoint::AfterContext { step });
+        let change = ResumeChange {
+            input: Some("/tdd проверь".into()),
+            ..ResumeChange::default()
+        };
+        let err = resume_with(&f, &deps, change).await;
+        assert!(matches!(err, Err(LoopError::Halted)), "{legacy}: {err:?}");
+        let names = effect_names(&events(&f.store, f.run).await);
+        let expected: &[&str] = if legacy {
+            &["boundary", "skill.load", "state", "context"]
+        } else {
+            &[
+                "boundary",
+                "skill.load",
+                "memory.prompt",
+                "state",
+                "context",
+            ]
+        };
+        assert_eq!(names_at(&names, step), expected, "{legacy}");
+        if legacy {
+            // Снимок той формы, что пишет R1-C2: v4 без состояния памяти.
+            rewrite_snapshot(&f, |o| {
+                o.insert("v".into(), json!(4));
+                assert!(o.remove("memory").is_some());
+            })
+            .await;
+        }
+        f.model.push(answer("ок"));
+        assert_eq!(
+            resume(&f, ResumeChange::default()).await.unwrap(),
+            done("ок"),
+            "{legacy}"
+        );
+        let evs = events(&f.store, f.run).await;
+        let after = effect_names(&evs);
+        assert_eq!(&after[..names.len()], &names[..], "{legacy}");
+        assert_eq!(
+            after.iter().filter(|(_, _, n)| n == "skill.load").count(),
+            1,
+            "{legacy}: эффект skill.load повторён"
+        );
+        let (_, snap) = last_snapshot(&f.store, f.run).await;
+        assert_eq!(snap.memory.legacy_until, legacy.then_some(step), "{legacy}");
+        // Блок `<state>` — один, после текста ввода со скиллом.
+        let h = Conversation::load(&f.store, &snap.messages).await.unwrap();
+        let texts: Vec<String> = h.messages().iter().map(text_of).collect();
+        let notes: Vec<usize> = texts
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.contains("action=\"resume\""))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(notes.len(), 1, "{legacy}");
+        let input = texts
+            .iter()
+            .position(|t| t.starts_with("/tdd проверь"))
+            .expect("нет ввода /tdd");
+        assert!(input < notes[0], "{legacy}: {texts:?}");
+    }
+}
+
+/// Minor 2 ревью задачи 3, D140: на границе resume со снимка `Boundary` шага 1 отложенный
+/// повтор дайджеста стоит после блока `<state>` и до `context`: эффекты ввода →
+/// `state` → `memory.retry` → `context`; в истории текст повтора — после сообщения `resume`.
+#[tokio::test]
+async fn retry_digest_after_state_block() {
+    let mut f = fx("retry_after_state");
+    let mem = Arc::new(support::memory::ScriptedMemory::new(
+        za_agent::MemoryLevel::L2,
+    ));
+    mem.push_snapshot(za_agent::Recall::Timeout);
+    mem.push_retry(za_agent::Recall::Hits("### Задачи\n[open] B — k:2".into()));
+    f.deps.memory = mem.clone();
+    f.model.push(server_error());
+    assert_eq!(start(&f, ask()).await.unwrap(), paused("provider"));
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!((snap.step, snap.next), (1, Next::Boundary));
+    assert!(snap.memory.retry_digest);
+    f.model.push(answer("ок"));
+    let change = ResumeChange {
+        input: Some("ещё".into()),
+        ..ResumeChange::default()
+    };
+    assert_eq!(resume(&f, change).await.unwrap(), done("ок"));
+    let names = effect_names(&events(&f.store, f.run).await);
+    let at = names_at(&names, 2);
+    assert_eq!(
+        &at[..5],
+        [
+            "boundary",
+            "memory.prompt",
+            "state",
+            "memory.retry",
+            "context"
+        ]
+    );
+    let texts = user_texts(&f.model.calls().last().unwrap().request.messages);
+    let note = texts
+        .iter()
+        .position(|t| t.contains("action=\"resume\""))
+        .expect("нет сообщения resume");
+    let digest = texts
+        .iter()
+        .position(|t| t.starts_with("<memory source=\"zam\" kind=\"digest\">"))
+        .expect("нет текста повтора");
+    assert_eq!(digest, note + 1, "{texts:?}");
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert!(!snap.memory.retry_digest);
 }

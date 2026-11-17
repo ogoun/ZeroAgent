@@ -15,12 +15,12 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
-use za_core::{Recovery, RunCtx, recover};
+use serde_json::{Value, json};
+use za_core::{Journal, Recovery, RunCtx, recover};
 use za_llm::EndpointId;
 use za_protocol::{
-    Budget, EffectClass, EffectKey, EventKind, RunId, RunMode, RunStatus, Seq, canonical_json,
-    pause_reason,
+    Actor, Budget, EffectClass, EffectKey, EventKind, NewEvent, RunId, RunMode, RunStatus, Seq,
+    canonical_json, pause_reason,
 };
 use za_store::{INTERRUPT_RESOLVED, ProjectStore, StoreError};
 
@@ -41,7 +41,8 @@ use za_llm::{Message, Part, Role};
 /// Изменения run при resume (CORE-110).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResumeChange {
-    /// Новый эндпоинт: только со снимка `Boundary` (D6), иначе `ChangeMidStep`.
+    /// Новый эндпоинт: только со снимка `Boundary`, следующий шаг которого не начат (D6,
+    /// D161), иначе `ChangeMidStep`.
     pub endpoint: Option<EndpointId>,
     /// Новый бюджет (выход из `blocked_on_budget`, D19).
     pub budget: Option<Budget>,
@@ -195,22 +196,43 @@ pub async fn resume_run(
     if next == Next::Model && change.endpoint.is_some() {
         return Err(LoopError::ChangeMidStep);
     }
-    // Шаг после снимка `Boundary` уже начат без блока `<state>` (Ruling I1): его эффекты
-    // реплеятся, а пороги по новому окну могли бы разойтись с журналом (m-new1).
+    // Шаг после снимка `Boundary` уже начат (в журнале есть его эффекты): они реплеятся, а
+    // аргументы, зависящие от окна, разошлись бы с журналом — пороги (m-new1) и `budget`
+    // эффектов памяти R1-M (I2 ревью задачи 3, D161). Как у шага посреди хода (D6).
+    if next == Next::Boundary
+        && change.endpoint.is_some()
+        && store.step_has_effects(run, snap.step + 1).await?
+    {
+        return Err(LoopError::ChangeMidStep);
+    }
+    // Тот же шаг начат без блока `<state>` на обычном месте (Ruling I1): блок — в конце
+    // границы.
     let late = match next {
         Next::Boundary => state_late(&store, run, snap.step + 1).await?,
         Next::Model => None,
     };
-    if late.is_some() && change.endpoint.is_some() {
-        return Err(LoopError::ChangeMidStep);
-    }
-    let mut st = match restore(deps, run, seq, snap, ctl).await {
+    // D161: шаги кода прежней версии (снимок ниже v5) — без эффектов памяти R1-M.
+    let legacy = match legacy_of(&store, run, seq, &snap).await {
+        Ok(l) => l,
+        Err(e @ LoopError::Snapshot(_)) => {
+            return Err(fail_broken(deps, run, status, generation, e).await);
+        }
+        Err(e) => return Err(e),
+    };
+    let mut st = match restore(deps, run, seq, snap, legacy.map(|l| l.until), ctl).await {
         Ok(st) => st,
         Err(e @ LoopError::Snapshot(_)) => {
             return Err(fail_broken(deps, run, status, generation, e).await);
         }
         Err(e) => return Err(e),
     };
+    // Вычисленное значение — в журнал до первого нового эффекта (уточнение D161): журнал
+    // дальше дописывает код R1-M, повторный resume того же снимка берёт записанное.
+    if let Some(l) = legacy
+        && !l.recorded
+    {
+        st.last_seq = legacy_recorded(j, run, seq, l).await?;
+    }
     // D19: простой между процессами и время в паузе — не активное время.
     st.counters.last_boundary_ms = None;
     let at = match next {
@@ -309,22 +331,103 @@ async fn state_late(
     Ok(started.then_some(step))
 }
 
-/// Последний шаг, начатый кодом со снимком ниже v5 (D161): шаг снимка (и следующий у
-/// снимка `Boundary`), а также шаги после снимка, у которых в журнале уже есть эффекты —
-/// у снимка `Model` шага `s` граница шага `s + 1` могла быть записана до сбоя. Эффекты
-/// памяти R1-M в этих шагах сдвинули бы ключи записанных эффектов.
+/// Признак шагов прежней версии у снимка ниже v5 (D161): последний такой шаг и записан ли
+/// он уже в журнал событием `memory.legacy`.
+#[derive(Clone, Copy, Debug)]
+struct Legacy {
+    /// Снимок, по которому значение вычислено.
+    v: u32,
+    until: u64,
+    recorded: bool,
+}
+
+/// D161 (уточнение 2026-11-17): у снимка v5 признак — в самом снимке (`None`). У снимка ниже
+/// v5 значение вычисляется **один раз**, при первом resume снимка, и пишется в журнал
+/// событием ([`legacy_recorded`]); повторный resume того же снимка (снимка v5 ещё нет) берёт
+/// первое такое событие после `seq` снимка, а не пересчитывает: журнал после первого resume
+/// дописывает код R1-M, и пересчёт отнёс бы его шаги к шагам прежней версии (I1 ревью
+/// задачи 3). Событие без `until` — нарушенный инвариант (`LoopError::Snapshot`).
+async fn legacy_of(
+    store: &ProjectStore,
+    run: RunId,
+    seq: Seq,
+    snap: &Snapshot,
+) -> Result<Option<Legacy>, LoopError> {
+    if snap.v >= SNAPSHOT_V {
+        return Ok(None);
+    }
+    let (until, recorded) = match recorded_legacy(store, run, seq).await? {
+        Some(until) => (until, true),
+        None => (legacy_until(store, run, snap).await?, false),
+    };
+    tracing::info!(run = %run, v = snap.v, legacy_until = until, recorded,
+        "снимок прежней версии: шаги до legacy_until — без эффектов памяти R1-M");
+    Ok(Some(Legacy {
+        v: snap.v,
+        until,
+        recorded,
+    }))
+}
+
+/// Последний шаг, начатый кодом со снимком ниже v5 (D161): шаг снимка и шаги после него, у
+/// которых в журнале уже есть эффекты — у снимка `Model` шага `s` граница шага `s + 1`
+/// могла быть записана до сбоя, у снимка `Boundary` — тоже. Эффекты памяти R1-M в этих
+/// шагах сдвинули бы ключи записанных эффектов. Шаг после снимка без эффектов целиком
+/// проходит код R1-M. Верно только до первого нового эффекта: вызывает его [`legacy_of`],
+/// когда значение ещё не записано.
 async fn legacy_until(
     store: &ProjectStore,
     run: RunId,
     snap: &Snapshot,
 ) -> Result<u64, StoreError> {
-    let mut until = snap.step + u64::from(snap.next == Next::Boundary);
-    let mut step = snap.step + 1;
-    while store.step_has_effects(run, step).await? {
-        until = until.max(step);
-        step += 1;
+    let mut until = snap.step;
+    while store.step_has_effects(run, until + 1).await? {
+        until += 1;
     }
     Ok(until)
+}
+
+/// `until` первого события `memory.legacy` снимка `seq` после него; `None` — события нет
+/// (первый resume снимка или журнал R1-C2).
+async fn recorded_legacy(
+    store: &ProjectStore,
+    run: RunId,
+    seq: Seq,
+) -> Result<Option<u64>, LoopError> {
+    let mut cursor = seq;
+    loop {
+        let page = store.read_run(run, cursor, STATE_PAGE).await?;
+        let n = page.len();
+        for e in page {
+            cursor = e.seq;
+            if e.kind == EventKind::MemoryLegacy && e.payload["snapshot_seq"] == seq.0 {
+                return match e.payload["until"].as_u64() {
+                    Some(until) => Ok(Some(until)),
+                    None => Err(LoopError::Snapshot(format!(
+                        "событие memory.legacy без until: seq {}",
+                        e.seq.0
+                    ))),
+                };
+            }
+        }
+        if n < STATE_PAGE {
+            return Ok(None);
+        }
+    }
+}
+
+/// Событие `memory.legacy {until, snapshot_seq, snapshot_v}` (D161): значение, вычисленное
+/// первым resume снимка `seq`, — до первого нового эффекта.
+async fn legacy_recorded(j: &Journal, run: RunId, seq: Seq, l: Legacy) -> Result<Seq, StoreError> {
+    j.append(NewEvent {
+        run_id: run,
+        parent_seq: None,
+        actor: Actor::Runtime,
+        kind: EventKind::MemoryLegacy,
+        payload: json!({ "until": l.until, "snapshot_seq": seq.0, "snapshot_v": l.v }),
+        tainted: false,
+    })
+    .await
 }
 
 /// Снимка нет или он испорчен: `failed` с причиной `snapshot` (D4, D11). Из `paused` и
@@ -354,12 +457,14 @@ async fn fail_broken(
     fail(deps, run, generation, e).await
 }
 
-/// [`LoopState`] из снимка на `seq`.
+/// [`LoopState`] из снимка на `seq`; `legacy` — `legacy_until` снимка ниже v5
+/// ([`legacy_of`]).
 async fn restore(
     deps: &LoopDeps,
     run: RunId,
     seq: Seq,
     snap: Snapshot,
+    legacy: Option<u64>,
     ctl: ControlRx,
 ) -> Result<LoopState, LoopError> {
     let store = deps.journal.store().clone();
@@ -377,16 +482,6 @@ async fn restore(
         })?;
     let registry = run_registry(deps)?;
     let (_, classes) = run_tools_of(&registry, snap.setup.role, snap.setup.tier);
-    // D161: снимок ниже v5 — шаги кода прежней версии доигрываются без эффектов памяти
-    // R1-M; у снимка v5 признак — из снимка (повторный сбой его не теряет).
-    let legacy = if snap.v < SNAPSHOT_V {
-        let until = legacy_until(&store, run, &snap).await?;
-        tracing::info!(run = %run, v = snap.v, legacy_until = until,
-            "снимок прежней версии: шаги до legacy_until — без эффектов памяти R1-M");
-        Some(until)
-    } else {
-        None
-    };
     let (task, env_text, user_inputs) = if snap.v == SNAPSHOT_V1 {
         // D66: в снимке R1-B1 полей нет — разбор истории.
         let (env_text, task) = conv
@@ -398,6 +493,8 @@ async fn restore(
     } else {
         (snap.task, snap.env_text, snap.user_inputs)
     };
+    // D161: снимок ниже v5 — шаги кода прежней версии доигрываются без эффектов памяти
+    // R1-M; у снимка v5 признак — из снимка (повторный сбой его не теряет).
     let memory = match legacy {
         Some(until) => MemoryState {
             legacy_until: Some(until),

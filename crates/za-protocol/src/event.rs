@@ -94,6 +94,11 @@ pub enum EventKind {
     MemorySessionEnded,
     /// Раскрыт ключ из Vault (D143, D153): `name`, `scope`, `item`, `cached`; значения нет.
     SecretRevealed,
+    /// Шаги журнала прежней версии доигрываются без эффектов памяти R1-M (D161, fix-3
+    /// задачи 3): `until` — последний такой шаг, `snapshot_seq` и `snapshot_v` — снимок ниже
+    /// v5, по которому значение вычислено. Пишет первый resume снимка до первого нового
+    /// эффекта; повторный resume того же снимка берёт значение отсюда, а не пересчитывает.
+    MemoryLegacy,
     Unknown(String),
 }
 
@@ -141,6 +146,7 @@ impl EventKind {
             Self::MemorySnapshotSent => "memory.snapshot_sent",
             Self::MemorySessionEnded => "memory.session_ended",
             Self::SecretRevealed => "secret.revealed",
+            Self::MemoryLegacy => "memory.legacy",
             Self::Unknown(s) => s,
         }
     }
@@ -188,6 +194,7 @@ impl EventKind {
             "memory.snapshot_sent" => Self::MemorySnapshotSent,
             "memory.session_ended" => Self::MemorySessionEnded,
             "secret.revealed" => Self::SecretRevealed,
+            "memory.legacy" => Self::MemoryLegacy,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -331,6 +338,7 @@ mod tests {
             (MemorySnapshotSent, "memory.snapshot_sent"),
             (MemorySessionEnded, "memory.session_ended"),
             (SecretRevealed, "secret.revealed"),
+            (MemoryLegacy, "memory.legacy"),
         ] {
             assert_eq!(k.as_str(), name);
             assert_eq!(EventKind::parse(name), k);
