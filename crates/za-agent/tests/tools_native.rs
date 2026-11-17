@@ -727,6 +727,47 @@ async fn approved_call_still_hits_builtin_ban() {
     assert!(of_kind(&b.events().await, EventKind::ToolStarted).is_empty());
 }
 
+/// R1-M, сомнение 3 прохода fix-1: чтение `ZA_HOME`, начатое кодом до R1-M (намерение и
+/// `tool.started` с `protected: false`, квитанции нет), после resume не повторяется по
+/// записанному решению: классы путей сменились, вызов идёт на новое решение, и шаг 1
+/// даёт отказ — инструмент не вызывается.
+#[tokio::test]
+async fn started_read_of_sealed_place_is_redecided() {
+    let b = bx("started_sealed").await;
+    let read = ReadStub::new();
+    let reads = Arc::clone(&read.calls);
+    let reg = registry(vec![Arc::new(read)]);
+    let env = b.env(RunMode::Auto);
+    let cfg = b.d.roots.za_home.join("config.toml");
+    let args = json!({"path": s(&cfg)});
+    let key = za_protocol::EffectKey::derive(b.run, 1, 0);
+    b.store
+        .record_intent(
+            b.run,
+            &key,
+            za_protocol::EffectClass::ReadOnly,
+            "read",
+            args.clone(),
+        )
+        .await
+        .unwrap();
+    let paths = json!([{"path": s(&cfg), "access": "read", "inside": false, "protected": false}]);
+    b.j.append(za_protocol::NewEvent {
+        run_id: b.run,
+        parent_seq: None,
+        actor: za_protocol::Actor::Runtime,
+        kind: EventKind::ToolStarted,
+        payload: json!({"call_id": "r1", "effect_key": key.0, "paths": paths}),
+        tainted: false,
+    })
+    .await
+    .unwrap();
+    let out = b.batch(&reg, &env, 1, &[pc("r1", "read", args)]).await;
+    assert!(out.suspend.is_none());
+    assert_eq!(content(&out, 0), ("denied: protected path".into(), true));
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "ZA_HOME прочитан");
+}
+
 /// R1-M, Minor 10 ревью задачи 1: `request_grant` на защищённое место (D157: `ZA_HOME`,
 /// `~/.zeroaimemory/` и пути внутри них) — отказ `protected path` без вопроса человеку:
 /// грант там ничего не дал бы. Грант на домашний каталог над защищённым местом — вопрос,
