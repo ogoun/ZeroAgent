@@ -21,7 +21,11 @@
 //! `za-secrets` (все виды), от него — только `zero-agent` и `xtask`; он — третий держатель
 //! HTTP-клиента: `reqwest` напрямую, клиент строится только в
 //! `crates/za-memory/src/transport.rs`, вне него в крейте `reqwest` не упоминается, атрибут
-//! `path` и `include!` в его `src/` запрещены (как у `za-web`).
+//! `path` и `include!` в его `src/` запрещены (как у `za-web`). Fix-2 R1-M (M4, M6 ревью
+//! задачи 2): файл, где строится клиент в `za-llm`, `za-web`, `za-memory`, содержит
+//! `.no_proxy()` и `.redirect(…Policy::none())` (исключения — с причиной); файл клиента
+//! держателя — один источник (`HTTP_HOLDERS`), он существует и не реэкспортирует `reqwest`,
+//! кроме `Method`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -126,28 +130,96 @@ const REQWEST_FORBIDDEN_FEATURES: &[&str] = &[
 /// Кто может зависеть от `reqwest` напрямую (все виды; Ruling I2 ревью задачи 6, D129):
 /// транспорт моделей, сетевой шлюз и клиент памяти (R1-M D133, третий держатель).
 const REQWEST_USERS: &[&str] = &["za-llm", "za-web", "za-memory"];
-/// Где можно строить HTTP-клиент `reqwest`, и почему (D129). Путь — от корня, через `/`.
-const HTTP_CLIENT_ALLOWED: &[(&str, &str)] = &[
+/// Крейты, где HTTP-клиент `reqwest` можно строить в любом файле, и почему (D129). Путь —
+/// от корня, через `/`. Прочие места клиента — файлы держателей [`HTTP_HOLDERS`]: вместе
+/// они — [`http_client_allowed`].
+const HTTP_CLIENT_CRATES: &[(&str, &str)] = &[("crates/za-llm/", "транспорт моделей (R1-A)")];
+
+/// Держатель HTTP-клиента со строгим подмножеством путей `reqwest` вне своего файла клиента
+/// (D129, R1-M D133).
+struct HttpHolder {
+    /// Крейт — префикс пути от корня (`crates/za-web/`).
+    prefix: &'static str,
+    /// Файл клиента от `src/` крейта: единственное место, где строится `reqwest::Client`
+    /// ([`HttpHolder::client_file`] — единственный источник для [`check_http_client`],
+    /// [`check_holder_reexports`] и [`check_client_files_present`]; M6 ревью задачи 2 R1-M).
+    file: &'static str,
+    /// Пути `reqwest`, допустимые в остальных файлах крейта (строка после имени `reqwest`
+    /// начинается с одного из них).
+    paths: &'static [&'static str],
+    /// Почему клиент здесь (D129).
+    why: &'static str,
+}
+
+impl HttpHolder {
+    /// Путь файла клиента от корня (`crates/za-web/src/gateway.rs`).
+    fn client_file(&self) -> String {
+        format!("{}src/{}", self.prefix, self.file)
+    }
+
+    /// Имя крейта (`za-web`).
+    fn krate(&self) -> &'static str {
+        self.prefix
+            .trim_start_matches("crates/")
+            .trim_end_matches('/')
+    }
+}
+
+/// Держатели HTTP-клиента (D129, R1-M D133). У `za-web` вне `gateway.rs` допустимы типы
+/// резолвера (`addr.rs`, тестовая подмена `lib.rs`) и код статуса (`fetch.rs`); у
+/// `za-memory` — ничего: метод HTTP другие модули берут реэкспортом `transport::Method`. Для
+/// этих же крейтов в `src/` запрещены атрибут `path` и `include!` ([`check_holder_includes`]).
+const HTTP_HOLDERS: &[HttpHolder] = &[
+    HttpHolder {
+        prefix: "crates/za-web/",
+        file: "gateway.rs",
+        paths: &["::dns::", "::StatusCode"],
+        why: "сетевой шлюз: фильтр адресов в резолвере, без прокси и cookie (D107, D108)",
+    },
+    HttpHolder {
+        prefix: "crates/za-memory/",
+        file: "transport.rs",
+        paths: &[],
+        why: "клиент памяти: без прокси и редиректов, чувствительный Authorization (R1-M D133)",
+    },
+];
+
+/// Можно ли строить HTTP-клиент `reqwest` в исходнике `rel` (D129): файл клиента держателя
+/// [`HTTP_HOLDERS`] или крейт из [`HTTP_CLIENT_CRATES`].
+fn http_client_allowed(rel: &str) -> bool {
+    HTTP_HOLDERS.iter().any(|h| rel == h.client_file())
+        || HTTP_CLIENT_CRATES
+            .iter()
+            .any(|(prefix, _)| rel.starts_with(prefix))
+}
+
+/// Свойство клиента «без прокси окружения» (образец в коде — вызов `.no_proxy()`).
+const NO_PROXY: &str = ".no_proxy()";
+/// Свойство клиента «без редиректов `reqwest`» (образец — `.redirect(` и `Policy::none()` в
+/// одной строке).
+const NO_REDIRECT: &str = "redirect(…Policy::none())";
+/// Свойства, без которых `reqwest::Client` строить нельзя ни в одном крейте из
+/// [`REQWEST_USERS`] (M4 ревью задачи 2 R1-M): свойство и что оно даёт.
+const CLIENT_PROPERTIES: &[(&str, &str)] = &[
     (
-        "crates/za-web/src/gateway.rs",
-        "сетевой шлюз: фильтр адресов в резолвере, без прокси и cookie (D107, D108)",
+        NO_PROXY,
+        "запросы и токены не уходят прокси из HTTP_PROXY/ALL_PROXY (D107, D133)",
     ),
     (
-        "crates/za-memory/src/transport.rs",
-        "клиент памяти: без прокси и редиректов, чувствительный Authorization (R1-M D133)",
+        NO_REDIRECT,
+        "3xx не повторяется на другой хост с телом и заголовками (D108, D133)",
     ),
-    ("crates/za-llm/", "транспорт моделей (R1-A)"),
 ];
-/// Держатели HTTP-клиента со строгим подмножеством путей `reqwest` вне своего файла клиента
-/// (D129, R1-M D133): крейт, файл клиента и пути, допустимые в остальных файлах крейта
-/// (строка после имени `reqwest` начинается с одного из них). У `za-web` — типы резолвера
-/// (`addr.rs`, тестовая подмена `lib.rs`) и код статуса (`fetch.rs`); у `za-memory` — ничего:
-/// метод HTTP другие модули берут реэкспортом `transport::Method`. Для этих же крейтов в
-/// `src/` запрещены атрибут `path` и `include!` ([`check_holder_includes`]).
-const HTTP_HOLDERS: &[(&str, &str, &[&str])] = &[
-    ("crates/za-web/", "gateway.rs", &["::dns::", "::StatusCode"]),
-    ("crates/za-memory/", "transport.rs", &[]),
-];
+/// Исключения из [`CLIENT_PROPERTIES`]: файл, свойство и причина. Поведение этих мест не
+/// менялось (бриф fix-2 R1-M, M4): исключение записано, а не исправлено.
+const CLIENT_PROPERTY_EXEMPT: &[(&str, &str, &str)] = &[(
+    "crates/za-llm/src/probe.rs",
+    NO_REDIRECT,
+    "зонд R0 probe_llama: GET /props локального llama-server без учётных данных (Authorization нет), переход по 3xx секретов не уносит; транспорт коннекторов R1-A (http/transport.rs) редиректы выключает, а этот зонд R1-A не трогал",
+)];
+/// Что можно реэкспортировать из `reqwest` в файле клиента держателя (M6 ревью задачи 2
+/// R1-M): метод HTTP для других модулей `za-memory` (`transport::Method`).
+const HOLDER_REEXPORT_ALLOWED: &[&str] = &["reqwest::Method"];
 
 /// Нарушение политики.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,7 +590,7 @@ fn resolved_features(root: &Path, sel: &[&str], krate: &str) -> Result<Vec<Strin
     Ok(parse_tree_features(&String::from_utf8_lossy(&res.stdout), krate).unwrap_or_default())
 }
 
-/// Построение HTTP-клиента `reqwest` в исходнике `rel` вне [`HTTP_CLIENT_ALLOWED`] (D129):
+/// Построение HTTP-клиента `reqwest` в исходнике `rel` вне [`http_client_allowed`] (D129):
 /// `Client::builder`, `ClientBuilder`, `Client::new(`, `Client::default(`, упоминание типа
 /// `reqwest::Client`, `reqwest::get(`, `reqwest::blocking`. Имя должно начинаться словом:
 /// `MemoryClient::new(` — не клиент `reqwest`. Строки-комментарии не считаются. Главный
@@ -541,18 +613,10 @@ pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
         "reqwest::get(",
         "reqwest::blocking",
     ];
-    if HTTP_CLIENT_ALLOWED
-        .iter()
-        .any(|(prefix, _)| rel.starts_with(prefix))
-    {
+    if http_client_allowed(rel) {
         return Vec::new();
     }
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
-    let word_start =
-        |code: &str, at: usize| code[..at].chars().next_back().is_none_or(|c| !ident(c));
-    let holder = HTTP_HOLDERS
-        .iter()
-        .find(|(prefix, _, _)| rel.starts_with(prefix));
+    let holder = HTTP_HOLDERS.iter().find(|h| rel.starts_with(h.prefix));
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let code = line.trim_start();
@@ -563,39 +627,210 @@ pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
             .iter()
             .any(|p| code.match_indices(p).any(|(at, _)| word_start(code, at)));
         if hit {
+            let places = HTTP_HOLDERS
+                .iter()
+                .map(|h| h.client_file().trim_start_matches("crates/").to_owned())
+                .chain(HTTP_CLIENT_CRATES.iter().map(|(p, _)| {
+                    p.trim_start_matches("crates/")
+                        .trim_end_matches('/')
+                        .to_owned()
+                }))
+                .collect::<Vec<_>>()
+                .join(", ");
             out.push(Violation(format!(
-                "{rel}:{}: HTTP-клиент reqwest вне za-web/src/gateway.rs, za-memory/src/transport.rs и za-llm (D129, D133: обход фильтра адресов и правил клиента)",
+                "{rel}:{}: HTTP-клиент reqwest вне {places} (D129, D133: обход фильтра адресов и правил клиента)",
                 i + 1
             )));
             continue;
         }
-        let Some((prefix, file, paths)) = holder else {
+        let Some(h) = holder else {
             continue;
         };
-        let other_path = code.match_indices("reqwest").any(|(at, w)| {
-            let rest = &code[at + w.len()..];
-            word_start(code, at)
-                && !rest.chars().next().is_some_and(ident)
-                && !paths.iter().any(|p| rest.starts_with(p))
-        });
-        if other_path {
-            let allowed = if paths.is_empty() {
+        if mentions_reqwest(code, h.paths) {
+            let allowed = if h.paths.is_empty() {
                 "ничего".to_owned()
             } else {
-                paths
+                h.paths
                     .iter()
                     .map(|p| format!("reqwest{p}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             };
             out.push(Violation(format!(
-                "{rel}:{}: в {} вне {file} из reqwest допустимо только {allowed} (D129, D133: клиент — только в {file})",
+                "{rel}:{}: в {} вне {} из reqwest допустимо только {allowed} (D129, D133: клиент — только в {})",
                 i + 1,
-                prefix.trim_start_matches("crates/").trim_end_matches('/'),
+                h.krate(),
+                h.file,
+                h.file,
             )));
         }
     }
     out
+}
+
+/// Символ идентификатора Rust (для границ слова в текстовых стражах).
+fn ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Слово начинается в `code` с позиции `at`: перед ним не символ идентификатора.
+fn word_start(code: &str, at: usize) -> bool {
+    code[..at].chars().next_back().is_none_or(|c| !ident(c))
+}
+
+/// Упоминание крейта `reqwest` словом (`reqwest::…`, `::reqwest`, `use reqwest as r`), кроме
+/// путей `allowed` (строка после имени начинается с одного из них).
+fn mentions_reqwest(code: &str, allowed: &[&str]) -> bool {
+    code.match_indices("reqwest").any(|(at, w)| {
+        let rest = &code[at + w.len()..];
+        word_start(code, at)
+            && !rest.chars().next().is_some_and(ident)
+            && !allowed.iter().any(|p| rest.starts_with(p))
+    })
+}
+
+/// Строки кода `text` с номерами (с 1), без строк-комментариев.
+fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l.trim_start()))
+        .filter(|(_, code)| !code.starts_with("//"))
+}
+
+/// Свойства клиента в исходнике `rel` крейта из [`REQWEST_USERS`] (M4 ревью задачи 2 R1-M):
+/// файл, где строится `reqwest::Client` (`Client::builder` словом вне комментария), содержит
+/// в коде вызов `.no_proxy()` и `.redirect(…Policy::none())` (оба — в одной строке), иначе
+/// нарушение, кроме [`CLIENT_PROPERTY_EXEMPT`]. Без теста с `HTTP_PROXY` удаление
+/// `.no_proxy()` иначе прошло бы незамеченным: CI без прокси, серверы — на `127.0.0.1`.
+///
+/// Граница: проверка текстовая и на файл, а не на каждый вызов `builder`. У
+/// `za-llm/src/http/transport.rs` вызов `no_proxy()` условный — только у локального
+/// эндпоинта: облачные идут через `HTTPS_PROXY` по решению R1-A (D26); страж видит вызов, а
+/// условие — решение R1-A, не нарушение.
+pub fn check_client_properties(rel: &str, text: &str) -> Vec<Violation> {
+    let in_user = REQWEST_USERS
+        .iter()
+        .any(|u| rel.starts_with(&format!("crates/{u}/")));
+    if !in_user {
+        return Vec::new();
+    }
+    let builds = code_lines(text).any(|(_, code)| {
+        code.match_indices("Client::builder")
+            .any(|(at, _)| word_start(code, at))
+    });
+    if !builds {
+        return Vec::new();
+    }
+    let has = |prop: &str| {
+        code_lines(text).any(|(_, code)| match prop {
+            NO_PROXY => code.contains(NO_PROXY),
+            _ => code
+                .split_once(".redirect(")
+                .is_some_and(|(_, rest)| rest.contains("Policy::none()")),
+        })
+    };
+    CLIENT_PROPERTIES
+        .iter()
+        .filter(|(prop, _)| {
+            !CLIENT_PROPERTY_EXEMPT
+                .iter()
+                .any(|(file, p, _)| rel == *file && p == prop)
+        })
+        .filter(|(prop, _)| !has(prop))
+        .map(|(prop, why)| {
+            Violation(format!(
+                "{rel}: HTTP-клиент reqwest без {prop}: {why} (M4 ревью задачи 2 R1-M; исключение — только с причиной в CLIENT_PROPERTY_EXEMPT)"
+            ))
+        })
+        .collect()
+}
+
+/// Реэкспорт `reqwest` из файла клиента держателя [`HTTP_HOLDERS`] (M6 ревью задачи 2 R1-M):
+/// `pub use …reqwest…` и `pub type … = …reqwest…` с любой видимостью (`pub(crate)`,
+/// `pub(super)`) — нарушение, кроме [`HOLDER_REEXPORT_ALLOWED`] (`pub use reqwest::Method;`).
+/// Иначе `pub use reqwest::Client as Http` или `pub type Http = reqwest::Client` дали бы
+/// другим модулям крейта клиент по умолчанию через `Http::default()` (системный прокси,
+/// редиректы), а [`check_http_client`] этого имени не видит. Инструкция может идти на
+/// несколько строк (до `;`).
+///
+/// Граница: только инструкции `use` и `type`, начатые с видимости в начале строки;
+/// двухшаговый псевдоним (`use reqwest::Client as C;` и `pub use C as Http;`) и публичное
+/// поле типа клиента страж не видит — их ловит ревью.
+pub fn check_holder_reexports(rel: &str, text: &str) -> Vec<Violation> {
+    let Some(h) = HTTP_HOLDERS.iter().find(|h| rel == h.client_file()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut lines = code_lines(text);
+    while let Some((n, code)) = lines.next() {
+        let Some(item) = strip_visibility(code) else {
+            continue;
+        };
+        if !(item.starts_with("use ") || item.starts_with("type ")) {
+            continue;
+        }
+        let mut stmt = item.to_owned();
+        while !stmt.contains(';') {
+            let Some((_, next)) = lines.next() else {
+                break;
+            };
+            stmt.push(' ');
+            stmt.push_str(next);
+        }
+        if !mentions_reqwest(&stmt, &[]) {
+            continue;
+        }
+        let tight: String = stmt.chars().filter(|c| !c.is_whitespace()).collect();
+        let allowed = HOLDER_REEXPORT_ALLOWED
+            .iter()
+            .any(|p| tight == format!("use{p};"));
+        if !allowed {
+            out.push(Violation(format!(
+                "{rel}:{n}: реэкспорт reqwest из {} (допустимо только {}): другие модули {} собрали бы клиент в обход {} (D129, D133)",
+                h.file,
+                HOLDER_REEXPORT_ALLOWED
+                    .iter()
+                    .map(|p| format!("pub use {p};"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                h.krate(),
+                h.file,
+            )));
+        }
+    }
+    out
+}
+
+/// Остаток строки после видимости `pub`, `pub(crate)`, `pub(super)`, `pub(in …)`; не
+/// публичная строка — `None`.
+fn strip_visibility(code: &str) -> Option<&str> {
+    let rest = code.strip_prefix("pub")?;
+    if let Some(inner) = rest.strip_prefix('(') {
+        let close = inner.find(')')?;
+        return Some(inner[close + 1..].trim_start());
+    }
+    rest.starts_with(char::is_whitespace)
+        .then(|| rest.trim_start())
+}
+
+/// Файл клиента каждого держателя [`HTTP_HOLDERS`] есть среди исходников `rels` (M6 ревью
+/// задачи 2 R1-M): после переименования файла без правки таблицы освобождение и проверки
+/// свойств молча указывали бы на пустое место.
+pub fn check_client_files_present<'a>(
+    rels: impl IntoIterator<Item = &'a str> + Clone,
+) -> Vec<Violation> {
+    HTTP_HOLDERS
+        .iter()
+        .filter(|h| !rels.clone().into_iter().any(|r| r == h.client_file()))
+        .map(|h| {
+            Violation(format!(
+                "{}: файл клиента держателя HTTP {} не найден ({}): переименован — поправьте HTTP_HOLDERS (M6 ревью задачи 2 R1-M)",
+                h.client_file(),
+                h.krate(),
+                h.why,
+            ))
+        })
+        .collect()
 }
 
 /// Подключение файла в обход `src/` в исходнике `rel` держателя HTTP-клиента из
@@ -610,13 +845,10 @@ pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
 /// самом. Тесты крейтов (`tests/`) подключают `test-support/*.rs` через `#[path]` законно:
 /// их страж не сканирует.
 pub fn check_holder_includes(rel: &str, text: &str) -> Vec<Violation> {
-    let Some((prefix, _, _)) = HTTP_HOLDERS
-        .iter()
-        .find(|(prefix, _, _)| rel.starts_with(prefix))
-    else {
+    let Some(h) = HTTP_HOLDERS.iter().find(|h| rel.starts_with(h.prefix)) else {
         return Vec::new();
     };
-    let krate = prefix.trim_start_matches("crates/").trim_end_matches('/');
+    let krate = h.krate();
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let code = line.trim_start();
@@ -796,10 +1028,16 @@ fn collect(root: &Path) -> Result<Vec<Violation>, String> {
     let lines =
         count_lines(&root.join("crates/za-shell/src")).map_err(|e| format!("za-shell: {e}"))?;
     out.extend(check_size("za-shell", lines, limit));
-    for (rel, text) in crate_sources(root).map_err(|e| format!("crates/*/src: {e}"))? {
-        out.extend(check_process_spawn(&rel, &text));
-        out.extend(check_http_client(&rel, &text));
-        out.extend(check_holder_includes(&rel, &text));
+    let sources = crate_sources(root).map_err(|e| format!("crates/*/src: {e}"))?;
+    out.extend(check_client_files_present(
+        sources.iter().map(|(rel, _)| rel.as_str()),
+    ));
+    for (rel, text) in &sources {
+        out.extend(check_process_spawn(rel, text));
+        out.extend(check_http_client(rel, text));
+        out.extend(check_holder_includes(rel, text));
+        out.extend(check_client_properties(rel, text));
+        out.extend(check_holder_reexports(rel, text));
     }
     Ok(out)
 }
@@ -1594,6 +1832,198 @@ version = \"0.0.1\"
                 to_memory(check_direction(&meta_with(bad, dev("za-memory")))),
                 "dev {bad}"
             );
+        }
+    }
+    /// M6 ревью задачи 2 R1-M: файл клиента держателя — один источник (`HTTP_HOLDERS`).
+    /// Освобождение `check_http_client`, страж реэкспорта и наличие файла берут путь оттуда;
+    /// второй таблицы с тем же путём нет, и переименование файла без правки таблицы — нарушение.
+    #[test]
+    fn client_file_has_one_source() {
+        for h in HTTP_HOLDERS {
+            let file = h.client_file();
+            assert!(file.starts_with(&format!("{}src/", h.prefix)), "{file}");
+            assert!(http_client_allowed(&file), "{file}");
+            assert!(
+                check_http_client(&file, "let c = Client::builder()").is_empty(),
+                "{file}"
+            );
+            let other = format!("{}src/other.rs", h.prefix);
+            assert!(!http_client_allowed(&other), "{other}");
+            assert_eq!(
+                check_http_client(&other, "let c = Client::builder()").len(),
+                1,
+                "{other}"
+            );
+        }
+        // `za-llm` — весь крейт (R1-A).
+        assert!(http_client_allowed("crates/za-llm/src/probe.rs"));
+        assert!(!http_client_allowed("crates/za-core/src/a.rs"));
+        let all: Vec<String> = HTTP_HOLDERS.iter().map(HttpHolder::client_file).collect();
+        assert!(check_client_files_present(all.iter().map(String::as_str)).is_empty());
+        let renamed = [
+            "crates/za-web/src/gateway.rs",
+            "crates/za-memory/src/client.rs",
+        ];
+        let v = check_client_files_present(renamed);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(
+            v[0].0.contains("crates/za-memory/src/transport.rs"),
+            "{v:?}"
+        );
+        // Настоящие исходники: файлы клиентов на месте.
+        let sources = crate_sources(&root()).unwrap();
+        assert!(check_client_files_present(sources.iter().map(|(r, _)| r.as_str())).is_empty());
+    }
+
+    /// M4 ревью задачи 2 R1-M: файл, где строится клиент `reqwest` (в `za-llm`, `za-web`,
+    /// `za-memory`), содержит в коде `.no_proxy()` и `.redirect(…Policy::none())`; иначе
+    /// нарушение. Исключения — только из таблицы с причиной.
+    #[test]
+    fn client_builder_needs_no_proxy_and_no_redirect() {
+        let full = "let c = reqwest::Client::builder()\n    .no_proxy()\n    .redirect(reqwest::redirect::Policy::none())\n    .build();";
+        let no_proxy = "let c = reqwest::Client::builder()\n    .redirect(reqwest::redirect::Policy::none())\n    .build();";
+        let no_redirect = "let c = reqwest::Client::builder()\n    .no_proxy()\n    .build();";
+        let commented = "let c = reqwest::Client::builder()\n    // .no_proxy()\n    // .redirect(reqwest::redirect::Policy::none())\n    .build();";
+        let limited = "let c = Client::builder()\n    .no_proxy()\n    .redirect(redirect::Policy::limited(3))\n    .build(); // Policy::none() — нет";
+        for rel in [
+            "crates/za-memory/src/transport.rs",
+            "crates/za-web/src/gateway.rs",
+            "crates/za-llm/src/http/transport.rs",
+            "crates/za-llm/src/x.rs",
+        ] {
+            assert!(check_client_properties(rel, full).is_empty(), "{rel}");
+            let v = check_client_properties(rel, no_proxy);
+            assert_eq!(v.len(), 1, "{rel}: {v:?}");
+            assert!(v[0].0.contains(".no_proxy()"), "{v:?}");
+            assert!(v[0].0.starts_with(rel), "{v:?}");
+            let v = check_client_properties(rel, no_redirect);
+            assert_eq!(v.len(), 1, "{rel}: {v:?}");
+            assert!(v[0].0.contains("Policy::none()"), "{v:?}");
+            assert_eq!(check_client_properties(rel, commented).len(), 2, "{rel}");
+            assert_eq!(check_client_properties(rel, limited).len(), 1, "{rel}");
+        }
+        // Клиент не строится — нечего проверять; вне держателей правило не действует (там
+        // клиента нет вовсе: `check_http_client`, `REQWEST_USERS`).
+        assert!(
+            check_client_properties("crates/za-memory/src/discovery.rs", "let x = 1;").is_empty()
+        );
+        assert!(check_client_properties("crates/za-core/src/a.rs", no_proxy).is_empty());
+        assert!(
+            check_client_properties(
+                "crates/za-memory/src/transport.rs",
+                "let m = MemoryClient::builder();"
+            )
+            .is_empty()
+        );
+        // Исключение с причиной: зонд R0 `probe_llama` без `Policy::none`, но прокси — нет.
+        assert!(check_client_properties("crates/za-llm/src/probe.rs", no_redirect).is_empty());
+        assert_eq!(
+            check_client_properties("crates/za-llm/src/probe.rs", no_proxy).len(),
+            1
+        );
+        for (file, prop, why) in CLIENT_PROPERTY_EXEMPT {
+            assert!(CLIENT_PROPERTIES.iter().any(|(p, _)| p == prop), "{file}");
+            assert!(!why.trim().is_empty(), "{file}");
+        }
+    }
+
+    /// M4: настоящие файлы клиентов `za-llm`, `za-web` и `za-memory` строят клиент (проверка
+    /// не пустая) и проходят страж свойств; без `.no_proxy()` клиент памяти — нарушение.
+    #[test]
+    fn real_client_files_have_properties() {
+        let root = root();
+        for rel in [
+            "crates/za-web/src/gateway.rs",
+            "crates/za-memory/src/transport.rs",
+            "crates/za-llm/src/http/transport.rs",
+            "crates/za-llm/src/probe.rs",
+        ] {
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            assert!(text.contains("Client::builder"), "{rel}");
+            let v = check_client_properties(rel, &text);
+            assert!(v.is_empty(), "{rel}: {v:?}");
+        }
+        let rel = "crates/za-memory/src/transport.rs";
+        let text = std::fs::read_to_string(root.join(rel)).unwrap();
+        for cut in [
+            ".no_proxy()",
+            ".redirect(reqwest::redirect::Policy::none())",
+        ] {
+            let mutated = text
+                .lines()
+                .filter(|l| l.trim() != cut)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_ne!(mutated.lines().count(), text.lines().count(), "{cut}");
+            assert_eq!(check_client_properties(rel, &mutated).len(), 1, "{cut}");
+        }
+    }
+
+    /// M6 ревью задачи 2 R1-M: из файла клиента держателя `reqwest` не реэкспортируется,
+    /// кроме `pub use reqwest::Method;`. Иначе `Http::default()` в другом модуле крейта —
+    /// клиент по умолчанию (прокси окружения, редиректы), которого `check_http_client` не видит.
+    #[test]
+    fn holder_client_file_reexports_only_method() {
+        for rel in [
+            "crates/za-memory/src/transport.rs",
+            "crates/za-web/src/gateway.rs",
+        ] {
+            for text in [
+                "pub use reqwest::Client as Http;",
+                "pub type Http = reqwest::Client;",
+                "pub(crate) use reqwest::Client;",
+                "pub(super) type B = ::reqwest::ClientBuilder;",
+                "pub use reqwest::{\n    Client,\n    Method,\n};",
+                "pub use reqwest::*;",
+                "pub use reqwest;",
+                "pub use reqwest::Method as M;",
+                "pub type M = reqwest::Method;",
+            ] {
+                let v = check_holder_reexports(rel, text);
+                assert_eq!(v.len(), 1, "{rel}: {text}: {v:?}");
+                assert!(v[0].0.contains(&format!("{rel}:1")), "{v:?}");
+            }
+            let v = check_holder_reexports(rel, "fn a() {}\npub type Http =\n    reqwest::Client;");
+            assert_eq!(v.len(), 1, "{v:?}");
+            assert!(v[0].0.contains(&format!("{rel}:2")), "{v:?}");
+            for text in [
+                "pub use reqwest::Method;",
+                "pub(crate) use reqwest::Method;",
+                "use reqwest::{Client, redirect};",
+                "use reqwest::Client as Http;",
+                "// pub use reqwest::Client as Http;",
+                "pub use crate::config::Token;",
+                "pub type Res = Result<(), ZamError>;",
+                "pub fn reqwest_like() {}",
+                "pub struct ZamClient {",
+            ] {
+                assert!(
+                    check_holder_reexports(rel, text).is_empty(),
+                    "{rel}: {text}"
+                );
+            }
+        }
+        // Вне файла клиента правило не действует (там — пути держателя, `check_http_client`).
+        assert!(
+            check_holder_reexports(
+                "crates/za-web/src/lib.rs",
+                "pub use reqwest::dns::{Addrs, Name};"
+            )
+            .is_empty()
+        );
+        assert!(
+            check_holder_reexports(
+                "crates/za-llm/src/http/mod.rs",
+                "pub use reqwest::header::HeaderMap;"
+            )
+            .is_empty()
+        );
+        // Настоящие файлы клиентов чисты.
+        for h in HTTP_HOLDERS {
+            let file = h.client_file();
+            let text = std::fs::read_to_string(root().join(&file)).unwrap();
+            let v = check_holder_reexports(&file, &text);
+            assert!(v.is_empty(), "{file}: {v:?}");
         }
     }
     #[test]
