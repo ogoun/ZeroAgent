@@ -17,10 +17,16 @@ const PLAIN_MAX: usize = 300;
 /// Вид ошибки сервера памяти (D137).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
-    /// Нет соединения (в том числе не уложились в срок соединения).
+    /// Не соединились (в том числе не уложились в срок соединения): запрос до сервера не
+    /// дошёл.
     Offline,
     /// Срок запроса вышел.
     Timeout,
+    /// Соединение оборвалось после отправки, ответа со статусом нет (сброс, `IncompleteMessage`,
+    /// обрыв тела ответа): исход неизвестен — сервер мог выполнить запрос. Очередь записей
+    /// (задача 7) повторяет `Interrupted` только у записи с `Idempotency-Key`: повтор с тем же
+    /// ключом не задваивает запись; без ключа — не повторяет.
+    Interrupted,
     /// Отвечает не API ZeroAIMemory (HTML WebUI, не JSON, нет `version`).
     NotZam,
     /// Нарушение протокола: любой 3xx, неожиданный код, ошибка JSON-RPC, неразобранный ответ.
@@ -61,6 +67,7 @@ impl ErrorKind {
         match self {
             Self::Offline => "offline",
             Self::Timeout => "timeout",
+            Self::Interrupted => "interrupted",
             Self::NotZam => "not_zam",
             Self::Protocol => "protocol",
             Self::Auth => "auth",
@@ -205,11 +212,12 @@ impl ZamError {
         }
     }
 
-    /// Нет ответа ZAM: нет соединения, срок вышел, отвечает не ZAM.
+    /// Нет ответа ZAM: не соединились, срок вышел, соединение оборвалось без ответа, отвечает
+    /// не ZAM.
     pub fn is_unreachable(&self) -> bool {
         matches!(
             self.kind,
-            ErrorKind::Offline | ErrorKind::Timeout | ErrorKind::NotZam
+            ErrorKind::Offline | ErrorKind::Timeout | ErrorKind::Interrupted | ErrorKind::NotZam
         )
     }
 

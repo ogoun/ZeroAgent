@@ -408,6 +408,84 @@ async fn rate_limited_carries_retry_after() {
     assert_eq!(e.status, Some(429));
 }
 
+/// Обрыв посреди запроса (M1 ревью задачи 2): сервер принял запрос целиком и закрыл
+/// соединение без ответа, или оборвал тело ответа, — `Interrupted` («исход неизвестен»: запись
+/// могла пройти), а не `Protocol`. «Не соединились» (закрытый порт) — по-прежнему `Offline`.
+#[tokio::test]
+async fn interrupted_mid_request_vs_offline() {
+    let body = json!({"kind": "task", "title": "t"});
+    let mut cut = fake_zam::CutServer::start(fake_zam::Cut::BeforeReply);
+    let c = client(&cut.url());
+    let e = within(
+        WAIT,
+        "cut before reply",
+        c.send_json(
+            Method::POST,
+            "/api/v1/journal",
+            &body,
+            &Ctx::default(),
+            Some("idem-cut-1"),
+            None,
+            LIMIT,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.kind, Interrupted, "{e:?}");
+    assert_eq!(e.status, None);
+    assert!(e.is_unreachable(), "{e:?}");
+    // Запрос дошёл до сервера: это не «нет соединения».
+    assert_eq!(cut.seen(), vec!["POST /api/v1/journal".to_owned()]);
+    // MCP — тот же разбор.
+    let e = within(
+        WAIT,
+        "cut mcp",
+        c.mcp_call(
+            "memory_search",
+            json!({"query": "x"}),
+            &Ctx::default(),
+            LIMIT,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.kind, Interrupted, "{e:?}");
+    assert_eq!(cut.seen(), vec!["POST /mcp".to_owned()]);
+
+    // Обрыв тела ответа 200 (`Content-Length` больше отданного).
+    let mut mid = fake_zam::CutServer::start(fake_zam::Cut::MidBody);
+    let c = client(&mid.url());
+    let e = within(
+        WAIT,
+        "cut mid body",
+        c.get_json("/api/v1/spaces", &Ctx::default(), LIMIT),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.kind, Interrupted, "{e:?}");
+    assert_eq!(mid.seen(), vec!["GET /api/v1/spaces".to_owned()]);
+
+    // Закрытый порт — не соединились: `Offline`, не `Interrupted`.
+    let c = client(&fake_zam::closed_port_url());
+    let e = within(
+        WAIT,
+        "offline",
+        c.send_json(
+            Method::POST,
+            "/api/v1/journal",
+            &body,
+            &Ctx::default(),
+            Some("idem-cut-2"),
+            None,
+            LIMIT,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.kind, Offline, "{e:?}");
+    assert_eq!(ErrorKind::Interrupted.as_str(), "interrupted");
+}
+
 /// Нет соединения — `Offline`; срок вышел — `Timeout`; не JSON в ответе 2xx — `NotZam`.
 #[tokio::test]
 async fn offline_timeout_and_not_json() {

@@ -19,6 +19,9 @@
 //! - **Сроки:** предел запроса — аргумент `limit` каждого вызова (константы ниже), он
 //!   покрывает и отправку, и чтение тела; не успели — [`ErrorKind::Timeout`]. Отмена run
 //!   бросает future — запрос обрывается.
+//! - **Обрыв:** не соединились — [`ErrorKind::Offline`] (запрос не дошёл); соединение
+//!   оборвалось после отправки без ответа со статусом или посреди тела —
+//!   [`ErrorKind::Interrupted`] (исход неизвестен, повтор — только с `Idempotency-Key`).
 //! - **Ошибки:** не 2xx — [`ZamError::from_problem`]; ошибка инструмента MCP (HTTP 200,
 //!   `isError`) — [`parse_mcp_error`]; ошибка JSON-RPC — `Protocol`. Тексты ошибок — без
 //!   тела запроса и без заголовков; значение токена, если сервер его повторил, заменяется.
@@ -347,7 +350,8 @@ impl ZamClient {
         Ok((status, v))
     }
 
-    /// Отправка до срока: нет соединения — `Offline`, срок вышел — `Timeout`.
+    /// Отправка до срока: не соединились — `Offline`, срок вышел — `Timeout`, обрыв после
+    /// отправки — `Interrupted` ([`transport_error`]).
     async fn send(
         &self,
         req: reqwest::RequestBuilder,
@@ -437,19 +441,32 @@ fn is_json(h: &HeaderMap) -> bool {
     mime == "application/json" || (mime.starts_with("application/") && mime.ends_with("+json"))
 }
 
-/// Ошибка `reqwest` в [`ZamError`]: соединение (в том числе его срок) — `Offline`, срок
-/// запроса — `Timeout`, прочее — `Protocol`. Текст — цепочка причин без адреса.
+/// Ошибка `reqwest` в [`ZamError`] (D137; M1 ревью задачи 2). Порядок проверок важен:
+///
+/// 1. не соединились (`is_connect`, в том числе срок соединения и TLS) — `Offline`: запрос
+///    до сервера не дошёл;
+/// 2. срок вышел — `Timeout`;
+/// 3. соединение оборвалось после отправки, ответа со статусом нет — `Interrupted`, исход
+///    неизвестен: `is_request` (сброс, `IncompleteMessage` — сервер закрыл соединение без
+///    ответа), `is_body` и `is_decode` (обрыв тела: `Response::chunk` в reqwest 0.12
+///    оборачивает ошибку тела в `Decode`, а JSON разбирается здесь, не в reqwest);
+/// 4. прочее (сборка запроса) — `Protocol`.
+///
+/// Текст — цепочка причин без адреса.
 fn transport_error(e: reqwest::Error) -> ZamError {
     let kind = if e.is_connect() {
         ErrorKind::Offline
     } else if e.is_timeout() {
         ErrorKind::Timeout
+    } else if e.is_request() || e.is_body() || e.is_decode() {
+        ErrorKind::Interrupted
     } else {
         ErrorKind::Protocol
     };
     let title = match kind {
         ErrorKind::Offline => "memory server unreachable",
         ErrorKind::Timeout => "memory server did not answer in time",
+        ErrorKind::Interrupted => "memory server connection interrupted; outcome unknown",
         _ => "memory request failed",
     };
     ZamError::new(kind, title).with_detail(error_chain(&e.without_url()))

@@ -348,6 +348,90 @@ impl FakeZam {
     }
 }
 
+/// Как [`CutServer`] рвёт соединение.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    /// Запрос прочитан целиком, ответа нет: соединение закрыто (у клиента — `IncompleteMessage`).
+    BeforeReply,
+    /// Ответ `200` с `Content-Length` больше отданного тела, затем закрытие: обрыв тела.
+    MidBody,
+}
+
+/// Сервер на `127.0.0.1:0`, который принимает запрос и рвёт соединение (D154: «обрыв
+/// соединения после записи»; M1 ревью задачи 2). Блокирующий сокет — в своём потоке ОС, не
+/// в рантайме теста. В канал уходит строка запроса (`POST /api/v1/x`) до обрыва: «запрос
+/// дошёл до сервера» тест проверяет каналом, а не таймером.
+pub struct CutServer {
+    pub addr: SocketAddr,
+    pub rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl CutServer {
+    pub fn start(cut: Cut) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { return };
+                let Some(line) = read_request(&mut s) else {
+                    continue;
+                };
+                if tx.send(line).is_err() {
+                    return;
+                }
+                if cut == Cut::MidBody {
+                    use std::io::Write;
+                    let _ = s.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"text\":",
+                    );
+                    let _ = s.flush();
+                }
+                // Закрытие: запрос прочитан целиком, поэтому уходит FIN, а не RST.
+                drop(s);
+            }
+        });
+        Self { addr, rx }
+    }
+
+    /// Базовый адрес `http://127.0.0.1:<порт>`.
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Строки принятых к этому моменту запросов (канал опустошается).
+    pub fn seen(&mut self) -> Vec<String> {
+        self.rx.try_iter().collect()
+    }
+}
+
+/// Строка запроса (`METHOD /path`) после чтения заголовков и тела `Content-Length`.
+fn read_request(s: &mut std::net::TcpStream) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = s.read(&mut chunk).ok().filter(|n| *n > 0)?;
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let length = head
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while buf.len() < head_end + length {
+        let n = s.read(&mut chunk).ok().filter(|n| *n > 0)?;
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let first = head.lines().next().unwrap_or("");
+    Some(first.rsplit_once(' ').map_or(first, |(l, _)| l).to_owned())
+}
+
 /// Адрес `http://127.0.0.1:<порт>`, на котором никто не слушает: порт занят и освобождён.
 pub fn closed_port_url() -> String {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
