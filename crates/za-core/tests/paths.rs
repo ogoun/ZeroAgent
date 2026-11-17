@@ -436,6 +436,42 @@ fn short_names_are_resolved() {
     }
 }
 
+/// R1-M, Minor 6 ревью задачи 1: корни только для границы проекта ([`Roots::boundary`]:
+/// разрешение пути инструментом, набор доверия, инструкции, скиллы) — без `ZA_HOME` и
+/// защищённых мест памяти. `resolve` не ставит `protected` обычным путям проекта (у
+/// прежних корней `Roots::canonical(d, d)` защищён был каждый путь); служебный
+/// `.zero-agent` проекта защищён, как и раньше. Его `ZA_HOME` не канонизируется: ссылка
+/// `.zero-agent` на недоступную цель корни не ломает.
+#[test]
+fn boundary_roots_protect_only_service_dir() {
+    let f = fixture("boundary");
+    let b = Roots::boundary(&f.project).unwrap();
+    assert_eq!(b.project, f.roots.project);
+    assert!(b.home.is_none() && b.sealed.is_empty());
+    let at = |arg: &str, access| resolve(&b, &classify(&b.project, arg).unwrap(), access).unwrap();
+    for access in [Access::Read, Access::Write, Access::Exec] {
+        let r = at("src/a.rs", access);
+        assert!(r.inside && !r.protected, "{access:?}");
+    }
+    assert!(at(".zero-agent/config.toml", Access::Write).protected);
+    assert!(at(".git/config", Access::Write).protected);
+    // Прежние корни границы: `ZA_HOME` = проект, защищён каждый путь.
+    let dd = Roots::canonical(&f.project, &f.project).unwrap();
+    let r = resolve(
+        &dd,
+        &classify(&dd.project, "src/a.rs").unwrap(),
+        Access::Read,
+    )
+    .unwrap();
+    assert!(r.protected);
+    // Висячая ссылка `.zero-agent`: корни границы строятся.
+    let missing = f.outside.join("missing");
+    std::fs::create_dir_all(&missing).unwrap();
+    dir_link(&f.project.join(".zero-agent"), &missing);
+    std::fs::remove_dir(&missing).unwrap();
+    assert!(Roots::boundary(&f.project).is_ok());
+}
+
 /// R1-M D157, Minor 4 ревью задачи 1: короткое имя 8.3 защищённого места (`ZEROAI~1` у
 /// `~/.zeroaimemory`) — то же защищённое место при любом доступе: сверяется канонический
 /// путь. Если том не создаёт имена 8.3, проверка пропускается с сообщением.

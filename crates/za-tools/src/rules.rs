@@ -313,7 +313,7 @@ mod tests {
     fn dir(name: &str) -> PathBuf {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/za-tools-unit");
         let d = crate::unique_dir::unique_dir_in(&root, name);
-        za_core::paths::Roots::canonical(&d, &d).unwrap().project
+        za_core::paths::Roots::boundary(&d).unwrap().project
     }
 
     fn limits() -> WalkLimits {

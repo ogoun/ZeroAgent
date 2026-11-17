@@ -47,7 +47,7 @@ fn skill(root: &Path, rel: &str, name: &str, desc: &str) {
 }
 
 fn roots(p: &Path) -> Roots {
-    Roots::canonical(p, p).unwrap()
+    Roots::boundary(p).unwrap()
 }
 
 /// Списки деревьев проекта — так, как их даст бинарник после сверки доверия.

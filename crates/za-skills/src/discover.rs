@@ -278,7 +278,7 @@ impl Discovery {
             return;
         }
         let shown = dir.display().to_string();
-        let roots = match Roots::canonical(dir, dir) {
+        let roots = match Roots::boundary(dir) {
             Ok(r) => r,
             Err(e) if tree::is_missing(&e) => return,
             Err(e) => return self.skip(shown, format!("unreadable: {e}")),

@@ -961,7 +961,7 @@ fn read_inside(roots: &za_core::paths::Roots, arg: &str) -> Option<String> {
 /// дерево `git worktree` основного репозитория) — `-`.
 pub fn git_branch(project_dir: &Path) -> String {
     let _drives = za_core::paths::DriveScope::enter();
-    let Ok(roots) = za_core::paths::Roots::canonical(project_dir, project_dir) else {
+    let Ok(roots) = za_core::paths::Roots::boundary(project_dir) else {
         return "-".into();
     };
     let dot_git = match inside_file(&roots, ".git") {

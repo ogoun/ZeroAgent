@@ -1125,7 +1125,7 @@ pub fn clean_edit_leftovers(project: &Path) -> io::Result<usize> {
 #[doc(hidden)]
 pub fn clean_leftovers_older(project: &Path, age: Duration) -> io::Result<usize> {
     let _drives = za_core::paths::DriveScope::enter();
-    let roots = Roots::canonical(project, project)?;
+    let roots = Roots::boundary(project)?;
     let dir_r = ResolvedPath {
         path: work_dir(&roots.project, EDITS_DIR)?,
         inside: true,

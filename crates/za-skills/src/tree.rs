@@ -369,7 +369,7 @@ pub(crate) enum ReadFail {
 /// Корни чтения каталога скилла `dir`: канонический каталог скилла — граница
 /// ([`read_in`], [`resolves_inside`]). Блокирующая.
 pub(crate) fn skill_roots(dir: &Path) -> Result<Roots, ReadFail> {
-    Roots::canonical(dir, dir).map_err(|e| {
+    Roots::boundary(dir).map_err(|e| {
         if is_missing(&e) {
             ReadFail::Missing
         } else {
@@ -445,7 +445,7 @@ mod tests {
             std::fs::create_dir_all(d.join(format!("node_modules/m{i}"))).unwrap();
         }
         std::fs::write(d.join("ok.md"), "x").unwrap();
-        let roots = Roots::canonical(&d, &d).unwrap();
+        let roots = Roots::boundary(&d).unwrap();
         let limits = TreeLimits {
             max_file: 1 << 20,
             max_entries: 2,
@@ -471,7 +471,7 @@ mod tests {
         }
         std::fs::create_dir_all(&p).unwrap();
         std::fs::write(p.join("f"), "x").unwrap();
-        let roots = Roots::canonical(&d, &d).unwrap();
+        let roots = Roots::boundary(&d).unwrap();
         let (_, l) = tree_listing(&roots, "", &TRUST_LIMITS).unwrap();
         let l = l.unwrap();
         assert_eq!(l.files.len(), 1);

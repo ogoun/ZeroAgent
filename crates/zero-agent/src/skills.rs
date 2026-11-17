@@ -52,7 +52,7 @@ pub fn project_skills(
     set: &TrustSet,
 ) -> io::Result<(Option<ProjectSkills>, Vec<Skipped>)> {
     // Корни — как у набора доверия (`trust_set`): значения обхода те же.
-    let roots = Roots::canonical(project, project)?;
+    let roots = Roots::boundary(project)?;
     let mut trees = Vec::new();
     let mut skipped = Vec::new();
     for rel in TRUSTED_TREES {

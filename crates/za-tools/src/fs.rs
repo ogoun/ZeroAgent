@@ -269,12 +269,12 @@ where
 
 /// Канонический корень проекта и разрешённый путь (блокирующая).
 ///
-/// Инструмент разрешает путь сам, от своего канонического корня проекта. `ZA_HOME` здесь
-/// не нужен: защищённость самого пути (в том числе мест памяти, R1-M D157) решила политика
-/// пакета, а `protected` этих корней (`ZA_HOME` — проект) инструмент не читает. Защищённые
-/// места внутри обхода и корень обхода в них сверяются по корням run (`ToolCx::roots`).
+/// Инструмент разрешает путь сам, от своего канонического корня проекта (корни границы,
+/// [`Roots::boundary`]). `ZA_HOME` здесь не нужен: защищённость самого пути (в том числе
+/// мест памяти, R1-M D157) решила политика пакета. Защищённые места внутри обхода и корень
+/// обхода в них сверяются по корням run (`ToolCx::roots`).
 fn resolve_in(project: &Path, lex: &LexPath) -> Result<(PathBuf, ResolvedPath), ToolOutput> {
-    let roots = Roots::canonical(project, project).map_err(|e| {
+    let roots = Roots::boundary(project).map_err(|e| {
         tracing::warn!(project = %project.display(), error = %e, "корень проекта не канонизирован");
         ToolOutput::error(format!(
             "project directory is not available: {}",

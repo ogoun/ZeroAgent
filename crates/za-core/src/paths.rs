@@ -110,19 +110,30 @@ impl Roots {
     /// или за ссылкой на UNC — ошибка, а не корень `\\?\UNC\…` (M5 ревью).
     pub fn canonical(project: &Path, za_home: &Path) -> io::Result<Roots> {
         let _drives = DriveScope::enter();
-        let p = std::path::absolute(project)?;
-        let (_, missing) = walk(&p, &mut 0).map_err(io::Error::other)?;
-        if !missing.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("каталог проекта не найден: {}", p.display()),
-            ));
-        }
-        let project = canonical_prefix(&p).map_err(io::Error::other)?;
+        let project = canonical_project(project)?;
         let za_home = canonical_prefix(&std::path::absolute(za_home)?).map_err(io::Error::other)?;
         Ok(Roots {
             project,
             za_home,
+            home: None,
+            sealed: Vec::new(),
+        })
+    }
+
+    /// Корни только для границы проекта (блокирующая; R1-M, Minor 6 ревью задачи 1): кто
+    /// смотрит лишь на `inside` и канонический путь — разрешение пути инструментом, набор
+    /// доверия, инструкции, скиллы. Проект канонизируется, как у [`Roots::canonical`];
+    /// `ZA_HOME` агента нет — на его месте служебный `<project>/.zero-agent` (от нативной
+    /// записи он защищён и так, D79), без канонизации: ссылка `.zero-agent` корни не
+    /// ломает. Защищённых мест памяти нет. Поэтому [`resolve`] ставит `protected` только
+    /// путям `.zero-agent`, `.git` (запись) и `.zeroaimemory` проекта (запись), а не
+    /// каждому пути, как корни `Roots::canonical(d, d)`.
+    pub fn boundary(project: &Path) -> io::Result<Roots> {
+        let _drives = DriveScope::enter();
+        let project = canonical_project(project)?;
+        Ok(Roots {
+            za_home: project.join(ZA_DIR),
+            project,
             home: None,
             sealed: Vec::new(),
         })
@@ -156,6 +167,20 @@ impl Roots {
             ..self
         })
     }
+}
+
+/// Канонический корень проекта (блокирующая): проект должен существовать; сетевой диск и
+/// ссылка на UNC — ошибка (M5 ревью).
+fn canonical_project(project: &Path) -> io::Result<PathBuf> {
+    let p = std::path::absolute(project)?;
+    let (_, missing) = walk(&p, &mut 0).map_err(io::Error::other)?;
+    if !missing.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("каталог проекта не найден: {}", p.display()),
+        ));
+    }
+    canonical_prefix(&p).map_err(io::Error::other)
 }
 
 /// Каталог служебных файлов проекта.
@@ -651,9 +676,8 @@ fn is_missing(e: &io::Error) -> bool {
 /// канонические пути, поэтому защита действует и через ссылку, junction, короткое имя 8.3
 /// и другой регистр.
 ///
-/// Вызывающий с корнями `Roots::canonical(d, d)` (`ZA_HOME` = проект: чтение скиллов,
-/// набор доверия, AGENTS.md) получает `protected` у каждого пути и на `protected` не
-/// смотрит: это корни для границы, а не для политики.
+/// Корни, где `ZA_HOME` совпадает с проектом (`Roots::canonical(d, d)`), дают `protected`
+/// каждому пути: для границы без политики — [`Roots::boundary`].
 pub fn resolve(roots: &Roots, lex: &LexPath, access: Access) -> Result<ResolvedPath, PathError> {
     let _drives = DriveScope::enter();
     let path = canonical_prefix(lex.as_path())?;

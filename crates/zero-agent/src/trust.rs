@@ -83,7 +83,7 @@ impl TrustSet {
 /// диске — ошибка (`Roots::canonical`).
 pub fn trust_set(project: &Path) -> io::Result<TrustSet> {
     // `ZA_HOME` нужен `Roots` только для защиты записи; набор только читает.
-    let roots = Roots::canonical(project, project)?;
+    let roots = Roots::boundary(project)?;
     let mut files = BTreeMap::new();
     for rel in TRUSTED_FILES {
         if let Some(v) = za_skills::file_value(&roots, rel)? {
@@ -248,7 +248,7 @@ pub fn read_trusted(project: &Path, set: &TrustSet, rel: &str) -> io::Result<Opt
         return Ok(None);
     }
     let expected = value.strip_prefix(LINK_PREFIX).unwrap_or(value);
-    let roots = Roots::canonical(project, project)?;
+    let roots = Roots::boundary(project)?;
     let Ok(lex) = paths::classify(&roots.project, rel) else {
         return Ok(None);
     };
