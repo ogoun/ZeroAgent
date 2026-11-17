@@ -51,6 +51,7 @@ fn cx(deadline: Option<std::time::Instant>) -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 0, 0),
         paths: Vec::new(),
+        roots: None,
         deadline,
         output_budget: None,
     }

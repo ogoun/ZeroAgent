@@ -83,6 +83,7 @@ fn cx_with(deadline: std::time::Instant, budget: Option<usize>) -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 0, 0),
         paths: Vec::new(),
+        roots: None,
         deadline: Some(deadline),
         output_budget: budget,
     }

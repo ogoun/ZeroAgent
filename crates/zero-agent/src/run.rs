@@ -1497,6 +1497,11 @@ fn deps(
     // D103: секретные файлы (имя, известные значения, PEM) в чекпоинты не входят.
     let mut checkpointer =
         GitCheckpointer::new(runner, agent_home).with_secret_filter(secret_filter);
+    // D157: обход файлов проекта для чекпоинта не заходит в `~/.zeroaimemory/` (проект —
+    // домашний каталог) — тот же домашний каталог, что у корней run.
+    if let Some(h) = &prep.roots.home {
+        checkpointer = checkpointer.with_user_home(h.clone());
+    }
     if let Some(t) = checkpoint_timeout {
         checkpointer = checkpointer.with_create_timeout_for_tests(t);
     }

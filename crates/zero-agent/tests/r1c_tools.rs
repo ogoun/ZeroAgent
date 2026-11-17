@@ -1180,6 +1180,78 @@ fn memory_places_and_client_denied() {
     }
 }
 
+/// Модель: `search` и `glob` по всему проекту и команда `bash` (чекпоинт git), затем ответ.
+fn home_walk_model(seen: &[Value]) -> Response {
+    if tool_results(seen.last()) > 0 {
+        return text_reply(&["готово"]);
+    }
+    calls_reply(&[
+        call("s1", "search", json!({"pattern": "SEALEDLINE"})),
+        call("g1", "glob", json!({"pattern": "**/*.toml"})),
+        call("b1", "bash", json!({"cmd": "echo hi"})),
+    ])
+}
+
+/// R1-M D157, Important 1 ревью задачи 1, в бинарнике: проект — домашний каталог
+/// пользователя (`USERPROFILE` на Windows, `HOME` иначе). Обход `search` и `glob` по всему
+/// проекту не заходит в `~/.zeroaimemory/`, чекпоинт git перед командой его не берёт, а
+/// восстановление с `--delete-new` его не удаляет.
+#[test]
+fn home_project_walk_and_checkpoint_skip_sealed() {
+    let c = Case::new("zam-home-project", home_walk_model);
+    c.trust();
+    let token = ["zam", "_", "Pq4Rs8Tu2Vw6Xy0Za3Bc", "7De1Fg5Hi9Jk2Lm6No4P"].concat();
+    let zam_dir = c.e.project.join(".zeroaimemory");
+    std::fs::create_dir_all(&zam_dir).unwrap();
+    let cfg = format!("marker = \"SEALEDLINE\"\ntoken = \"{token}\"\n");
+    std::fs::write(zam_dir.join("config.toml"), &cfg).unwrap();
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let project = c.e.project_arg().to_owned();
+    let c = c.var(home_var, &project);
+    let o = c.run(&["--mode", "auto", "обход проекта"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let bodies = c.bodies();
+    assert_eq!(result_of(&bodies, "s1"), "no matches");
+    assert_eq!(result_of(&bodies, "g1"), "no files matched");
+    for b in &bodies {
+        assert!(
+            !b.to_string().contains("marker = "),
+            "строка файла ушла модели"
+        );
+        assert!(!b.to_string().contains(&token[4..]), "токен ушёл модели");
+    }
+    let events = c.e.events(run_id(&o));
+    let cp = of_call(&events, EventKind::CheckpointCreated, "b1");
+    assert_eq!(cp.len(), 1, "{events:?}");
+    assert_eq!(cp[0]["kind"], "git", "{}", cp[0]);
+    let repo = c.e.journal_dir().join("checkpoints").join("repo.git");
+    let git_ref = cp[0]["ref"].as_str().unwrap();
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .args(["ls-tree", "-r", "--name-only", git_ref])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git не запустился");
+    let names = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!names.contains(".zeroaimemory"), "{names}");
+    let id = cp[0]["id"].as_str().unwrap();
+    let r = c.za(&[
+        "checkpoints",
+        "restore",
+        "--project",
+        c.e.project_arg(),
+        id,
+        "--delete-new",
+    ]);
+    assert_eq!(r.code(), Some(0), "{r:?}");
+    assert_eq!(
+        std::fs::read_to_string(zam_dir.join("config.toml")).unwrap(),
+        cfg
+    );
+}
+
 /// D157: проект внутри `ZA_HOME` — отказ старта run с причиной, к модели нет запросов.
 #[test]
 fn project_inside_za_home_refused() {

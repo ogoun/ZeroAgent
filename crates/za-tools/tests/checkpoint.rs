@@ -437,6 +437,48 @@ async fn repo_hooks_fsmonitor_filters_not_executed() {
     assert!(left.is_empty(), "сработал код репозитория: {left:?}");
 }
 
+/// R1-M D157, Ruling I1 ревью задачи 1: проект — домашний каталог пользователя
+/// (`with_user_home`), `ZA_HOME` лежит в нём (как `%LOCALAPPDATA%\zero-agent` на Windows).
+/// Чекпоинт git не берёт ни `~/.zeroaimemory/config.toml`, ни файлы `ZA_HOME` (там и сам
+/// репозиторий чекпоинтов); восстановление с удалением новых файлов их не трогает.
+#[tokio::test]
+async fn checkpoint_skips_sealed_places() {
+    let mut c = case("sealed_home");
+    c.home.za_home = c.project.join("AppData/zero-agent");
+    std::fs::create_dir_all(&c.home.za_home).unwrap();
+    c.init();
+    c.write("notes.txt", "one\n");
+    c.write(".zeroaimemory/config.toml", "token = \"t\"\n");
+    c.write("AppData/zero-agent/config.toml", "[llama]\n");
+    c.git(&["add", "notes.txt"]);
+    c.git(&["commit", "-q", "-m", "init"]);
+    let ck = c.ck().with_user_home(c.project.clone());
+    let cp = create(&ck, c.req(ToolKind::Exec, true, RunId::new(), 1)).await;
+    assert_eq!(cp.kind, checkpoint_kind::GIT, "{cp:?}");
+    let names = c.ours(&[
+        "ls-tree",
+        "-r",
+        "--name-only",
+        cp.commit.as_deref().unwrap(),
+    ]);
+    assert!(names.lines().any(|l| l == "notes.txt"), "{names}");
+    assert!(
+        !names.contains(".zeroaimemory") && !names.contains("AppData"),
+        "защищённое место в чекпоинте: {names}"
+    );
+    c.write("notes.txt", "two\n");
+    within(
+        Duration::from_secs(60),
+        "восстановление",
+        restore(&ck, &c.root(), &cp, true, true),
+    )
+    .await
+    .expect("восстановление");
+    assert_eq!(c.read("notes.txt"), b"one\n");
+    assert_eq!(c.read(".zeroaimemory/config.toml"), b"token = \"t\"\n");
+    assert_eq!(c.read("AppData/zero-agent/config.toml"), b"[llama]\n");
+}
+
 // ---- git: восстановление байт в байт ----
 
 #[tokio::test]

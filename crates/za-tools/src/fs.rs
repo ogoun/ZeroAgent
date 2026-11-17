@@ -9,9 +9,11 @@
 //! меняет файловую систему. Собственное чтение файлов правил у `ignore` выключено: правила
 //! `.gitignore`, `.ignore` и `.git/info/exclude` читает [`crate::rules`] от корня проекта
 //! до каталога поиска, только через `open_checked`. Каталоги `.git` и `.zero-agent`
-//! пропускаются на любой глубине. Обход и чтение внутри файла останавливают флаг отмены
-//! (бросок future вызова) и дедлайн `timeout − 1 с`. Перечень локальных томов строится
-//! один раз на вызов ([`DriveScope`]).
+//! пропускаются на любой глубине. Защищённые места корней run (`ToolCx::roots`, R1-M D157:
+//! `ZA_HOME`, `~/.zeroaimemory/`) пропускаются так же, даже если корень обхода лежит выше
+//! них, а корень в защищённом месте не обходится и не читается вовсе. Обход и чтение
+//! внутри файла останавливают флаг отмены (бросок future вызова) и дедлайн `timeout − 1 с`.
+//! Перечень локальных томов строится один раз на вызов ([`DriveScope`]).
 //!
 //! Пути в выводе — [`display`]: внутри проекта относительные через `/`, снаружи абсолютные.
 //! Экранирование и предел размера результата — на стороне пакета (D94, D44).
@@ -46,7 +48,7 @@ use za_core::extract::{
 };
 use za_core::paths::{
     DriveScope, LexPath, ResolvedPath, Roots, classify, display, open_checked, read_dir_checked,
-    resolve, stat_checked,
+    resolve, sealed_place, stat_checked,
 };
 use za_core::{
     Access, Approval, BoxFuture, RawPath, RiskClass, Subjects, Tool, ToolCx, ToolKind, ToolOutput,
@@ -267,10 +269,10 @@ where
 
 /// Канонический корень проекта и разрешённый путь (блокирующая).
 ///
-/// До задачи 12 пакет не передаёт разрешённые пути в [`ToolCx`], поэтому инструмент
-/// разрешает путь сам. `ZA_HOME` здесь не нужен: защищённость пути (в том числе мест
-/// памяти, R1-M D157) решила политика пакета, а `protected` этих корней (`ZA_HOME` —
-/// проект) инструмент не читает.
+/// Инструмент разрешает путь сам, от своего канонического корня проекта. `ZA_HOME` здесь
+/// не нужен: защищённость самого пути (в том числе мест памяти, R1-M D157) решила политика
+/// пакета, а `protected` этих корней (`ZA_HOME` — проект) инструмент не читает. Защищённые
+/// места внутри обхода и корень обхода в них сверяются по корням run (`ToolCx::roots`).
 fn resolve_in(project: &Path, lex: &LexPath) -> Result<(PathBuf, ResolvedPath), ToolOutput> {
     let roots = Roots::canonical(project, project).map_err(|e| {
         tracing::warn!(project = %project.display(), error = %e, "корень проекта не канонизирован");
@@ -768,10 +770,11 @@ fn mime(head: &[u8]) -> &'static str {
 
 // ---- обход ----
 
-/// Обход `base` (D87). Ссылки и junction не обходятся и не выдаются; `.git` и
-/// `.zero-agent` пропускаются. `ignore` сам файлы правил не читает (C1): все его
-/// источники правил выключены, правила применяет `rules` в `filter_entry`.
-fn walker(base: &Path, rules: Arc<Rules>) -> ignore::Walk {
+/// Обход `base` (D87). Ссылки и junction не обходятся и не выдаются; `.git`,
+/// `.zero-agent` и каталоги защищённых мест корней `sealed` (D157) пропускаются. `ignore`
+/// сам файлы правил не читает (C1): все его источники правил выключены, правила применяет
+/// `rules` в `filter_entry`.
+fn walker(base: &Path, rules: Arc<Rules>, sealed: Option<Arc<Roots>>) -> ignore::Walk {
     let mut wb = WalkBuilder::new(base);
     wb.hidden(false)
         .parents(false)
@@ -783,11 +786,11 @@ fn walker(base: &Path, rules: Arc<Rules>) -> ignore::Walk {
         .follow_links(false)
         .same_file_system(true)
         .sort_by_file_name(|a, b| a.cmp(b))
-        .filter_entry(move |e| keep(e, &rules));
+        .filter_entry(move |e| keep(e, &rules, sealed.as_deref()));
     wb.build()
 }
 
-fn keep(e: &DirEntry, rules: &Rules) -> bool {
+fn keep(e: &DirEntry, rules: &Rules, sealed: Option<&Roots>) -> bool {
     if e.depth() == 0 {
         return true;
     }
@@ -800,7 +803,19 @@ fn keep(e: &DirEntry, rules: &Rules) -> bool {
     if ft.is_dir() && SKIP_DIRS.iter().any(|d| same_name(e.file_name(), d)) {
         return false;
     }
+    // Путь записи канонический: корень обхода канонический, ссылки не обходятся, имена —
+    // с диска. Файл внутри защищённого места достижим только через его каталог.
+    if ft.is_dir() && in_sealed(sealed, e.path()) {
+        tracing::debug!(path = %e.path().display(), "обход пропускает защищённое место");
+        return false;
+    }
     !rules.ignored(e.path(), ft.is_dir())
+}
+
+/// Канонический путь `p` — в защищённом месте корней run `sealed` (D157, [`sealed_place`];
+/// на Windows без учёта регистра). Без корней run (`None`) защищённых мест нет.
+fn in_sealed(sealed: Option<&Roots>, p: &Path) -> bool {
+    sealed.is_some_and(|r| sealed_place(r, p))
 }
 
 /// Имя служебного каталога: на Windows без учёта ASCII-регистра (`.GIT` — тот же каталог,
@@ -814,19 +829,25 @@ fn same_name(name: &std::ffi::OsStr, skip: &str) -> bool {
 }
 
 /// Обычные файлы обхода `base` по порядку; `root` — канонический корень проекта (от него
-/// собираются правила игнорирования).
+/// собираются правила игнорирования), `sealed` — корни run с защищёнными местами (D157):
+/// корень в защищённом месте не обходится вовсе.
 fn walk_files(
     root: &Path,
     base: &ResolvedPath,
     limits: &WalkLimits,
+    sealed: Option<&Arc<Roots>>,
     mut f: impl FnMut(&Path),
 ) -> WalkEnd {
+    if in_sealed(sealed.map(Arc::as_ref), &base.path) {
+        tracing::debug!(path = %base.path.display(), "корень обхода в защищённом месте");
+        return WalkEnd::default();
+    }
     let rules = Arc::new(Rules::new(root, &base.path, base.inside, limits));
     let end = |rules: &Rules| WalkEnd {
         stopped: limits.stopped(),
         rules_over_budget: rules.over_budget(),
     };
-    for entry in walker(&base.path, rules.clone()) {
+    for entry in walker(&base.path, rules.clone(), sealed.cloned()) {
         if limits.stopped() {
             return end(&rules);
         }
@@ -855,17 +876,19 @@ pub(crate) struct ProjectWalk {
 }
 
 /// Файлы проекта для чекпоинта (D89): тот же обход, что у `search` и `glob` — правила
-/// игнорирования читает агент сам, без ссылок и junction, без `.git` и `.zero-agent`;
-/// файл `.git` (gitdir) тоже не входит.
-pub(crate) fn project_files(root: &Path, deadline: Instant) -> ProjectWalk {
+/// игнорирования читает агент сам, без ссылок и junction, без `.git`, `.zero-agent` и
+/// защищённых мест корней `roots` (D157: проект — домашний каталог пользователя или
+/// предок `ZA_HOME`); файл `.git` (gitdir) тоже не входит. Корень — `roots.project`.
+pub(crate) fn project_files(roots: &Arc<Roots>, deadline: Instant) -> ProjectWalk {
     let limits = WalkLimits::new(deadline);
+    let root = roots.project.as_path();
     let base = ResolvedPath {
         path: root.to_path_buf(),
         inside: true,
         protected: false,
     };
     let mut out = Vec::new();
-    let end = walk_files(root, &base, &limits, |p| {
+    let end = walk_files(root, &base, &limits, Some(roots), |p| {
         if !p.file_name().is_some_and(|n| same_name(n, ".git")) {
             out.push(p.to_path_buf());
         }
@@ -973,7 +996,14 @@ impl Tool for SearchTool {
             let limits = WalkLimits::new(Instant::now() + timeout.saturating_sub(WALK_MARGIN));
             let _cancel = CancelOnDrop(limits.clone());
             blocking(move || match resolve_in(&cx.project_dir, &lex) {
-                Ok((root, base)) => search_in(&root, &base, &a.pattern, a.glob.as_deref(), &limits),
+                Ok((root, base)) => search_in(
+                    &root,
+                    &base,
+                    &a.pattern,
+                    a.glob.as_deref(),
+                    &limits,
+                    cx.roots.as_ref(),
+                ),
                 Err(o) => o,
             })
             .await
@@ -1091,12 +1121,17 @@ impl<R: Read> Read for Watched<'_, R> {
 /// длинной строки остаются в выводе, а у явно указанного файла отбрасываются вместе с
 /// ошибкой (N5). Двоичные файлы (NUL) пропускаются, строки не в UTF-8 показываются с
 /// заменой. Правила игнорирования сверх бюджета памяти не загружаются — пометка в выводе.
+///
+/// `sealed` — корни run (`ToolCx::roots`, D157): обход не заходит в их защищённые места, а
+/// `base` в защищённом месте (файл или каталог) не читается — `no matches` (защита в
+/// глубину: политика отвергает такой вызов раньше).
 pub fn search_in(
     root: &Path,
     base: &ResolvedPath,
     pattern: &str,
     glob: Option<&str>,
     limits: &WalkLimits,
+    sealed: Option<&Arc<Roots>>,
 ) -> ToolOutput {
     let matcher = match RegexMatcherBuilder::new()
         .line_terminator(Some(b'\n'))
@@ -1113,6 +1148,10 @@ pub fn search_in(
         Err(e) => return ToolOutput::error(invalid_glob_text(&e.to_string())),
     };
     let by_path = glob.is_some_and(|g| g.contains('/'));
+    if in_sealed(sealed.map(Arc::as_ref), &base.path) {
+        tracing::debug!(path = %base.path.display(), "поиск в защищённом месте не идёт");
+        return ToolOutput::ok(NO_MATCHES);
+    }
     let meta = match stat_checked(base) {
         Ok(m) => m,
         Err(e) => return open_error(root, base, &e),
@@ -1136,7 +1175,7 @@ pub fn search_in(
     };
     let (mut unreadable, mut too_long) = (0u64, 0u64);
     let walk = if meta.is_dir() {
-        walk_files(root, base, limits, |p| {
+        walk_files(root, base, limits, sealed, |p| {
             let keep = match &filter {
                 None => true,
                 Some(m) if by_path => m.is_match(rel(&base.path, p)),
@@ -1287,7 +1326,7 @@ impl Tool for GlobTool {
             let limits = WalkLimits::new(Instant::now() + timeout.saturating_sub(WALK_MARGIN));
             let _cancel = CancelOnDrop(limits.clone());
             blocking(move || match resolve_in(&cx.project_dir, &lex) {
-                Ok((root, base)) => glob_in(&root, &base, &rest, &limits),
+                Ok((root, base)) => glob_in(&root, &base, &rest, &limits, cx.roots.as_ref()),
                 Err(o) => o,
             })
             .await
@@ -1326,8 +1365,15 @@ impl Tool for GlobTool {
 /// Файлы в `base`, чей путь от `base` (через `/`) подходит под `rest` (`*` не переходит
 /// `/`, `**` — любые каталоги; на Windows без учёта регистра), — блокирующая, только в
 /// `spawn_blocking`. Пути по возрастанию, до [`GLOB_MAX`]. Пустой `rest` — все файлы.
-/// Нет каталога `base` — пустой список.
-pub fn glob_in(root: &Path, base: &ResolvedPath, rest: &str, limits: &WalkLimits) -> ToolOutput {
+/// Нет каталога `base` — пустой список. `sealed` — корни run (D157): обход не заходит в их
+/// защищённые места, `base` в защищённом месте — пустой список.
+pub fn glob_in(
+    root: &Path,
+    base: &ResolvedPath,
+    rest: &str,
+    limits: &WalkLimits,
+    sealed: Option<&Arc<Roots>>,
+) -> ToolOutput {
     let matcher = match glob_matcher(if rest.is_empty() { "**" } else { rest }) {
         Ok(m) => m,
         Err(e) => return ToolOutput::error(invalid_pattern_text(&e.to_string())),
@@ -1335,7 +1381,7 @@ pub fn glob_in(root: &Path, base: &ResolvedPath, rest: &str, limits: &WalkLimits
     let mut found = BTreeSet::new();
     let mut more = 0u64;
     let walk = if stat_checked(base).is_ok_and(|m| m.is_dir()) {
-        walk_files(root, base, limits, |p| {
+        walk_files(root, base, limits, sealed, |p| {
             if matcher.is_match(rel(&base.path, p)) {
                 found.insert(display(root, p));
                 if found.len() > GLOB_MAX {

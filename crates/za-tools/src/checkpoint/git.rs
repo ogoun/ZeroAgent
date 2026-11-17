@@ -77,9 +77,21 @@ const SECRET_TRAILER: &str = "zero-agent-skipped-secret: ";
 const MODE_FILE: &str = "100644";
 const MODE_EXEC: &str = "100755";
 
-/// Проект: корень рабочего дерева (канонический).
+/// Проект: корень рабочего дерева (канонический) и корни, по которым обход файлов
+/// проекта пропускает защищённые места (R1-M D157).
 pub(super) struct Repo {
     pub top: PathBuf,
+    pub roots: Arc<Roots>,
+}
+
+impl Repo {
+    /// Проект корней `roots`: корень рабочего дерева — `roots.project`.
+    pub fn new(roots: Roots) -> Self {
+        Self {
+            top: roots.project.clone(),
+            roots: Arc::new(roots),
+        }
+    }
 }
 
 /// Сделанный (или найденный) чекпоинт git и пути, вошедшие в его дерево.
@@ -444,9 +456,9 @@ impl Session {
 
     /// Файлы проекта (от корня, через `/`) — обход агента, не git.
     async fn project_rels(&self, repo: &Repo) -> Result<Vec<String>, Skip> {
-        let (top, timeout) = (repo.top.clone(), self.timeout);
+        let (top, roots, timeout) = (repo.top.clone(), Arc::clone(&repo.roots), self.timeout);
         let (files, stopped) = blocking(move || {
-            let walk = crate::fs::project_files(&top, Instant::now() + timeout);
+            let walk = crate::fs::project_files(&roots, Instant::now() + timeout);
             Ok((
                 walk.files
                     .iter()

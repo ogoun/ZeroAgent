@@ -90,12 +90,13 @@ fn scale() -> u32 {
         .clamp(1, 6)
 }
 
-/// Run, корень и ключ эффекта одного вызова.
+/// Run, корень и ключ эффекта одного вызова; корни run (`ToolCx::roots`) — по желанию.
 #[derive(Clone)]
 struct Cx {
     root: PathBuf,
     run: RunId,
     step: u64,
+    roots: Option<Arc<Roots>>,
 }
 
 impl Cx {
@@ -104,6 +105,7 @@ impl Cx {
             root: root.to_path_buf(),
             run: RunId::new(),
             step: 0,
+            roots: None,
         }
     }
 
@@ -121,6 +123,7 @@ impl Cx {
             call_id: format!("c{}", self.step),
             effect_key: EffectKey::derive(self.run, self.step, 1),
             paths: Vec::new(),
+            roots: self.roots.clone(),
             deadline: None,
             output_budget: None,
         }
@@ -708,6 +711,44 @@ async fn protected_places_are_denied() {
     }
     assert_eq!(bytes(&root, ".git/config"), b"[core]\n");
     assert!(!root.join(".git/new-file").exists());
+}
+
+/// R1-M D157, защита в глубину (ревью задачи 1): с корнями run в `ToolCx::roots` `edit` и
+/// `multi_edit` в защищённом месте (`~/.zeroaimemory/`) отвечают `denied: protected path`
+/// и файл не меняют, даже если вызов дошёл до инструмента мимо политики. Без корней run
+/// (вызов вне пакета) — прежнее поведение: защищён только `ZA_HOME` инструмента.
+#[tokio::test]
+async fn edit_in_sealed_place_is_denied() {
+    let root = unique_dir("sealed_edit");
+    let user = root.parent().unwrap().join("user");
+    write(&user, ".zeroaimemory/config.toml", "token = \"t\"\n");
+    let roots = Roots::canonical(&root, &home(&root).za_home)
+        .unwrap()
+        .with_home(&user)
+        .unwrap();
+    let target = roots.sealed[0]
+        .join("config.toml")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut k = Kit::new(&root);
+    k.cx.roots = Some(Arc::new(roots));
+    let o = k
+        .edit(json!({"path": target, "old": "\"t\"", "new": "\"x\""}))
+        .await;
+    assert_eq!(o.content, "denied: protected path", "edit");
+    let o = k
+        .multi(json!({"path": target, "edits": [{"old": "\"t\"", "new": "\"x\""}]}))
+        .await;
+    assert_eq!(o.content, "denied: protected path", "multi_edit");
+    let o = k
+        .edit(json!({"path": format!("{target}.new"), "old": "", "new": "x"}))
+        .await;
+    assert_eq!(o.content, "denied: protected path", "новый файл");
+    assert_eq!(
+        bytes(&user, ".zeroaimemory/config.toml"),
+        b"token = \"t\"\n"
+    );
+    assert!(!user.join(".zeroaimemory/config.toml.new").exists());
 }
 
 #[tokio::test]

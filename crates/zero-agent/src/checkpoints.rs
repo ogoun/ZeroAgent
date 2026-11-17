@@ -94,7 +94,7 @@ fn open(
         source,
     })?;
     // Чекпоинт «до» восстановления тоже не сохраняет секреты (D103).
-    let ck = GitCheckpointer::new(
+    let mut ck = GitCheckpointer::new(
         Arc::new(DirectRunner),
         AgentHome {
             za_home: za_home.to_path_buf(),
@@ -102,6 +102,10 @@ fn open(
         },
     )
     .with_secret_filter(StoreSecrets::from_env().checkpoint_filter());
+    // D157: обход и восстановление не трогают `~/.zeroaimemory/` — как у чекпоинтов run.
+    if let Some(h) = home::user_home() {
+        ck = ck.with_user_home(h);
+    }
     Ok((project, store, ck))
 }
 

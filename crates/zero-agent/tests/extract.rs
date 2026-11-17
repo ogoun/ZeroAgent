@@ -371,6 +371,7 @@ fn web_fetch_of_backslash_page_returns_text() {
             call_id: "c1".into(),
             effect_key: EffectKey::derive(run, 0, 0),
             paths: Vec::new(),
+            roots: None,
             deadline: Some(call_deadline(
                 std::time::Instant::now(),
                 scaled(Duration::from_secs(60)),

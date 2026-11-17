@@ -88,6 +88,7 @@ fn cx(root: &Path, run: RunId) -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 1, 1),
         paths: Vec::new(),
+        roots: None,
         deadline: None,
         output_budget: None,
     }
@@ -786,12 +787,12 @@ async fn search_stops_at_deadline() {
     let r = roots(&root);
     // Дедлайн уже прошёл: обход останавливается сразу, без порогов времени.
     let limits = WalkLimits::new(Instant::now());
-    let o = search_in(&r.project, &base, "hit", None, &limits);
+    let o = search_in(&r.project, &base, "hit", None, &limits, None);
     assert_eq!(o.content, "no matches\n... search stopped after 0 s");
     // Флаг отмены тоже останавливает обход.
     let limits = WalkLimits::new(Instant::now() + Duration::from_secs(3600));
     limits.cancel();
-    let o = search_in(&r.project, &base, "hit", None, &limits);
+    let o = search_in(&r.project, &base, "hit", None, &limits, None);
     assert!(o.content.contains("search stopped"), "{}", o.content);
 }
 
@@ -818,6 +819,125 @@ async fn walk_does_not_follow_dir_links() {
     assert_eq!(o.content, "a.rs:1:hit");
     let o = call(&glob, &root, json!({"pattern": "*.rs"})).await;
     assert_eq!(o.content, "a.rs");
+}
+
+/// Вызов с корнями run `roots` в `ToolCx::roots` — так их передаёт пакет вызовов (R1-M
+/// D157).
+async fn call_rooted(tool: &Arc<dyn Tool>, root: &Path, roots: &Roots, args: Value) -> ToolOutput {
+    let limit = Duration::from_secs(60 * u64::from(scale()));
+    let cx = ToolCx {
+        roots: Some(Arc::new(roots.clone())),
+        ..cx(root, RunId::new())
+    };
+    tokio::time::timeout(limit, tool.call(args, cx))
+        .await
+        .unwrap_or_else(|_| panic!("инструмент не ответил за {limit:?}"))
+}
+
+/// Путь через `/` (аргумент модели).
+fn slashed(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// R1-M D157, Important 1 ревью задачи 1: обход `search` и `glob` не заходит в защищённые
+/// места (`ZA_HOME`, `~/.zeroaimemory/`), если корень обхода лежит выше них. Корни вызова —
+/// корни run (`ToolCx::roots`), как их строит бинарник (`Roots::with_home`). Случаи ревью:
+/// проект — домашний каталог (и `ZA_HOME` под ним, как `%LOCALAPPDATA%\zero-agent` на
+/// Windows); корень обхода — домашний каталог вне проекта (грант); шаблон `glob` с
+/// префиксом выше защищённого места; корень обхода — само защищённое место.
+#[tokio::test]
+async fn walk_skips_sealed_places() {
+    let base = unique_dir("walk_sealed");
+    let user = base.join("user");
+    write(&user, "notes.txt", "token: open\n");
+    write(&user, ".zeroaimemory/config.toml", "token: sealed-zam\n");
+    write(
+        &user,
+        "AppData/zero-agent/config.toml",
+        "token: sealed-home\n",
+    );
+    let za_home = user.join("AppData/zero-agent");
+    let (search, glob) = (search_tool(), glob_tool());
+    // Контроль фикстуры: без корней run (вызов вне пакета) обход видит всё.
+    let o = call(&search, &user, json!({"pattern": "sealed"})).await;
+    assert!(
+        o.content.contains(".zeroaimemory/config.toml"),
+        "{}",
+        o.content
+    );
+
+    // Проект — домашний каталог.
+    let rooted = Roots::canonical(&user, &za_home)
+        .unwrap()
+        .with_home(&user)
+        .unwrap();
+    let o = call_rooted(&search, &user, &rooted, json!({"pattern": "token"})).await;
+    assert_eq!(o.content, "notes.txt:1:token: open");
+    let o = call_rooted(&glob, &user, &rooted, json!({"pattern": "**/*.toml"})).await;
+    assert_eq!(o.content, "no files matched");
+    let o = call_rooted(&glob, &user, &rooted, json!({"pattern": "**"})).await;
+    assert_eq!(o.content, "notes.txt");
+
+    // Другой проект, корень обхода — домашний каталог (грант): пути вывода абсолютные.
+    let project = base.join("project");
+    write(&project, "a.txt", "token: project\n");
+    let other = Roots::canonical(&project, &za_home)
+        .unwrap()
+        .with_home(&user)
+        .unwrap();
+    let home = slashed(other.home.as_deref().unwrap());
+    let o = call_rooted(
+        &search,
+        &project,
+        &other,
+        json!({"pattern": "token", "path": home}),
+    )
+    .await;
+    assert!(
+        o.content.ends_with("notes.txt:1:token: open"),
+        "{}",
+        o.content
+    );
+    assert!(!o.content.contains("token: sealed"), "{}", o.content);
+    assert_eq!(o.content.lines().count(), 1, "{}", o.content);
+    // Шаблон `glob` с префиксом выше защищённых мест.
+    for pattern in [format!("{home}/**/*.toml"), format!("{home}/*/*.toml")] {
+        let o = call_rooted(&glob, &project, &other, json!({"pattern": pattern})).await;
+        assert_eq!(o.content, "no files matched", "{pattern}");
+    }
+    let o = call_rooted(
+        &glob,
+        &project,
+        &other,
+        json!({"pattern": format!("{home}/**")}),
+    )
+    .await;
+    assert!(o.content.ends_with("notes.txt"), "{}", o.content);
+    assert_eq!(o.content.lines().count(), 1, "{}", o.content);
+    // Корень обхода — само защищённое место (защита в глубину: политика отвергает такой
+    // вызов раньше); на Windows — и в другом регистре.
+    let mut inside = vec![format!("{home}/.zeroaimemory"), slashed(&other.za_home)];
+    if cfg!(windows) {
+        inside.push(format!("{home}/.ZEROAIMEMORY"));
+    }
+    for dir in inside {
+        let o = call_rooted(
+            &search,
+            &project,
+            &other,
+            json!({"pattern": "token", "path": dir}),
+        )
+        .await;
+        assert_eq!(o.content, "no matches", "{dir}");
+        let o = call_rooted(
+            &glob,
+            &project,
+            &other,
+            json!({"pattern": format!("{dir}/**")}),
+        )
+        .await;
+        assert_eq!(o.content, "no files matched", "{dir}");
+    }
 }
 
 /// C1 ревью: файлы правил читаются только через `open_checked`. Файл правил — ссылка (на
@@ -936,7 +1056,7 @@ async fn search_line_limit_and_cancel_inside_file() {
     let file = resolved(&root, "many.txt");
     let limits = WalkLimits::new(Instant::now() + Duration::from_secs(3600));
     limits.cancel();
-    let o = search_in(&roots(&root).project, &file, "hit", None, &limits);
+    let o = search_in(&roots(&root).project, &file, "hit", None, &limits, None);
     assert_eq!(o.content, "no matches\n... search stopped after 0 s");
     assert!(!o.is_error);
 }

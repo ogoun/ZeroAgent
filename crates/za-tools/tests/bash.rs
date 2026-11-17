@@ -54,6 +54,7 @@ fn cx(root: &Path, run: RunId) -> ToolCx {
         call_id: "c1".into(),
         effect_key: EffectKey::derive(run, 1, 1),
         paths: Vec::new(),
+        roots: None,
         deadline: None,
         output_budget: None,
     }

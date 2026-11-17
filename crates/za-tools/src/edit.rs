@@ -458,6 +458,7 @@ impl Tool for EditTool {
                 hook,
                 mask,
                 cancel: Arc::default(),
+                sealed: cx.roots,
             };
             // Бросок future (тайм-аут вызова) останавливает нечёткий поиск в
             // `spawn_blocking` (N1): сам поток пула не прерывается.
@@ -558,6 +559,9 @@ struct Job {
     mask: Option<TextMask>,
     /// Отмена вызова: ставится при броске future.
     cancel: Arc<AtomicBool>,
+    /// Корни run (`ToolCx::roots`, R1-M D157): их защищённые места (`~/.zeroaimemory/`)
+    /// правка не трогает и без политики — защита в глубину. `None` — вызов вне пакета.
+    sealed: Option<Arc<Roots>>,
 }
 
 /// Ставит флаг отмены при броске future вызова.
@@ -606,13 +610,18 @@ impl Job {
     }
 
     fn run_inner(&self, lex: &LexPath, shown_abs: &mut Option<(String, String)>) -> ToolOutput {
-        let roots = match Roots::canonical(&self.project, &self.home.za_home) {
+        let mut roots = match Roots::canonical(&self.project, &self.home.za_home) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(project = %self.project.display(), error = %e, "корень проекта не канонизирован");
                 return ToolOutput::error(project_text(&self.project));
             }
         };
+        // Защищённые места памяти корней run (D157): `resolve` ставит им `protected`.
+        if let Some(run) = &self.sealed {
+            roots.home.clone_from(&run.home);
+            roots.sealed.clone_from(&run.sealed);
+        }
         let root = roots.project.clone();
         let r = match resolve(&roots, lex, Access::Write) {
             Ok(r) => r,

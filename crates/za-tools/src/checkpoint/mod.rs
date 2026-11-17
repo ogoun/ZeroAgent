@@ -131,6 +131,10 @@ pub struct GitCheckpointer {
     lock: Arc<tokio::sync::Mutex<()>>,
     /// Проверка секретов (D103): имя и фильтр по содержимому с кэшем итогов.
     scan: SecretScan,
+    /// Домашний каталог пользователя (R1-M D157, [`GitCheckpointer::with_user_home`]):
+    /// его защищённое место `~/.zeroaimemory/` обход чекпоинта пропускает, а
+    /// восстановление не трогает, как и `ZA_HOME`. `None` — защищён только `ZA_HOME`.
+    user_home: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for GitCheckpointer {
@@ -138,6 +142,7 @@ impl std::fmt::Debug for GitCheckpointer {
         f.debug_struct("GitCheckpointer")
             .field("git", &self.git)
             .field("home", &self.home)
+            .field("user_home", &self.user_home)
             .finish_non_exhaustive()
     }
 }
@@ -162,7 +167,17 @@ impl GitCheckpointer {
             slow: Arc::new(Mutex::new(HashSet::new())),
             lock: Arc::new(tokio::sync::Mutex::new(())),
             scan: SecretScan::default(),
+            user_home: None,
         }
+    }
+
+    /// Домашний каталог пользователя (R1-M D157): корни чекпоинтов и восстановления —
+    /// `Roots::with_home(home)`, как у run. Обход файлов проекта (проект — домашний каталог
+    /// или предок `ZA_HOME`) пропускает защищённые места, восстановление их не пишет и не
+    /// удаляет. Бинарник передаёт тот же каталог, что и корням run.
+    pub fn with_user_home(mut self, home: PathBuf) -> Self {
+        self.user_home = Some(home);
+        self
     }
 
     /// Фильтр секретов по содержимому (D103): и для чекпоинта git, и для копии файлов.
@@ -225,18 +240,35 @@ impl GitCheckpointer {
             .insert(run);
     }
 
+    /// Канонические корни проекта `project` (блокирующая): `ZA_HOME` и, если задан,
+    /// домашний каталог пользователя с его защищёнными местами (D157).
+    fn roots_fn(&self, project: &Path) -> impl FnOnce() -> io::Result<Roots> + Send + 'static {
+        let (p, h, user) = (
+            project.to_path_buf(),
+            self.home.za_home.clone(),
+            self.user_home.clone(),
+        );
+        move || {
+            let roots = Roots::canonical(&p, &h)?;
+            match user {
+                Some(u) => roots.with_home(&u),
+                None => Ok(roots),
+            }
+        }
+    }
+
     /// Проект для чекпоинтов git: у корня есть `.git` (только признак режима, его
     /// содержимое не читается — git работает со своим репозиторием агента).
     async fn repo(&self, project: &Path) -> Result<git::Repo, &'static str> {
-        let (p, h) = (project.to_path_buf(), self.home.za_home.clone());
+        let roots = self.roots_fn(project);
         let r = blocking(move || {
-            let roots = Roots::canonical(&p, &h)?;
+            let roots = roots()?;
             let has_git = std::fs::symlink_metadata(roots.project.join(".git")).is_ok();
-            Ok(has_git.then_some(roots.project))
+            Ok(has_git.then_some(roots))
         })
         .await;
         match r {
-            Ok(Some(top)) => Ok(git::Repo { top }),
+            Ok(Some(roots)) => Ok(git::Repo::new(roots)),
             Ok(None) => Err(checkpoint_reason::NO_GIT),
             Err(e) => {
                 tracing::warn!(error = %e, "корень проекта не канонизирован");
@@ -247,17 +279,13 @@ impl GitCheckpointer {
 
     /// Проект для чтения своего хранилища: только если хранилище уже есть.
     async fn own_repo(&self, project: &Path) -> Option<git::Repo> {
-        let (p, h, home) = (
-            project.to_path_buf(),
-            self.home.za_home.clone(),
-            self.home.clone(),
-        );
+        let (roots, home) = (self.roots_fn(project), self.home.clone());
         blocking(move || {
-            let roots = Roots::canonical(&p, &h)?;
+            let roots = roots()?;
             let dir = home::agent_dir(&home, None)?.join(git::REPO_DIR);
             Ok(std::fs::symlink_metadata(dir.join("HEAD"))
                 .is_ok()
-                .then_some(git::Repo { top: roots.project }))
+                .then(|| git::Repo::new(roots)))
         })
         .await
         .ok()
@@ -558,10 +586,7 @@ pub async fn restore(
     trusted: bool,
 ) -> Result<Restored, RestoreError> {
     let _one = ck.lock.lock().await;
-    let roots = {
-        let (p, h) = (project.to_path_buf(), ck.home.za_home.clone());
-        blocking(move || Roots::canonical(&p, &h)).await?
-    };
+    let roots = blocking(ck.roots_fn(project)).await?;
     match cp.kind.as_str() {
         checkpoint_kind::GIT => {
             let (mut s, repo, commit) = git_parts(ck, project, cp, trusted).await?;
