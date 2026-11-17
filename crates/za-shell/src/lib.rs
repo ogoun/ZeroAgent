@@ -30,10 +30,8 @@
 //! команды; скрипты (`./clean.sh`, `bash x.sh`, `pwsh -File`, `source x.sh`); переменные
 //! окружения, меняющие поведение (`GIT_SSH_COMMAND`); код других языков, кроме явных
 //! опасных вызовов в `python -c` и подобных; `docker exec`; массовое удаление без флагов
-//! (`ls | xargs rm`, `gci | ri`) — его страхует чекпоинт D89. Начала домашнего каталога
-//! (`~`, `$HOME`, `%USERPROFILE%`, `$env:USERPROFILE`, [`HOME_PREFIXES`]) лексер не
-//! раскрывает: слова с ними — пути ([`path_words`], [`home_rest`]), раскрывает их
-//! вызывающий по своему домашнему каталогу (R1-M D157).
+//! (`ls | xargs rm`, `gci | ri`) — его страхует чекпоинт D89; `$HOME`, `%USERPROFILE%`,
+//! `$env:…` лексер не раскрывает: это делает вызывающий ([`home_rest`]).
 
 mod classify;
 mod command;
@@ -48,7 +46,6 @@ use command::{Inner, analyze};
 use lex::lex_code;
 pub use net::{NetHosts, command_hosts, network_hosts};
 use words::words_of;
-pub use words::{HOME_PREFIXES, home_rest};
 
 /// Метки необратимых команд (D81). Те же строки — `za_protocol::irreversible`;
 /// совпадение проверяет тест `za-core`.
@@ -141,11 +138,24 @@ pub fn command_args(seg: &Segment) -> Option<(String, Vec<String>)> {
     analyze(&seg.argv, Lang::Pwsh).map(|c| (c.name, c.args))
 }
 
-/// Слова сегмента, похожие на путь наружу (D77, best effort): абсолютные пути, `~`,
-/// компонент `..`, цели перенаправлений, аргументы `cd`, `Set-Location`, `pushd`,
-/// `git -C`, файлы `git config --global|--system|--file`. Слова с `~` вызывающий
-/// считает внешними сам: `paths::classify` `~` не раскрывает. URL, шаблоны
-/// `grep`/`sed`/`awk`, аргументы `echo`, ключи `/x` Windows и `/dev/null` не попадают.
+/// Начала домашнего каталога в bash, PowerShell и cmd (R1-M D157), без учёта регистра ASCII.
+#[rustfmt::skip]
+pub const HOME_PREFIXES: [&str; 8] = ["~", "$HOME", "${HOME}", "%USERPROFILE%",
+    "$env:USERPROFILE", "${env:USERPROFILE}", "$env:HOME", "${env:HOME}"];
+
+/// Остаток после начала из [`HOME_PREFIXES`], за которым конец, `/` или `\` (`~u` — `None`).
+pub fn home_rest(w: &str) -> Option<&str> {
+    HOME_PREFIXES.iter().find_map(|p| {
+        let head = w.get(..p.len()).filter(|h| h.eq_ignore_ascii_case(p))?;
+        let rest = &w[head.len()..];
+        (rest.is_empty() || rest.starts_with(['/', '\\'])).then_some(rest)
+    })
+}
+
+/// Слова сегмента, похожие на путь наружу (D77, best effort): абсолютные пути, `..`, начала
+/// домашнего каталога ([`home_rest`]: раскрывает и считает внешними вызывающий), цели
+/// перенаправлений, аргументы `cd`, `Set-Location`, `pushd`, `git -C`, файлы `git config
+/// --global|--system|--file`; не URL, шаблоны `grep`/`sed`/`awk`, `echo`, `/x`, `/dev/null`.
 pub fn path_words(seg: &Segment, d: Dialect) -> Vec<String> {
     let lang = Lang::from(d);
     let mut out = Vec::new();
