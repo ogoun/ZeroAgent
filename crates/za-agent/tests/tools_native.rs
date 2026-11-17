@@ -771,7 +771,9 @@ async fn started_read_of_sealed_place_is_redecided() {
 /// R1-M, Minor 10 ревью задачи 1: `request_grant` на защищённое место (D157: `ZA_HOME`,
 /// `~/.zeroaimemory/` и пути внутри них) — отказ `protected path` без вопроса человеку:
 /// грант там ничего не дал бы. Грант на домашний каталог над защищённым местом — вопрос,
-/// как раньше.
+/// как раньше. Путь сверяется после разрешения (Minor 6 повторного ревью fix-1): ссылка
+/// внутри проекта на `~/.zeroaimemory` (Unix — symlink, Windows — junction; создать нельзя
+/// — `ПРОПУСК`) и, на Windows, другой регистр имени — тот же отказ.
 #[tokio::test]
 async fn request_grant_on_sealed_place_denied_without_asking() {
     let b = bx("grant_sealed").await;
@@ -781,15 +783,28 @@ async fn request_grant_on_sealed_place_denied_without_asking() {
     env.roots = Arc::new(b.d.roots.clone().with_home(&user).unwrap());
     let reg = registry(vec![]);
     let za_home = b.d.roots.za_home.clone();
-    for (step, path) in [
+    let mut paths = vec![
         user.join(".zeroaimemory"),
         user.join(".zeroaimemory").join("config.toml"),
         za_home.clone(),
         za_home.join("config.toml"),
-    ]
-    .iter()
-    .enumerate()
-    {
+    ];
+    if cfg!(windows) {
+        let upper = |p: &Path| PathBuf::from(p.to_string_lossy().to_uppercase());
+        paths.extend([
+            user.join(".ZeroAIMemory"),
+            user.join(".ZEROAIMEMORY").join("CONFIG.TOML"),
+            upper(&za_home),
+            upper(&za_home.join("config.toml")),
+        ]);
+    }
+    let link = b.d.roots.project.join("zlink");
+    if make_dir_link(&link, &user.join(".zeroaimemory")) {
+        paths.extend([link.clone(), link.join("config.toml")]);
+    } else {
+        eprintln!("ПРОПУСК: ссылка на ~/.zeroaimemory не создаётся (нет прав)");
+    }
+    for (step, path) in paths.iter().enumerate() {
         let calls = [pc(
             "g1",
             "request_grant",
@@ -806,7 +821,7 @@ async fn request_grant_on_sealed_place_denied_without_asking() {
     }
     assert!(of_kind(&b.events().await, EventKind::InterruptOpened).is_empty());
     let calls = [pc("g2", "request_grant", json!({"path": s(&user)}))];
-    let out = b.batch(&reg, &env, 10, &calls).await;
+    let out = b.batch(&reg, &env, 50, &calls).await;
     assert_eq!(reasons(&out), ["grant"]);
 }
 
