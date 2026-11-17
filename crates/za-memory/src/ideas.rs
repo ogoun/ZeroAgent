@@ -8,8 +8,10 @@
 //! Признак `review` — `items[].reason: "idea_review"` в ответе `/recall` `session_start` или
 //! `prompt` (сервер ставит его только в режиме `review`) или 409 `/problems/idea-mode` на
 //! предложение идеи человека; признак `propose` — 409 на разбор (задача 8). Последний признак
-//! run хранит снимок (`MemoryState.ideas`, задача 3) — так реплей детерминирован. Без
-//! признака и без флага `idea_review` в `/health.features` — [`IdeasMode::Wait`].
+//! run хранит снимок (`MemoryState.ideas`, задача 3) — так реплей детерминирован; драйвер
+//! передаёт его аргументом методов порта, а порт укладывает ответ по признаку того же ответа,
+//! иначе по нему ([`crate::port`]). Без признака и без флага `idea_review` в
+//! `/health.features` — [`IdeasMode::Wait`].
 
 use std::collections::BTreeSet;
 

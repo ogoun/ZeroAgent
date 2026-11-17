@@ -1319,7 +1319,12 @@ impl za_agent::MemoryPort for EmptyMemory {
         za_agent::MemoryLevel::L1
     }
 
-    fn snapshot(&self, _run: RunId, _budget_tokens: u32) -> BoxFuture<'_, za_agent::RecallReply> {
+    fn snapshot(
+        &self,
+        _run: RunId,
+        _budget_tokens: u32,
+        _ideas: Option<za_agent::IdeasSignal>,
+    ) -> BoxFuture<'_, za_agent::RecallReply> {
         Box::pin(async { za_agent::Recall::Empty.into() })
     }
 
@@ -1331,6 +1336,7 @@ impl za_agent::MemoryPort for EmptyMemory {
         &self,
         _run: RunId,
         _budget_tokens: u32,
+        _ideas: Option<za_agent::IdeasSignal>,
     ) -> BoxFuture<'_, za_agent::Recall> {
         Box::pin(async { za_agent::Recall::Empty })
     }
@@ -1525,8 +1531,14 @@ async fn step0_digest_and_prompt_hint_in_first_message() {
     assert!(!first.contains("<memory source="), "{first}");
     let b = za_agent::memory_budget(8192);
     let calls = mem.calls();
-    assert_eq!(calls[0], MemCall::Snapshot { budget: b });
-    let MemCall::Prompt { text, budget } = &calls[1] else {
+    assert_eq!(
+        calls[0],
+        MemCall::Snapshot {
+            budget: b,
+            ideas: None
+        }
+    );
+    let MemCall::Prompt { text, budget, .. } = &calls[1] else {
         panic!("{calls:?}");
     };
     assert_eq!(text, &task);
@@ -1590,6 +1602,43 @@ async fn memory_text_cleaned_before_escape() {
     for e in &evs {
         assert!(!e.payload.to_string().contains(&secret), "{:?}", e.kind);
     }
+}
+
+/// D169, Minor 6 ревью задачи 4 R1-M: повтор дайджеста — тот же `session_start`, его признак
+/// режима идей не теряется: значение `memory.retry` несёт `ideas`, признак уходит в
+/// `MemoryState.ideas`. Сам повтор шёл с признаком run до ответа (`None`).
+#[tokio::test]
+async fn digest_retry_keeps_ideas_signal() {
+    let mut f = fx("mem_retry_ideas", scripted());
+    let mem = with_memory(&mut f, za_agent::MemoryLevel::L2);
+    mem.push_snapshot(za_agent::Recall::Timeout);
+    mem.push_retry(za_agent::RecallReply {
+        recall: za_agent::Recall::Hits("### Идеи на разбор\nw:1".into()),
+        ideas: Some(za_agent::IdeasSignal::Review),
+    });
+    f.model
+        .push(vec![calls(vec![call_part("c1", "echo", json!({"x": 1}))])]);
+    f.model.push(answer("готово"));
+    assert!(done_outcome(
+        &start(&mut f, spec(RunRole::Top)).await.unwrap()
+    ));
+    let retry: Vec<MemCall> = mem
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, MemCall::Retry { .. }))
+        .collect();
+    assert_eq!(
+        retry,
+        [MemCall::Retry {
+            budget: 200,
+            ideas: None
+        }]
+    );
+    let evs = events(&f.store, f.run).await;
+    let v = receipt_value(&evs, intents(&evs, "memory.retry")[0]);
+    assert_eq!(v["ideas"], "review", "{v}");
+    let (_, snap) = last_snapshot(&f.store, f.run).await;
+    assert_eq!(snap.memory.ideas, Some(za_agent::IdeasSignal::Review));
 }
 
 /// D140: «не успели» на шаге 0 — один отложенный повтор на границе шага второго вызова
@@ -1749,6 +1798,7 @@ async fn inbox_input_gets_hint() {
     assert!(mem.calls().contains(&MemCall::Prompt {
         text: "и проверь Y".into(),
         budget: 100,
+        ideas: None,
     }));
     let (_, snap) = last_snapshot(&f.store, f.run).await;
     let u = snap.user_inputs.last().unwrap();

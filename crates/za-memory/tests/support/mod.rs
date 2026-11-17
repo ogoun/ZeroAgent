@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use za_memory::discovery::from_health;
 use za_memory::{
-    Clock, Discovery, IdeasMode, MemoryConfig, RunBinding, TokioClock, ZamClient, ZamMemory,
-    ZamParts, discover,
+    Clock, Discovery, MemoryConfig, RunBinding, TokioClock, ZamClient, ZamMemory, ZamParts,
+    discover,
 };
 use za_secrets::SecretMasker;
 
@@ -44,7 +44,6 @@ pub fn port(
     discovery: Discovery,
     clock: Arc<dyn Clock>,
     masker: SecretMasker,
-    ideas: IdeasMode,
 ) -> ZamMemory {
     let client = ZamClient::new(&MemoryConfig::new(url), None).unwrap();
     ZamMemory::new(ZamParts {
@@ -54,14 +53,12 @@ pub fn port(
         masker: Arc::new(masker),
         store: None,
         clock,
-        ideas,
     })
 }
 
-/// Порт к серверу `url` с настоящим обнаружением (`/api/v1/health`), часы tokio, режим идей
-/// `mode`.
-pub async fn port_at(url: &str, mode: IdeasMode) -> ZamMemory {
+/// Порт к серверу `url` с настоящим обнаружением (`/api/v1/health`), часы tokio.
+pub async fn port_at(url: &str) -> ZamMemory {
     let client = ZamClient::new(&MemoryConfig::new(url), None).unwrap();
     let d = discover(&client).await;
-    port(url, d, Arc::new(TokioClock), SecretMasker::default(), mode)
+    port(url, d, Arc::new(TokioClock), SecretMasker::default())
 }

@@ -29,7 +29,7 @@ use za_store::{ProjectStore, StoreError};
 
 use super::{ContextBudget, TEMPLATE_TOKENS, UserInput, message_text, output_plan};
 use crate::conversation::{Conversation, HistoryError, cut_points, split_tail};
-use crate::memory::{MemoryPort, memory_budget, recovery_effect};
+use crate::memory::{IdeasSignal, MemoryPort, memory_budget, recovery_effect};
 use crate::prompt::{ControlAction, ControlFrom, approx_tokens, escape_untrusted, render_control};
 use crate::request::{FrozenPrefix, RunSetup, TurnOptions, build_request};
 use crate::state::ActiveSkill;
@@ -235,6 +235,9 @@ pub struct CompactInput<'a> {
     pub masker: Option<&'a za_secrets::SecretMasker>,
     /// Активные скиллы run (R1-C2 D118): их блоки — в первом сообщении новой эпохи.
     pub skills: &'a [ActiveSkill],
+    /// Признак режима идей run (`MemoryState.ideas`, R1-M D169): режим укладки пакета
+    /// восстановления — строка плана из идей приходит и в нём.
+    pub ideas: Option<IdeasSignal>,
 }
 
 /// Итог компакции: история новой эпохи и её данные.
@@ -372,6 +375,7 @@ pub async fn compact(
         mem,
         input.masker,
         memory_budget(n_ctx),
+        input.ideas,
     )
     .await?;
     let recovery = recovery.text();

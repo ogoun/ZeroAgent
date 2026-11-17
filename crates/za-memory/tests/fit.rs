@@ -6,9 +6,9 @@
 use std::collections::BTreeSet;
 
 use za_memory::fit::{
-    OMITTED_HEAD, OMITTED_TAIL, PRIORITY_ENVIRONMENT, PRIORITY_IDEAS_REVIEW, PRIORITY_OTHER,
-    PRIORITY_POINTERS, PRIORITY_RULES, PRIORITY_SNAPSHOT, PRIORITY_TASKS, PRIORITY_TRAPS,
-    PRIORITY_UNKNOWN, approx_tokens, header_priority,
+    NOTICES_NAME, OMITTED_HEAD, OMITTED_TAIL, PRIORITY_ENVIRONMENT, PRIORITY_IDEAS_REVIEW,
+    PRIORITY_OTHER, PRIORITY_POINTERS, PRIORITY_RULES, PRIORITY_SNAPSHOT, PRIORITY_TASKS,
+    PRIORITY_TRAPS, PRIORITY_UNKNOWN, approx_tokens, header_priority,
 };
 use za_memory::{Fitted, IdeasMode, fetch_budget, fit_digest};
 
@@ -49,17 +49,21 @@ fn omitted_line(f: &Fitted) -> Option<&str> {
 }
 
 /// Общие свойства итога: счёт не больше бюджета, оценка D22 не больше счёта, снятое названо
-/// последней строкой тогда и только тогда, когда что-то снято.
+/// последней строкой тогда и только тогда, когда снят раздел с именем; строки без заголовка
+/// (уведомления, текст подсказки) в строке снятого не называются (Minor 2 ревью задачи 4).
 fn check(f: &Fitted, budget: u32) {
     assert!(f.tokens <= budget, "{} > {budget}:\n{}", f.tokens, f.text);
     assert!(approx_tokens(&f.text) <= f.tokens.max(1) || f.text.is_empty());
     assert_eq!(
         omitted_line(f).is_some(),
-        !f.omitted.is_empty(),
+        f.omitted.iter().any(|n| n != NOTICES_NAME),
         "{:?}\n{}",
         f.omitted,
         f.text
     );
+    if let Some(l) = omitted_line(f) {
+        assert!(!l.contains(NOTICES_NAME), "{l}");
+    }
 }
 
 #[test]
@@ -233,7 +237,7 @@ fn fit_section_header_by_prefix() {
         "{}",
         f.text
     );
-    assert!(!f.text.contains("синтетическое уведомление"), "{}", f.text);
+    assert!(!f.text.contains("запросы доступа"), "{}", f.text);
     // Порядок вывода — по приоритету: задачи, затем снимок.
     let t = f.text.find("### Задачи").unwrap();
     let s = f.text.find(head).unwrap();
@@ -376,14 +380,15 @@ fn fit_header_longest_prefix() {
 fn fit_plan_line_by_prefix() {
     let text = fixture("ideas_review_m65.md");
     let plan = "План из идей: 2 открытых";
-    // Строка плана — сразу за задачами, без заголовка: в `Review` — пятая по приоритету,
-    // в выводе — после ответов человека, а не внутри задач.
+    // Строка плана — без заголовка: в `Review` она пятая по приоритету, а в выводе стоит там,
+    // где её ставит сервер, — сразу за задачами (Minor 1 ревью задачи 4). После `### Ответы
+    // человека` она читалась бы частью ответов: раздел в Markdown длится до заголовка.
     let review = fit(&text, 100_000, IdeasMode::Review);
+    check(&review, 100_000);
     let tasks = section(&review.text, "### Задачи").unwrap();
-    assert!(tasks.iter().all(|l| !l.starts_with(plan)), "{tasks:?}");
-    let p = review.text.find(plan).unwrap();
-    assert!(review.text.find("### Ответы человека").unwrap() < p);
-    assert!(p < review.text.find("### Окружение").unwrap());
+    assert!(tasks.last().unwrap().starts_with(plan), "{tasks:?}");
+    let answers = section(&review.text, "### Ответы человека").unwrap();
+    assert!(answers.iter().all(|l| !l.starts_with(plan)), "{answers:?}");
     // В `Wait` строка снимается, где бы ни стояла: и внутри другого раздела.
     let inside = "### Правила\n\
                   synthetic/rule-x [th] n:01M8SYNTH00000000000000R41\n\
@@ -392,13 +397,107 @@ fn fit_plan_line_by_prefix() {
         let f = fit(t, 100_000, IdeasMode::Wait);
         assert!(!f.text.contains("План из идей"), "{}", f.text);
     }
-    // `Review`: строка плана (5) выводится раньше правил (7), хотя стояла внутри них.
+    // Задач нет: строка плана (5) — под заголовком `### Идеи на разбор`, раньше правил (7).
     let f = fit(inside, 100_000, IdeasMode::Review);
-    assert!(f.text.starts_with("План из идей: 1 открытых"), "{}", f.text);
+    check(&f, 100_000);
     assert!(
-        f.text.contains("### Правила\nsynthetic/rule-x"),
+        f.text
+            .starts_with("### Идеи на разбор\nПлан из идей: 1 открытых\n\n### Правила"),
         "{}",
         f.text
+    );
+    // Задач нет, раздел разбора есть: строка плана — в нём, а не после ответов человека.
+    let no_tasks = text.replacen(
+        "### Задачи\nZeroAIMemory: [in_progress] Синтетическая задача режима идей — далее: write test — k:01M8SYNTH00000000000000K05\n",
+        "",
+        1,
+    );
+    assert_ne!(no_tasks, text);
+    let f = fit(&no_tasks, 100_000, IdeasMode::Review);
+    check(&f, 100_000);
+    let ideas = section(&f.text, "### Идеи на разбор").unwrap();
+    assert!(ideas.iter().any(|l| l.starts_with(plan)), "{}", f.text);
+    let answers = section(&f.text, "### Ответы человека").unwrap();
+    assert!(answers.iter().all(|l| !l.starts_with(plan)), "{}", f.text);
+    assert_eq!(
+        f.text.matches("### Идеи на разбор").count(),
+        1,
+        "{}",
+        f.text
+    );
+}
+
+/// Minor 2 ревью задачи 4: у подсказки (`prompt`, `post_tool`) весь текст — строки без
+/// заголовка; снятые бюджетом строки в строке снятого не называются — слово `notices` модели
+/// ничего не говорит, а сама строка заняла бы бюджет подсказки. Данные события имя знают.
+#[test]
+fn fit_hint_cut_without_omitted_line() {
+    let hint: Vec<String> = (1..=6)
+        .map(|n| {
+            format!(
+                "ZeroAIMemory: синтетическая подсказка {n} с текстом для проверки укладки подсказки [th] i:01M8SYNTH00000000000000H{n:02}"
+            )
+        })
+        .collect();
+    let hint = hint.join("\n");
+    let full = fit(&hint, 100_000, IdeasMode::Wait).tokens;
+    let budget = full / 2;
+    let f = fit(&hint, budget, IdeasMode::Wait);
+    check(&f, budget);
+    assert!(omitted_line(&f).is_none(), "{}", f.text);
+    assert!(!f.text.contains(OMITTED_HEAD), "{}", f.text);
+    assert!(f.text.contains("H01"), "{}", f.text);
+    assert!(!f.text.contains("H06"), "{}", f.text);
+    assert_eq!(f.omitted, vec![NOTICES_NAME.to_owned()]);
+    // Рядом со снятым разделом уведомление по-прежнему не называется, раздел — называется.
+    let digest = format!("{hint}\n### Ловушки и сбои\n{}\n", hint.replace("H0", "T0"));
+    let f = fit(&digest, budget, IdeasMode::Wait);
+    check(&f, budget);
+    let line = omitted_line(&f).unwrap_or_else(|| panic!("{}", f.text));
+    assert!(line.contains("Ловушки и сбои"), "{line}");
+}
+
+/// Сверка по ZAM `v0.0.12-m6.5` (`arrange`, `Arranged::notices`, `api/recall.rs`): в пакете
+/// восстановления уведомления идут без заголовка сразу за задачами, ответами и решениями.
+/// Клиент узнаёт их по началу строки, а не относит к предыдущему разделу: в выводе они не стоят
+/// под `### Решения`, а их приоритет (3) — выше ответов (4) и решений (9).
+#[test]
+fn fit_recovery_notice_after_decisions() {
+    let text = fixture("recovery_m65.md");
+    let notice = "ZeroAIMemory: запросы доступа к вашим решениям ждут ответа";
+    let f = fit(&text, 100_000, IdeasMode::Review);
+    check(&f, 100_000);
+    assert!(f.text.contains(notice), "{}", f.text);
+    let decisions = section(&f.text, "### Решения").unwrap();
+    assert!(
+        decisions.iter().all(|l| !l.starts_with(notice)),
+        "{decisions:?}"
+    );
+    // Тесный бюджет: задачи, снимок и уведомление; ответы человека и решения сняты.
+    let head = "### Последнее известное состояние";
+    let kept = format!(
+        "### Задачи\n{}\n\n{head}{}\n{}",
+        section(&text, "### Задачи").unwrap()[0],
+        text.split(head)
+            .nth(1)
+            .unwrap()
+            .split("\n\n")
+            .next()
+            .unwrap(),
+        text.lines().find(|l| l.starts_with(notice)).unwrap(),
+    );
+    let budget = fit(&kept, 100_000, IdeasMode::Wait).tokens + 50;
+    let f = fit(&text, budget, IdeasMode::Wait);
+    check(&f, budget);
+    assert!(f.text.contains(notice), "{}", f.text);
+    assert!(f.text.contains(head), "{}", f.text);
+    for gone in ["### Ответы человека", "### Решения"] {
+        assert!(!f.text.contains(gone), "{gone}:\n{}", f.text);
+    }
+    assert!(
+        !f.omitted.iter().any(|n| n == NOTICES_NAME),
+        "{:?}",
+        f.omitted
     );
 }
 
@@ -479,11 +578,7 @@ fn fit_rules_ladder_first_line_then_refs() {
     for first in &firsts {
         assert!(f.text.contains(first), "{first}:\n{}", f.text);
     }
-    assert!(
-        !f.text.contains("Каждый шаг проверяется сборкой"),
-        "{}",
-        f.text
-    );
+    assert!(!f.text.contains("Вторая строка правила 01"), "{}", f.text);
     assert!(
         f.text
             .contains("synthetic/rule-01 [ax] n:01M8SYNTH00000000000000R01")

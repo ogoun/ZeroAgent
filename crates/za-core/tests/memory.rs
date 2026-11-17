@@ -157,18 +157,24 @@ async fn no_memory_defaults() {
     let run = RunId::new();
     let m = NoMemory;
     assert_eq!(m.level(), MemoryLevel::L0);
-    assert_eq!(m.snapshot(run, 200).await, Recall::Unavailable.into());
-    assert_eq!(m.snapshot(run, 200).await.ideas, None);
+    assert_eq!(m.snapshot(run, 200, None).await, Recall::Unavailable.into());
+    assert_eq!(m.snapshot(run, 200, None).await.ideas, None);
     assert_eq!(
-        m.prompt_hint(run, "task", 100).await,
+        m.prompt_hint(run, "task", 100, None).await,
         Recall::Unavailable.into()
     );
     assert_eq!(
         m.tool_error_hint(run, "read", "no such file", 100).await,
         Recall::Unavailable
     );
-    assert_eq!(m.retry_digest(run, 200).await, Recall::Unavailable);
-    assert_eq!(m.after_compaction(run, 200).await, Recall::Unavailable);
+    assert_eq!(
+        m.retry_digest(run, 200, None).await,
+        Recall::Unavailable.into()
+    );
+    assert_eq!(
+        m.after_compaction(run, 200, None).await,
+        Recall::Unavailable
+    );
     m.before_compaction(run, "next").await;
     let note = SessionNote {
         trigger: "stop",
@@ -190,7 +196,7 @@ async fn no_memory_defaults() {
     m.end_session(run, true).await;
     // Порт вызывается из `tokio::spawn`: future — `Send + 'static` при `Arc` порта.
     let shared: std::sync::Arc<dyn MemoryPort> = std::sync::Arc::new(NoMemory);
-    let got = tokio::spawn(async move { shared.snapshot(run, 200).await.recall })
+    let got = tokio::spawn(async move { shared.snapshot(run, 200, None).await.recall })
         .await
         .unwrap();
     assert_eq!(got, Recall::Unavailable);

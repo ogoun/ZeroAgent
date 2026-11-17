@@ -5,25 +5,31 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use za_agent::{MemoryLevel, MemoryPort, NoteOutcome, Recall, RecallReply, SessionNote};
+use za_agent::{
+    IdeasSignal, MemoryLevel, MemoryPort, NoteOutcome, Recall, RecallReply, SessionNote,
+};
 use za_llm::BoxFuture;
 use za_protocol::RunId;
 
-/// Вызов порта памяти, как его видит заглушка.
+/// Вызов порта памяти, как его видит заглушка; `ideas` — признак режима идей run, который
+/// передал драйвер (D169).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemCall {
     Snapshot {
         budget: u32,
+        ideas: Option<IdeasSignal>,
     },
     Before {
         next_step: String,
     },
     After {
         budget: u32,
+        ideas: Option<IdeasSignal>,
     },
     Prompt {
         text: String,
         budget: u32,
+        ideas: Option<IdeasSignal>,
     },
     ToolError {
         tool: String,
@@ -32,6 +38,7 @@ pub enum MemCall {
     },
     Retry {
         budget: u32,
+        ideas: Option<IdeasSignal>,
     },
     Note {
         trigger: &'static str,
@@ -50,7 +57,7 @@ pub struct ScriptedMemory {
     snapshot: Mutex<VecDeque<RecallReply>>,
     prompt: Mutex<VecDeque<RecallReply>>,
     tool_error: Mutex<VecDeque<Recall>>,
-    retry: Mutex<VecDeque<Recall>>,
+    retry: Mutex<VecDeque<RecallReply>>,
     after: Mutex<VecDeque<Recall>>,
     calls: Mutex<Vec<MemCall>>,
 }
@@ -80,8 +87,8 @@ impl ScriptedMemory {
         self.tool_error.lock().unwrap().push_back(r);
     }
 
-    pub fn push_retry(&self, r: Recall) {
-        self.retry.lock().unwrap().push_back(r);
+    pub fn push_retry(&self, r: impl Into<RecallReply>) {
+        self.retry.lock().unwrap().push_back(r.into());
     }
 
     pub fn push_after(&self, r: Recall) {
@@ -110,9 +117,15 @@ impl MemoryPort for ScriptedMemory {
         self.level
     }
 
-    fn snapshot(&self, _run: RunId, budget_tokens: u32) -> BoxFuture<'_, RecallReply> {
+    fn snapshot(
+        &self,
+        _run: RunId,
+        budget_tokens: u32,
+        ideas: Option<IdeasSignal>,
+    ) -> BoxFuture<'_, RecallReply> {
         self.log(MemCall::Snapshot {
             budget: budget_tokens,
+            ideas,
         });
         let r = next(&self.snapshot);
         Box::pin(async move { r })
@@ -125,9 +138,15 @@ impl MemoryPort for ScriptedMemory {
         Box::pin(async {})
     }
 
-    fn after_compaction(&self, _run: RunId, budget_tokens: u32) -> BoxFuture<'_, Recall> {
+    fn after_compaction(
+        &self,
+        _run: RunId,
+        budget_tokens: u32,
+        ideas: Option<IdeasSignal>,
+    ) -> BoxFuture<'_, Recall> {
         self.log(MemCall::After {
             budget: budget_tokens,
+            ideas,
         });
         let r = next(&self.after);
         Box::pin(async move { r })
@@ -138,10 +157,12 @@ impl MemoryPort for ScriptedMemory {
         _run: RunId,
         text: &'a str,
         budget: u32,
+        ideas: Option<IdeasSignal>,
     ) -> BoxFuture<'a, RecallReply> {
         self.log(MemCall::Prompt {
             text: text.into(),
             budget,
+            ideas,
         });
         let r = next(&self.prompt);
         Box::pin(async move { r })
@@ -163,8 +184,13 @@ impl MemoryPort for ScriptedMemory {
         Box::pin(async move { r })
     }
 
-    fn retry_digest(&self, _run: RunId, budget: u32) -> BoxFuture<'_, Recall> {
-        self.log(MemCall::Retry { budget });
+    fn retry_digest(
+        &self,
+        _run: RunId,
+        budget: u32,
+        ideas: Option<IdeasSignal>,
+    ) -> BoxFuture<'_, RecallReply> {
+        self.log(MemCall::Retry { budget, ideas });
         let r = next(&self.retry);
         Box::pin(async move { r })
     }

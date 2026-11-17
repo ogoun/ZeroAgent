@@ -120,7 +120,12 @@ impl MemoryPort for MemLog {
         MemoryLevel::L1
     }
 
-    fn snapshot(&self, _run: RunId, _budget_tokens: u32) -> BoxFuture<'_, za_agent::RecallReply> {
+    fn snapshot(
+        &self,
+        _run: RunId,
+        _budget_tokens: u32,
+        _ideas: Option<za_agent::IdeasSignal>,
+    ) -> BoxFuture<'_, za_agent::RecallReply> {
         Box::pin(async { Recall::Empty.into() })
     }
 
@@ -132,7 +137,12 @@ impl MemoryPort for MemLog {
         Box::pin(async {})
     }
 
-    fn after_compaction(&self, _run: RunId, budget_tokens: u32) -> BoxFuture<'_, Recall> {
+    fn after_compaction(
+        &self,
+        _run: RunId,
+        budget_tokens: u32,
+        _ideas: Option<za_agent::IdeasSignal>,
+    ) -> BoxFuture<'_, Recall> {
         self.calls
             .lock()
             .unwrap()
@@ -886,6 +896,7 @@ async fn emergency_input_fits_window() {
                 grants: None,
                 masker: None,
                 skills: &[],
+                ideas: None,
             },
             0,
             &mut sig,
@@ -955,6 +966,59 @@ async fn memory_hooks_called_around_compaction() {
     assert_eq!(intents(&evs, "memory.after").len(), 2);
     let last = turn_requests(&f.model).pop().unwrap();
     assert!(!text_of(&last.messages[0]).contains("<memory>"));
+}
+
+/// D169, I3 ревью задачи 4 R1-M: драйвер передаёт порту последний признак режима идей run
+/// (`MemoryState.ideas`), а не режим, зафиксированный при сборке порта. Новый run идёт на шаг 0
+/// без признака; признак ответа шага 0 доходит до подсказки к задаче и до обоих пакетов
+/// восстановления после компакций. Аргументы эффектов прежние (D161).
+#[tokio::test]
+async fn ideas_signal_reaches_recovery() {
+    use za_agent::IdeasSignal;
+
+    let b0 = probe("ideas_recovery", 8192).await;
+    let d = THRESHOLD_8K - b0;
+    let mem = Arc::new(ScriptedMemory::new(MemoryLevel::L2));
+    mem.push_snapshot(za_agent::RecallReply {
+        recall: Recall::Empty,
+        ideas: Some(IdeasSignal::Review),
+    });
+    let f = fx_in(&dir("ideas_recovery"), scripted(8192), mem.clone());
+    two_compactions(&f, d);
+    assert_eq!(start(&f).await.unwrap(), done("готово"));
+    let calls = mem.calls();
+    assert_eq!(
+        calls[0],
+        MemCall::Snapshot {
+            budget: 200,
+            ideas: None
+        }
+    );
+    assert!(
+        matches!(
+            &calls[1],
+            MemCall::Prompt {
+                ideas: Some(IdeasSignal::Review),
+                ..
+            }
+        ),
+        "{calls:?}"
+    );
+    let after: Vec<Option<IdeasSignal>> = calls
+        .iter()
+        .filter_map(|c| match c {
+            MemCall::After { ideas, .. } => Some(*ideas),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        after,
+        [Some(IdeasSignal::Review), Some(IdeasSignal::Review)]
+    );
+    let evs = events(&f.store, f.run).await;
+    for i in intents(&evs, "memory.after") {
+        assert_eq!(i.payload["args"], json!({"budget_tokens": 200}));
+    }
 }
 
 /// Две компакции по порогу: на границах 3 и 5, затем ответ.
@@ -1408,6 +1472,7 @@ async fn direct_compact(
                 grants: None,
                 masker: None,
                 skills: &[],
+                ideas: None,
             },
             0,
             &mut sig,

@@ -32,6 +32,9 @@
 //!   `warnings`, `tokens`); выключенный тип подсказок — пустой `text` без сбора, `hooks` — только
 //!   у `session_start`; задержка ответа `/recall` — до [`FakeZam::release_recall`] (ворота, а не
 //!   таймер); дайджест формы `0.0.12-m6.5` в режиме `review` — [`digest_m65_review`].
+//! - **«Недоступный» сервер** без гонки за порт (Minor 9 ревью задачи 4):
+//!   [`FakeZam::refuse_connections`] — порт остаётся за сервером, а принятое соединение
+//!   закрывается до чтения запроса; запроса в канале нет.
 //!
 //! Задачи 5–9 дополняют сервер записями, ключами идемпотентности, снимками.
 
@@ -40,6 +43,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -352,20 +356,41 @@ pub struct FakeZam {
     state: Arc<Mutex<State>>,
     /// Ворота ответа `/recall`: `true` — ответ ждёт [`FakeZam::release_recall`].
     held: watch::Sender<bool>,
+    /// `true` — принятые соединения закрываются до чтения запроса.
+    refuse: Arc<AtomicBool>,
+}
+
+/// Слушатель поддельного сервера: при [`FakeZam::refuse_connections`] принятое соединение
+/// закрывается сразу, до HTTP; порт остаётся занят сервером.
+struct Gated {
+    inner: tokio::net::TcpListener,
+    refuse: Arc<AtomicBool>,
+}
+
+impl axum::serve::Listener for Gated {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((s, _)) if self.refuse.load(Ordering::SeqCst) => drop(s),
+                Ok(pair) => return pair,
+                // Сбой `accept` (нехватка дескрипторов и т. п.) — повтор, как у axum.
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
 impl FakeZam {
     /// Сервер на `127.0.0.1:0` с формой `0.0.11-m6`, без требуемого токена.
     pub async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        Self::serve(listener)
-    }
-
-    /// Сервер на заданном адресе `127.0.0.1:<порт>` — например, на порту
-    /// [`closed_port_url`], когда тест «поднимает» недоступный сервер.
-    pub async fn start_at(addr: SocketAddr) -> Self {
-        assert!(addr.ip().is_loopback(), "поддельный ZAM — только 127.0.0.1");
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         Self::serve(listener)
     }
 
@@ -394,15 +419,28 @@ impl FakeZam {
             async move { handle(req, &tx, &state, gate).await }
         });
         let addr = listener.local_addr().unwrap();
+        let refuse = Arc::new(AtomicBool::new(false));
+        let gated = Gated {
+            inner: listener,
+            refuse: refuse.clone(),
+        };
         tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(gated, app).await.unwrap();
         });
         Self {
             addr,
             rx,
             state,
             held,
+            refuse,
         }
+    }
+
+    /// `true` — сервер «недоступен»: соединение принимается и сразу закрывается, запрос не
+    /// читается и в канал не попадает; `false` — обычная работа. Порт всё время за сервером,
+    /// поэтому «сервер поднялся» не зависит от того, свободен ли порт.
+    pub fn refuse_connections(&self, on: bool) {
+        self.refuse.store(on, Ordering::SeqCst);
     }
 
     /// Базовый адрес `http://127.0.0.1:<порт>`.
@@ -479,6 +517,13 @@ impl FakeZam {
         let r = route.to_owned();
         self.with(|s| {
             s.failures.insert(r, f);
+        });
+    }
+
+    /// Снимает подмену [`FakeZam::fail`] пути `route`: дальше — обычный ответ.
+    pub fn clear_fail(&self, route: &str) {
+        self.with(|s| {
+            s.failures.remove(route);
         });
     }
 

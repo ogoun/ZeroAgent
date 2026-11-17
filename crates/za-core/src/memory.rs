@@ -239,28 +239,47 @@ pub struct NoteOutcome {
 
 /// Порт памяти для цикла (D138). Новые моменты обмена с памятью добавляются методами с
 /// реализацией по умолчанию («недоступна» или «ничего»): прежние реализации не ломаются.
+///
+/// **Режим идей укладки** (D169, I3 ревью задачи 4 R1-M): чтения, в ответ на которые сервер
+/// может прислать раздел разбора идей или строку плана (`snapshot`, `after_compaction`,
+/// `prompt_hint`, `retry_digest`), получают аргументом `ideas` последний признак run —
+/// `MemoryState.ideas` драйвера. Порт состояния режима не хранит: признак выводится из журнала,
+/// поэтому после resume он тот же. В аргументы эффектов признак не входит (D161): ключи и
+/// аргументы прежних эффектов не меняются.
 pub trait MemoryPort: Send + Sync {
     /// Уровень памяти; L0 — цикл пишет `memory.unavailable` на шаге 0 (D24).
     fn level(&self) -> MemoryLevel;
 
     /// Замороженный снимок для первого сообщения (MEM-031): `recall` события
     /// `session_start` в пределах `budget_tokens` ([`memory_budget`], MEM-060) и признак
-    /// режима идей (D169).
-    fn snapshot(&self, run: RunId, budget_tokens: u32) -> BoxFuture<'_, RecallReply>;
+    /// режима идей (D169); `ideas` — признак run до этого ответа.
+    fn snapshot(
+        &self,
+        run: RunId,
+        budget_tokens: u32,
+        ideas: Option<IdeasSignal>,
+    ) -> BoxFuture<'_, RecallReply>;
 
     /// CTX-013 перед компакцией: `next_step`, очередь файлов, снимок сессии.
     fn before_compaction<'a>(&'a self, run: RunId, next_step: &'a str) -> BoxFuture<'a, ()>;
 
-    /// MEM-050: `recall` события `recovery` после компакции, не больше `budget_tokens`.
-    fn after_compaction(&self, run: RunId, budget_tokens: u32) -> BoxFuture<'_, Recall>;
+    /// MEM-050: `recall` события `recovery` после компакции, не больше `budget_tokens`;
+    /// `ideas` — признак режима идей run (строка плана из идей приходит и в `recovery`).
+    fn after_compaction(
+        &self,
+        run: RunId,
+        budget_tokens: u32,
+        ideas: Option<IdeasSignal>,
+    ) -> BoxFuture<'_, Recall>;
 
     /// Подсказка к вводу пользователя (D142, событие [`PROMPT_EVENT`]) в пределах
-    /// `budget` и признак режима идей (D169).
+    /// `budget` и признак режима идей (D169); `ideas` — признак run до этого ответа.
     fn prompt_hint<'a>(
         &'a self,
         _run: RunId,
         _text: &'a str,
         _budget: u32,
+        _ideas: Option<IdeasSignal>,
     ) -> BoxFuture<'a, RecallReply> {
         Box::pin(async { Recall::Unavailable.into() })
     }
@@ -276,9 +295,15 @@ pub trait MemoryPort: Send + Sync {
         Box::pin(async { Recall::Unavailable })
     }
 
-    /// Отложенный повтор дайджеста шага 0 (D140, MEM-034).
-    fn retry_digest(&self, _run: RunId, _budget: u32) -> BoxFuture<'_, Recall> {
-        Box::pin(async { Recall::Unavailable })
+    /// Отложенный повтор дайджеста шага 0 (D140, MEM-034): тот же `session_start`, поэтому и
+    /// признак режима идей (D169; Minor 6 ревью задачи 4 — признак повтора не теряется).
+    fn retry_digest(
+        &self,
+        _run: RunId,
+        _budget: u32,
+        _ideas: Option<IdeasSignal>,
+    ) -> BoxFuture<'_, RecallReply> {
+        Box::pin(async { Recall::Unavailable.into() })
     }
 
     /// Снимок сессии (D149).
@@ -307,7 +332,12 @@ impl MemoryPort for NoMemory {
         MemoryLevel::L0
     }
 
-    fn snapshot(&self, _run: RunId, _budget_tokens: u32) -> BoxFuture<'_, RecallReply> {
+    fn snapshot(
+        &self,
+        _run: RunId,
+        _budget_tokens: u32,
+        _ideas: Option<IdeasSignal>,
+    ) -> BoxFuture<'_, RecallReply> {
         Box::pin(async { Recall::Unavailable.into() })
     }
 
@@ -315,7 +345,12 @@ impl MemoryPort for NoMemory {
         Box::pin(async {})
     }
 
-    fn after_compaction(&self, _run: RunId, _budget_tokens: u32) -> BoxFuture<'_, Recall> {
+    fn after_compaction(
+        &self,
+        _run: RunId,
+        _budget_tokens: u32,
+        _ideas: Option<IdeasSignal>,
+    ) -> BoxFuture<'_, Recall> {
         Box::pin(async { Recall::Unavailable })
     }
 }

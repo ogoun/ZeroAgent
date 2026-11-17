@@ -492,14 +492,19 @@ async fn step_zero(
     // Снимок памяти — эффект: внешнее значение входит в цикл только так (D9, D24). Значение
     // `{text, state, ideas?}` (R1-M D140, D169): `timeout` и `partial` ставят отложенный
     // повтор, признак режима идей — в состояние памяти run.
+    // Режим укладки — признак run до ответа (D169): у нового run его нет.
     let b = memory_budget(n_ctx);
-    let digest = snapshot_effect(&mut ctx, Arc::clone(&deps.memory), deps.masker.clone(), b)
-        .await
-        .map_err(effect_err)?;
-    let mut memory = MemoryState {
-        retry_digest: digest.recall.needs_retry(),
-        ..MemoryState::default()
-    };
+    let mut memory = MemoryState::default();
+    let digest = snapshot_effect(
+        &mut ctx,
+        Arc::clone(&deps.memory),
+        deps.masker.clone(),
+        b,
+        memory.ideas,
+    )
+    .await
+    .map_err(effect_err)?;
+    memory.retry_digest = digest.recall.needs_retry();
     memory.observe(digest.ideas);
     // D119: `/имя` в задаче (любой тир) или карточка роутера (top small) — эффект
     // `skill.load` сразу после снимка памяти; блок дописывается к задаче в первом
@@ -524,6 +529,7 @@ async fn step_zero(
         deps.masker.clone(),
         spec.task.clone(),
         hint_budget(b, memory.injected).min(left),
+        memory.ideas,
     )
     .await
     .map_err(effect_err)?;
@@ -1328,6 +1334,7 @@ async fn input_hint(
         deps.masker.clone(),
         text.to_owned(),
         budget,
+        st.memory.ideas,
     )
     .await
     .map_err(effect_err)?;
@@ -1353,12 +1360,15 @@ async fn digest_retry_at_boundary(
         Arc::clone(&deps.memory),
         deps.masker.clone(),
         budget,
+        st.memory.ideas,
     )
     .await
     .map_err(effect_err)?;
     st.memory.retry_digest = false;
-    if let Some(t) = r.text() {
-        st.memory.inject(tokens_of(&r));
+    // Повтор — тот же `session_start`: его признак режима идей — последний признак run (D169).
+    st.memory.observe(r.ideas);
+    if let Some(t) = r.recall.text() {
+        st.memory.inject(tokens_of(&r.recall));
         st.conv.push_user(memory_block(DIGEST, t))?;
     }
     Ok(())
@@ -1900,6 +1910,7 @@ async fn run_compaction(
             grants: recite_grants.as_deref(),
             masker: deps.masker.as_deref(),
             skills: &st.skills,
+            ideas: st.memory.ideas,
         },
         st.turn,
         &mut st.sig,

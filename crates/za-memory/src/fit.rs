@@ -9,9 +9,14 @@
 //!   префиксу на границе слова ([`header_priority`]): `### Идеи на разбор` раньше `### Идеи`,
 //!   `### Ловушки и сбои` раньше `### Ловушки`, `### Последнее известное состояние (снимок …,
 //!   извлечено автоматически)` — по началу. Строки до первого раздела — уведомления.
-//! - **Строки без заголовка** узнаются по началу в любом разделе: `План из идей:` (сервер
-//!   ставит её сразу за задачами без пустой строки), `Словарь:`, `Проверенные команды:`,
-//!   строка карты кода `ZeroAIMemory: карта кода:`. Строка с отступом продолжает предыдущую
+//!   Незнакомый заголовок — `tracing::warn!` один раз на имя за процесс: дрифт формы ZAM виден
+//!   раньше живого теста (Minor 10 ревью задачи 4).
+//! - **Строки без заголовка** узнаются по началу в любом разделе (формы — по коду ZAM на теге
+//!   `v0.0.12-m6.5`): `План из идей:` (сервер ставит её сразу за задачами без пустой строки),
+//!   `Словарь:`, `Проверенные команды:`, строка карты кода `ZeroAIMemory: карта кода:` и
+//!   уведомления (`ZeroAIMemory: запросы доступа к вашим решениям ждут ответа:`,
+//!   `ZeroAIMemory: Блок ZeroAIMemory устарел`) — в пакете `recovery` сервер ставит их без
+//!   заголовка за задачами, ответами и решениями. Строка с отступом продолжает предыдущую
 //!   (блок правила: `<путь> [надёжность] n:<id>` и текст с отступом в две позиции).
 //! - **Приоритет** (меньше — важнее, константы `PRIORITY_*`): задачи; последнее известное
 //!   состояние; уведомления; ответы человека; `Идеи на разбор` и строка плана — только в
@@ -26,13 +31,19 @@
 //!   снятие с конца), прочие — по блокам с конца. Снятое называет одна строка
 //!   `[memory: omitted <разделы>; use memory_search]` (первые пять имён по приоритету и `+N`);
 //!   она входит в бюджет. Снятое режимом и уже показанное не называется: искать его модели
-//!   незачем.
+//!   незачем. Строки без заголовка (уведомления, весь текст подсказки `prompt` и `post_tool`)
+//!   в строке снятого тоже не называются (Minor 2 ревью задачи 4): имя `notices` модели ничего
+//!   не говорит, а у подсказки строка съела бы её бюджет. В [`Fitted::omitted`] они есть.
 //! - **Счёт** — `ceil(байты / 4)` × `k`, `k = max(1, server_tokens / ceil(байты всего текста /
 //!   4)) × 1,1` (запас 10 %): сервер считает своим токенизатором (`/health.token_counter:
 //!   "model"`), оценка D22 может быть ниже. Дроби — в целых.
-//! - **Вывод** — по приоритету, задачи первыми; разделы через пустую строку.
+//! - **Вывод** — по приоритету, задачи первыми; разделы через пустую строку. Исключение —
+//!   строка плана из идей (Minor 1 ревью задачи 4): она идёт сразу за задачами, где её ставит
+//!   сервер; задач нет — в разделе `### Идеи на разбор` (нет и его — под этим заголовком).
+//!   Строка без заголовка после чужого раздела читалась бы его частью.
 
 use std::collections::BTreeSet;
+use std::sync::Mutex;
 
 use crate::ideas::IdeasMode;
 
@@ -64,7 +75,7 @@ pub const OMITTED_HEAD: &str = "[memory: omitted ";
 /// Конец строки снятого.
 pub const OMITTED_TAIL: &str = "; use memory_search]";
 /// Имя строк до первого раздела в строке снятого.
-const NOTICES_NAME: &str = "notices";
+pub const NOTICES_NAME: &str = "notices";
 /// Имя раздела, которого нет в таблице, в данных события `memory.recall` (D153: текста
 /// памяти в событии нет).
 pub const UNKNOWN_NAME: &str = "unknown";
@@ -74,6 +85,12 @@ const NAME_MAX_CHARS: usize = 60;
 pub const OMITTED_NAMES_MAX: usize = 5;
 
 const HEADER_PREFIX: &str = "### ";
+/// Заголовок раздела разбора идей (`SECTION_IDEAS_REVIEW`): под ним выводится и строка плана,
+/// если задач нет.
+const IDEAS_REVIEW_HEADER: &str = "### Идеи на разбор";
+/// Имён незнакомых разделов, о которых процесс предупреждает, не больше: память может прислать
+/// много разных заголовков, журнал ими не засоряется.
+const WARNED_MAX: usize = 64;
 
 /// Заголовки разделов ZAM и их приоритет (`crates/zam-server/src/api/recall.rs`,
 /// `api/snapshot.rs:577`, `api/code.rs:904` по тегу `v0.0.12-m6.5`).
@@ -81,7 +98,7 @@ const HEADERS: &[(&str, u8)] = &[
     ("### Задачи", PRIORITY_TASKS),
     ("### Последнее известное состояние", PRIORITY_SNAPSHOT),
     ("### Ответы человека", PRIORITY_ANSWERS),
-    ("### Идеи на разбор", PRIORITY_IDEAS_REVIEW),
+    (IDEAS_REVIEW_HEADER, PRIORITY_IDEAS_REVIEW),
     ("### Окружение", PRIORITY_ENVIRONMENT),
     ("### Правила", PRIORITY_RULES),
     ("### Ловушки и сбои", PRIORITY_TRAPS),
@@ -100,8 +117,19 @@ const HEADERS: &[(&str, u8)] = &[
 ];
 
 /// Строки без заголовка, которые узнаются по началу в любом разделе: начало, приоритет,
-/// имя в строке снятого.
+/// имя в строке снятого (`api/recall.rs@v0.0.12-m6.5`: `PLAN_LINE`, `glossary_line`,
+/// `verified_line`, уведомления `digest`; `api/code.rs`: `digest_line`).
 const LINES: &[(&str, u8, &str)] = &[
+    (
+        "ZeroAIMemory: запросы доступа к вашим решениям ждут ответа:",
+        PRIORITY_NOTICES,
+        NOTICES_NAME,
+    ),
+    (
+        "ZeroAIMemory: Блок ZeroAIMemory устарел",
+        PRIORITY_NOTICES,
+        NOTICES_NAME,
+    ),
     ("План из идей:", PRIORITY_IDEAS_REVIEW, "План из идей"),
     ("Словарь:", PRIORITY_POINTERS, "Словарь"),
     (
@@ -125,7 +153,8 @@ pub struct Fitted {
     pub text: String,
     /// Счёт текста ([`approx_tokens`] × `k`).
     pub tokens: u32,
-    /// Разделы, снятые или сокращённые бюджетом, — в порядке приоритета.
+    /// Разделы, снятые или сокращённые бюджетом, — в порядке приоритета; строки без
+    /// заголовка — [`NOTICES_NAME`] (в строке снятого его нет).
     pub omitted: Vec<String>,
     /// Ссылки ZAM в тексте (`k:…`, `n:…`, …) в порядке появления, без повторов.
     pub refs: Vec<String>,
@@ -190,11 +219,7 @@ pub(crate) fn fit_with(
         let out = render(&units, &omitted);
         let tokens = scale.count(&out);
         if tokens <= budget {
-            let refs = if out.is_empty() {
-                Vec::new()
-            } else {
-                kept_refs(&units)
-            };
+            let refs = text_refs(&out);
             return Fitted {
                 text: out,
                 tokens,
@@ -322,9 +347,15 @@ impl Unit {
                     .chars()
                     .take(NAME_MAX_CHARS)
                     .collect();
+                warn_unknown_header(&name);
                 Self::new(PRIORITY_UNKNOWN, order, Some(line.to_owned()), name)
             }
         }
+    }
+
+    /// Строка плана из идей: раздел режима `Review` без заголовка.
+    fn is_plan(&self) -> bool {
+        self.ideas && self.title.is_none()
     }
 
     /// Строка без заголовка из [`LINES`].
@@ -383,11 +414,31 @@ impl Unit {
     }
 }
 
-/// `<путь> n:<id>` из строки правила `<путь> [надёжность] n:<id>`.
+/// `<путь> n:<id>` из строки правила `<путь> [надёжность] n:<id>`. Голова с `:` в конце —
+/// метка строки-примечания (`ZeroAIMemory: правила сокращены … n:<id>`), а не путь правила
+/// (Minor 4 ревью задачи 4): такой блок на ступени ссылок снимается.
 fn rule_ref(head: &str) -> Option<String> {
     let path = head.split_whitespace().next()?;
+    if path.ends_with(':') {
+        return None;
+    }
     let r = refs_in(head).into_iter().find(|r| r.starts_with("n:"))?;
     (path != r).then(|| format!("{path} {r}"))
+}
+
+/// Предупреждение о незнакомом заголовке `name` (Minor 10 ревью задачи 4): один раз на имя за
+/// процесс, не больше [`WARNED_MAX`] имён; `true` — предупреждение выведено сейчас.
+fn warn_unknown_header(name: &str) -> bool {
+    static WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.len() >= WARNED_MAX || !warned.insert(name.to_owned()) {
+        return false;
+    }
+    tracing::warn!(
+        section = ?name,
+        "память: незнакомый заголовок раздела дайджеста — укладка снимает его первым; форма ответа ZAM могла измениться"
+    );
+    true
 }
 
 /// Известный заголовок: самый длинный префикс из [`HEADERS`] на границе слова.
@@ -489,10 +540,42 @@ fn omitted_names(units: &[Unit]) -> Vec<String> {
     out
 }
 
-/// Текст выводимых блоков и строка снятого.
+/// Текст выводимых блоков и строка снятого. Разделы — по приоритету через пустую строку;
+/// строка плана — сразу за задачами, иначе в конце раздела `### Идеи на разбор`, иначе под
+/// этим заголовком на своём месте по приоритету (Minor 1 ревью задачи 4). В строке снятого
+/// нет [`NOTICES_NAME`] (Minor 2); нечего назвать — строки нет.
 fn render(units: &[Unit], omitted: &[String]) -> String {
+    let shown: Vec<&Unit> = units.iter().filter(|u| u.kept > 0).collect();
+    let plan: Vec<&Unit> = shown.iter().copied().filter(|u| u.is_plan()).collect();
+    // Раздел, за блоками которого идёт строка плана: задачи, иначе раздел разбора идей.
+    let host = shown
+        .iter()
+        .position(|u| u.prio == PRIORITY_TASKS && u.title.is_some())
+        .or_else(|| shown.iter().position(|u| u.ideas && u.title.is_some()));
+    let push_blocks = |out: &mut String, u: &Unit| {
+        for l in u.blocks[..u.kept].iter().flatten() {
+            out.push_str(l);
+            out.push('\n');
+        }
+    };
     let mut out = String::new();
-    for u in units.iter().filter(|u| u.kept > 0) {
+    let mut plan_done = plan.is_empty();
+    for (i, u) in shown.iter().enumerate() {
+        if u.is_plan() {
+            if host.is_some() || plan_done {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(IDEAS_REVIEW_HEADER);
+            out.push('\n');
+            for p in &plan {
+                push_blocks(&mut out, p);
+            }
+            plan_done = true;
+            continue;
+        }
         if !out.is_empty() {
             out.push('\n');
         }
@@ -500,29 +583,36 @@ fn render(units: &[Unit], omitted: &[String]) -> String {
             out.push_str(t);
             out.push('\n');
         }
-        for l in u.blocks[..u.kept].iter().flatten() {
-            out.push_str(l);
-            out.push('\n');
+        push_blocks(&mut out, u);
+        if !plan_done && host == Some(i) {
+            for p in &plan {
+                push_blocks(&mut out, p);
+            }
+            plan_done = true;
         }
     }
-    if !omitted.is_empty() {
+    let named: Vec<String> = omitted
+        .iter()
+        .filter(|n| n.as_str() != NOTICES_NAME)
+        .cloned()
+        .collect();
+    if !named.is_empty() {
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&omitted_line(omitted));
+        out.push_str(&omitted_line(&named));
     }
     out.truncate(out.trim_end().len());
     out
 }
 
-/// Ссылки выводимых блоков в порядке вывода, без повторов.
-fn kept_refs(units: &[Unit]) -> Vec<String> {
+/// Ссылки уложенного текста в порядке появления, без повторов (заголовки и строка снятого
+/// ссылок не несут).
+fn text_refs(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for u in units.iter().filter(|u| u.kept > 0) {
-        for r in u.blocks[..u.kept].iter().flatten().flat_map(|l| refs_in(l)) {
-            if !out.iter().any(|x| x == r) {
-                out.push(r.to_owned());
-            }
+    for r in refs_in(text) {
+        if !out.iter().any(|x| x == r) {
+            out.push(r.to_owned());
         }
     }
     out
@@ -577,6 +667,25 @@ mod tests {
             rule_ref("ZeroAIMemory: правила сокращены — memory_read n:<id>"),
             None
         );
+        // Minor 4: строка-примечание с настоящей ссылкой — не правило: голова с `:` в конце
+        // (метка `ZeroAIMemory:`) путём правила не бывает.
+        assert_eq!(
+            rule_ref(&format!(
+                "ZeroAIMemory: правила сокращены («…» — обрезано) — полностью memory_read n:{id}"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_header_warned_once_per_name() {
+        // Minor 10: дрифт формы ZAM виден в журнале процесса — один раз на имя.
+        assert!(warn_unknown_header("Синтетический раздел A"));
+        assert!(!warn_unknown_header("Синтетический раздел A"));
+        assert!(warn_unknown_header("Синтетический раздел B"));
+        let u = Unit::header("### Синтетический раздел C", 1);
+        assert_eq!(u.prio, PRIORITY_UNKNOWN);
+        assert!(!warn_unknown_header("Синтетический раздел C"));
     }
 
     #[test]

@@ -1367,6 +1367,7 @@ async fn recitation_after_compaction_has_grants() {
                 grants: Some(&text),
                 masker: None,
                 skills: &[],
+                ideas: None,
             },
             0,
             &mut sig,

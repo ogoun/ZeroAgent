@@ -418,12 +418,12 @@ async fn no_memory_is_l0() {
     let run = RunId::new();
     assert_eq!(NoMemory.level(), MemoryLevel::L0);
     assert_eq!(
-        NoMemory.snapshot(run, 200).await.recall,
+        NoMemory.snapshot(run, 200, None).await.recall,
         Recall::Unavailable
     );
-    assert_eq!(NoMemory.snapshot(run, 200).await.ideas, None);
+    assert_eq!(NoMemory.snapshot(run, 200, None).await.ideas, None);
     assert_eq!(
-        NoMemory.after_compaction(run, 400).await,
+        NoMemory.after_compaction(run, 400, None).await,
         Recall::Unavailable
     );
     let next = String::from("next");
@@ -432,7 +432,7 @@ async fn no_memory_is_l0() {
     assert_eq!(port.level(), MemoryLevel::L0);
     // Порт вызывается из `tokio::spawn`: future — `Send + 'static` при `Arc` порта.
     let shared: std::sync::Arc<dyn MemoryPort> = std::sync::Arc::new(NoMemory);
-    let got = tokio::spawn(async move { shared.snapshot(run, 200).await.recall })
+    let got = tokio::spawn(async move { shared.snapshot(run, 200, None).await.recall })
         .await
         .unwrap();
     assert_eq!(got, Recall::Unavailable);

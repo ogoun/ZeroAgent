@@ -10,6 +10,10 @@
 //! и добавочные блоки [`memory_block`].
 //!
 //! Ключи эффектов не зависят от уровня памяти (D50): эффекты пишутся и при `NoMemory`.
+//!
+//! Режим идей укладки (D169, I3 ревью задачи 4): чтения получают последний признак run
+//! (`MemoryState.ideas`) аргументом порта, но не аргументом эффекта — аргументы прежних
+//! эффектов не меняются (D161), а признак при реплее и так выводится из журнала.
 
 use std::sync::Arc;
 
@@ -126,12 +130,14 @@ where
     Ok(RecallReply::from_value(&v))
 }
 
-/// Эффект `memory.snapshot` шага 0 (D140): аргументы прежние — `{budget_tokens}`.
+/// Эффект `memory.snapshot` шага 0 (D140): аргументы прежние — `{budget_tokens}`; `ideas` —
+/// признак режима идей run (новый run — `None`).
 pub(crate) async fn snapshot_effect(
     ctx: &mut RunCtx,
     mem: Arc<dyn MemoryPort>,
     masker: Option<Arc<SecretMasker>>,
     budget: u32,
+    ideas: Option<IdeasSignal>,
 ) -> Result<RecallReply, EffectError> {
     let run = ctx.run_id();
     recall_effect(
@@ -139,7 +145,7 @@ pub(crate) async fn snapshot_effect(
         SNAPSHOT_EFFECT,
         json!({ "budget_tokens": budget }),
         masker.as_deref(),
-        async move { mem.snapshot(run, budget).await },
+        async move { mem.snapshot(run, budget, ideas).await },
     )
     .await
 }
@@ -152,6 +158,7 @@ pub(crate) async fn prompt_effect(
     masker: Option<Arc<SecretMasker>>,
     text: String,
     budget: u32,
+    ideas: Option<IdeasSignal>,
 ) -> Result<RecallReply, EffectError> {
     let run = ctx.run_id();
     recall_effect(
@@ -163,7 +170,7 @@ pub(crate) async fn prompt_effect(
             if budget == 0 {
                 return Recall::Capped.into();
             }
-            mem.prompt_hint(run, &text, budget).await
+            mem.prompt_hint(run, &text, budget, ideas).await
         },
     )
     .await
@@ -198,13 +205,15 @@ pub(crate) async fn tool_error_effect(
 }
 
 /// Эффект `memory.retry` (D140): отложенный повтор дайджеста, аргументы `{budget}`;
-/// бюджет 0 — `capped` без запроса.
+/// бюджет 0 — `capped` без запроса. Значение — `{text, state, ideas?}`: повтор — тот же
+/// `session_start`, его признак режима идей не теряется (D169, Minor 6 ревью задачи 4).
 pub(crate) async fn retry_effect(
     ctx: &mut RunCtx,
     mem: Arc<dyn MemoryPort>,
     masker: Option<Arc<SecretMasker>>,
     budget: u32,
-) -> Result<Recall, EffectError> {
+    ideas: Option<IdeasSignal>,
+) -> Result<RecallReply, EffectError> {
     let run = ctx.run_id();
     recall_effect(
         ctx,
@@ -215,25 +224,26 @@ pub(crate) async fn retry_effect(
             if budget == 0 {
                 return Recall::Capped.into();
             }
-            mem.retry_digest(run, budget).await.into()
+            mem.retry_digest(run, budget, ideas).await
         },
     )
     .await
-    .map(|r| r.recall)
 }
 
-/// Эффект `memory.after` компакции (D50, D140): аргументы прежние — `{budget_tokens}`.
+/// Эффект `memory.after` компакции (D50, D140): аргументы прежние — `{budget_tokens}`;
+/// `ideas` — признак режима идей run.
 pub(crate) async fn recovery_effect(
     ctx: &mut RunCtx,
     name: &str,
     mem: &dyn MemoryPort,
     masker: Option<&SecretMasker>,
     budget: u32,
+    ideas: Option<IdeasSignal>,
 ) -> Result<Recall, EffectError> {
     let run = ctx.run_id();
     let args = json!({ "budget_tokens": budget });
     recall_effect(ctx, name, args, masker, async move {
-        mem.after_compaction(run, budget).await.into()
+        mem.after_compaction(run, budget, ideas).await.into()
     })
     .await
     .map(|r| r.recall)
