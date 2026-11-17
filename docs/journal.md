@@ -2,6 +2,20 @@
 
 Решения, прогоны, замеры. Новые записи сверху.
 
+## 2026-11-17. R1-M, задача 5: ключи моделей из Vault памяти, ожидание Vault, маска после раскрытия
+
+Бриф — `.superpowers/sdd/2026-11-16-r1m-memory/task-5-brief.md`, отчёт — `task-5-report.md`. База — `221241f` (после fix-4). Формы Vault сверены по ZAM `v0.0.12-m6.5` (`api/vault.rs`, `zam-store/src/vault.rs`; между m6 и m6.5 `api/vault.rs` не менялся).
+
+- **Только Vault** (решение владельца 1, D143). Обычная и release-сборка `ZA_SECRET_*` не читают; без `[memory]` у эндпоинтов с `key_ref` ключей нет — `inactive` «память не настроена ([memory] url)». `EnvStore` — только сборка с `test-hooks` без `[memory]` (тесты R1-A…R1-C2; `r1a_models`, `r1c_tools`, `secret` получили `required-features`).
+- **Поиск и раскрытие** (`za-memory::vault`, `keys`). Vault решения (только доверенный проект с решением), затем личный; точное имя, затем единственное без учёта регистра; `host`/`environment` — не ключи. Список кэшируется, пока Vault открыт. Раскрываются только ключи команды: `run`/resume — ключ выбранного эндпоинта (D24; resume без `--model` — эндпоинт снимка), `ask`, `models probe`; прочие команды не раскрывают. Ключ заблокированного Vault ждёт без запроса раскрытия.
+- **Ожидание.** `wait_for_keys` бинарника: строка stderr при смене причины, паузы 2, 4, 8, 16, 30… с на `za_memory::clock::Clock` — это и есть `Sleeper` плана, второй абстракции времени не заведено. Отмена — будущее `cancel` (Ctrl+C), код 130, run не создаётся. `models probe` не ждёт.
+- **Порядок `cmd_run` (D160).** Журнал проекта открывается на проверку доверия и привязку и закрывается до ожидания; маска процесса (`MaskCell`: токен памяти, раскрытые значения) строится до `start_gateway`, её снимок — маска печати, цикла, файла инструкций проекта и фильтр чекпоинтов. Порт памяти берёт маску из ячейки (`ZamParts::masker: Arc<MaskCell>`).
+- **Привязка (D135).** `.zeroaimemory/solution.toml` и `area.toml` — в `TRUSTED_FILES` (миграция доверия, запись в CHANGELOG), читаются `read_trusted` со сверкой хэша.
+- **Журнал и аудит.** `secret.revealed` — запись аудита на каждое раскрытие с сервера и события шага 0 (`RunSpec.secrets_revealed`) или продолжения (`ResumeChange.secrets_revealed`), значений нет. `RunSpec::new` — литералы тестов `za-agent` переведены на `..RunSpec::new(…)`.
+- **Без раскрытия.** `audit`, `journal export`, `checkpoints restore` — `StoreSecrets::patterns_only()`; `models`, `doctor`, `inspect`, `resources` — `unrevealed`. `secret list [--project]` и строка `doctor` `secrets` — по метаданным Vault (D144, D152).
+- **Мелочь fix-4:** 408 `/problems/timeout` у регистрации сессии — временная ошибка, повтор.
+- **Отступления от интерфейса брифа** (причины — в отчёте): `VaultClient::find` берёт `&SolutionVault` (недоверенный проект и доверенный без решения различаются в причине «не найден»); `memory_runtime(cfg, binding, token, mask) -> Memory` (привязку считает `project_binding`, причина «памяти нет» нужна тексту ошибки и `EnvStore` тестовой сборки); `read_binding` берёт доверенный набор (`Option<&TrustSet>`) вместо `bool` — файлы читаются со сверкой хэша.
+
 ## 2026-11-17. R1-M, проход fix-4: ревью задачи 4 — режим укладки по последнему признаку, повтор регистрации сессии, нейтральные фикстуры; D11 на границе шага
 
 Бриф — `.superpowers/sdd/2026-11-16-r1m-memory/fix-4-brief.md`, находки — `task-4-review.md` (I1–I3, Minor 1–4, 6–10), отчёт — раздел «Исправления fix-4» в `task-4-report.md`. База — `7625b65` (после fix-3). Формы ZAM сверены по тегу `v0.0.12-m6.5`, логи — `.tmp/r1m-fix4/`.
