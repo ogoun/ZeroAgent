@@ -187,7 +187,8 @@ pub mod skill_by {
     pub const ROUTER: &str = "router";
 }
 
-/// Источник очищенного ввода (R1-C2 D102): поле `source` события `input.cleaned`.
+/// Источник очищенного ввода (R1-C2 D102): поле `source` событий `input.cleaned` и
+/// `input.masked` (R1-M).
 ///
 /// Значения — часть протокола, менять строки нельзя.
 pub mod input_source {
@@ -195,7 +196,7 @@ pub mod input_source {
     pub const TASK: &str = "task";
     /// Ввод пользователя или поправка из `inbox`.
     pub const INPUT: &str = "input";
-    /// Текст `AGENTS.md` проекта.
+    /// Текст файла инструкций проекта: `AGENTS.md`, без него — `CLAUDE.md`.
     pub const AGENTS_MD: &str = "agents_md";
 }
 

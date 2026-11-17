@@ -35,6 +35,7 @@
 //! `correct` применяется на границе: управляющее сообщение в историю и
 //! `control.applied {action: "correct", command}` с тем же `command`.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -464,6 +465,27 @@ async fn step_zero(
         spec.agents_md = Some(md);
         cleaned.push((input_source::AGENTS_MD, removed));
     }
+    // R1-M (Important 2 ревью задачи 1): файл инструкций проекта до префикса проходит маску
+    // процесса — шаблоны (`zam_` и др.) и известные значения, как результаты инструментов:
+    // клиент `zam` прежнего формата писал в `CLAUDE.md` строку `ZeroAIMemoryToken=…`. После
+    // очистки: невидимый символ внутри токена маску не обходит. Число замен — событие
+    // `input.masked` (значений нет), бинарник печатает по нему строку stderr.
+    let masked = match (deps.masker.as_deref(), spec.agents_md.as_deref()) {
+        (Some(m), Some(md)) => match m.mask_counted(md) {
+            (Cow::Owned(text), n) => Some((text, n)),
+            (Cow::Borrowed(_), _) => None,
+        },
+        _ => None,
+    };
+    let mut masked_inputs = Vec::new();
+    if let Some((text, n)) = masked {
+        tracing::warn!(
+            masked = n,
+            "в файле инструкций проекта замаскированы секреты"
+        );
+        spec.agents_md = Some(text);
+        masked_inputs.push((input_source::AGENTS_MD, n));
+    }
 
     // Снимок памяти — эффект: внешнее значение входит в цикл только так (D9, D24).
     let budget_tokens = memory_budget(n_ctx);
@@ -501,6 +523,18 @@ async fn step_zero(
     // на последнем событии run (D4).
     for (source, removed) in cleaned {
         last_seq = Some(input_cleaned(&deps.journal, run, source, removed, None).await?);
+    }
+    for (source, n) in masked_inputs {
+        last_seq = Some(
+            append(
+                &deps.journal,
+                run,
+                Actor::Runtime,
+                EventKind::InputMasked,
+                json!({ "source": source, "masked": n }),
+            )
+            .await?,
+        );
     }
     if deps.memory.level() == MemoryLevel::L0 {
         last_seq = Some(

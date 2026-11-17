@@ -1600,6 +1600,8 @@ impl Printer {
             }
             // D112: сетевое обращение нативного инструмента — строка на запрос.
             EventKind::WebRequest => eprintln!("{}", crate::web::request_line(p)),
+            // R1-M: секреты файла инструкций замаскированы до промпта — число, без значений.
+            EventKind::InputMasked => eprintln!("{}", masked_line(p)),
             // D122: загруженный скилл.
             EventKind::SkillActivated => {
                 let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("?");
@@ -1747,6 +1749,21 @@ async fn drive(
         eprintln!("{RULE_OF_TWO_LINE}");
     }
     outcome
+}
+
+/// Строка stderr по событию `input.masked {source, masked}` (R1-M, Important 2 ревью
+/// задачи 1): сколько секретов замаскировано во вводе до промпта; значений в событии нет.
+fn masked_line(p: &Value) -> String {
+    let n = p.get("masked").and_then(Value::as_u64).unwrap_or(0);
+    match p.get("source").and_then(Value::as_str) {
+        Some(za_protocol::input_source::AGENTS_MD) => format!(
+            "zero-agent: в файле инструкций проекта замаскировано секретов: {n} — модель видит метки вместо значений; уберите секреты из AGENTS.md / CLAUDE.md"
+        ),
+        source => format!(
+            "zero-agent: во вводе {} замаскировано секретов: {n}",
+            source.unwrap_or("?")
+        ),
+    }
 }
 
 /// Строка `zero-agent: вне проекта: <tool> <access> <path>` (D96) по элементу `paths`

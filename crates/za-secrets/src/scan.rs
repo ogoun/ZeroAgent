@@ -125,6 +125,17 @@ impl SecretMasker {
         self.mask_with_steps(s).0
     }
 
+    /// [`SecretMasker::mask`] и число замаскированных мест (пересекающиеся находки слиты в
+    /// одно): отчёт о срабатывании без значений (R1-M, файл инструкций проекта).
+    pub fn mask_counted<'a>(&self, s: &'a str) -> (Cow<'a, str>, usize) {
+        let mut steps = 0u64;
+        let spans = self.merged(s, &mut steps);
+        if spans.is_empty() {
+            return (Cow::Borrowed(s), 0);
+        }
+        (Cow::Owned(render(s, &spans, s.len())), spans.len())
+    }
+
     /// [`SecretMasker::mask`] и число элементарных шагов сканера — для теста линейности
     /// (I1), не для продукта.
     #[doc(hidden)]

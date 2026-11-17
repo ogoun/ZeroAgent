@@ -75,6 +75,9 @@ pub enum EventKind {
     SkillCatalog,
     /// Скилл загружен в контекст (R1-C2).
     SkillActivated,
+    /// В тексте ввода замаскированы секреты (R1-M, Important 2 ревью задачи 1): `source`
+    /// (`input_source`), `masked` — число замен; значений в событии нет.
+    InputMasked,
     Unknown(String),
 }
 
@@ -114,6 +117,7 @@ impl EventKind {
             Self::ExposureChanged => "exposure.changed",
             Self::SkillCatalog => "skill.catalog",
             Self::SkillActivated => "skill.activated",
+            Self::InputMasked => "input.masked",
             Self::Unknown(s) => s,
         }
     }
@@ -153,6 +157,7 @@ impl EventKind {
             "exposure.changed" => Self::ExposureChanged,
             "skill.catalog" => Self::SkillCatalog,
             "skill.activated" => Self::SkillActivated,
+            "input.masked" => Self::InputMasked,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -282,6 +287,12 @@ mod tests {
             assert_eq!(k.as_str(), name);
             assert_eq!(EventKind::parse(name), k);
         }
+    }
+
+    #[test]
+    fn r1m_kinds_round_trip() {
+        assert_eq!(EventKind::InputMasked.as_str(), "input.masked");
+        assert_eq!(EventKind::parse("input.masked"), EventKind::InputMasked);
     }
 
     #[test]

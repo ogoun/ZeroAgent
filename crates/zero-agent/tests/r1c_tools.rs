@@ -926,6 +926,78 @@ fn secrets_never_in_journal_or_spill() {
     assert!(x.stdout.contains("[secret masked: "), "{}", x.stdout.len());
 }
 
+/// Модель: сразу ответ.
+fn answer_model(_seen: &[Value]) -> Response {
+    text_reply(&["готово"])
+}
+
+/// R1-M, Important 2 ревью задачи 1: клиент `zam` прежнего формата писал токен строкой
+/// `ZeroAIMemoryToken=…` в `CLAUDE.md`. Файл инструкций доверенного проекта до системного
+/// промпта проходит маску процесса — шаблон `zam_` и известные значения (`ZA_SECRET_*`),
+/// как результаты инструментов: ни в запросах к модели, ни в журнале и прочих файлах
+/// `ZA_HOME`, ни в stderr значений нет. Срабатывание — строка stderr и событие
+/// `input.masked {source: agents_md, masked}` без значений.
+#[test]
+fn instruction_file_secrets_masked_before_prompt() {
+    let c = Case::new("zam-claude-md", answer_model).var("ZA_SECRET_T", SECRET);
+    let token = ["zam", "_", "Mn3Bv7Cx1Zl5Kj9Hg2Fd", "4Sa8Qw6Er0Ty3Ui7Op1A"].concat();
+    c.write(
+        "CLAUDE.md",
+        &format!(
+            "# Проект\n\nZeroAIMemoryUrl=http://127.0.0.1:9\nZeroAIMemoryToken={token}\nPASS={SECRET}\n"
+        ),
+    );
+    c.trust();
+    let o = c.run(&["задача"]);
+    assert_eq!(o.code(), Some(0), "{o:?}");
+    let tail = &token[4..];
+    let bodies = c.bodies();
+    let system = content(&messages(&bodies[0])[0]);
+    assert!(
+        system.contains("ZeroAIMemoryToken=[secret masked: zam_token]"),
+        "{system}"
+    );
+    assert!(
+        system.contains("ZeroAIMemoryUrl=http://127.0.0.1:9"),
+        "{system}"
+    );
+    for b in &bodies {
+        let s = b.to_string();
+        assert!(
+            !s.contains(tail) && !s.contains(SECRET),
+            "секрет ушёл модели"
+        );
+    }
+    assert!(
+        o.stderr
+            .contains("zero-agent: в файле инструкций проекта замаскировано секретов: 2"),
+        "{o:?}"
+    );
+    assert!(
+        !o.stderr.contains(tail) && !o.stderr.contains(SECRET),
+        "{o:?}"
+    );
+    let events = c.e.events(run_id(&o));
+    let masked: Vec<&Value> = events
+        .iter()
+        .filter(|(k, _)| *k == EventKind::InputMasked)
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(
+        masked,
+        [&json!({"source": "agents_md", "masked": 2})],
+        "{events:?}"
+    );
+    for f in files_under(&c.e.home) {
+        let data = std::fs::read(&f).unwrap();
+        assert!(
+            !contains(&data, tail.as_bytes()) && !contains(&data, SECRET.as_bytes()),
+            "секрет в {}",
+            f.display()
+        );
+    }
+}
+
 // ---- Секреты в чекпоинтах (R1-C2 D103) ----
 
 /// Модель: чтение `.env` и `config.txt`, затем правка обоих, затем ответ.

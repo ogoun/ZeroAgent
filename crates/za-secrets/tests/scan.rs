@@ -671,6 +671,22 @@ fn zam_token_masked() {
     }
 }
 
+/// R1-M (Important 2 ревью задачи 1): `mask_counted` — та же маска и число замаскированных
+/// мест (шаблон и известное значение — каждое отдельно); без находок — исходный текст без
+/// копии и 0.
+#[test]
+fn mask_counted_counts_places() {
+    let m = SecretMasker::new(vec![("k".into(), "verylongsecretvalue".into())]);
+    let token = j(&["zam", "_", &zam_body()]);
+    let text = format!("ZeroAIMemoryToken={token}\nPASS=verylongsecretvalue\nok");
+    let (out, n) = m.mask_counted(&text);
+    assert_eq!(out, m.mask(&text));
+    assert_eq!(n, 2, "{out}");
+    let (out, n) = m.mask_counted("plain text");
+    assert!(matches!(out, Cow::Borrowed("plain text")));
+    assert_eq!(n, 0);
+}
+
 /// Длинный незаконченный токен и блок PEM мелкими фрагментами: метка отдаётся сразу,
 /// продолжение пропускается, склейка равна маске целого текста.
 #[test]
