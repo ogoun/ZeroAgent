@@ -1,0 +1,387 @@
+//! Генератор golden-журналов `r1c2_journal` (R1-M задача 3, шаг 0, D161): журналы run,
+//! записанные кодом R1-C2 (ветка `r1m-memory` на fc61b7c, снимок v4, до правок задачи 3).
+//!
+//! Четыре журнала, у каждого `run.txt`, `snapshot.json`, `store/journal.db` (как у
+//! `r1b1_v1`):
+//! - `compact_mid` — пакет шага 1 с ошибкой инструмента и большим аргументом, компакция по
+//!   порогу на границе шага 2, сбой `AfterCompact { step: 2 }`; последний снимок — `Model`
+//!   шага 1;
+//! - `inbox_mid` — большой ввод `inbox` перед чтением границы шага 2, компакция на ней,
+//!   сбой `AfterInbox { step: 2 }`; последний снимок — `Model` шага 1, граница шага 2 уже
+//!   записана кодом R1-C2 (ввод прочитан);
+//! - `batch_error` — пакеты шагов 1 и 2 с ошибкой инструмента, сбой `AfterModelEffect
+//!   { step: 2 }`; последний снимок — `Model` шага 2;
+//! - `approval` — пакет шага 1 `[fail, incr]`: ошибка чтения исполнена, `incr` ждёт
+//!   одобрения (`interrupt.txt`); последний снимок — `Model` шага 1.
+//!
+//! Запуск (файл временно кладётся в `crates/za-agent/tests/gen_r1c2_journal.rs`, рядом
+//! каталог `support` той же ревизии):
+//! `GEN_R1C2_DIR=<каталог> cargo test -p za-agent --test gen_r1c2_journal -- --test-threads=1`.
+//! После прогона в `store/` оставляется только `journal.db`.
+
+mod support;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use support::*;
+
+use serde_json::{Value, json};
+use za_agent::{
+    ContextConfig, ContextMeter, CrashPoint, EnvInfo, FaultPoint, InputMode, LoopDeps, LoopError,
+    LoopOutcome, NoMemory, RunSpec, builtin_tools, control_channel, start_run, submit_input,
+};
+use za_core::{
+    Approval, EventBus, Journal, RiskClass, Tool, ToolCx, ToolKind, ToolOutput, ToolRegistry,
+    ToolSpec,
+};
+use za_llm::{
+    BackendKind, BoxFuture, EndpointId, FinishReason, Message, ModelError, Part, Role,
+    ScriptedModel, StreamEvent, ToolCall, ToolSchema, Usage, default_caps,
+};
+use za_protocol::{Budget, EffectClass, Priority, RunId, RunMode, RunRole, Tier};
+use za_store::ProjectStore;
+
+/// Порог компакции на окне 8192 (тир small): оценка ≥ 0,75 × 8192 − 3072 = 3072.
+const THRESHOLD_8K: u32 = 3072;
+
+/// Чтение `note`: результат `ok`.
+struct Note {
+    spec: ToolSpec,
+}
+
+impl Tool for Note {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        Box::pin(async { ToolOutput::ok("ok") })
+    }
+}
+
+/// Чтение `fail`: результат-ошибка `fail {args}`.
+struct Fail {
+    spec: ToolSpec,
+}
+
+impl Tool for Fail {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn call(&self, args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        Box::pin(async move { ToolOutput::error(format!("fail {args}")) })
+    }
+}
+
+/// Мутация `incr`: в режиме `ask` ждёт одобрения.
+struct Incr {
+    spec: ToolSpec,
+}
+
+impl Tool for Incr {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn call(&self, _args: Value, _cx: ToolCx) -> BoxFuture<'static, ToolOutput> {
+        Box::pin(async { ToolOutput::ok("incr 1") })
+    }
+}
+
+fn tool_spec(name: &str, kind: ToolKind, class: EffectClass) -> ToolSpec {
+    ToolSpec {
+        schema: ToolSchema {
+            name: name.into(),
+            description: "t".into(),
+            parameters: json!({"type": "object"}),
+        },
+        class,
+        kind,
+        approval: Approval::Mode,
+        risk: match kind {
+            ToolKind::Exec => RiskClass::Exec,
+            _ => RiskClass::Read,
+        },
+        roles: vec![RunRole::Top, RunRole::Worker, RunRole::Orchestrator],
+        min_tier: Tier::Small,
+        timeout: Duration::from_secs(600),
+        output_limit: None,
+        tainted: false,
+    }
+}
+
+fn registry() -> ToolRegistry {
+    let mut reg = ToolRegistry::default();
+    for t in builtin_tools() {
+        reg.register(t).unwrap();
+    }
+    reg.register(Arc::new(Note {
+        spec: tool_spec("note", ToolKind::Read, EffectClass::ReadOnly),
+    }))
+    .unwrap();
+    reg.register(Arc::new(Fail {
+        spec: tool_spec("fail", ToolKind::Read, EffectClass::ReadOnly),
+    }))
+    .unwrap();
+    reg.register(Arc::new(Incr {
+        spec: tool_spec("incr", ToolKind::Exec, EffectClass::NonIdempotent),
+    }))
+    .unwrap();
+    reg
+}
+
+struct Fx {
+    store: ProjectStore,
+    model: Arc<ScriptedModel>,
+    deps: LoopDeps,
+    run: RunId,
+}
+
+fn fx(store_dir: &Path) -> Fx {
+    let store = ProjectStore::open(store_dir).unwrap();
+    let model = Arc::new(ScriptedModel::new(default_caps(BackendKind::LlamaCpp)).with_context(8192));
+    let bus = EventBus::new(EventBus::DEFAULT_CAPACITY);
+    let deps = LoopDeps {
+        memory: Arc::new(NoMemory),
+        ..LoopDeps::new(
+            Journal::new(store.clone(), bus),
+            model.clone(),
+            Arc::new(registry()),
+        )
+    };
+    Fx {
+        store,
+        model,
+        deps,
+        run: RunId::new(),
+    }
+}
+
+fn spec() -> RunSpec {
+    RunSpec {
+        project_id: "p".into(),
+        project_dir: PathBuf::from("H:/p"),
+        role: RunRole::Top,
+        parent: None,
+        endpoint: EndpointId("a".into()),
+        run_mode: RunMode::Ask,
+        work_mode: None,
+        tier: None,
+        budget: Budget::default(),
+        priority: Priority::Top,
+        max_wait: None,
+        task: "Задача".into(),
+        agents_md: None,
+        env: EnvInfo {
+            os: "windows".into(),
+            shell: "powershell".into(),
+            project_dir: "H:/p".into(),
+            date: "2026-11-17".into(),
+            tier: Tier::Full,
+            n_ctx: 1,
+            budget: "x".into(),
+            branch: "main".into(),
+        },
+        context: ContextConfig::default(),
+        trusted: true,
+        grants: Vec::new(),
+    }
+}
+
+type Script = Vec<Result<StreamEvent, ModelError>>;
+
+fn finished(parts: Vec<Part>, finish: FinishReason) -> Script {
+    vec![Ok(StreamEvent::Finished {
+        message: Message {
+            role: Role::Assistant,
+            parts,
+        },
+        finish,
+        usage: Usage::default(),
+    })]
+}
+
+fn answer(t: &str) -> Script {
+    finished(vec![Part::Text(t.into())], FinishReason::Stop)
+}
+
+fn call(id: &str, name: &str, args: Value) -> Part {
+    Part::ToolCall(ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args,
+        raw_arguments: None,
+    })
+}
+
+fn calls(parts: Vec<Part>) -> Script {
+    finished(parts, FinishReason::ToolCalls)
+}
+
+/// Сводка компакции с разделом `## Next step`.
+fn summary(next: &str) -> Script {
+    answer(&format!(
+        "## Decisions\nd\n## Files changed\n-\n## Errors\n-\n## Next step\n{next}"
+    ))
+}
+
+fn root() -> Option<PathBuf> {
+    std::env::var("GEN_R1C2_DIR").ok().map(PathBuf::from)
+}
+
+fn fresh(root: &Path, name: &str) -> PathBuf {
+    let d = root.join(name);
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+async fn start(f: &Fx) -> Result<LoopOutcome, LoopError> {
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    within("start_run", start_run(&f.deps, f.run, spec(), rx)).await
+}
+
+/// Оценка первого запроса run на окне 8192 (байты / 4, D41).
+async fn probe(root: &Path) -> u32 {
+    let d = fresh(root, "_probe");
+    let f = fx(&d);
+    f.model.push(answer("ok"));
+    assert!(matches!(
+        start(&f).await.unwrap(),
+        LoopOutcome::Finished { .. }
+    ));
+    let req = f.model.calls()[0].request.clone();
+    let est = ContextMeter::default()
+        .estimate(&req, f.model.as_ref(), &EndpointId("a".into()))
+        .await;
+    drop(f);
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(est.tokens > 600 && est.tokens < 1800, "{}", est.tokens);
+    est.tokens
+}
+
+/// Крюк сбоя: один раз в точке `at`.
+fn crash_once(at: CrashPoint) -> za_agent::CrashHook {
+    let armed = Arc::new(AtomicBool::new(true));
+    Arc::new(move |p| p == at && armed.swap(false, Ordering::SeqCst))
+}
+
+/// Пишет `run.txt` и `snapshot.json`, проверяет версию и место снимка; в `store/` —
+/// только `journal.db`.
+async fn finish(d: &Path, f: Fx, step: u64, next: &str) {
+    let (_, snap) = f.store.latest_snapshot(f.run).await.unwrap().unwrap();
+    assert_eq!(snap["v"], 4);
+    assert_eq!(snap["step"], step);
+    assert_eq!(snap["next"], next);
+    std::fs::write(d.join("run.txt"), f.run.to_string()).unwrap();
+    std::fs::write(
+        d.join("snapshot.json"),
+        serde_json::to_string_pretty(&snap).unwrap() + "\n",
+    )
+    .unwrap();
+    drop(f);
+    // Повторное открытие и закрытие переносит WAL в `journal.db` (чекпоинт последнего
+    // соединения): в фикстуре один файл.
+    drop(ProjectStore::open(&d.join("store")).unwrap());
+    for e in std::fs::read_dir(d.join("store")).unwrap() {
+        let p = e.unwrap().path();
+        match p.file_name().and_then(|n| n.to_str()) {
+            Some("journal.db") => {}
+            Some("journal.lock") => std::fs::remove_file(&p).unwrap(),
+            other => panic!("лишний файл журнала: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn gen_r1c2_journals() {
+    let Some(root) = root() else {
+        return;
+    };
+    std::fs::create_dir_all(&root).unwrap();
+    let b0 = probe(&root).await;
+    let big = (THRESHOLD_8K - b0 + 400) as usize;
+
+    // compact_mid: пакет шага 1 — ошибка и большой аргумент; компакция на границе шага 2.
+    {
+        let d = fresh(&root, "compact_mid");
+        let mut f = fx(&d.join("store"));
+        f.model.push(calls(vec![
+            call("c1", "fail", json!({"n": 1})),
+            call("c2", "note", json!({"t": "a".repeat(big * 4)})),
+        ]));
+        f.model.push(summary("n"));
+        f.deps.crash = Some(crash_once(CrashPoint::AfterCompact { step: 2 }));
+        assert!(matches!(start(&f).await, Err(LoopError::Halted)));
+        finish(&d, f, 1, "model").await;
+    }
+
+    // inbox_mid: ввод перед чтением границы шага 2 (из отдельного потока: крюк синхронный).
+    {
+        let d = fresh(&root, "inbox_mid");
+        let mut f = fx(&d.join("store"));
+        f.model.push(calls(vec![call("c1", "note", json!({"n": 1}))]));
+        f.model.push(summary("n"));
+        let (store, run) = (f.store.clone(), f.run);
+        let text = "x ".repeat(big * 2);
+        let once = Arc::new(AtomicBool::new(true));
+        f.deps.fault = Some(Arc::new(move |p| {
+            if p == (FaultPoint::BeforeReadBoundary { step: 2 }) && once.swap(false, Ordering::SeqCst)
+            {
+                let (store, text) = (store.clone(), text.clone());
+                std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(submit_input(&store, run, &text, InputMode::Queue))
+                        .unwrap();
+                })
+                .join()
+                .unwrap();
+            }
+            false
+        }));
+        f.deps.crash = Some(crash_once(CrashPoint::AfterInbox { step: 2 }));
+        assert!(matches!(start(&f).await, Err(LoopError::Halted)));
+        finish(&d, f, 1, "model").await;
+    }
+
+    // batch_error: ошибки инструмента в пакетах шагов 1 и 2, сбой после хода шага 2.
+    {
+        let d = fresh(&root, "batch_error");
+        let mut f = fx(&d.join("store"));
+        f.model.push(calls(vec![
+            call("c1", "fail", json!({"n": 1})),
+            call("c2", "note", json!({"n": 1})),
+        ]));
+        f.model.push(calls(vec![
+            call("c3", "fail", json!({"n": 2})),
+            call("c4", "note", json!({"n": 2})),
+        ]));
+        f.deps.crash = Some(crash_once(CrashPoint::AfterModelEffect { step: 2 }));
+        assert!(matches!(start(&f).await, Err(LoopError::Halted)));
+        finish(&d, f, 2, "model").await;
+    }
+
+    // approval: ошибка чтения исполнена, `incr` ждёт одобрения посреди пакета.
+    {
+        let d = fresh(&root, "approval");
+        let f = fx(&d.join("store"));
+        f.model.push(calls(vec![
+            call("c1", "fail", json!({"n": 1})),
+            call("c2", "incr", json!({"n": 1})),
+        ]));
+        let out = start(&f).await.unwrap();
+        let LoopOutcome::Paused {
+            reason,
+            interrupt: Some(id),
+        } = out
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!(reason, "needs_approval");
+        std::fs::write(d.join("interrupt.txt"), id).unwrap();
+        finish(&d, f, 1, "model").await;
+    }
+}
