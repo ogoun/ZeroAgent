@@ -17,6 +17,11 @@
 //! только у `za-extract`.
 //! R1-C2 (D114): `za-skills` — только от `za-protocol` и `za-core` (все виды); `za-agent`
 //! может зависеть от него, а он от `za-agent` — нет.
+//! R1-M (D133, ADR 0007): `za-memory` — только от `za-protocol`, `za-core`, `za-store`,
+//! `za-secrets` (все виды), от него — только `zero-agent` и `xtask`; он — третий держатель
+//! HTTP-клиента: `reqwest` напрямую, клиент строится только в
+//! `crates/za-memory/src/transport.rs`, вне него в крейте `reqwest` не упоминается, атрибут
+//! `path` и `include!` в его `src/` запрещены (как у `za-web`).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -82,6 +87,13 @@ const SKILLS_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-core"];
 const WEB_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-core"];
 /// Кто может зависеть от `za-web` (все виды): бинарник и `xtask` (бюджеты промптов).
 const WEB_USERS: &[&str] = &["zero-agent", "xtask"];
+/// Крейты `za-*`, от которых может зависеть клиент памяти `za-memory` (все виды, R1-M D133):
+/// трейты и порт `za-core`, outbox `za-store`, маска `za-secrets`; не цикл, не модели, не
+/// инструменты, не шлюз.
+const MEMORY_ALLOWED_ZA_DEPS: &[&str] = &["za-protocol", "za-core", "za-store", "za-secrets"];
+/// Кто может зависеть от `za-memory` (все виды, D133): бинарник и `xtask` (бюджет промптов,
+/// снимки формы ответов). `za-agent` видит память только через порт `za-core` (D138).
+const MEMORY_USERS: &[&str] = &["zero-agent", "xtask"];
 /// Кто может зависеть от `za-extract` (все виды, D113, D127): только бинарник — его скрытая
 /// подкоманда `extract` и есть подпроцесс разбора.
 const EXTRACT_USERS: &[&str] = &["zero-agent"];
@@ -112,15 +124,29 @@ const REQWEST_FORBIDDEN_FEATURES: &[&str] = &[
     "default-tls",
 ];
 /// Кто может зависеть от `reqwest` напрямую (все виды; Ruling I2 ревью задачи 6, D129):
-/// транспорт моделей и сетевой шлюз.
-const REQWEST_USERS: &[&str] = &["za-llm", "za-web"];
+/// транспорт моделей, сетевой шлюз и клиент памяти (R1-M D133, третий держатель).
+const REQWEST_USERS: &[&str] = &["za-llm", "za-web", "za-memory"];
 /// Где можно строить HTTP-клиент `reqwest`, и почему (D129). Путь — от корня, через `/`.
 const HTTP_CLIENT_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/za-web/src/gateway.rs",
         "сетевой шлюз: фильтр адресов в резолвере, без прокси и cookie (D107, D108)",
     ),
+    (
+        "crates/za-memory/src/transport.rs",
+        "клиент памяти: без прокси и редиректов, чувствительный Authorization (R1-M D133)",
+    ),
     ("crates/za-llm/", "транспорт моделей (R1-A)"),
+];
+/// Держатели HTTP-клиента со строгим подмножеством путей `reqwest` вне своего файла клиента
+/// (D129, R1-M D133): крейт, файл клиента и пути, допустимые в остальных файлах крейта
+/// (строка после имени `reqwest` начинается с одного из них). У `za-web` — типы резолвера
+/// (`addr.rs`, тестовая подмена `lib.rs`) и код статуса (`fetch.rs`); у `za-memory` — ничего:
+/// метод HTTP другие модули берут реэкспортом `transport::Method`. Для этих же крейтов в
+/// `src/` запрещены атрибут `path` и `include!` ([`check_holder_includes`]).
+const HTTP_HOLDERS: &[(&str, &str, &[&str])] = &[
+    ("crates/za-web/", "gateway.rs", &["::dns::", "::StatusCode"]),
+    ("crates/za-memory/", "transport.rs", &[]),
 ];
 
 /// Нарушение политики.
@@ -349,6 +375,25 @@ pub fn check_direction(metadata: &Metadata) -> Vec<Violation> {
                     WEB_USERS.join(", ")
                 )));
             }
+            // Все виды (R1-M D133): клиент памяти — над `za-core`, без цикла и моделей; от
+            // него — только бинарник и `xtask`.
+            if pkg.name == "za-memory"
+                && is_workspace_crate(&dep.name)
+                && !MEMORY_ALLOWED_ZA_DEPS.contains(&dep.name.as_str())
+            {
+                out.push(Violation(format!(
+                    "za-memory не должен зависеть от {} (допустимы {})",
+                    dep.name,
+                    MEMORY_ALLOWED_ZA_DEPS.join(", ")
+                )));
+            }
+            if dep.name == "za-memory" && !MEMORY_USERS.contains(&pkg.name.as_str()) {
+                out.push(Violation(format!(
+                    "{} не должен зависеть от za-memory (только {})",
+                    pkg.name,
+                    MEMORY_USERS.join(", ")
+                )));
+            }
             // Все виды (D114): скиллы — над `za-core`; от `za-agent` — ни в каком виде.
             if pkg.name == "za-skills"
                 && is_workspace_crate(&dep.name)
@@ -477,14 +522,15 @@ fn resolved_features(root: &Path, sel: &[&str], krate: &str) -> Result<Vec<Strin
 /// `Client::builder`, `ClientBuilder`, `Client::new(`, `Client::default(`, упоминание типа
 /// `reqwest::Client`, `reqwest::get(`, `reqwest::blocking`. Имя должно начинаться словом:
 /// `MemoryClient::new(` — не клиент `reqwest`. Строки-комментарии не считаются. Главный
-/// страж — зависимость (`REQWEST_USERS`): этот проверяет файлы внутри `za-web`.
+/// страж — зависимость (`REQWEST_USERS`): этот проверяет файлы внутри держателей.
 ///
-/// Внутри `za-web` вне `gateway.rs` действует ещё строгое подмножество (Minor 1
-/// финального ревью безопасности, m1 ревью fix-5/6): из `reqwest` допустимы только пути
-/// [`WEB_REQWEST_PATHS`]. Импорт `use reqwest::{Client}` с `Default::default()` образцы
-/// выше не видят, а клиент по умолчанию — системный резолвер и прокси из окружения, обход
-/// фильтра D108. Перечня обходов здесь нет: любое другое упоминание крейта (группа импорта,
-/// псевдоним, `extern crate`, иной тип) — нарушение.
+/// Внутри держателя из [`HTTP_HOLDERS`] (`za-web`, `za-memory`) вне его файла клиента
+/// действует ещё строгое подмножество (Minor 1 финального ревью безопасности R1-C2, m1 ревью
+/// fix-5/6; R1-M D133): из `reqwest` допустимы только пути держателя. Импорт `use
+/// reqwest::{Client}` с `Default::default()` образцы выше не видят, а клиент по умолчанию —
+/// системный резолвер, прокси из окружения и редиректы: обход фильтра D108 и правил D133.
+/// Перечня обходов здесь нет: любое другое упоминание крейта (группа импорта, псевдоним,
+/// `extern crate`, иной тип) — нарушение.
 pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
     const PATTERNS: &[&str] = &[
         "Client::builder",
@@ -504,7 +550,9 @@ pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
     let ident = |c: char| c.is_alphanumeric() || c == '_';
     let word_start =
         |code: &str, at: usize| code[..at].chars().next_back().is_none_or(|c| !ident(c));
-    let in_web = rel.starts_with("crates/za-web/");
+    let holder = HTTP_HOLDERS
+        .iter()
+        .find(|(prefix, _, _)| rel.starts_with(prefix));
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let code = line.trim_start();
@@ -516,41 +564,59 @@ pub fn check_http_client(rel: &str, text: &str) -> Vec<Violation> {
             .any(|p| code.match_indices(p).any(|(at, _)| word_start(code, at)));
         if hit {
             out.push(Violation(format!(
-                "{rel}:{}: HTTP-клиент reqwest вне za-web/src/gateway.rs и za-llm (D129: обход фильтра адресов)",
+                "{rel}:{}: HTTP-клиент reqwest вне za-web/src/gateway.rs, za-memory/src/transport.rs и za-llm (D129, D133: обход фильтра адресов и правил клиента)",
                 i + 1
             )));
             continue;
         }
-        let other_path = in_web
-            && code.match_indices("reqwest").any(|(at, w)| {
-                let rest = &code[at + w.len()..];
-                word_start(code, at)
-                    && !rest.chars().next().is_some_and(ident)
-                    && !WEB_REQWEST_PATHS.iter().any(|p| rest.starts_with(p))
-            });
+        let Some((prefix, file, paths)) = holder else {
+            continue;
+        };
+        let other_path = code.match_indices("reqwest").any(|(at, w)| {
+            let rest = &code[at + w.len()..];
+            word_start(code, at)
+                && !rest.chars().next().is_some_and(ident)
+                && !paths.iter().any(|p| rest.starts_with(p))
+        });
         if other_path {
+            let allowed = if paths.is_empty() {
+                "ничего".to_owned()
+            } else {
+                paths
+                    .iter()
+                    .map(|p| format!("reqwest{p}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             out.push(Violation(format!(
-                "{rel}:{}: в za-web вне gateway.rs из reqwest допустимы только reqwest::dns:: и reqwest::StatusCode (D129: клиент — только в шлюзе)",
-                i + 1
+                "{rel}:{}: в {} вне {file} из reqwest допустимо только {allowed} (D129, D133: клиент — только в {file})",
+                i + 1,
+                prefix.trim_start_matches("crates/").trim_end_matches('/'),
             )));
         }
     }
     out
 }
 
-/// Подключение файла в обход `src/` в исходнике `rel` крейта `za-web` (Minor 2 повторного
-/// ревью финального прохода, D129): атрибут `path` (`#[path = …]`, `#![path = …]`, аргумент
+/// Подключение файла в обход `src/` в исходнике `rel` держателя HTTP-клиента из
+/// [`HTTP_HOLDERS`] — `za-web`, `za-memory` (Minor 2 повторного ревью финального прохода
+/// R1-C2, D129; R1-M D133): атрибут `path` (`#[path = …]`, `#![path = …]`, аргумент
 /// `cfg_attr`, отдельная строка многострочного атрибута) и `include!`. Страж исходников
 /// сканирует только `crates/*/src` и `build.rs`, а модуль с атрибутом `path` или `include!`
 /// взял бы код из любого файла, в том числе вне крейта. Строка сравнивается без пробелов
 /// (`# [ path = …]`, `include ! (…)`); признак атрибута — `path=` перед строковым литералом,
 /// поэтому присваивание `path = format!(…)` не нарушение. Строки-комментарии не считаются.
-/// Правило — для всех файлов `za-web`, и для `gateway.rs`: клиент строится только в нём
-/// самом.
-pub fn check_web_includes(rel: &str, text: &str) -> Vec<Violation> {
-    if !rel.starts_with("crates/za-web/") {
+/// Правило — для всех файлов держателя, и для файла клиента: клиент строится только в нём
+/// самом. Тесты крейтов (`tests/`) подключают `test-support/*.rs` через `#[path]` законно:
+/// их страж не сканирует.
+pub fn check_holder_includes(rel: &str, text: &str) -> Vec<Violation> {
+    let Some((prefix, _, _)) = HTTP_HOLDERS
+        .iter()
+        .find(|(prefix, _, _)| rel.starts_with(prefix))
+    else {
         return Vec::new();
-    }
+    };
+    let krate = prefix.trim_start_matches("crates/").trim_end_matches('/');
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let code = line.trim_start();
@@ -566,18 +632,13 @@ pub fn check_web_includes(rel: &str, text: &str) -> Vec<Violation> {
                 .any(|p| tight.contains(p));
         if hit {
             out.push(Violation(format!(
-                "{rel}:{}: в za-web атрибут path и include! запрещены (D129: код крейта — только модули src/, их видит страж HTTP-клиента)",
+                "{rel}:{}: в {krate} атрибут path и include! запрещены (D129: код крейта — только модули src/, их видит страж HTTP-клиента)",
                 i + 1
             )));
         }
     }
     out
 }
-
-/// Пути `reqwest`, допустимые в `za-web` вне `gateway.rs` (D129): типы резолвера
-/// (`addr.rs`, тестовая подмена `lib.rs`) и код статуса (`fetch.rs`). Строка после имени
-/// крейта начинается с одного из них.
-const WEB_REQWEST_PATHS: &[&str] = &["::dns::", "::StatusCode"];
 
 /// Запуск процессов в исходнике `rel` (путь от корня через `/`) вне [`PROCESS_ALLOWED`]:
 /// `std::process::Command`, `tokio::process::Command`, `Command::new`, импорт `Command`
@@ -738,7 +799,7 @@ fn collect(root: &Path) -> Result<Vec<Violation>, String> {
     for (rel, text) in crate_sources(root).map_err(|e| format!("crates/*/src: {e}"))? {
         out.extend(check_process_spawn(&rel, &text));
         out.extend(check_http_client(&rel, &text));
-        out.extend(check_web_includes(&rel, &text));
+        out.extend(check_holder_includes(&rel, &text));
     }
     Ok(out)
 }
@@ -901,7 +962,9 @@ version = \"0.0.1\"
             assert!(check_direction(&meta("za-agent", ok)).is_empty(), "{ok}");
         }
         assert_eq!(check_direction(&meta("za-agent", "zero-agent")).len(), 1);
-        assert_eq!(check_direction(&meta("za-agent", "za-memory")).len(), 1);
+        // Два правила: нижние слои `za-agent` и «от za-memory — только zero-agent и xtask»
+        // (R1-M D133).
+        assert_eq!(check_direction(&meta("za-agent", "za-memory")).len(), 2);
         assert_eq!(check_direction(&meta("za-agent", "reqwest")).len(), 1);
     }
     #[test]
@@ -1200,10 +1263,11 @@ version = \"0.0.1\"
         }
     }
     /// Ruling I2 ревью задачи 6: прямая зависимость от `reqwest` любого вида (обычная, dev,
-    /// build) — только у `za-llm` и `za-web`. Иначе второй HTTP-клиент вне шлюза строится
-    /// и без `Client::builder` в исходнике (`Client::default()`, обёртка, макрос).
+    /// build) — только у `za-llm`, `za-web` и клиента памяти `za-memory` (R1-M D133). Иначе
+    /// второй HTTP-клиент вне шлюза строится и без `Client::builder` в исходнике
+    /// (`Client::default()`, обёртка, макрос).
     #[test]
-    fn reqwest_only_in_llm_and_web() {
+    fn reqwest_only_in_http_holders() {
         let kinds = [None, Some("dev"), Some("build")];
         let with_kind = |k: Option<&str>| Dependency {
             kind: k.map(str::to_owned),
@@ -1214,7 +1278,7 @@ version = \"0.0.1\"
                 .filter(|x| x.0.contains("от reqwest (только za-llm, za-web"))
                 .count()
         };
-        for ok in ["za-llm", "za-web"] {
+        for ok in ["za-llm", "za-web", "za-memory"] {
             for k in kinds {
                 let v = check_direction(&meta_with(ok, with_kind(k)));
                 assert!(v.is_empty(), "{ok} {k:?}: {v:?}");
@@ -1259,7 +1323,7 @@ version = \"0.0.1\"
             serde_json::from_str(&json).unwrap()
         };
         let renamed = |v: &[Violation]| v.iter().filter(|x| x.0.contains("переименована")).count();
-        for pkg in ["za-web", "za-llm", "za-tools"] {
+        for pkg in ["za-web", "za-llm", "za-memory", "za-tools"] {
             let v = check_direction(&meta(pkg, r#""http""#));
             assert_eq!(renamed(&v), 1, "{pkg}: {v:?}");
         }
@@ -1273,13 +1337,20 @@ version = \"0.0.1\"
         let m: Metadata = serde_json::from_str(json).unwrap();
         assert_eq!(renamed(&check_direction(&m)), 0);
     }
-    /// Minor 2 повторного ревью финального прохода: в `za-web` код подключается только из
-    /// `src/` обычными модулями. Атрибут `path` (`#[path = …]`, `#![path = …]`, внутри
-    /// `cfg_attr`, с пробелами между лексемами) и `include!` подключили бы файл, который
-    /// страж исходников не сканирует. Правило — для всех файлов `za-web`, и для `gateway.rs`.
+    /// Minor 2 повторного ревью финального прохода: в `za-web` и `za-memory` (R1-M D133) код
+    /// подключается только из `src/` обычными модулями. Атрибут `path` (`#[path = …]`,
+    /// `#![path = …]`, внутри `cfg_attr`, с пробелами между лексемами) и `include!`
+    /// подключили бы файл, который страж исходников не сканирует. Правило — для всех файлов
+    /// держателя, и для файла клиента (`gateway.rs`, `transport.rs`).
     #[test]
-    fn web_crate_includes_no_outside_files() {
-        for rel in ["crates/za-web/src/lib.rs", "crates/za-web/src/gateway.rs"] {
+    fn holder_crates_include_no_outside_files() {
+        for rel in [
+            "crates/za-web/src/lib.rs",
+            "crates/za-web/src/gateway.rs",
+            "crates/za-memory/src/lib.rs",
+            "crates/za-memory/src/transport.rs",
+            "crates/za-memory/src/gateway.rs",
+        ] {
             for line in [
                 r#"#[path = "../extra/client.rs"] mod client;"#,
                 r#"# [ path = "../../za-core/src/x.rs" ]"#,
@@ -1290,7 +1361,7 @@ version = \"0.0.1\"
                 r#"include!("../extra/client.rs");"#,
                 r#"include ! (concat!(env!("OUT_DIR"), "/gen.rs"));"#,
             ] {
-                let v = check_web_includes(rel, line);
+                let v = check_holder_includes(rel, line);
                 assert_eq!(v.len(), 1, "{rel}: {line}");
                 assert!(v[0].0.contains(&format!("{rel}:1")), "{v:?}");
             }
@@ -1302,15 +1373,23 @@ version = \"0.0.1\"
             "const DOC: &str = include_str!(\"doc.md\");",
             "mod gateway;",
         ] {
+            for rel in [
+                "crates/za-web/src/gateway.rs",
+                "crates/za-memory/src/transport.rs",
+            ] {
+                assert!(check_holder_includes(rel, line).is_empty(), "{rel}: {line}");
+            }
+        }
+        // Вне держателей правило не действует; тесты крейтов подключают `test-support/*.rs`
+        // через `#[path]` законно — их страж не сканирует.
+        for rel in ["crates/zero-agent/tests/x.rs", "crates/za-core/src/lib.rs"] {
             assert!(
-                check_web_includes("crates/za-web/src/gateway.rs", line).is_empty(),
-                "{line}"
+                check_holder_includes(rel, "#[path = \"a.rs\"]").is_empty(),
+                "{rel}"
             );
         }
-        // Вне `za-web` правило не действует.
-        assert!(
-            check_web_includes("crates/zero-agent/tests/x.rs", "#[path = \"a.rs\"]").is_empty()
-        );
+        let v = check_holder_includes("crates/za-memory/src/x.rs", "#[path = \"a.rs\"]");
+        assert!(v[0].0.contains("в za-memory атрибут path"), "{v:?}");
     }
     #[test]
     fn reqwest_features_are_guarded() {
@@ -1349,7 +1428,11 @@ version = \"0.0.1\"
                 "{line}"
             );
         }
-        for rel in ["crates/za-web/src/gateway.rs", "crates/za-llm/src/probe.rs"] {
+        for rel in [
+            "crates/za-web/src/gateway.rs",
+            "crates/za-memory/src/transport.rs",
+            "crates/za-llm/src/probe.rs",
+        ] {
             assert!(
                 check_http_client(rel, "Client::builder()").is_empty(),
                 "{rel}"
@@ -1398,12 +1481,120 @@ version = \"0.0.1\"
         ] {
             assert!(check_http_client(rel, line).is_empty(), "{line}");
         }
-        // Вне `za-web` правило путей не действует (там — зависимость, `REQWEST_USERS`), а в
+        // Вне держателей правило путей не действует (там — зависимость, `REQWEST_USERS`), а в
         // `gateway.rs` клиент разрешён.
         assert!(check_http_client("crates/za-llm/src/a.rs", "use reqwest::{Client};").is_empty());
         assert!(
             check_http_client("crates/za-web/src/gateway.rs", "use reqwest::{Client};").is_empty()
         );
+    }
+    /// R1-M D133: в `za-memory` вне `transport.rs` `reqwest` не упоминается вовсе — ни
+    /// клиент, ни типы (`reqwest::dns`, `StatusCode`, `Method`): метод HTTP — реэкспорт
+    /// `transport::Method`.
+    #[test]
+    fn memory_crate_mentions_reqwest_only_in_transport() {
+        let rel = "crates/za-memory/src/gateway.rs";
+        for line in [
+            "let c = reqwest::Client::builder().build()?;",
+            "let c = Client::builder()",
+            "use reqwest::{Client};",
+            "use reqwest::Method;",
+            "use reqwest::dns::Name;",
+            "match reqwest::StatusCode::from_u16(s) {",
+            "use reqwest as r;",
+            "extern crate reqwest;",
+        ] {
+            let v = check_http_client(rel, line);
+            assert_eq!(v.len(), 1, "{line}: {v:?}");
+            assert!(
+                v[0].0.contains("crates/za-memory/src/gateway.rs:1"),
+                "{v:?}"
+            );
+        }
+        let v = check_http_client(rel, "use reqwest::Method;");
+        assert!(v[0].0.contains("допустимо только ничего"), "{v:?}");
+        for line in [
+            "use crate::transport::{Method, ZamClient};",
+            "// reqwest::Client — только в transport.rs",
+            "let reqwest_like = 1;",
+        ] {
+            assert!(check_http_client(rel, line).is_empty(), "{line}");
+        }
+        for line in [
+            "let http = reqwest::Client::builder()",
+            "pub use reqwest::Method;",
+            "use reqwest::header::{ACCEPT, HeaderValue};",
+        ] {
+            assert!(
+                check_http_client("crates/za-memory/src/transport.rs", line).is_empty(),
+                "{line}"
+            );
+        }
+    }
+    /// R1-M D133: `za-memory` — только от `za-protocol`, `za-core`, `za-store`, `za-secrets`
+    /// в любом виде; от него — только `zero-agent` и `xtask`; `za-agent` от него не зависит
+    /// (порт памяти — в `za-core`, D138).
+    #[test]
+    fn r1m_memory_directions() {
+        let dev = |name: &str| Dependency {
+            kind: Some("dev".into()),
+            ..dep(name)
+        };
+        for ok in [
+            "za-protocol",
+            "za-core",
+            "za-store",
+            "za-secrets",
+            "reqwest",
+            "url",
+            "axum",
+        ] {
+            assert!(check_direction(&meta("za-memory", ok)).is_empty(), "{ok}");
+            assert!(
+                check_direction(&meta_with("za-memory", dev(ok))).is_empty(),
+                "dev {ok}"
+            );
+        }
+        for bad in [
+            "za-agent",
+            "za-llm",
+            "za-tools",
+            "za-jail",
+            "za-web",
+            "za-skills",
+            "za-extract",
+            "za-res",
+            "za-shell",
+            "zero-agent",
+        ] {
+            assert!(
+                !check_direction(&meta("za-memory", bad)).is_empty(),
+                "{bad}"
+            );
+            assert!(
+                !check_direction(&meta_with("za-memory", dev(bad))).is_empty(),
+                "dev {bad}"
+            );
+        }
+        let to_memory = |v: Vec<Violation>| v.iter().any(|x| x.0.contains("зависеть от za-memory"));
+        for ok in ["zero-agent", "xtask"] {
+            assert!(check_direction(&meta(ok, "za-memory")).is_empty(), "{ok}");
+        }
+        for bad in [
+            "za-tools",
+            "za-agent",
+            "za-core",
+            "za-web",
+            "za-skills",
+            "za-store",
+            "za-llm",
+        ] {
+            assert!(to_memory(check_direction(&meta(bad, "za-memory"))), "{bad}");
+            assert!(
+                to_memory(check_direction(&meta_with(bad, dev("za-memory")))),
+                "dev {bad}"
+            );
+        }
     }
     #[test]
     fn core_over_limit_is_reported() {
