@@ -6,8 +6,8 @@
 //! молчат). Каждый случай — строка таблицы с текстом команды в сообщении о падении.
 
 use za_shell::{
-    Dialect, NetHosts, Segment, argv0, command_args, command_hosts, irreversible, is_network,
-    is_simple, path_words, reads_network, segments,
+    Dialect, HOME_PREFIXES, NetHosts, Segment, argv0, command_args, command_hosts, home_rest,
+    irreversible, is_network, is_simple, path_words, reads_network, segments,
 };
 
 const B: Dialect = Dialect::Bash;
@@ -131,6 +131,63 @@ fn path_words_corpus() {
     ] {
         assert!(path_words(&segments(c, B)[0], B).is_empty(), "{c}");
     }
+}
+
+/// R1-M D157, Minor 2 ревью задачи 1: слова с началом домашнего каталога (`$HOME`,
+/// `${HOME}`, `%USERPROFILE%`, `$env:USERPROFILE` и прочие [`HOME_PREFIXES`]) — пути
+/// команды, как `~`: они задают границу проекта. За началом — конец слова или `/`, `\`;
+/// `$HOMEDIR`, `~user`-подобные переменные и аргументы `echo` — нет.
+#[test]
+fn home_words_are_paths() {
+    for (c, d, w) in [
+        ("cat $HOME/notes.txt", B, "$HOME/notes.txt"),
+        ("cat ${HOME}/notes.txt", B, "${HOME}/notes.txt"),
+        ("cat $HOME", B, "$HOME"),
+        ("cat \"$HOME/a b\"", B, "$HOME/a b"),
+        (
+            r"type %USERPROFILE%\notes.txt",
+            P,
+            r"%USERPROFILE%\notes.txt",
+        ),
+        (
+            "Get-Content $env:USERPROFILE/notes.txt",
+            P,
+            "$env:USERPROFILE/notes.txt",
+        ),
+        (
+            "Get-Content ${env:USERPROFILE}/n.txt",
+            P,
+            "${env:USERPROFILE}/n.txt",
+        ),
+        (
+            "Get-Content $Env:UserProfile\\n.txt",
+            P,
+            "$Env:UserProfile\\n.txt",
+        ),
+        ("cat $env:HOME/n.txt", P, "$env:HOME/n.txt"),
+        ("cp a.txt $HOME/b.txt", B, "$HOME/b.txt"),
+    ] {
+        assert!(
+            path_words(&segments(c, d)[0], d).iter().any(|p| p == w),
+            "{c}: {:?}",
+            path_words(&segments(c, d)[0], d)
+        );
+    }
+    for c in [
+        "cat $HOMEDIR/x",
+        "cat $HOME_X",
+        "echo $HOME/x",
+        "cat %USERPROFILE%x",
+    ] {
+        assert!(path_words(&segments(c, B)[0], B).is_empty(), "{c}");
+    }
+    assert_eq!(home_rest("$HOME/x"), Some("/x"));
+    assert_eq!(home_rest("${home}"), Some(""));
+    assert_eq!(home_rest(r"%UserProfile%\x"), Some(r"\x"));
+    assert_eq!(home_rest("~/x"), Some("/x"));
+    assert_eq!(home_rest("~user/x"), None);
+    assert_eq!(home_rest("$HOMEDIR"), None);
+    assert_eq!(HOME_PREFIXES.len(), 8);
 }
 
 #[test]

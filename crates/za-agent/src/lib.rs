@@ -75,8 +75,8 @@ pub use inspect::{BlockCost, InspectError, Inspection, RunMetrics, inspect, run_
 pub use memory::{MemoryLevel, MemoryPort, NoMemory, Recall, memory_budget};
 pub use policy::{
     Decision, Grant, GrantConfig, GrantMode, GrantSource, PolicyConfig, PolicyCx, PolicyError,
-    PolicySnapshot, Rule, RuleAction, RuleSource, covers, decide, grants_text, parse_grant_flag,
-    subject_paths,
+    PolicySnapshot, Rule, RuleAction, RuleSource, command_path, covers, decide, grants_text,
+    parse_grant_flag, subject_paths,
 };
 pub use prompt::{
     AGENTS_MD_LIMIT, BRANCH_MAX_CHARS, BudgetCase, ControlAction, ControlFrom, ENV_LIMIT, EnvInfo,

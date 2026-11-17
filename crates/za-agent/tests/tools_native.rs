@@ -769,6 +769,49 @@ async fn request_grant_on_sealed_place_denied_without_asking() {
     assert_eq!(reasons(&out), ["grant"]);
 }
 
+/// R1-M D157, Minor 2 ревью задачи 1: пакет разрешает слово-путь команды с началом
+/// домашнего каталога (`$HOME/…`, `~/…`) по домашнему каталогу корней и канонически. В
+/// вопросе `outside_project` — настоящий путь, после одобрения — событие
+/// `boundary.outside` с ним; путь в защищённое место через другой регистр имени (Windows)
+/// — отказ `protected path` по каноническому пути.
+#[tokio::test]
+async fn home_words_resolved_by_roots_home() {
+    let b = bx("home_words").await;
+    let user = b.d.outside.join("user");
+    std::fs::create_dir_all(user.join(".zeroaimemory")).unwrap();
+    std::fs::write(user.join("notes.txt"), "n").unwrap();
+    let mut env = b.env(RunMode::Auto);
+    env.roots = Arc::new(b.d.roots.clone().with_home(&user).unwrap());
+    let notes = env.roots.home.as_ref().unwrap().join("notes.txt");
+    let reg = registry(vec![Arc::new(BashStub::new())]);
+    for (step, cmd) in [(1, "cat $HOME/notes.txt"), (2, "cat ~/notes.txt")] {
+        let calls = [pc("b1", "bash", json!({"cmd": cmd}))];
+        let out = b.batch(&reg, &env, step, &calls).await;
+        assert_eq!(reasons(&out), ["outside_project"], "{cmd}");
+        let int = out.suspend.unwrap();
+        assert_eq!(int.payload["paths"][0]["path"], s(&notes), "{cmd}");
+        assert_eq!(int.payload["paths"][0]["inside"], false, "{cmd}");
+        b.approve(&int.id, json!({"approved": true})).await;
+        let out = b.batch(&reg, &env, step, &calls).await;
+        assert_eq!(out.executed, ["b1"], "{cmd}");
+    }
+    let evs = b.events().await;
+    let bo = of_kind(&evs, EventKind::BoundaryOutside);
+    assert_eq!(bo.len(), 2, "{bo:?}");
+    for e in bo {
+        assert_eq!(e.payload["paths"][0]["path"], s(&notes));
+    }
+    if cfg!(windows) {
+        let calls = [pc(
+            "b2",
+            "bash",
+            json!({"cmd": "cat $HOME/.ZEROAIMEMORY/config.toml"}),
+        )];
+        let out = b.batch(&reg, &env, 3, &calls).await;
+        assert_eq!(content(&out, 0), ("denied: protected path".into(), true));
+    }
+}
+
 #[test]
 fn texts_hash_covers_tool_texts() {
     let t: Arc<dyn Tool> = Arc::new(TextStub::new("t"));

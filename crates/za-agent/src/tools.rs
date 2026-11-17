@@ -83,8 +83,8 @@ use crate::context::{
 use crate::driver::{CrashHook, CrashPoint, FaultHook, FaultPoint, INJECTED_FAULT};
 use crate::exposure::{Exposure, RULE_OF_TWO_MARK, untrusted_origin};
 use crate::policy::{
-    Decision, Grant, GrantMode, GrantSource, PolicyCx, PolicySnapshot, builtin_deny, covers,
-    decide, subject_paths,
+    Decision, Grant, GrantMode, GrantSource, PolicyCx, PolicySnapshot, builtin_deny, command_path,
+    covers, decide, subject_paths,
 };
 use crate::prompt::escape_untrusted;
 use crate::skills::{ACTIVATE_SKILL_TOOL, Activation, LoadJob, SkillRef, plan_activation};
@@ -980,24 +980,26 @@ fn with_reason(d: Decision, reason: &'static str) -> Decision {
     }
 }
 
-/// Разрешение путей предметов перед решением (D98). У команды (`Exec`) слово, которое
-/// отверг разбор пути (`classify`: UNC, устройство, `/etc/x` на Windows и т. п.),
-/// выбрасывается из предметов, а итог помечается `rejected` (I4): решение — `Ask`. У
-/// нативного инструмента путь — сам аргумент: отказ разбора — ошибка вызова.
+/// Разрешение путей предметов перед решением (D98). У команды (`Exec`) слова-пути
+/// разрешаются через [`command_path`] (начало домашнего каталога раскрыто по корням,
+/// D157); слово, которое отверг разбор пути (`classify`: UNC, устройство, `/etc/x` на
+/// Windows и т. п.), выбрасывается из предметов, а итог помечается `rejected` (I4):
+/// решение — `Ask`. `cwd` команды и путь нативного инструмента — аргумент инструмента, от
+/// корня проекта: отказ разбора у нативного инструмента — ошибка вызова.
 async fn plan_paths(
     env: &ToolEnv,
     spec: &ToolSpec,
     mut s: Subjects,
 ) -> Result<(Subjects, bool, Vec<ResolvedPath>), PathError> {
     if spec.kind != ToolKind::Exec {
-        let planned = resolve_all(&env.roots, &subject_paths(&s)).await?;
+        let planned = resolve_all(&env.roots, &subject_paths(&s), false).await?;
         return Ok((s, false, planned));
     }
     let mut rejected = false;
     let mut keep = Vec::new();
     let mut planned = Vec::new();
     for p in std::mem::take(&mut s.paths) {
-        match resolve_all(&env.roots, std::slice::from_ref(&p)).await {
+        match resolve_all(&env.roots, std::slice::from_ref(&p), true).await {
             Ok(mut r) => {
                 planned.append(&mut r);
                 keep.push(p);
@@ -1014,7 +1016,7 @@ async fn plan_paths(
             arg: cwd.clone(),
             access: Access::Exec,
         };
-        match resolve_all(&env.roots, std::slice::from_ref(&raw)).await {
+        match resolve_all(&env.roots, std::slice::from_ref(&raw), false).await {
             Ok(mut r) => {
                 planned.append(&mut r);
                 s.cwd = Some(cwd);
@@ -1023,6 +1025,27 @@ async fn plan_paths(
         }
     }
     Ok((s, rejected, planned))
+}
+
+/// Повторное разрешение путей предметов `s` в слоте (D98) — так же, как [`plan_paths`]
+/// разрешил их при решении, в порядке [`subject_paths`].
+async fn resolve_subjects(
+    roots: &Arc<Roots>,
+    kind: ToolKind,
+    s: &Subjects,
+) -> Result<Vec<ResolvedPath>, PathError> {
+    if kind != ToolKind::Exec {
+        return resolve_all(roots, &subject_paths(s), false).await;
+    }
+    let mut out = resolve_all(roots, &s.paths, true).await?;
+    if let Some(cwd) = &s.cwd {
+        let raw = RawPath {
+            arg: cwd.clone(),
+            access: Access::Exec,
+        };
+        out.append(&mut resolve_all(roots, std::slice::from_ref(&raw), false).await?);
+    }
+    Ok(out)
 }
 
 /// Пути из `tool.started` вызова `key` (запись D98): события после намерения.
@@ -1181,7 +1204,7 @@ async fn prepare_grant(
         arg: arg.to_owned(),
         access: Access::Read,
     }];
-    let path = match resolve_all(&env.roots, &raw).await {
+    let path = match resolve_all(&env.roots, &raw, false).await {
         Ok(mut p) => p.remove(0).path,
         Err(e) => return Ok(Prep::Done(result(call, path_error_text(&e), true))),
     };
@@ -1320,7 +1343,13 @@ fn observe_store<T>(ctx: &mut RunCtx, r: Result<T, StoreError>) -> Result<T, Eff
 }
 
 /// Разрешение путей предметов (D76, D98) в `spawn_blocking`; первый отказ — ошибка.
-async fn resolve_all(roots: &Arc<Roots>, raw: &[RawPath]) -> Result<Vec<ResolvedPath>, PathError> {
+/// `shell` — слова-пути команды: начало домашнего каталога раскрывается по корням
+/// ([`command_path`], D157); иначе путь — от корня проекта.
+async fn resolve_all(
+    roots: &Arc<Roots>,
+    raw: &[RawPath],
+    shell: bool,
+) -> Result<Vec<ResolvedPath>, PathError> {
     if raw.is_empty() {
         return Ok(Vec::new());
     }
@@ -1329,7 +1358,11 @@ async fn resolve_all(roots: &Arc<Roots>, raw: &[RawPath]) -> Result<Vec<Resolved
     let work = tokio::task::spawn_blocking(move || {
         raw.iter()
             .map(|r| {
-                let lex = paths::classify(&roots.project, &r.arg)?;
+                let lex = if shell {
+                    command_path(&roots, &r.arg)?
+                } else {
+                    paths::classify(&roots.project, &r.arg)?
+                };
                 paths::resolve(&roots, &lex, r.access)
             })
             .collect::<Result<Vec<_>, _>>()
@@ -2161,7 +2194,7 @@ impl Live {
             ..Receipt::default()
         };
         // (2) Повторное разрешение путей: смена класса — ошибка (D98).
-        let now = match resolve_all(&roots, &raw).await {
+        let now = match resolve_subjects(&roots, spec.kind, &subjects).await {
             Ok(p) => p,
             Err(e) => return fail(path_error_text(&e)),
         };

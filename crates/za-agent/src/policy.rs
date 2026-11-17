@@ -44,7 +44,7 @@ use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use za_core::net::normalize_host;
-use za_core::paths::{self, ResolvedPath, Roots};
+use za_core::paths::{self, LexPath, PathError, ResolvedPath, Roots};
 use za_core::shell::{self, Segment};
 use za_core::{Access, Approval, Gate, RawPath, RiskClass, Subjects, ToolKind, ToolSpec, gate};
 use za_protocol::{RunMode, approval_reason, canonical_json, deny_reason};
@@ -714,8 +714,10 @@ fn call_of<'a>(
         .zip(resolved)
         .map(|(r, p)| {
             let inside = p.inside && paths::within(project, &p.path);
-            // Оболочка раскрывает `~` сама; нативные инструменты — нет (D76).
-            let tilde = exec && r.arg.starts_with('~');
+            // Оболочка раскрывает начало домашнего каталога (`~`, `$HOME`, `%USERPROFILE%`,
+            // `$env:USERPROFILE`, D157) сама; нативные инструменты — нет (D76). Такой путь —
+            // вне проекта и не покрывается грантом: раскрытие по корням — best effort.
+            let tilde = exec && (r.arg.starts_with('~') || shell::home_rest(&r.arg).is_some());
             let home = paths::in_za_home(cx.roots, &p.path);
             CallPath {
                 abs: slashed(&p.path.to_string_lossy()),
@@ -755,7 +757,7 @@ fn call_of<'a>(
 /// цели перенаправлений и значения опций (`--file=…`, `-Path:…`, `of=…`) каждого сегмента
 /// — в том числе тел подстановок и строки вложенной интерпретации, которые [`Subjects`]
 /// несёт отдельными сегментами (D81). Относительные — от `cwd`, если он задан; слово с
-/// началом домашнего каталога ([`HOME_PREFIXES`]) раскрывается по [`Roots::home`].
+/// началом домашнего каталога ([`shell::HOME_PREFIXES`]) раскрывается по [`Roots::home`].
 /// Слово, которое [`paths::classify`] отвергает, пропускается.
 ///
 /// Слова сверяются с правилами `deny` по `path` и с защищёнными местами памяти
@@ -778,8 +780,8 @@ fn command_words(cx: &PolicyCx<'_>, s: &Subjects) -> Vec<CallPath> {
         for word in seg.argv.iter().map(String::as_str).chain(redirects) {
             for w in word_values(word) {
                 let path = match cx.roots.home.as_deref().and_then(|h| home_word(h, w)) {
-                    Some(p) => p,
-                    None => match paths::classify(&base, w) {
+                    Some(Ok(lex)) => lex.as_path().to_path_buf(),
+                    _ => match paths::classify(&base, w) {
                         Ok(lex) => lex.as_path().to_path_buf(),
                         Err(_) => continue,
                     },
@@ -818,42 +820,30 @@ fn word_values(w: &str) -> impl Iterator<Item = &str> {
         .filter(|v| !v.is_empty())
 }
 
-/// Начала слов команды, которые оболочка раскрывает в домашний каталог пользователя
-/// (D157, best effort): `~` (bash, PowerShell), `$HOME` и `${HOME}` (bash; в PowerShell —
-/// автоматическая переменная), `%USERPROFILE%` (cmd), `$env:USERPROFILE`,
-/// `${env:USERPROFILE}`, `$env:HOME`, `${env:HOME}` (PowerShell). Сравнение без учёта
-/// регистра ASCII (так у PowerShell и cmd; в bash `$home` — другая переменная, ошибка в
-/// безопасную сторону). За началом — конец слова или разделитель `/`, `\`; `~user`,
-/// `$HOMEDIR` — не домашний каталог.
-const HOME_PREFIXES: [&str; 8] = [
-    "~",
-    "$HOME",
-    "${HOME}",
-    "%USERPROFILE%",
-    "$env:USERPROFILE",
-    "${env:USERPROFILE}",
-    "$env:HOME",
-    "${env:HOME}",
-];
-
-/// Слово с началом из [`HOME_PREFIXES`] — путь от домашнего каталога `home`, лексически
-/// нормализованный; хвост делится и по `/`, и по `\` на любой ОС (в безопасную сторону).
-/// Иначе `None`.
-fn home_word(home: &Path, w: &str) -> Option<PathBuf> {
-    let rest = HOME_PREFIXES.iter().find_map(|p| {
-        let head = w.get(..p.len())?;
-        let rest = &w[p.len()..];
-        (head.eq_ignore_ascii_case(p) && (rest.is_empty() || rest.starts_with(['/', '\\'])))
-            .then_some(rest)
-    })?;
-    let rel = rest.replace('\\', "/");
+/// Слово с началом домашнего каталога ([`shell::home_rest`]) — лексический путь от
+/// домашнего каталога `home` ([`paths::classify`]: `..` не уходит за корень, сетевой и
+/// device-путь — ошибка); хвост делится и по `/`, и по `\` на любой ОС (в безопасную
+/// сторону). Не такое слово — `None`.
+fn home_word(home: &Path, w: &str) -> Option<Result<LexPath, PathError>> {
+    let rel = shell::home_rest(w)?.replace('\\', "/");
     let rel = rel.trim_start_matches('/');
-    if rel.is_empty() {
-        return Some(home.to_path_buf());
+    Some(paths::classify(
+        home,
+        if rel.is_empty() { "." } else { rel },
+    ))
+}
+
+/// Лексический путь слова-пути команды `bash` ([`Subjects::paths`], D77): слово с началом
+/// домашнего каталога (`~`, `$HOME`, `%USERPROFILE%`, `$env:USERPROFILE`, D157) — от
+/// [`Roots::home`], если он задан (оболочка раскрывает начало сама); прочее и без
+/// домашнего каталога — от корня проекта, как аргумент нативного инструмента. Пакет
+/// вызовов разрешает так пути команды перед решением; граница таких слов — вне проекта
+/// при любом разрешении (`call_of`).
+pub fn command_path(roots: &Roots, arg: &str) -> Result<LexPath, PathError> {
+    match roots.home.as_deref().and_then(|h| home_word(h, arg)) {
+        Some(lex) => lex,
+        None => paths::classify(&roots.project, arg),
     }
-    paths::classify(home, rel)
-        .ok()
-        .map(|l| l.as_path().to_path_buf())
 }
 
 /// Имя команды клиента ZeroAIMemory (D158) — как его даёт [`shell::argv0`]: без пути,

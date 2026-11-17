@@ -15,8 +15,8 @@ use std::time::Duration;
 use serde_json::json;
 use za_agent::{
     Decision, Exposure, Grant, GrantConfig, GrantMode, GrantSource, PolicyConfig, PolicyCx,
-    PolicyError, PolicySnapshot, Rule, RuleAction, RuleSource, covers, decide, grants_text,
-    parse_grant_flag, runtime_texts, subject_paths,
+    PolicyError, PolicySnapshot, Rule, RuleAction, RuleSource, command_path, covers, decide,
+    grants_text, parse_grant_flag, runtime_texts, subject_paths,
 };
 use za_core::net::{normalize_host, shell_hosts};
 use za_core::paths::{
@@ -131,6 +131,11 @@ fn search() -> (Subjects, Vec<ResolvedPath>) {
 /// `paths::resolve` (D79, D157): защищённое место — при любом доступе, прочие — от записи.
 fn rp(r: &Roots, arg: &str, access: Access) -> ResolvedPath {
     let path = classify(&r.project, arg).unwrap().as_path().to_path_buf();
+    resolved_of(r, path, access)
+}
+
+/// Признаки [`rp`] для уже разобранного пути `path`.
+fn resolved_of(r: &Roots, path: PathBuf, access: Access) -> ResolvedPath {
     ResolvedPath {
         inside: within(&r.project, &path),
         protected: sealed_place(r, &path) || (access == Access::Write && protected_place(r, &path)),
@@ -195,12 +200,14 @@ fn bash_in(r: &Roots, cmd: &str, d: Dialect) -> (Subjects, Vec<ResolvedPath>) {
         hosts,
         hosts_unknown,
     };
-    // Слово, которое `classify` отвергает (на Windows `/etc/hosts` — `DriveRelative`),
-    // не разрешается: список короче `subject_paths`, граница неизвестна — Ask.
+    // Слова-пути — как их разрешает пакет вызовов (`command_path`: начало домашнего
+    // каталога раскрыто по корням, D157). Слово, которое разбор отвергает (на Windows
+    // `/etc/hosts` — `DriveRelative`), не разрешается: список короче `subject_paths`,
+    // граница неизвестна — Ask.
     let resolved = subject_paths(&s)
         .iter()
-        .filter(|p| classify(&r.project, &p.arg).is_ok())
-        .map(|p| rp(r, &p.arg, p.access))
+        .filter_map(|p| command_path(r, &p.arg).ok().map(|l| (l, p.access)))
+        .map(|(l, access)| resolved_of(r, l.as_path().to_path_buf(), access))
         .collect();
     (s, resolved)
 }
@@ -2326,6 +2333,53 @@ fn bash_words_into_sealed_denied() {
         ),
         ask(&[ar::OUTSIDE_PROJECT])
     );
+}
+
+/// R1-M D157, Minor 2 ревью задачи 1: слово с началом `$HOME`, `${HOME}`, `%USERPROFILE%`,
+/// `$env:USERPROFILE` — путь команды, как `~` (раскрытый по домашнему каталогу корней):
+/// оно задаёт границу проекта. В `auto` команда с ним спрашивает `outside_project`, а не
+/// исполняется молча; грант на домашний каталог и проект, равный домашнему каталогу, этого
+/// не меняют — как у `~`, оболочка раскрывает начало сама. Без домашнего каталога корней
+/// — тоже вопрос.
+#[test]
+fn home_words_set_project_boundary() {
+    let pwsh = Dialect::PowerShell;
+    let table = [
+        ("cat ~/notes.txt", Dialect::Bash),
+        ("cat $HOME/notes.txt", Dialect::Bash),
+        ("cat ${HOME}/notes.txt", Dialect::Bash),
+        ("cp a.txt $HOME/b.txt", Dialect::Bash),
+        (r"type %USERPROFILE%\notes.txt", pwsh),
+        ("Get-Content $env:USERPROFILE/notes.txt", pwsh),
+        (r"Get-Content $env:USERPROFILE\notes.txt", pwsh),
+    ];
+    let user_project = Roots {
+        project: abs("/home/u"),
+        ..sealed_roots()
+    };
+    for r in [sealed_roots(), user_project, roots()] {
+        let mut auto = Cx::new(RunMode::Auto);
+        auto.roots = r.clone();
+        let granted = Cx {
+            roots: r.clone(),
+            ..Cx::new(RunMode::Auto).grants(vec![grant("/home/u", GrantMode::Rw)])
+        };
+        for (cmd, d) in table {
+            for cx in [&auto, &granted] {
+                assert_eq!(
+                    cx.decide(&bash_spec(), &bash_in(&r, cmd, d)),
+                    ask(&[ar::OUTSIDE_PROJECT]),
+                    "{d:?} {cmd} {}",
+                    r.project.display()
+                );
+            }
+        }
+        // Обычные слова внутри проекта — без вопроса.
+        assert_eq!(
+            auto.decide(&bash_spec(), &bash_in(&r, "cat notes.txt", Dialect::Bash)),
+            Decision::Allow
+        );
+    }
 }
 
 /// D158: вызов клиента памяти `zam` в `bash` — Deny("memory client") в любом сегменте, во

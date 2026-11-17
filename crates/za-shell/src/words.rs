@@ -4,13 +4,43 @@ use crate::classify::{git_config_key, git_split, null_dev, parse_redirect};
 use crate::command::{analyze, pwsh_expression};
 use crate::{Lang, Segment};
 
-/// Похоже на путь наружу: абсолютный путь, `~`, UNC, компонент `..`.
+/// Начала слов команды, которые оболочка раскрывает в домашний каталог пользователя
+/// (R1-M D157, best effort): `~` (bash, PowerShell), `$HOME` и `${HOME}` (bash; в
+/// PowerShell — автоматическая переменная), `%USERPROFILE%` (cmd), `$env:USERPROFILE`,
+/// `${env:USERPROFILE}`, `$env:HOME`, `${env:HOME}` (PowerShell). Сравнение без учёта
+/// регистра ASCII (так у PowerShell и cmd; в bash `$home` — другая переменная, ошибка в
+/// безопасную сторону).
+pub const HOME_PREFIXES: [&str; 8] = [
+    "~",
+    "$HOME",
+    "${HOME}",
+    "%USERPROFILE%",
+    "$env:USERPROFILE",
+    "${env:USERPROFILE}",
+    "$env:HOME",
+    "${env:HOME}",
+];
+
+/// Слово с началом из [`HOME_PREFIXES`], за которым конец слова или разделитель `/`, `\`:
+/// остаток после начала (пустой или с разделителя). `~user`, `$HOMEDIR` — `None`.
+pub fn home_rest(w: &str) -> Option<&str> {
+    HOME_PREFIXES.iter().find_map(|p| {
+        let head = w.get(..p.len())?;
+        let rest = &w[p.len()..];
+        (head.eq_ignore_ascii_case(p) && (rest.is_empty() || rest.starts_with(['/', '\\'])))
+            .then_some(rest)
+    })
+}
+
+/// Похоже на путь наружу: абсолютный путь, `~` и прочие начала домашнего каталога
+/// ([`home_rest`]), UNC, компонент `..`.
 pub(crate) fn path_like(w: &str) -> bool {
     if w.is_empty() || w.contains("://") || null_dev(w) {
         return false;
     }
     let b = w.as_bytes();
-    w.starts_with(['/', '\\', '~'])
+    home_rest(w).is_some()
+        || w.starts_with(['/', '\\', '~'])
         || (b.len() >= 3
             && b[0].is_ascii_alphabetic()
             && b[1] == b':'

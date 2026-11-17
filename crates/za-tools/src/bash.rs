@@ -488,9 +488,12 @@ pub fn bash_tool(runner: Arc<dyn Runner>, shell: Shell, home: AgentHome) -> Arc<
 }
 
 /// Слово-путь относительно: не от корня, не `~`, не `X:`.
+/// Слово относительное: не абсолютное, не `~` и не другое начало домашнего каталога
+/// (`$HOME`, `%USERPROFILE%`, `$env:USERPROFILE`, R1-M D157) — его `cwd` не сдвигает.
 fn is_relative(w: &str) -> bool {
     let b = w.as_bytes();
     !(w.starts_with(['/', '\\', '~'])
+        || shell::home_rest(w).is_some()
         || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'))
 }
 
@@ -511,10 +514,12 @@ fn path_args(segs: &[Segment], d: Dialect, cwd: Option<&str>) -> Vec<String> {
     out
 }
 
-/// Путь вне проекта `root` лексически (без ввода-вывода): `~`, `..` выше корня, другой
-/// абсолютный путь; сетевой путь и неразборчивый — тоже. Имя устройства (`NUL`) — нет.
+/// Путь вне проекта `root` лексически (без ввода-вывода): `~` и другие начала домашнего
+/// каталога (`$HOME`, `%USERPROFILE%`, `$env:USERPROFILE`, R1-M D157), `..` выше корня,
+/// другой абсолютный путь; сетевой путь и неразборчивый — тоже. Имя устройства (`NUL`) —
+/// нет.
 fn outside_lex(root: &Path, w: &str) -> bool {
-    if w.starts_with('~') {
+    if w.starts_with('~') || shell::home_rest(w).is_some() {
         return true;
     }
     match classify(root, w) {
@@ -963,6 +968,10 @@ mod tests {
         let root = Path::new(LEX_ROOT);
         for (w, want) in [
             ("~/x", true),
+            ("$HOME/x", true),
+            ("%USERPROFILE%/x", true),
+            ("$env:USERPROFILE/x", true),
+            ("$HOMEDIR/x", false),
             ("../x", true),
             ("a/../../x", true),
             ("a/../b", false),

@@ -30,8 +30,10 @@
 //! команды; скрипты (`./clean.sh`, `bash x.sh`, `pwsh -File`, `source x.sh`); переменные
 //! окружения, меняющие поведение (`GIT_SSH_COMMAND`); код других языков, кроме явных
 //! опасных вызовов в `python -c` и подобных; `docker exec`; массовое удаление без флагов
-//! (`ls | xargs rm`, `gci | ri`) — его страхует чекпоинт D89; `$HOME`, `%USERPROFILE%`,
-//! `$env:…` в путях не раскрываются.
+//! (`ls | xargs rm`, `gci | ri`) — его страхует чекпоинт D89. Начала домашнего каталога
+//! (`~`, `$HOME`, `%USERPROFILE%`, `$env:USERPROFILE`, [`HOME_PREFIXES`]) лексер не
+//! раскрывает: слова с ними — пути ([`path_words`], [`home_rest`]), раскрывает их
+//! вызывающий по своему домашнему каталогу (R1-M D157).
 
 mod classify;
 mod command;
@@ -46,6 +48,7 @@ use command::{Inner, analyze};
 use lex::lex_code;
 pub use net::{NetHosts, command_hosts, network_hosts};
 use words::words_of;
+pub use words::{HOME_PREFIXES, home_rest};
 
 /// Метки необратимых команд (D81). Те же строки — `za_protocol::irreversible`;
 /// совпадение проверяет тест `za-core`.
