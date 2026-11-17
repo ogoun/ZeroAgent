@@ -1,0 +1,1 @@
+{"case": "gotcha with a trigger string file_glob:*.rs", "op": "log", "args": {"kind": "insight", "title": "Synthetic gotcha", "data": {"kind": "gotcha"}, "triggers": ["file_glob:*.rs"]}, "error": "triggers[0]: expected an object"}

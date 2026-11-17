@@ -113,6 +113,15 @@ impl ErrorKind {
     }
 }
 
+/// Id записи сервера: 1–64 символа, только буквы ASCII, цифры, `_` и `-` (ULID ZAM — 26
+/// символов): в текст модели не попадёт чужая строка из тела ошибки.
+fn is_plain_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Имя problem из `type`: последний сегмент после `/problems/`; `about:blank` — `None`.
 fn problem_name(ty: &str) -> Option<&str> {
     ty.rsplit_once("/problems/").map(|(_, n)| n)
@@ -125,14 +134,32 @@ pub struct ZamError {
     /// Код HTTP; у ошибок соединения и форм MCP без кода — `None`.
     pub status: Option<u16>,
     /// `type` problem+json как пришёл.
-    pub problem_type: Option<String>,
+    pub problem_type: Option<Box<str>>,
     pub title: String,
     pub detail: String,
     /// Машинный код (`code` problem+json, `(код …)` текста MCP).
     pub code: Option<String>,
     /// `Retry-After` в секундах (429, 503 `busy`).
     pub retry_after: Option<Duration>,
+    /// Поля конфликта записи (409): кандидаты в дубли и текущая ревизия; нет — `None`. В
+    /// куче: ошибка остаётся малой (`clippy::result_large_err`).
+    pub conflict: Option<Box<Conflict>>,
 }
+
+/// Поля ответа 409, которые нужны шлюзу записи (D145, MEM-073).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Conflict {
+    /// Id кандидатов в дубли (`candidates[].id` у `possible-duplicate`, до
+    /// [`CANDIDATES_MAX`]): шлюз называет их модели. Только id, без заголовков записей.
+    pub candidates: Vec<String>,
+    /// Текущая ревизия цели (`rev` у `conflict`, `current_rev` у правки заметки): шлюз отдаёт
+    /// её модели при конфликте правки секции и повторяет с ней `append`.
+    pub rev: Option<i64>,
+}
+
+/// Предел id кандидатов в дубли в [`Conflict::candidates`] (как у сервера,
+/// `DEDUP_CANDIDATES_MAX` ZAM).
+pub const CANDIDATES_MAX: usize = 5;
 
 impl fmt::Display for ZamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -161,7 +188,24 @@ impl ZamError {
             detail: String::new(),
             code: None,
             retry_after: None,
+            conflict: None,
         }
+    }
+
+    /// Имя problem из `type` (`possible-duplicate`, `idea-mode`, …); `about:blank` и ошибки без
+    /// `type` — `None`.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem_type.as_deref().and_then(problem_name)
+    }
+
+    /// Id кандидатов в дубли (409 `possible-duplicate`).
+    pub fn candidates(&self) -> &[String] {
+        self.conflict.as_deref().map_or(&[], |c| &c.candidates)
+    }
+
+    /// Текущая ревизия цели из ответа 409.
+    pub fn current_rev(&self) -> Option<i64> {
+        self.conflict.as_deref().and_then(|c| c.rev)
     }
 
     /// С подробностью `detail` (обрезается до предела).
@@ -189,7 +233,7 @@ impl ZamError {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         };
-        let problem_type = str_of("type");
+        let problem_type: Option<Box<str>> = str_of("type").map(String::into_boxed_str);
         let title = str_of("title")
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| canonical(status).to_owned());
@@ -201,6 +245,26 @@ impl ZamError {
             }
             (None, _) => String::new(),
         };
+        let candidates: Vec<String> = parsed
+            .as_ref()
+            .and_then(|v| v.get("candidates"))
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.get("id").and_then(serde_json::Value::as_str))
+                    .filter(|id| is_plain_id(id))
+                    .take(CANDIDATES_MAX)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rev = parsed.as_ref().and_then(|v| {
+            v.get("rev")
+                .or_else(|| v.get("current_rev"))
+                .and_then(serde_json::Value::as_i64)
+        });
+        let conflict = (status == 409 && (!candidates.is_empty() || rev.is_some()))
+            .then(|| Box::new(Conflict { candidates, rev }));
         Self {
             kind: ErrorKind::from_status(status, problem_type.as_deref()),
             status: Some(status),
@@ -209,6 +273,7 @@ impl ZamError {
             detail: truncate(&detail, DETAIL_MAX),
             code: str_of("code").map(|c| truncate(&c, 100)),
             retry_after,
+            conflict,
         }
     }
 

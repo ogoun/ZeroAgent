@@ -1,0 +1,1 @@
+{"case": "changelog without data.kind", "op": "log", "args": {"kind": "changelog", "title": "Synthetic change", "data": {}}, "error": "data.kind: one of feat"}

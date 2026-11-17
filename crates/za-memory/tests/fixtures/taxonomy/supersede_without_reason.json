@@ -1,0 +1,1 @@
+{"case": "supersede without reason (MEM-078)", "op": "supersede", "args": {"id": "01M8SYNENTRY0000000000001", "body": {"title": "Newer synthetic insight", "data": {"kind": "discovery"}}}, "error": "supersede: reason is required, at least 10 characters"}

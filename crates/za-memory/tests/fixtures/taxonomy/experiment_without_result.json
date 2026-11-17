@@ -1,0 +1,1 @@
+{"case": "experiment without data.experiment.result", "op": "log", "args": {"kind": "insight", "title": "Synthetic experiment", "data": {"kind": "experiment", "experiment": {"hypothesis": "h"}}}, "error": "data.experiment.result"}

@@ -45,22 +45,40 @@
 //!   `/problems/vault-locked`, метаданные — 200 с `locked: true`. Раскрытия с `X-Zam-Session`
 //!   — в [`FakeZam::reveals`]; 403 `solution-access` у Vault решения — [`FakeZam::forbid_solution`].
 //!
-//! Задачи 6–9 дополняют сервер записями, ключами идемпотентности, снимками.
+//! - **Записи** (задача 6, формы `@v0.0.12-m6.5`): журнал `POST /api/v1/spaces/{s}/entries`
+//!   с `Idempotency-Key` (201, повтор того же запроса — 200, другой запрос — 422
+//!   `/problems/idempotency-mismatch`), 409 `possible-duplicate` с `candidates`
+//!   ([`FakeZam::duplicate_title`]); `GET`/`PATCH /api/v1/entries/{id}` (без `If-Match` — 428,
+//!   устаревшая ревизия — 409 `conflict` с `rev`, `by` — только у правки идеи); `claim`,
+//!   `release`, `supersede` (с ключом), `retract`, `answer` с проверкой `by` (нет — 400
+//!   `/problems/by-required`), `propose`, `decide`, `review` (409 `idea-mode` в обе стороны
+//!   по [`FakeZam::set_idea_mode`], повтор по ключу — `replay: true`, ключ после правки идеи —
+//!   422); `POST /api/v1/cache`; заметки `POST /api/v1/nodes` с ключом, `GET` по id и по
+//!   пути, `PUT` с `If-Match`, `PATCH {base_rev, ops}`, ревизии с сессией автора. Подмены:
+//!   обрыв соединения после записи ([`FakeZam::cut_after_write`]: запись сделана, тело ответа
+//!   рвётся — у клиента `Interrupted`), правка идеи «человеком» после обрыва, одноразовый
+//!   отказ ([`FakeZam::fail_once`]), предупреждения следующей записи, ворота записей
+//!   ([`FakeZam::hold_writes`]).
+//!
+//! Задачи 7–9 дополняют сервер outbox-приёмником и снимками.
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
+use http_body::Frame;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
@@ -252,6 +270,79 @@ struct State {
     vault: Vec<VaultRow>,
     /// Раскрытия `?reveal=1`: id записи и `X-Zam-Session`.
     reveals: Vec<(String, Option<String>)>,
+    /// Записи журнала по id (форма `Entry` ZAM).
+    entries: BTreeMap<String, Value>,
+    /// Заметки по id.
+    nodes: BTreeMap<String, NodeRow>,
+    /// Ключи идемпотентности: отпечаток запроса и id цели.
+    idem: BTreeMap<String, (String, String)>,
+    /// Счётчик id.
+    next_id: u64,
+    /// Маршруты, у которых следующий ответ записи рвётся после записи.
+    cut: BTreeSet<String>,
+    /// Запись, которую «человек» правит сразу после обрыва (ревизия растёт).
+    touch_after_cut: Option<String>,
+    /// Одноразовые отказы по маршруту.
+    fail_once: BTreeMap<String, VecDeque<Failure>>,
+    /// Предупреждения следующего ответа записи.
+    warnings_next: Vec<String>,
+    /// Режим идей владельца базы: `review` (умолчание сервера) или `propose`.
+    idea_mode: String,
+    /// Заголовки, на которые запись журнала получает 409 `possible-duplicate`: id кандидата.
+    duplicates: BTreeMap<String, String>,
+    /// Тела принятых `POST /api/v1/cache`.
+    caches: Vec<Value>,
+}
+
+/// Заметка поддельного сервера.
+#[derive(Debug, Clone)]
+struct NodeRow {
+    id: String,
+    space: String,
+    path: String,
+    content: String,
+    rev: i64,
+    /// Ревизии новыми первыми: `{rev, session_id, author_kind}`.
+    revisions: Vec<Value>,
+}
+
+impl NodeRow {
+    fn json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "space_id": space_id(&self.space),
+            "kind": "note",
+            "name": self.path.rsplit('/').next().unwrap_or(""),
+            "path": self.path,
+            "current_rev": self.rev,
+            "certainty": frontmatter_certainty(&self.content),
+        })
+    }
+}
+
+/// Id пространства (26 символов, как у ZAM) по ссылке на него.
+fn space_id(space: &str) -> String {
+    let mut s: String = space
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    s.insert_str(0, "SP");
+    s.truncate(26);
+    while s.len() < 26 {
+        s.push('0');
+    }
+    s
+}
+
+/// `certainty:` frontmatter заметки (первый блок `---`).
+fn frontmatter_certainty(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    rest[..end]
+        .lines()
+        .find_map(|l| l.strip_prefix("certainty:"))
+        .map(|c| c.trim().to_owned())
 }
 
 /// Запись Vault поддельного сервера.
@@ -399,6 +490,9 @@ pub struct FakeZam {
     state: Arc<Mutex<State>>,
     /// Ворота ответа `/recall`: `true` — ответ ждёт [`FakeZam::release_recall`].
     held: watch::Sender<bool>,
+    /// Ворота записей: `true` — запись принята (она в канале), ответ ждёт
+    /// [`FakeZam::release_writes`].
+    held_writes: watch::Sender<bool>,
     /// `true` — принятые соединения закрываются до чтения запроса.
     refuse: Arc<AtomicBool>,
 }
@@ -453,15 +547,28 @@ impl FakeZam {
             sessions: Vec::new(),
             vault: Vec::new(),
             reveals: Vec::new(),
+            entries: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            idem: BTreeMap::new(),
+            next_id: 0,
+            cut: BTreeSet::new(),
+            touch_after_cut: None,
+            fail_once: BTreeMap::new(),
+            warnings_next: Vec::new(),
+            idea_mode: "review".to_owned(),
+            duplicates: BTreeMap::new(),
+            caches: Vec::new(),
         }));
         let (held, gate) = watch::channel(false);
+        let (held_writes, wgate) = watch::channel(false);
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = state.clone();
         let app = Router::new().fallback(move |req: Request| {
             let tx = tx.clone();
             let state = shared.clone();
             let gate = gate.clone();
-            async move { handle(req, &tx, &state, gate).await }
+            let wgate = wgate.clone();
+            async move { handle(req, &tx, &state, gate, wgate).await }
         });
         let addr = listener.local_addr().unwrap();
         let refuse = Arc::new(AtomicBool::new(false));
@@ -477,6 +584,7 @@ impl FakeZam {
             rx,
             state,
             held,
+            held_writes,
             refuse,
         }
     }
@@ -645,6 +753,138 @@ impl FakeZam {
         self.with(|s| s.sessions.clone())
     }
 
+    /// Запись журнала в пространстве `space` (GUID решения или `knowledge`) с полями `fields`
+    /// поверх умолчаний (`kind`, `title`, `status` по виду, `rev: 1`). Итог — id.
+    pub fn add_entry(&self, space: &str, fields: Value) -> String {
+        self.with(|s| {
+            let id = next_id(s, "ENTRY");
+            let mut e = entry_json(&id, space, &fields, None);
+            if let (Some(o), Some(f)) = (e.as_object_mut(), fields.as_object()) {
+                for (k, v) in f {
+                    o.insert(k.clone(), v.clone());
+                }
+            }
+            s.entries.insert(id.clone(), e);
+            id
+        })
+    }
+
+    /// Запись журнала по id.
+    pub fn entry(&self, id: &str) -> Option<Value> {
+        self.with(|s| s.entries.get(id).cloned())
+    }
+
+    /// Все записи журнала.
+    pub fn entries(&self) -> Vec<Value> {
+        self.with(|s| s.entries.values().cloned().collect())
+    }
+
+    /// Заметка в пространстве `space` по пути `path` с текстом `content` и автором-сессией
+    /// `session`. Итог — id.
+    pub fn add_node(
+        &self,
+        space: &str,
+        path: &str,
+        content: &str,
+        session: Option<&str>,
+    ) -> String {
+        self.with(|s| {
+            let id = next_id(s, "NODE");
+            s.nodes.insert(
+                id.clone(),
+                NodeRow {
+                    id: id.clone(),
+                    space: space.to_owned(),
+                    path: path.to_owned(),
+                    content: content.to_owned(),
+                    rev: 1,
+                    revisions: vec![revision(1, session)],
+                },
+            );
+            id
+        })
+    }
+
+    /// Текст и ревизия заметки по id.
+    pub fn node(&self, id: &str) -> Option<(String, i64)> {
+        self.with(|s| s.nodes.get(id).map(|n| (n.content.clone(), n.rev)))
+    }
+
+    /// Число заметок.
+    pub fn node_count(&self) -> usize {
+        self.with(|s| s.nodes.len())
+    }
+
+    /// Тела принятых выжимок `POST /api/v1/cache`.
+    pub fn caches(&self) -> Vec<Value> {
+        self.with(|s| s.caches.clone())
+    }
+
+    /// Режим идей владельца базы: `review` или `propose` (409 `idea-mode` в обе стороны, Δ7).
+    pub fn set_idea_mode(&self, mode: &str) {
+        let m = mode.to_owned();
+        self.with(|s| s.idea_mode = m);
+    }
+
+    /// Запись журнала с заголовком `title` (без `force`) получает 409 `possible-duplicate` с
+    /// кандидатом `candidate`.
+    pub fn duplicate_title(&self, title: &str, candidate: &str) {
+        let (t, c) = (title.to_owned(), candidate.to_owned());
+        self.with(|s| {
+            s.duplicates.insert(t, c);
+        });
+    }
+
+    /// Следующая запись по маршруту `route` выполняется, а ответ рвётся посреди тела (у
+    /// клиента — `Interrupted`, исход неизвестен).
+    pub fn cut_after_write(&self, route: &str) {
+        let r = route.to_owned();
+        self.with(|s| {
+            s.cut.insert(r);
+        });
+    }
+
+    /// После обрыва запись `id` правит «человек»: ревизия растёт (повтор разбора по ключу
+    /// получит 422).
+    pub fn touch_after_cut(&self, id: &str) {
+        let i = id.to_owned();
+        self.with(|s| s.touch_after_cut = Some(i));
+    }
+
+    /// Следующий запрос к `route` получает problem+json с кодом и типом (один раз).
+    pub fn fail_once(
+        &self,
+        route: &str,
+        status: u16,
+        problem_type: &str,
+        retry_after: Option<u64>,
+    ) {
+        let f = Failure {
+            status,
+            problem_type: problem_type.to_owned(),
+            detail: format!("fake {status}"),
+            retry_after,
+        };
+        let r = route.to_owned();
+        self.with(|s| s.fail_once.entry(r).or_default().push_back(f));
+    }
+
+    /// Предупреждения следующего удачного ответа записи (`warnings`).
+    pub fn warn_next(&self, warnings: &[&str]) {
+        let w: Vec<String> = warnings.iter().map(|w| (*w).to_owned()).collect();
+        self.with(|s| s.warnings_next = w);
+    }
+
+    /// Ответы записей ждут [`FakeZam::release_writes`]: запрос принят (он уже в канале).
+    pub fn hold_writes(&self) {
+        self.held_writes.send_replace(true);
+    }
+
+    /// Отпускает задержанные ответы записей.
+    pub fn release_writes(&self) {
+        self.held_writes.send_replace(false);
+    }
+
     /// Все принятые к этому моменту запросы (канал опустошается).
     pub fn seen(&mut self) -> Vec<Seen> {
         let mut out = Vec::new();
@@ -752,6 +992,7 @@ async fn handle(
     tx: &mpsc::UnboundedSender<Seen>,
     state: &Mutex<State>,
     mut gate: watch::Receiver<bool>,
+    mut wgate: watch::Receiver<bool>,
 ) -> Response {
     let method = req.method().as_str().to_owned();
     let path = req
@@ -846,7 +1087,58 @@ async fn handle(
         // Задержка — воротами теста, а не таймером: запрос уже в канале.
         let _ = gate.wait_for(|held| !*held).await;
     }
+    if method != "GET" && is_memory_route(&route) {
+        let _ = wgate.wait_for(|held| !*held).await;
+    }
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let once = s.fail_once.get_mut(&route).and_then(VecDeque::pop_front);
+    if let Some(f) = once {
+        let mut r = problem(f.status, &f.problem_type, &f.detail);
+        if let Some(sec) = f.retry_after {
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(sec));
+        }
+        return r;
+    }
+    if is_memory_route(&route) {
+        let session = headers
+            .get("x-zam-session")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned);
+        let key = headers
+            .get("idempotency-key")
+            .and_then(|h| h.to_str().ok())
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty());
+        let if_match = headers
+            .get(header::IF_MATCH)
+            .and_then(|h| h.to_str().ok())
+            .map(|v| {
+                v.trim()
+                    .trim_start_matches("W/")
+                    .trim_matches('"')
+                    .to_owned()
+            });
+        let rq = MemReq {
+            method: &method,
+            route: &route,
+            query: path.split_once('?').map_or("", |(_, q)| q),
+            session: session.as_deref(),
+            key: key.as_deref(),
+            if_match: if_match.as_deref(),
+            body: &body,
+        };
+        let resp = memory(&rq, &mut s);
+        if method != "GET" && resp.status().is_success() && s.cut.remove(&route) {
+            if let Some(id) = s.touch_after_cut.take()
+                && let Some(e) = s.entries.get_mut(&id)
+            {
+                e["rev"] = json!(e["rev"].as_i64().unwrap_or(1) + 1);
+            }
+            return broken();
+        }
+        return resp;
+    }
     match (method.as_str(), route.as_str()) {
         ("GET", "/api/v1/spaces") => json_reply(
             200,
@@ -965,6 +1257,613 @@ async fn handle(
         }
         _ => problem(404, "about:blank", "ресурс не найден"),
     }
+}
+
+/// Запрос к маршрутам записей памяти.
+struct MemReq<'a> {
+    method: &'a str,
+    route: &'a str,
+    query: &'a str,
+    session: Option<&'a str>,
+    key: Option<&'a str>,
+    if_match: Option<&'a str>,
+    body: &'a Value,
+}
+
+/// Маршруты записей памяти (задача 6).
+fn is_memory_route(route: &str) -> bool {
+    route.starts_with("/api/v1/entries/")
+        || route == "/api/v1/nodes"
+        || route.starts_with("/api/v1/nodes/")
+        || route == "/api/v1/cache"
+        || (route.starts_with("/api/v1/spaces/") && route.ends_with("/entries"))
+}
+
+/// Следующий синтетический id (26 символов, как ULID ZAM).
+fn next_id(s: &mut State, tag: &str) -> String {
+    s.next_id += 1;
+    let mut id = format!("01M8SYN{tag}");
+    let n = s.next_id.to_string();
+    while id.len() + n.len() < 26 {
+        id.push('0');
+    }
+    id.push_str(&n);
+    id
+}
+
+/// Ревизия заметки с автором-сессией.
+fn revision(rev: i64, session: Option<&str>) -> Value {
+    json!({"rev": rev, "session_id": session, "author_kind": "agent"})
+}
+
+/// Статус новой записи по виду.
+fn initial_status(kind: &str) -> Value {
+    match kind {
+        "insight" | "term" => json!("active"),
+        "task" | "question" => json!("open"),
+        "idea" => json!("new"),
+        _ => Value::Null,
+    }
+}
+
+/// Запись формы `Entry` ZAM по телу создания.
+fn entry_json(id: &str, space: &str, body: &Value, session: Option<&str>) -> Value {
+    let kind = body["kind"].as_str().unwrap_or("insight").to_owned();
+    let certainty = match kind.as_str() {
+        "insight" => body
+            .get("certainty")
+            .cloned()
+            .filter(|c| !c.is_null())
+            .unwrap_or(json!("hypothesis")),
+        _ => Value::Null,
+    };
+    json!({
+        "id": id,
+        "space_id": space_id(space),
+        "kind": kind,
+        "title": body["title"].as_str().unwrap_or(""),
+        "body": body["body"].as_str().unwrap_or(""),
+        "data": body.get("data").cloned().filter(Value::is_object).unwrap_or(json!({})),
+        "tags": body.get("tags").cloned().filter(Value::is_array).unwrap_or(json!([])),
+        "area": body.get("area").cloned().unwrap_or(Value::Null),
+        "status": initial_status(&kind),
+        "certainty": certainty,
+        "rev": 1,
+        "author": {"kind": "agent", "session_id": session},
+    })
+}
+
+/// Ответ записи с предупреждениями следующего ответа (если заданы).
+fn with_warnings(s: &mut State, status: u16, mut v: Value) -> Response {
+    let w = std::mem::take(&mut s.warnings_next);
+    if !w.is_empty() {
+        v["warnings"] = json!(w);
+    }
+    json_reply(status, v)
+}
+
+/// Ключ идемпотентности: повтор того же запроса — `Ok(Some(id))`, другой запрос — 422.
+fn idem_check(s: &State, rq: &MemReq<'_>) -> Result<Option<String>, Box<Response>> {
+    let Some(k) = rq.key else { return Ok(None) };
+    match s.idem.get(k) {
+        None => Ok(None),
+        Some((fp, id)) if *fp == fingerprint(rq) => Ok(Some(id.clone())),
+        Some(_) => Err(Box::new(problem(
+            422,
+            "/problems/idempotency-mismatch",
+            "ключ повторён с другим запросом",
+        ))),
+    }
+}
+
+/// Отпечаток запроса: метод, маршрут и тело (ключи `serde_json` упорядочены).
+fn fingerprint(rq: &MemReq<'_>) -> String {
+    format!("{} {} {}", rq.method, rq.route, rq.body)
+}
+
+fn remember(s: &mut State, rq: &MemReq<'_>, id: &str) {
+    if let Some(k) = rq.key {
+        s.idem
+            .insert(k.to_owned(), (fingerprint(rq), id.to_owned()));
+    }
+}
+
+/// Значение параметра строки запроса (с раскодированием `%XX`).
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == name).then(|| percent_decode(v))
+    })
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let hex = |c: u8| char::from(c).to_digit(16).map(|d| d as u8);
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push(h * 16 + l);
+            i += 3;
+            continue;
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Маршруты записей памяти: журнал, операции записей, выжимки, заметки (формы
+/// `@v0.0.12-m6.5`, см. модуль).
+fn memory(rq: &MemReq<'_>, s: &mut State) -> Response {
+    let r = rq.route;
+    if let Some(space) = r
+        .strip_prefix("/api/v1/spaces/")
+        .and_then(|x| x.strip_suffix("/entries"))
+    {
+        return match rq.method {
+            "POST" => create_entry(rq, s, space),
+            _ => problem(405, "about:blank", "метод не поддерживается"),
+        };
+    }
+    if r == "/api/v1/cache" && rq.method == "POST" {
+        s.caches.push(rq.body.clone());
+        let id = next_id(s, "CACHE");
+        return json_reply(
+            201,
+            json!({"id": id, "ref": format!("c_{id}"), "state": "valid"}),
+        );
+    }
+    if r == "/api/v1/nodes" && rq.method == "POST" {
+        return create_node(rq, s);
+    }
+    if r == "/api/v1/nodes/by-path" && rq.method == "GET" {
+        let space = query_param(rq.query, "space").unwrap_or_default();
+        let path = query_param(rq.query, "path").unwrap_or_default();
+        return match s
+            .nodes
+            .values()
+            .find(|n| n.space == space && n.path == path)
+        {
+            Some(n) => json_reply(200, json!({"node": n.json()})),
+            None => problem(404, "about:blank", "ресурс не найден"),
+        };
+    }
+    if let Some(rest) = r.strip_prefix("/api/v1/nodes/") {
+        return node_route(rq, s, rest);
+    }
+    if let Some(rest) = r.strip_prefix("/api/v1/entries/") {
+        let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
+        if !s.entries.contains_key(id) {
+            return problem(404, "about:blank", "ресурс не найден");
+        }
+        return match (rq.method, action) {
+            ("GET", "") => json_reply(200, s.entries[id].clone()),
+            ("PATCH", "") => patch_entry(rq, s, id),
+            ("POST", "claim") => claim(rq, s, id),
+            ("POST", "release") => {
+                let e = s.entries.get_mut(id).unwrap();
+                if e["data"]["claimed_by"]["session"].as_str() == rq.session {
+                    e["data"].as_object_mut().unwrap().remove("claimed_by");
+                }
+                json_reply(200, e.clone())
+            }
+            ("POST", "supersede") => supersede(rq, s, id),
+            ("POST", "retract") => {
+                let reason = rq.body["reason"].as_str().unwrap_or("").trim().to_owned();
+                if reason.is_empty() {
+                    return problem(
+                        422,
+                        "/problems/unprocessable",
+                        "reason: причина обязательна",
+                    );
+                }
+                let e = s.entries.get_mut(id).unwrap();
+                if e["status"] == "retracted" {
+                    return problem(409, "/problems/conflict", "запись уже отозвана");
+                }
+                e["status"] = json!("retracted");
+                e["retract_reason"] = json!(reason);
+                e["rev"] = json!(e["rev"].as_i64().unwrap_or(1) + 1);
+                json_reply(200, e.clone())
+            }
+            ("POST", "answer") => answer(rq, s, id),
+            ("POST", "propose") => {
+                let e = s.entries.get_mut(id).unwrap();
+                if s.idea_mode == "review" && e["status"] == "new" && e["data"]["origin"] == "human"
+                {
+                    return problem(409, "/problems/idea-mode", "идею разбирает агент");
+                }
+                e["status"] = json!("proposed");
+                e["rev"] = json!(e["rev"].as_i64().unwrap_or(1) + 1);
+                let v =
+                    json!({"entry": e.clone(), "question": {"id": "01M8SYNQUESTION0000000001"}});
+                json_reply(200, v)
+            }
+            ("POST", "decide") => {
+                if rq.body.get("by").is_none_or(Value::is_null) {
+                    return problem(400, "/problems/by-required", "укажите by");
+                }
+                let status = match rq.body["decision"].as_str() {
+                    Some("accept") => "accepted",
+                    Some("defer") => "deferred",
+                    Some("decline") => "declined",
+                    _ => return problem(422, "/problems/unprocessable", "decision"),
+                };
+                let e = s.entries.get_mut(id).unwrap();
+                e["status"] = json!(status);
+                e["rev"] = json!(e["rev"].as_i64().unwrap_or(1) + 1);
+                json_reply(200, json!({"entry": e.clone()}))
+            }
+            ("POST", "review") => review(rq, s, id),
+            _ => problem(405, "about:blank", "метод не поддерживается"),
+        };
+    }
+    problem(404, "about:blank", "ресурс не найден")
+}
+
+fn create_entry(rq: &MemReq<'_>, s: &mut State, space: &str) -> Response {
+    match idem_check(s, rq) {
+        Err(r) => return *r,
+        Ok(Some(id)) => return json_reply(200, s.entries[&id].clone()),
+        Ok(None) => {}
+    }
+    let kind = rq.body["kind"].as_str().unwrap_or("");
+    if matches!(kind, "changelog" | "release" | "report") && space == "knowledge" {
+        return problem(
+            422,
+            "/problems/unprocessable",
+            "changelog и release ведутся только в пространстве решения",
+        );
+    }
+    if kind == "idea" && rq.body["data"]["origin"].as_str().is_none() {
+        return problem(
+            422,
+            "/problems/unprocessable",
+            "data.origin: укажите human или agent",
+        );
+    }
+    let title = rq.body["title"].as_str().unwrap_or("");
+    if rq.body["force"] != json!(true)
+        && let Some(c) = s.duplicates.get(title).cloned()
+    {
+        let mut v = problem_body(
+            409,
+            "/problems/possible-duplicate",
+            "похоже на уже записанный insight (1 шт.)",
+        );
+        v["candidates"] = json!([{"id": c, "title": title, "status": "active", "certainty": "hypothesis", "reason": "title", "score": null}]);
+        v["dedup"] = json!("degraded");
+        return problem_json(409, v);
+    }
+    let id = next_id(s, "ENTRY");
+    let e = entry_json(&id, space, rq.body, rq.session);
+    s.entries.insert(id.clone(), e.clone());
+    remember(s, rq, &id);
+    with_warnings(s, 201, e)
+}
+
+fn patch_entry(rq: &MemReq<'_>, s: &mut State, id: &str) -> Response {
+    let Some(im) = rq.if_match else {
+        return problem(
+            428,
+            "/problems/precondition-required",
+            "передайте If-Match: <rev> текущей ревизии",
+        );
+    };
+    let Ok(rev) = im.parse::<i64>() else {
+        return problem(400, "about:blank", "If-Match: номер ревизии");
+    };
+    let e = s.entries.get_mut(id).unwrap();
+    let current = e["rev"].as_i64().unwrap_or(1);
+    if rev != current {
+        let mut v = problem_body(409, "/problems/conflict", "ревизия устарела");
+        v["rev"] = json!(current);
+        return problem_json(409, v);
+    }
+    let b = rq.body;
+    if b.get("by").is_some_and(|v| !v.is_null()) {
+        let edit = ["title", "body", "append_body"]
+            .iter()
+            .any(|k| b.get(*k).is_some());
+        if e["kind"] != "idea" || !edit {
+            return problem(422, "/problems/unprocessable", "by: только у правки идеи");
+        }
+    }
+    for k in ["title", "body", "status", "certainty", "area"] {
+        if let Some(v) = b.get(k) {
+            e[k] = v.clone();
+        }
+    }
+    if let Some(a) = b["append_body"].as_str() {
+        let old = e["body"].as_str().unwrap_or("").to_owned();
+        e["body"] = json!(format!("{old}\n\n{a}"));
+    }
+    if let Some(t) = b.get("tags") {
+        e["tags"] = t.clone();
+    }
+    let data = e["data"].as_object_mut().unwrap();
+    if let Some(d) = b["data"].as_object() {
+        for (k, v) in d {
+            if v.is_null() {
+                data.remove(k);
+            } else {
+                data.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    for k in ["next_step", "blocked_by"] {
+        if let Some(v) = b.get(k) {
+            data.insert(k.to_owned(), v.clone());
+        }
+    }
+    e["rev"] = json!(current + 1);
+    let v = e.clone();
+    with_warnings(s, 200, v)
+}
+
+fn claim(rq: &MemReq<'_>, s: &mut State, id: &str) -> Response {
+    let Some(session) = rq.session else {
+        return problem(
+            400,
+            "about:blank",
+            "захват требует сессии: заголовок X-Zam-Session",
+        );
+    };
+    let e = s.entries.get_mut(id).unwrap();
+    if let Some(other) = e["data"]["claimed_by"]["session"].as_str()
+        && other != session
+    {
+        let mut v = problem_body(
+            409,
+            "/problems/task-claimed",
+            "задача захвачена другой сессией",
+        );
+        v["claimed_by"] = e["data"]["claimed_by"].clone();
+        return problem_json(409, v);
+    }
+    e["data"]["claimed_by"] = json!({
+        "session": session,
+        "agent": rq.body["agent"],
+        "until": "2026-11-17T02:00:00Z",
+    });
+    json_reply(200, e.clone())
+}
+
+fn supersede(rq: &MemReq<'_>, s: &mut State, id: &str) -> Response {
+    match idem_check(s, rq) {
+        Err(r) => return *r,
+        Ok(Some(new)) => {
+            let v = json!({"entry": s.entries[&new].clone(), "superseded": s.entries[id].clone()});
+            return json_reply(200, v);
+        }
+        Ok(None) => {}
+    }
+    let old = s.entries[id].clone();
+    if old["status"] == "superseded" || old["status"] == "retracted" {
+        return problem(
+            409,
+            "/problems/conflict",
+            "запись уже замещена или отозвана",
+        );
+    }
+    let new_id = next_id(s, "ENTRY");
+    let mut body = rq.body.clone();
+    body["kind"] = old["kind"].clone();
+    let mut e = entry_json(&new_id, "", &body, rq.session);
+    e["space_id"] = old["space_id"].clone();
+    e["supersedes_id"] = json!(id);
+    s.entries.insert(new_id.clone(), e.clone());
+    let o = s.entries.get_mut(id).unwrap();
+    o["status"] = json!("superseded");
+    o["superseded_by_id"] = json!(new_id);
+    let o = o.clone();
+    remember(s, rq, &new_id);
+    json_reply(201, json!({"entry": e, "superseded": o}))
+}
+
+fn answer(rq: &MemReq<'_>, s: &mut State, id: &str) -> Response {
+    let Some(by) = rq.body["by"].as_str() else {
+        return problem(
+            400,
+            "/problems/by-required",
+            "ответ на вопрос токеном: укажите by: human или by: agent",
+        );
+    };
+    let by = by.to_owned();
+    let e = s.entries.get_mut(id).unwrap();
+    if e["status"] != "open" {
+        let mut v = problem_body(409, "/problems/already-answered", "вопрос уже отвечен");
+        v["decision_id"] = json!("01M8SYNDECISION0000000001");
+        return problem_json(409, v);
+    }
+    e["status"] = json!("answered");
+    e["data"]["answer"] = json!({
+        "text": rq.body["text"],
+        "option": rq.body["option"],
+        "by": by,
+        "channel": rq.body.get("channel").cloned().unwrap_or(json!("chat")),
+        "decision_id": "01M8SYNDECISION0000000001",
+    });
+    e["rev"] = json!(e["rev"].as_i64().unwrap_or(1) + 1);
+    let v = json!({
+        "entry": e.clone(),
+        "decision": {"id": "01M8SYNDECISION0000000001", "kind": "insight"},
+        "decision_id": "01M8SYNDECISION0000000001",
+    });
+    json_reply(200, v)
+}
+
+/// `POST /entries/{id}/review` (Δ2, Δ4): режим `propose` — 409 `idea-mode` раньше тела;
+/// повтор по ключу — `replay: true`, пока идея не менялась после разбора, иначе 422; идея не
+/// `new` — 409 `transition-not-allowed`.
+fn review(rq: &MemReq<'_>, s: &mut State, id: &str) -> Response {
+    if s.idea_mode == "propose" {
+        return problem(
+            409,
+            "/problems/idea-mode",
+            "разбор выключен (ideas.mode = propose)",
+        );
+    }
+    if rq.body.get("by").is_some() {
+        return problem(400, "about:blank", "unknown field `by`");
+    }
+    let e = s.entries.get_mut(id).unwrap();
+    let rev = e["rev"].as_i64().unwrap_or(1);
+    if let Some(k) = rq.key
+        && let Some(r) = e["data"]["reviews"]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["key"] == k).cloned())
+    {
+        if r["rev_after"].as_i64() == Some(rev) && r["outcome"] == rq.body["outcome"] {
+            return json_reply(200, json!({"entry": e.clone(), "replay": true}));
+        }
+        return problem(
+            422,
+            "/problems/idempotency-mismatch",
+            "ключ разбора повторён после правки идеи",
+        );
+    }
+    if e["status"] != "new" {
+        let mut v = problem_body(409, "/problems/conflict", "переход идеи не разрешён");
+        v["code"] = json!("transition-not-allowed");
+        return problem_json(409, v);
+    }
+    let outcome = rq.body["outcome"].as_str().unwrap_or("").to_owned();
+    let status = match outcome.as_str() {
+        "plan" => "accepted",
+        "return" => "returned",
+        "decline" => "declined",
+        "done" => "done",
+        _ => return problem(422, "/problems/unprocessable", "outcome"),
+    };
+    let item = json!({"key": rq.key, "outcome": outcome, "rev_after": rev + 1});
+    e["data"]["review"] = item.clone();
+    if !e["data"]["reviews"].is_array() {
+        e["data"]["reviews"] = json!([]);
+    }
+    e["data"]["reviews"].as_array_mut().unwrap().push(item);
+    e["status"] = json!(status);
+    e["rev"] = json!(rev + 1);
+    json_reply(200, json!({"entry": e.clone(), "replay": false}))
+}
+
+fn create_node(rq: &MemReq<'_>, s: &mut State) -> Response {
+    match idem_check(s, rq) {
+        Err(r) => return *r,
+        Ok(Some(id)) => return json_reply(200, s.nodes[&id].json()),
+        Ok(None) => {}
+    }
+    let space = rq.body["space"].as_str().unwrap_or("").to_owned();
+    let path = rq.body["path"].as_str().unwrap_or("").to_owned();
+    if s.nodes.values().any(|n| n.space == space && n.path == path) {
+        return problem(409, "/problems/conflict", "путь занят");
+    }
+    let id = next_id(s, "NODE");
+    let n = NodeRow {
+        id: id.clone(),
+        space,
+        path,
+        content: rq.body["content"].as_str().unwrap_or("").to_owned(),
+        rev: 1,
+        revisions: vec![revision(1, rq.session)],
+    };
+    let v = n.json();
+    s.nodes.insert(id.clone(), n);
+    remember(s, rq, &id);
+    with_warnings(s, 201, v)
+}
+
+fn node_route(rq: &MemReq<'_>, s: &mut State, rest: &str) -> Response {
+    let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    if !s.nodes.contains_key(id) {
+        return problem(404, "about:blank", "ресурс не найден");
+    }
+    match (rq.method, tail) {
+        ("GET", "") => json_reply(200, s.nodes[id].json()),
+        ("GET", "revisions") => json_reply(200, json!(s.nodes[id].revisions)),
+        ("PUT", "") => {
+            let Some(base) = rq.if_match.and_then(|v| v.parse::<i64>().ok()) else {
+                return problem(428, "/problems/precondition-required", "передайте If-Match");
+            };
+            if let Ok(Some(_)) = idem_check(s, rq) {
+                return json_reply(200, s.nodes[id].json());
+            }
+            let n = s.nodes.get_mut(id).unwrap();
+            if base != n.rev {
+                let mut v = problem_body(409, "/problems/conflict", "ревизия устарела");
+                v["current_rev"] = json!(n.rev);
+                return problem_json(409, v);
+            }
+            n.content = rq.body["content"].as_str().unwrap_or("").to_owned();
+            n.rev += 1;
+            n.revisions.insert(0, revision(n.rev, rq.session));
+            let v = n.json();
+            remember(s, rq, id);
+            with_warnings(s, 200, v)
+        }
+        ("PATCH", "") => {
+            if let Ok(Some(_)) = idem_check(s, rq) {
+                return json_reply(200, s.nodes[id].json());
+            }
+            let base = rq.body["base_rev"].as_i64().unwrap_or(0);
+            let n = s.nodes.get_mut(id).unwrap();
+            if base != n.rev {
+                let mut v = problem_body(
+                    409,
+                    "/problems/conflict",
+                    "секция изменилась после base_rev",
+                );
+                v["current_rev"] = json!(n.rev);
+                return problem_json(409, v);
+            }
+            for op in rq.body["ops"].as_array().cloned().unwrap_or_default() {
+                n.content.push_str(op["content"].as_str().unwrap_or(""));
+            }
+            n.rev += 1;
+            n.revisions.insert(0, revision(n.rev, rq.session));
+            let v = n.json();
+            remember(s, rq, id);
+            with_warnings(s, 200, v)
+        }
+        _ => problem(405, "about:blank", "метод не поддерживается"),
+    }
+}
+
+/// Тело ответа, которое рвётся после первого куска: запись уже сделана, исход у клиента
+/// неизвестен (`Interrupted`).
+struct Broken(bool);
+
+impl http_body::Body for Broken {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        if !self.0 {
+            self.0 = true;
+            return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"{\"id\":")))));
+        }
+        Poll::Ready(Some(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "fake cut after write",
+        ))))
+    }
+}
+
+/// Ответ 200 с телом, оборванным после записи.
+fn broken() -> Response {
+    let mut r = Response::new(Body::new(Broken(false)));
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    r
 }
 
 /// Поля блокировки ответа метаданных Vault: `locked` и при блокировке `reason`.

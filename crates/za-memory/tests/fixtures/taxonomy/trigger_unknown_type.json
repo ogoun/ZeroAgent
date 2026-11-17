@@ -1,0 +1,1 @@
+{"case": "trigger of an unknown type", "op": "log", "args": {"kind": "insight", "title": "Synthetic gotcha", "data": {"kind": "gotcha"}, "triggers": [{"type": "glob", "pattern": "*.rs"}]}, "error": "triggers[0].type"}

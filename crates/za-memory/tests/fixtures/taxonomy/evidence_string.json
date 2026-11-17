@@ -1,0 +1,1 @@
+{"case": "evidence as a string", "op": "log", "args": {"kind": "insight", "title": "Synthetic theorem", "certainty": "theorem", "data": {"kind": "discovery", "evidence": "call:c1"}}, "error": "data.evidence: expected an object"}

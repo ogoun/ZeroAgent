@@ -1,0 +1,1 @@
+{"case": "decision with data.decided_by at the top level", "op": "log", "args": {"kind": "insight", "title": "Synthetic decision", "data": {"kind": "decision", "decided_by": "agent", "decision": {"chosen": "a"}}}, "error": "data.decided_by: decision fields go inside data.decision"}

@@ -1,0 +1,1 @@
+{"case": "task data.priority with the idea_review flag", "op": "log", "flags": {"idea_review": true}, "args": {"kind": "task", "title": "Synthetic task", "data": {"priority": "high", "next_step": "write the test"}}, "error": null}

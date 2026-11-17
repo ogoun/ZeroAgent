@@ -1,0 +1,1 @@
+{"case": "idea data.review is kept by the server (P8)", "op": "log", "args": {"kind": "idea", "title": "Synthetic idea", "data": {"origin": "agent", "review": {"outcome": "plan"}}}, "error": "data.review: kept by the memory server"}

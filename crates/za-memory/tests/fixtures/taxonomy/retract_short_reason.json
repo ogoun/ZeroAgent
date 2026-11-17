@@ -1,0 +1,1 @@
+{"case": "retract with a short reason", "op": "retract", "args": {"id": "01M8SYNENTRY0000000000001", "reason": "wrong"}, "error": "retract: reason is required"}

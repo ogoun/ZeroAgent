@@ -1,0 +1,1 @@
+{"case": "theorem without evidence", "op": "log", "args": {"kind": "insight", "title": "Synthetic theorem", "certainty": "theorem", "data": {"kind": "discovery"}}, "error": "certainty theorem needs data.evidence"}

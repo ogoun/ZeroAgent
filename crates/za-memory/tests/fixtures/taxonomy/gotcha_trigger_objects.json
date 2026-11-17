@@ -1,0 +1,1 @@
+{"case": "gotcha with trigger objects", "op": "log", "args": {"kind": "insight", "title": "Synthetic gotcha", "data": {"kind": "gotcha"}, "tags": ["b", " a ", "b", ""], "triggers": [{"type": "file_glob", "pattern": "**/*.rs", "tools": ["edit"]}, {"type": "error_regex", "pattern": "E0432"}]}, "error": null}

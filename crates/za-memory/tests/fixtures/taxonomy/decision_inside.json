@@ -1,0 +1,1 @@
+{"case": "decision with ADR fields inside data.decision", "op": "log", "args": {"kind": "insight", "title": "Synthetic decision", "data": {"kind": "decision", "decision": {"options": ["a", "b"], "chosen": "b", "rationale": "a was refuted", "decided_by": "agent", "revisit_if": "never"}}}, "error": null}

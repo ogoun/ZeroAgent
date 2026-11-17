@@ -1,0 +1,1 @@
+{"case": "supersede with a reason shorter than 10 characters", "op": "supersede", "args": {"id": "01M8SYNENTRY0000000000001", "body": {"title": "Newer synthetic insight", "reason": "outdated", "data": {"kind": "discovery"}}}, "error": "at least 10 characters"}

@@ -1,0 +1,1 @@
+{"case": "theorem with evidence {checked, method, result}", "op": "log", "args": {"kind": "insight", "title": "Synthetic theorem", "certainty": "theorem", "data": {"kind": "discovery", "evidence": {"checked": "call:c1", "method": "cargo test", "result": "green"}}}, "error": null}

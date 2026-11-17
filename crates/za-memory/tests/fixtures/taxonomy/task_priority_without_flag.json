@@ -1,0 +1,1 @@
+{"case": "task data.priority without the idea_review flag (P8)", "op": "log", "flags": {"idea_review": false}, "args": {"kind": "task", "title": "Synthetic task", "data": {"priority": "high"}}, "error": "data.priority: a task priority needs"}

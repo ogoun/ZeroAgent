@@ -44,3 +44,6 @@ axum.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "time", "test-util", "sync"] }
 # Подписчик теста: в записях `tracing` клиента нет токена.
 tracing-subscriber.workspace = true
+# Тело ответа поддельного ZAM с обрывом после записи (`Frame`, задача 6): исход записи
+# неизвестен. Крейт уже в дереве через axum, новых крейтов нет.
+http-body.workspace = true

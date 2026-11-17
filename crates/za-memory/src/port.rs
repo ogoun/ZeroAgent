@@ -34,14 +34,15 @@
 //!   L0; три `Timeout` подряд без ответа сервера (хост за фильтром, который молча отбрасывает
 //!   пакеты; Minor 7 ревью задачи 4) — тоже L0, любой ответ сервера счёт сбрасывает. После L0 —
 //!   проба `/api/v1/health` не чаще раза в 30 с при следующем обращении (D136), время —
-//!   [`Clock`] (D165). Ошибка со статусом уровень не меняет.
+//!   [`Clock`] (D165). Ошибка со статусом уровень не меняет. Уровень, флаги и проба — в
+//!   [`Link`], общей с шлюзом записи (задача 6): [`ZamMemory::link`].
 //! - **Отчёты** `memory.recall` (D153) копятся в порту ([`ZamMemory::drain_reports`]): журнал
 //!   run пишет владелец порта.
 //! - Запись (`session_note`, `files_changed`, `end_session`) — умолчания порта до задачи 9.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::watch;
 use za_core::BoxFuture;
@@ -51,10 +52,11 @@ use za_secrets::MaskCell;
 use za_store::ProjectStore;
 
 use crate::clock::Clock;
-use crate::discovery::{Discovery, Level, discover};
+use crate::discovery::{Discovery, Level};
 use crate::error::{ErrorKind, ZamError};
 use crate::fit::fit_with;
 use crate::ideas::{IdeasMode, ideas_mode};
+use crate::link::Link;
 use crate::recall::{
     Answer, Ask, DIGEST_TIMEOUT_MS, FEATURE_RECALL_TIMEOUT, RECALL_PATH, RETRY_TIMEOUT_MS,
     RecallReport, error_field, outcome, prompt_field,
@@ -62,11 +64,6 @@ use crate::recall::{
 use crate::session::{RunBinding, WARN_SESSION_NOT_REGISTERED, register, session_id};
 use crate::transport::{Ctx, Method, ZamClient};
 
-/// Повторная проба после перехода в L0 — не чаще (D136).
-pub const PROBE_INTERVAL: Duration = Duration::from_secs(30);
-/// `Timeout` подряд без ответа сервера до перехода в L0 («мёртвый хост», Minor 7 ревью
-/// задачи 4).
-pub const DEAD_HOST_TIMEOUTS: u32 = 3;
 /// Сколько отчётов `memory.recall` порт держит до [`ZamMemory::drain_reports`]; старые
 /// вытесняются.
 const REPORTS_MAX: usize = 256;
@@ -85,19 +82,13 @@ pub struct ZamParts {
     pub clock: Arc<dyn Clock>,
 }
 
-/// Изменяемое состояние порта.
+/// Изменяемое состояние порта (уровень, флаги и проба — в [`Link`]).
 #[derive(Debug)]
 struct State {
-    /// Флаги сервера по последнему удачному обнаружению.
-    features: BTreeSet<String>,
-    /// Последняя проба или переход в L0 (D136).
-    probed_at: Instant,
     /// Сессии run, регистрация которых закончена: успехом или отказом без повтора (D139).
     registered: BTreeSet<String>,
     /// Повтор регистрации сессии — не раньше (`Retry-After` временной ошибки).
     register_after: BTreeMap<String, Instant>,
-    /// `Timeout` подряд без ответа сервера.
-    timeouts: u32,
     /// Ссылки, показанные в текущей эпохе контекста (D140).
     shown: BTreeSet<String>,
     /// Выключенные типы подсказок по последнему `session_start`.
@@ -116,39 +107,36 @@ enum Registration {
 /// Порт памяти ZeroAIMemory.
 pub struct ZamMemory {
     parts: ZamParts,
-    level: watch::Sender<Level>,
+    link: Arc<Link>,
     state: Mutex<State>,
 }
 
 impl ZamMemory {
     pub fn new(p: ZamParts) -> Self {
-        let features = p
-            .discovery
-            .info
-            .as_ref()
-            .map(|i| i.features.clone())
-            .unwrap_or_default();
+        let link = Arc::new(Link::new(p.client.clone(), &p.discovery, p.clock.clone()));
         let state = State {
-            features,
-            probed_at: p.clock.now(),
             registered: BTreeSet::new(),
             register_after: BTreeMap::new(),
-            timeouts: 0,
             shown: BTreeSet::new(),
             hooks_off: Vec::new(),
             reports: VecDeque::new(),
         };
-        let (level, _) = watch::channel(p.discovery.level);
         Self {
             parts: p,
-            level,
+            link,
             state: Mutex::new(state),
         }
     }
 
     /// Подписка на уровень памяти: смену видит бинарник (D137).
     pub fn level_watch(&self) -> watch::Receiver<Level> {
-        self.level.subscribe()
+        self.link.subscribe()
+    }
+
+    /// Связь с сервером (уровень, флаги, проба): её же берёт шлюз записи (задача 6), чтобы
+    /// чтения и записи видели один уровень.
+    pub fn link(&self) -> Arc<Link> {
+        self.link.clone()
     }
 
     /// Накопленные отчёты `memory.recall` (D153), порт их забывает.
@@ -161,75 +149,24 @@ impl ZamMemory {
     }
 
     fn current(&self) -> Level {
-        *self.level.borrow()
+        self.link.level()
     }
 
-    /// Можно ли обращаться к серверу: при L0 — проба не чаще раза в [`PROBE_INTERVAL`].
+    /// Можно ли обращаться к серверу: при L0 — проба не чаще раза в [`crate::link::PROBE_INTERVAL`].
     async fn available(&self) -> bool {
-        if self.current() != Level::L0 {
-            return true;
-        }
-        let now = self.parts.clock.now();
-        {
-            let mut st = self.state();
-            if now.saturating_duration_since(st.probed_at) < PROBE_INTERVAL {
-                return false;
-            }
-            // Слот пробы занят сразу: параллельный вызов не пробует второй раз.
-            st.probed_at = now;
-        }
-        let d = discover(&self.parts.client).await;
-        let Some(info) = d.info.filter(|_| d.level != Level::L0) else {
-            self.state().probed_at = self.parts.clock.now();
-            return false;
-        };
-        {
-            let mut st = self.state();
-            st.features = info.features;
-            st.timeouts = 0;
-        }
-        self.level.send_replace(d.level);
-        tracing::info!(level = d.level.as_str(), "память: сервер снова доступен");
-        true
+        self.link.available().await
     }
 
     /// Нет соединения, обрыв, «не ZAM» или мёртвый хост — L0 с повторной пробой через
-    /// [`PROBE_INTERVAL`].
+    /// [`crate::link::PROBE_INTERVAL`].
     fn drop_to_l0(&self, e: &ZamError) {
-        {
-            let mut st = self.state();
-            st.probed_at = self.parts.clock.now();
-            st.timeouts = 0;
-        }
-        if self.level.send_replace(Level::L0) != Level::L0 {
-            tracing::warn!(error = %e, "zero-agent: память недоступна; записи — в очередь");
-        }
+        self.link.drop_to_l0(e);
     }
 
-    /// Счёт мёртвого хоста по итогу запроса: `Timeout` без ответа сервера — +1, на
-    /// [`DEAD_HOST_TIMEOUTS`] подряд — L0; любой ответ сервера (успех или ошибка со статусом)
-    /// счёт сбрасывает. Нет соединения, обрыв, «не ZAM» переводят в L0 сами ([`Self::failed`]).
+    /// Счёт мёртвого хоста по итогу запроса ([`Link::note_outcome`]). Нет соединения, обрыв,
+    /// «не ZAM» переводят в L0 сами ([`Self::failed`]).
     fn note_outcome(&self, e: Option<&ZamError>) {
-        let dead = {
-            let mut st = self.state();
-            match e {
-                Some(e) if e.kind == ErrorKind::Timeout => {
-                    st.timeouts += 1;
-                    st.timeouts >= DEAD_HOST_TIMEOUTS
-                }
-                _ => {
-                    st.timeouts = 0;
-                    false
-                }
-            }
-        };
-        if let Some(e) = e.filter(|_| dead) {
-            tracing::warn!(
-                timeouts = DEAD_HOST_TIMEOUTS,
-                "память: сервер не отвечает в срок подряд — уровень L0"
-            );
-            self.drop_to_l0(e);
-        }
+        self.link.note_outcome(e);
     }
 
     /// Итог ошибки запроса: срок вышел — `Timeout`; сервер недоступен — `Unavailable` и L0;
@@ -345,7 +282,7 @@ impl ZamMemory {
             Registration::Go(w) => w,
             Registration::Stop(r) => return r.into(),
         };
-        let features = self.state().features.clone();
+        let features = self.link.features();
         let body = ask.body(&sid, b, budget, features.contains(FEATURE_RECALL_TIMEOUT));
         let started = self.parts.clock.now();
         let res = self
