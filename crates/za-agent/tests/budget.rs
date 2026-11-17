@@ -168,18 +168,14 @@ fn fx(name: &str) -> Fx {
 
 fn spec(budget: Budget) -> RunSpec {
     RunSpec {
-        project_id: "p".into(),
-        project_dir: PathBuf::from("H:/p"),
         role: RunRole::Worker,
         parent: None,
-        endpoint: EndpointId("local".into()),
         run_mode: RunMode::Ask,
         work_mode: None,
         tier: None,
         budget,
         priority: Priority::Top,
         max_wait: None,
-        task: "Задача".into(),
         agents_md: None,
         env: EnvInfo {
             os: "windows".into(),
@@ -194,6 +190,12 @@ fn spec(budget: Budget) -> RunSpec {
         context: za_agent::ContextConfig::default(),
         trusted: true,
         grants: Vec::new(),
+        ..RunSpec::new(
+            "p".into(),
+            PathBuf::from("H:/p"),
+            EndpointId("local".into()),
+            "Задача".into(),
+        )
     }
 }
 

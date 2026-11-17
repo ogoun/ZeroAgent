@@ -55,6 +55,10 @@ pub struct ResumeChange {
     pub trusted: Option<bool>,
     /// Новые гранты (`run --grant` при resume, D78): с границы.
     pub grants_add: Vec<Grant>,
+    /// Раскрытия ключей Vault памяти до продолжения (R1-M D143): payload событий
+    /// `secret.revealed {name, scope, item, cached}` — первые события продолжения, без
+    /// значений.
+    pub secrets_revealed: Vec<Value>,
 }
 
 /// Длина аргументов вызова в блоке `<state>`, символы.
@@ -226,6 +230,19 @@ pub async fn resume_run(
         }
         Err(e) => return Err(e),
     };
+    // R1-M D143: раскрытия ключей Vault этого продолжения — первые его события (значений нет).
+    for p in change.secrets_revealed {
+        st.last_seq = j
+            .append(NewEvent {
+                run_id: run,
+                parent_seq: None,
+                actor: Actor::Runtime,
+                kind: EventKind::SecretRevealed,
+                payload: p,
+                tainted: false,
+            })
+            .await?;
+    }
     // Вычисленное значение — в журнал до первого нового эффекта (уточнение D161): журнал
     // дальше дописывает код R1-M, повторный resume того же снимка берёт записанное.
     if let Some(l) = legacy

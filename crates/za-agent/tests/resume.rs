@@ -220,18 +220,14 @@ fn fx_in(d: &std::path::Path) -> Fx {
 
 fn spec(mode: RunMode, budget: Budget) -> RunSpec {
     RunSpec {
-        project_id: "p".into(),
-        project_dir: PathBuf::from("H:/p"),
         role: RunRole::Top,
         parent: None,
-        endpoint: EndpointId("a".into()),
         run_mode: mode,
         work_mode: None,
         tier: None,
         budget,
         priority: Priority::Top,
         max_wait: None,
-        task: "Задача".into(),
         agents_md: None,
         env: EnvInfo {
             os: "windows".into(),
@@ -246,6 +242,12 @@ fn spec(mode: RunMode, budget: Budget) -> RunSpec {
         context: ContextConfig::default(),
         trusted: true,
         grants: Vec::new(),
+        ..RunSpec::new(
+            "p".into(),
+            PathBuf::from("H:/p"),
+            EndpointId("a".into()),
+            "Задача".into(),
+        )
     }
 }
 

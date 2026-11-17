@@ -573,18 +573,14 @@ fn answer(t: &str) -> Vec<Result<StreamEvent, ModelError>> {
 
 fn run_spec(project: &Path) -> RunSpec {
     RunSpec {
-        project_id: "p".into(),
-        project_dir: project.to_path_buf(),
         role: RunRole::Top,
         parent: None,
-        endpoint: EndpointId("local".into()),
         run_mode: RunMode::Ask,
         work_mode: None,
         tier: None,
         budget: Budget::default(),
         priority: Priority::Top,
         max_wait: None,
-        task: "Собери данные".into(),
         agents_md: None,
         env: EnvInfo {
             os: "windows".into(),
@@ -599,6 +595,12 @@ fn run_spec(project: &Path) -> RunSpec {
         context: ContextConfig::default(),
         trusted: true,
         grants: Vec::new(),
+        ..RunSpec::new(
+            "p".into(),
+            project.to_path_buf(),
+            EndpointId("local".into()),
+            "Собери данные".into(),
+        )
     }
 }
 

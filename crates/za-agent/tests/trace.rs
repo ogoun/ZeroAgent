@@ -171,18 +171,14 @@ fn fx(name: &str) -> Fx {
 
 fn spec(project: &std::path::Path) -> RunSpec {
     RunSpec {
-        project_id: "p".into(),
-        project_dir: project.to_path_buf(),
         role: RunRole::Top,
         parent: None,
-        endpoint: EndpointId("a".into()),
         run_mode: RunMode::Ask,
         work_mode: None,
         tier: Some(Tier::Small),
         budget: Budget::default(),
         priority: Priority::Top,
         max_wait: None,
-        task: "Collect the echo outputs and report".into(),
         agents_md: None,
         env: EnvInfo {
             os: "windows".into(),
@@ -197,6 +193,12 @@ fn spec(project: &std::path::Path) -> RunSpec {
         context: ContextConfig::default(),
         trusted: true,
         grants: Vec::new(),
+        ..RunSpec::new(
+            "p".into(),
+            project.to_path_buf(),
+            EndpointId("a".into()),
+            "Collect the echo outputs and report".into(),
+        )
     }
 }
 

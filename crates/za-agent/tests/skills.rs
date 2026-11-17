@@ -120,18 +120,14 @@ fn fx_with(name: &str, catalog: Catalog, n_ctx: u32, extra: Vec<Arc<dyn Tool>>) 
 
 fn spec(f: &Fx, task: &str, tier: Tier) -> RunSpec {
     RunSpec {
-        project_id: "p".into(),
-        project_dir: f.project.clone(),
         role: RunRole::Top,
         parent: None,
-        endpoint: EndpointId("a".into()),
         run_mode: RunMode::Ask,
         work_mode: None,
         tier: Some(tier),
         budget: Budget::default(),
         priority: Priority::Top,
         max_wait: None,
-        task: task.into(),
         agents_md: None,
         env: EnvInfo {
             os: "windows".into(),
@@ -146,6 +142,12 @@ fn spec(f: &Fx, task: &str, tier: Tier) -> RunSpec {
         context: ContextConfig::default(),
         trusted: true,
         grants: Vec::new(),
+        ..RunSpec::new(
+            "p".into(),
+            f.project.clone(),
+            EndpointId("a".into()),
+            task.into(),
+        )
     }
 }
 

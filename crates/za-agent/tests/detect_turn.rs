@@ -588,18 +588,14 @@ fn spec(role: RunRole) -> RunSpec {
 
 fn spec_mode(role: RunRole, run_mode: RunMode) -> RunSpec {
     RunSpec {
-        project_id: "p".into(),
-        project_dir: PathBuf::from("H:/p"),
         role,
         parent: None,
-        endpoint: EndpointId("local".into()),
         run_mode,
         work_mode: None,
         tier: None,
         budget: Budget::default(),
         priority: Priority::Top,
         max_wait: None,
-        task: "Запусти тесты".into(),
         agents_md: None,
         env: EnvInfo {
             os: "windows".into(),
@@ -614,6 +610,12 @@ fn spec_mode(role: RunRole, run_mode: RunMode) -> RunSpec {
         context: ContextConfig::default(),
         trusted: true,
         grants: Vec::new(),
+        ..RunSpec::new(
+            "p".into(),
+            PathBuf::from("H:/p"),
+            EndpointId("local".into()),
+            "Запусти тесты".into(),
+        )
     }
 }
 

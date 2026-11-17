@@ -179,18 +179,14 @@ fn scripted() -> ScriptedModel {
 
 fn spec(role: RunRole) -> RunSpec {
     RunSpec {
-        project_id: "p".into(),
-        project_dir: PathBuf::from("H:/p"),
         role,
         parent: None,
-        endpoint: EndpointId("local".into()),
         run_mode: RunMode::Ask,
         work_mode: None,
         tier: None,
         budget: Budget::default(),
         priority: Priority::Top,
         max_wait: None,
-        task: "Столица Франции?".into(),
         agents_md: None,
         env: EnvInfo {
             os: "windows".into(),
@@ -205,6 +201,12 @@ fn spec(role: RunRole) -> RunSpec {
         context: za_agent::ContextConfig::default(),
         trusted: true,
         grants: Vec::new(),
+        ..RunSpec::new(
+            "p".into(),
+            PathBuf::from("H:/p"),
+            EndpointId("local".into()),
+            "Столица Франции?".into(),
+        )
     }
 }
 
@@ -1254,6 +1256,60 @@ async fn endpoint_change_refused_on_started_step() {
             ..
         }
     ));
+}
+
+/// R1-M D143: раскрытия ключей Vault до создания run — события `secret.revealed` шага 0
+/// (`RunSpec.secrets_revealed`), раньше первого хода; у продолжения — первыми событиями
+/// resume (`ResumeChange.secrets_revealed`). Payload — как передал вызывающий, значений нет.
+#[tokio::test]
+async fn secrets_revealed_events_at_start_and_resume() {
+    let mut f = fx("secrets_revealed", scripted());
+    f.deps.crash = Some(crash_once(CrashPoint::AfterContext { step: 1 }));
+    f.model.push(answer("готово"));
+    let started =
+        json!({"name": "demo-key", "scope": "solution", "item": "01M8V1", "cached": false});
+    let s = RunSpec {
+        secrets_revealed: vec![started.clone()],
+        ..spec(RunRole::Top)
+    };
+    assert!(matches!(start(&mut f, s).await, Err(LoopError::Halted)));
+    let evs = events(&f.store, f.run).await;
+    let revealed = of_kind(&evs, EventKind::SecretRevealed);
+    assert_eq!(revealed.len(), 1);
+    assert_eq!(revealed[0].payload, started);
+    let first_turn = evs
+        .iter()
+        .position(|e| e.kind == EventKind::TurnStarted)
+        .unwrap_or(evs.len());
+    let at = evs
+        .iter()
+        .position(|e| e.kind == EventKind::SecretRevealed)
+        .unwrap();
+    assert!(at < first_turn, "secret.revealed после первого хода");
+
+    let resumed =
+        json!({"name": "demo-key", "scope": "solution", "item": "01M8V1", "cached": true});
+    let before = evs.len();
+    let (_ctl, rx) = control_channel(f.store.clone(), f.run);
+    let change = ResumeChange {
+        secrets_revealed: vec![resumed.clone()],
+        ..ResumeChange::default()
+    };
+    let out = within("resume_run", resume_run(&f.deps, f.run, change, rx))
+        .await
+        .unwrap();
+    assert!(matches!(
+        out,
+        LoopOutcome::Finished {
+            status: RunStatus::Done,
+            ..
+        }
+    ));
+    let evs = events(&f.store, f.run).await;
+    let tail = &evs[before..];
+    assert_eq!(tail[0].kind, EventKind::SecretRevealed, "{tail:?}");
+    assert_eq!(tail[0].payload, resumed);
+    assert_eq!(of_kind(&evs, EventKind::SecretRevealed).len(), 2);
 }
 
 // ---- R1-C2, задача 1: невидимые символы во вводе (D102, SEC-051) ----

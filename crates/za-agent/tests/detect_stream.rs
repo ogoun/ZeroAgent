@@ -353,18 +353,14 @@ fn fx(name: &str) -> Fx {
 
 fn spec() -> RunSpec {
     RunSpec {
-        project_id: "p".into(),
-        project_dir: PathBuf::from("H:/p"),
         role: RunRole::Top,
         parent: None,
-        endpoint: EndpointId("local".into()),
         run_mode: RunMode::Ask,
         work_mode: None,
         tier: None,
         budget: Budget::default(),
         priority: Priority::Top,
         max_wait: None,
-        task: "Проверь конфигурацию".into(),
         agents_md: None,
         env: EnvInfo {
             os: "windows".into(),
@@ -379,6 +375,12 @@ fn spec() -> RunSpec {
         context: ContextConfig::default(),
         trusted: true,
         grants: Vec::new(),
+        ..RunSpec::new(
+            "p".into(),
+            PathBuf::from("H:/p"),
+            EndpointId("local".into()),
+            "Проверь конфигурацию".into(),
+        )
     }
 }
 

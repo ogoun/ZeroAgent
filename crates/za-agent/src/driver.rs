@@ -249,6 +249,56 @@ pub struct RunSpec {
     pub trusted: bool,
     /// Гранты run (`--grant`, `[[policy.grants]]`, D78).
     pub grants: Vec<Grant>,
+    /// Раскрытия ключей Vault памяти до создания run (R1-M D143): payload событий
+    /// `secret.revealed {name, scope, item, cached}` шага 0, без значений. Пишет драйвер
+    /// событиями шага 0 по порядку.
+    pub secrets_revealed: Vec<Value>,
+}
+
+impl RunSpec {
+    /// Параметры с нейтральными значениями прочих полей (R1-M D143, preflight 1.7): роль `top`
+    /// без родителя, режим по умолчанию (`ask`), без режима работы и тира (тир — по окну),
+    /// бюджет по умолчанию, приоритет `top`, без `max_wait`, без инструкций проекта, `<env>` с
+    /// каталогом проекта (прочие поля пустые; `tier`, `n_ctx`, `budget` перезаписывает
+    /// `start_run`, D37), `[context]` по умолчанию, проект **не доверен**, без грантов и
+    /// раскрытий. Литералы `RunSpec { …, ..RunSpec::new(…) }` задают отличия явно.
+    pub fn new(
+        project_id: String,
+        project_dir: PathBuf,
+        endpoint: EndpointId,
+        task: String,
+    ) -> Self {
+        let env = EnvInfo {
+            os: String::new(),
+            shell: String::new(),
+            project_dir: project_dir.to_string_lossy().into_owned(),
+            date: String::new(),
+            tier: Tier::Small,
+            n_ctx: 0,
+            budget: String::new(),
+            branch: String::new(),
+        };
+        Self {
+            project_id,
+            project_dir,
+            role: RunRole::Top,
+            parent: None,
+            endpoint,
+            run_mode: RunMode::default(),
+            work_mode: None,
+            tier: None,
+            budget: Budget::default(),
+            priority: Priority::Top,
+            max_wait: None,
+            task,
+            agents_md: None,
+            env,
+            context: ContextConfig::default(),
+            trusted: false,
+            grants: Vec::new(),
+            secrets_revealed: Vec::new(),
+        }
+    }
 }
 
 /// Итог цикла.
@@ -541,6 +591,20 @@ async fn step_zero(
     };
     // Ревью задачи 1, m1: события шага 0 — после квитанции памяти, снимок шага 0 стоит
     // на последнем событии run (D4).
+    // R1-M D143: раскрытия ключей Vault до создания run — первые события шага 0, значений
+    // нет.
+    for p in std::mem::take(&mut spec.secrets_revealed) {
+        last_seq = Some(
+            append(
+                &deps.journal,
+                run,
+                Actor::Runtime,
+                EventKind::SecretRevealed,
+                p,
+            )
+            .await?,
+        );
+    }
     for (source, removed) in cleaned {
         last_seq = Some(input_cleaned(&deps.journal, run, source, removed, None).await?);
     }
@@ -3647,18 +3711,14 @@ mod tests {
         );
         let run = RunId::new();
         let spec = RunSpec {
-            project_id: "p".into(),
-            project_dir: PathBuf::from("H:/p"),
             role: RunRole::Top,
             parent: None,
-            endpoint: EndpointId("a".into()),
             run_mode: RunMode::Ask,
             work_mode: None,
             tier: None,
             budget: Budget::default(),
             priority: Priority::Top,
             max_wait: None,
-            task: "t".into(),
             agents_md: None,
             env: EnvInfo {
                 os: "windows".into(),
@@ -3673,6 +3733,12 @@ mod tests {
             context: ContextConfig::default(),
             trusted: true,
             grants: Vec::new(),
+            ..RunSpec::new(
+                "p".into(),
+                PathBuf::from("H:/p"),
+                EndpointId("a".into()),
+                "t".into(),
+            )
         };
         store
             .create_run(NewRun {

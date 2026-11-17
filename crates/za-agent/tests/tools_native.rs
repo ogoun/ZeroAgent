@@ -968,18 +968,14 @@ fn lx(name: &str) -> Lx {
 fn spec(l: &Lx, mode: RunMode) -> RunSpec {
     let dir = s(&l.d.roots.project);
     RunSpec {
-        project_id: "p".into(),
-        project_dir: l.d.roots.project.clone(),
         role: RunRole::Top,
         parent: None,
-        endpoint: EndpointId("a".into()),
         run_mode: mode,
         work_mode: None,
         tier: Some(Tier::Standard),
         budget: Budget::default(),
         priority: Priority::Top,
         max_wait: None,
-        task: "Задача".into(),
         agents_md: None,
         env: EnvInfo {
             os: "windows".into(),
@@ -994,6 +990,12 @@ fn spec(l: &Lx, mode: RunMode) -> RunSpec {
         context: ContextConfig::default(),
         trusted: true,
         grants: Vec::new(),
+        ..RunSpec::new(
+            "p".into(),
+            l.d.roots.project.clone(),
+            EndpointId("a".into()),
+            "Задача".into(),
+        )
     }
 }
 

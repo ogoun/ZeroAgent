@@ -1309,6 +1309,7 @@ pub async fn cmd_run(home: &Path, args: RunArgs) -> Result<ExitCode, RunError> {
                 context: cfg.context.clone(),
                 trusted: prep.trusted,
                 grants: prep.grants.clone(),
+                secrets_revealed: Vec::new(),
             };
             let (mut deps, bus) = deps(
                 &store,
