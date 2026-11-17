@@ -5,6 +5,13 @@
 ## Не выпущено
 
 ### Добавлено
+- R1-M, задача 4 — порт памяти ZeroAIMemory `ZamMemory` (D139–D142, D148, D168, D169; П3, Δ11, П15 изменений по ZAM 0.0.12-m6.5; ADR 0007, раздел «Сессия run, `/recall` и укладка в бюджет»):
+  - `za-memory`: `session` — сессия run `za-<project_id>-<run>`, `RunBinding`, регистрация `POST /api/v1/sessions` строгим телом один раз на run;
+  - `za-memory`: `recall` — `/recall` без `output_limit`, `source`, `code_map`, `agent_block_version`; `fetch_budget(b) = min(4 × b, 6000)`; `timeout_ms` по флагу `recall_timeout`; маска ввода подсказок до отправки (`prompt` — 512 символов, `error` — 4 КиБ); итоги `Hits`, `Partial`, `Empty`, `Timeout`, `Unavailable`, `Capped`; данные события `memory.recall` — `RecallReport`;
+  - `za-memory`: `fit::fit_digest` — укладка ответа в бюджет на клиенте: приоритет разделов D141, самый длинный префикс заголовка, строка плана и указатели по началу, правила ступенями до `<путь> n:<id>`, строка `[memory: omitted …; use memory_search]` в бюджете (до пяти имён и `+N`), счёт с поправкой по `tokens` сервера;
+  - `za-memory`: `ideas` — `IdeasMode::{Wait, Review}`, `ideas_mode(features, visible)`; в `Wait` раздел `### Идеи на разбор`, строка `План из идей` и подсказки с `reason: idea_review` снимаются; признак `review` — полем `ideas` значения эффекта;
+  - `za-memory`: `port` — `ZamParts`, `ZamMemory` (`MemoryPort`: `snapshot`, `after_compaction`, `prompt_hint`, `tool_error_hint`, `retry_digest`), уровень `level_watch`, проба после L0 не чаще раза в 30 с, без повторов ссылок в эпохе, `drain_reports`;
+  - тесты: поддельный ZAM — `/api/v1/sessions`, ответы `/recall` по событию (`RecallAnswer`), ворота задержки `/recall`, `FakeZam::start_at`, формы `@m6.5` с `items[].reason: idea_review`; `za-memory/tests/{fit,recall,session}.rs`, синтетические дайджесты `tests/fixtures/digest/*.md`.
 - R1-M, задача 3 — память в цикле (D138, D140, D142, D161, D168, D169):
   - `za-core`: модуль `memory` — порт `MemoryPort` (перенос из `za-agent`, реэкспорт там же), `Recall::{Partial, Capped}`, `state()`, `to_value()`/`from_value()` (значение эффекта `{text, state}`, квитанция `{text}` R1-B читается), `RecallReply` и признак режима идей `IdeasSignal` (`review`/`propose`, поле `ideas` значения), `SessionNote`, `CommandNote`, `NoteOutcome`, `PROMPT_EVENT`, `POST_TOOL_EVENT`; новые методы порта с умолчаниями — `prompt_hint`, `tool_error_hint`, `retry_digest`, `session_note`, `files_changed`, `end_session`;
   - цикл: эффект `memory.prompt` к задаче (шаг 0) и к каждому вводу `inbox` — подсказка блоком `<memory source="zam" kind="hint">` после текста ввода; на шаге 0 дайджест и подсказка — в блоке `<memory>` первого сообщения в одном бюджете `memory_budget`;
