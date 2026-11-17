@@ -23,8 +23,9 @@
 //!   с `isError: true`, текстом `Ошибка <код> <title>: <detail>` и строкой `~N tok`;
 //!   неизвестный инструмент — ошибка JSON-RPC; у Vault `?name=` молча игнорируется.
 //! - **Подмены** включаются методами в тесте, без таймеров: форма `/api/v1/health`
-//!   ([`Health`]), требуемый токен, 3xx на другой сервер, ответ-ошибка по пути, решение
-//!   и отказ в доступе к нему, блокировка Vault, выключенные типы подсказок, ошибка MCP.
+//!   ([`Health`]), требуемый токен, 3xx на другой сервер, ответ-ошибка или иное тело по
+//!   пути, решение и отказ в доступе к нему, блокировка Vault, выключенные типы подсказок,
+//!   ошибка MCP; обрыв соединения — отдельный [`CutServer`].
 //!
 //! Задачи 4–9 дополняют сервер сессиями, записями, ключами идемпотентности, снимками.
 
@@ -216,6 +217,7 @@ struct State {
     vault_locked: Option<String>,
     hooks_off: Vec<String>,
     failures: BTreeMap<String, Failure>,
+    replies: BTreeMap<String, Value>,
     mcp_error: Option<String>,
 }
 
@@ -238,6 +240,7 @@ impl FakeZam {
             vault_locked: None,
             hooks_off: Vec::new(),
             failures: BTreeMap::new(),
+            replies: BTreeMap::new(),
             mcp_error: None,
         }));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -329,6 +332,15 @@ impl FakeZam {
         let r = route.to_owned();
         self.with(|s| {
             s.failures.insert(r, f);
+        });
+    }
+
+    /// Путь `route` (без строки запроса) отвечает 200 с телом `body` вместо обычного ответа:
+    /// форма, которой у сервера нет (поле пропало, тип другой).
+    pub fn reply(&self, route: &str, body: Value) {
+        let r = route.to_owned();
+        self.with(|s| {
+            s.replies.insert(r, body);
         });
     }
 
@@ -517,6 +529,15 @@ async fn handle(req: Request, tx: &mpsc::UnboundedSender<Seen>, state: &Mutex<St
                 .insert(header::RETRY_AFTER, HeaderValue::from(s));
         }
         return r;
+    }
+    let reply = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replies
+        .get(&route)
+        .cloned();
+    if let Some(v) = reply {
+        return json_reply(200, v);
     }
     if route == "/mcp" {
         return mcp(&headers, &body, state);

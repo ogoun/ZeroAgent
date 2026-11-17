@@ -174,6 +174,7 @@ async fn status_reports_token_solution_vault_hooks() {
     );
     assert_eq!(st.vault, VaultState::Locked("no master key".into()));
     assert_eq!(st.hooks_off, vec!["prompt".to_owned()]);
+    assert_eq!(st.hooks_unchecked, None);
     let seen = fake.seen();
     let recall = seen
         .iter()
@@ -204,6 +205,7 @@ async fn status_reports_token_solution_vault_hooks() {
     );
     assert_eq!(st.vault, VaultState::Unlocked);
     assert!(st.hooks_off.is_empty());
+    assert_eq!(st.hooks_unchecked, None);
     let st = within(WAIT, "status", status(&c, None)).await;
     assert_eq!(st.solution, SolutionState::NotBound);
     // Решения нет на сервере — 404.
@@ -224,6 +226,7 @@ async fn status_without_token_or_server() {
     assert_eq!(st.discovery.level, Level::L2);
     assert_eq!(st.token, TokenState::NotSet);
     assert!(matches!(st.vault, VaultState::Unchecked(_)));
+    assert!(st.hooks_unchecked.is_some(), "{st:?}");
     let seen = fake.seen();
     assert_eq!(seen.len(), 1, "{seen:?}");
 
@@ -252,6 +255,49 @@ async fn status_rate_limited_token() {
         st.token,
         TokenState::RateLimited(Some(Duration::from_secs(9)))
     );
+}
+
+/// «Не проверено» — не «всё хорошо» (M2 ревью задачи 2): `/recall` для подсказок не удался
+/// или ответил без `hooks` — `hooks_unchecked` с причиной (пустой `hooks_off` ничего не
+/// значит); ответ Vault без поля `locked` — `VaultState::Unchecked`, а не `Unlocked`.
+#[tokio::test]
+async fn status_unchecked_is_not_ok() {
+    let fake = FakeZam::start().await;
+    let c = client(&fake.url(), Some(token()));
+    fake.fail("/api/v1/recall", 500, "about:blank", None);
+    fake.reply(
+        "/api/v1/spaces/knowledge/vault",
+        serde_json::json!({"items": []}),
+    );
+    let st = within(WAIT, "status", status(&c, None)).await;
+    assert_eq!(st.token, TokenState::Accepted);
+    assert!(st.hooks_off.is_empty(), "{st:?}");
+    assert!(
+        matches!(st.hooks_unchecked.as_deref(), Some(why) if why.contains("500")),
+        "{st:?}"
+    );
+    assert!(
+        matches!(&st.vault, VaultState::Unchecked(why) if why.contains("locked")),
+        "{st:?}"
+    );
+
+    // Ответ `/recall` без `hooks` — тоже не проверено; `locked` не булево — тоже.
+    let fake = FakeZam::start().await;
+    let c = client(&fake.url(), Some(token()));
+    fake.reply(
+        "/api/v1/recall",
+        serde_json::json!({"text": "", "items": []}),
+    );
+    fake.reply(
+        "/api/v1/spaces/knowledge/vault",
+        serde_json::json!({"items": [], "locked": "no"}),
+    );
+    let st = within(WAIT, "status", status(&c, None)).await;
+    assert!(
+        matches!(st.hooks_unchecked.as_deref(), Some(why) if why.contains("hooks")),
+        "{st:?}"
+    );
+    assert!(matches!(st.vault, VaultState::Unchecked(_)), "{st:?}");
 }
 
 /// Живая проверка на тестовом стенде (решение владельца 4, D151): только
@@ -288,12 +334,13 @@ async fn live_stand_discovery_and_status() {
         st.vault
     );
     eprintln!(
-        "стенд: {} ({}), {}, флагов {}, Vault {:?}, hooks_off {:?}",
+        "стенд: {} ({}), {}, флагов {}, Vault {:?}, hooks_off {:?}, hooks_unchecked {:?}",
         info.version,
         info.git.as_deref().unwrap_or("-"),
         st.discovery.level.as_str(),
         info.features.len(),
         st.vault,
-        st.hooks_off
+        st.hooks_off,
+        st.hooks_unchecked
     );
 }

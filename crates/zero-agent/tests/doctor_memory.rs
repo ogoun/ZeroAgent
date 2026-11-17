@@ -128,3 +128,29 @@ async fn doctor_memory_unreachable_is_warn() {
         "{c:?}"
     );
 }
+
+/// «Не проверено» — `Warn` с причиной, а не `Ok` (M2 ревью задачи 2): `/recall` для
+/// подсказок не удался; ответ Vault без поля `locked`.
+#[tokio::test]
+async fn doctor_memory_unchecked_is_warn() {
+    let fake = FakeZam::start().await;
+    fake.fail("/api/v1/recall", 500, "about:blank", None);
+    let cfg = MemoryConfig::new(&fake.url());
+    let c = within(WAIT, "hooks", check_memory_live(Some(&cfg), token())).await;
+    assert!(
+        matches!(&c, Check::Warn(t) if t.contains("подсказки: не проверено: 500") && t.contains("Vault открыт")),
+        "{c:?}"
+    );
+
+    let fake = FakeZam::start().await;
+    fake.reply(
+        "/api/v1/spaces/knowledge/vault",
+        serde_json::json!({"items": []}),
+    );
+    let cfg = MemoryConfig::new(&fake.url());
+    let c = within(WAIT, "vault", check_memory_live(Some(&cfg), token())).await;
+    assert!(
+        matches!(&c, Check::Warn(t) if t.contains("Vault: не проверено: в ответе Vault нет поля locked") && !t.contains("Vault открыт")),
+        "{c:?}"
+    );
+}

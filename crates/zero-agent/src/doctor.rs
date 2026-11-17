@@ -286,8 +286,9 @@ pub async fn check_memory_live(cfg: Option<&MemoryConfig>, token: Option<Token>)
 
 /// Строка `memory` по конфигурации, токену и статусу сервера (D152). Токен — параметром
 /// (`Option<Token>`): функция не читает окружение. `Ok` — L1/L2, токен принят, Vault открыт,
-/// подсказки включены, адрес не уходит открытым текстом за пределы локальной сети; иначе
-/// `Warn` с причинами. `Fail` нет: без памяти агент работает (MEM-011).
+/// подсказки проверены и включены, адрес не уходит открытым текстом за пределы локальной
+/// сети; иначе `Warn` с причинами («не проверено: <причина>» у Vault и подсказок — тоже
+/// `Warn`). `Fail` нет: без памяти агент работает (MEM-011).
 pub fn check_memory(
     cfg: Option<&MemoryConfig>,
     token: Option<Token>,
@@ -365,6 +366,9 @@ pub fn check_memory(
         }
         SolutionState::NotBound | SolutionState::Unchecked(_) => {}
     }
+    // Проверки после принятого токена: «не проверено» — `Warn` с причиной, а не `Ok` (M2
+    // ревью задачи 2). Без принятого токена причина уже названа строкой токена.
+    let checked = st.token == TokenState::Accepted;
     match &st.vault {
         VaultState::Unlocked => text.push_str("; Vault открыт"),
         VaultState::Locked(why) => {
@@ -373,7 +377,15 @@ pub fn check_memory(
                 "; Vault заблокирован: {why} (модели с ключом ждут Vault)"
             ));
         }
+        VaultState::Unchecked(why) if checked => {
+            warn = true;
+            text.push_str(&format!("; Vault: не проверено: {why}"));
+        }
         VaultState::Unchecked(_) => {}
+    }
+    if let Some(why) = st.hooks_unchecked.as_deref().filter(|_| checked) {
+        warn = true;
+        text.push_str(&format!("; подсказки: не проверено: {why}"));
     }
     if !st.hooks_off.is_empty() {
         warn = true;

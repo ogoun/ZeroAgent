@@ -11,7 +11,9 @@
 //!   vault`, поле `locked`) и выключенные типы подсказок (`hooks` ответа `POST /api/v1/recall
 //!   {event: "session_start", record: false, budget_tokens: 1}` без сессии — ни отметок
 //!   показа, ни учёта). Несовместимость или недоступность сервера агента не останавливает
-//!   (MEM-011): статус только описывает.
+//!   (MEM-011): статус только описывает. Не проверенное — не «всё хорошо»: Vault без
+//!   булева `locked` — [`VaultState::Unchecked`], подсказки без `hooks` или с ошибкой
+//!   `/recall` — [`MemoryStatus::hooks_unchecked`] (M2 ревью задачи 2).
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -169,9 +171,12 @@ pub enum SolutionState {
 /// Личный Vault (`knowledge`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultState {
+    /// `locked: false` в ответе списка.
     Unlocked,
-    /// Заблокирован: причина сервера.
+    /// Заблокирован (`locked: true`): причина сервера.
     Locked(String),
+    /// Не проверен: причина (ошибка запроса, токен не принят, в ответе нет булева `locked`).
+    /// «Не проверено» — не «открыт» (M2 ревью задачи 2).
     Unchecked(String),
 }
 
@@ -183,7 +188,12 @@ pub struct MemoryStatus {
     pub solution: SolutionState,
     pub vault: VaultState,
     /// Выключенные у пользователя типы подсказок из [`RECALL_HOOKS`] (`hooks.<тип> = false`).
+    /// Значим только при `hooks_unchecked == None`.
     pub hooks_off: Vec<String>,
+    /// Подсказки не проверены: причина (`/recall` не удался, в ответе нет `hooks`, токен не
+    /// принят, сервер недоступен). Пустой `hooks_off` тогда ничего не значит (M2 ревью
+    /// задачи 2).
+    pub hooks_unchecked: Option<String>,
 }
 
 /// Обнаружение и проверки статуса: без ответа ZAM и без токена — только обнаружение;
@@ -201,6 +211,7 @@ pub async fn status(c: &ZamClient, solution: Option<&str>) -> MemoryStatus {
         solution: SolutionState::Unchecked(why.to_owned()),
         vault: VaultState::Unchecked(why.to_owned()),
         hooks_off: Vec::new(),
+        hooks_unchecked: Some(why.to_owned()),
     };
     if discovery.level == Level::L0 {
         return unchecked("сервер памяти недоступен");
@@ -215,14 +226,19 @@ pub async fn status(c: &ZamClient, solution: Option<&str>) -> MemoryStatus {
             ..unchecked("токен не принят")
         };
     }
-    let (solution, vault, hooks_off) =
+    let (solution, vault, hooks) =
         tokio::join!(check_solution(c, solution), check_vault(c), check_hooks(c));
+    let (hooks_off, hooks_unchecked) = match hooks {
+        Ok(off) => (off, None),
+        Err(why) => (Vec::new(), Some(why)),
+    };
     MemoryStatus {
         discovery,
         token,
         solution,
         vault,
         hooks_off,
+        hooks_unchecked,
     }
 }
 
@@ -291,21 +307,24 @@ async fn check_vault(c: &ZamClient) -> VaultState {
         Ok(v) => v,
         Err(e) => return VaultState::Unchecked(e.to_string()),
     };
-    if v.get("locked").and_then(Value::as_bool) == Some(true) {
-        let reason = v
-            .get("reason")
-            .and_then(Value::as_str)
-            .filter(|r| !r.trim().is_empty())
-            .unwrap_or("причина не указана");
-        VaultState::Locked(reason.to_owned())
-    } else {
-        VaultState::Unlocked
+    match v.get("locked").and_then(Value::as_bool) {
+        Some(true) => {
+            let reason = v
+                .get("reason")
+                .and_then(Value::as_str)
+                .filter(|r| !r.trim().is_empty())
+                .unwrap_or("причина не указана");
+            VaultState::Locked(reason.to_owned())
+        }
+        Some(false) => VaultState::Unlocked,
+        None => VaultState::Unchecked("в ответе Vault нет поля locked".to_owned()),
     }
 }
 
 /// Выключенные типы подсказок: `hooks` ответа `/recall` `session_start` без сессии и без
-/// учёта (`record: false`). Ошибка — пустой список (статус об этом не судит).
-async fn check_hooks(c: &ZamClient) -> Vec<String> {
+/// учёта (`record: false`). Ошибка запроса или ответ без объекта `hooks` — `Err(причина)`:
+/// подсказки не проверены.
+async fn check_hooks(c: &ZamClient) -> Result<Vec<String>, String> {
     let body = json!({"event": "session_start", "record": false, "budget_tokens": 1});
     match c
         .send_json(
@@ -319,10 +338,11 @@ async fn check_hooks(c: &ZamClient) -> Vec<String> {
         )
         .await
     {
-        Ok((_, v)) => hooks_off(&v),
+        Ok((_, v)) if v.get("hooks").is_some_and(Value::is_object) => Ok(hooks_off(&v)),
+        Ok(_) => Err("в ответе /recall нет hooks".to_owned()),
         Err(e) => {
             tracing::debug!(error = %e, "память: hooks не прочитаны");
-            Vec::new()
+            Err(e.to_string())
         }
     }
 }
